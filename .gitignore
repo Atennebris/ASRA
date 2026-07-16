@@ -1,0 +1,25 @@
+# Planning / working docs (not part of the public hackathon deliverable)
+m_Docs/
+
+# Local CLI tool config (not project content)
+.qwen/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Environment / secrets
+.env
+
+# Runtime session data (file-based storage, not committed)
+data/sessions/*
+!data/sessions/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
