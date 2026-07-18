@@ -25,6 +25,9 @@ venv/
 data/sessions/*
 !data/sessions/.gitkeep
 
+# Exploitation allowlist (managed only via the /settings UI, see agent/tools/allowed_targets.py)
+data/allowed_targets.json
+
 # Debug logs (see agent/utils/debug.py)
 data/debug.log
 data/debug/*
