@@ -3,8 +3,7 @@ import logging
 import os
 from pathlib import Path
 
-# Matches LOG_CATEGORIES in logger.py — extend both together when a new module
-# starts logging (see CLAUDE.md "Debug module").
+# Matches LOG_CATEGORIES in logger.py — extend both together when a new module starts logging.
 CATEGORY_COLORS: dict[str, str] = {
     "TOOLS": "\033[36m",  # cyan
     "SESSION": "\033[35m",  # magenta

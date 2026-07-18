@@ -1,10 +1,8 @@
 """LOG_CATEGORIES and get_logger(category): central logging entrypoint for every module."""
 import logging
 
-# Every module with real logic gets a category here before it starts logging
-# (see CLAUDE.md "Debug module"). Pre-declared for the modules already planned
-# across the roadmap phases: TOOLS (2.1.3), SESSION (2.6.4), LLM (3.1.2),
-# AGENT (3.3.6), API (4.1.5).
+# Every module with real logic gets a category here before it starts logging.
+# Pre-declared for the modules already planned: TOOLS, SESSION, LLM, AGENT, API.
 LOG_CATEGORIES: set[str] = {
     "TOOLS",
     "SESSION",

@@ -5,5 +5,7 @@ pyyaml
 python-multipart
 python-dotenv
 openai
+httpx
+mmh3
 pytest
 ruff
