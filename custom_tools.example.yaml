@@ -1,0 +1,33 @@
+# Template for registering your own tools with ASRA.
+#
+# Copy the entries you need into custom_tools.yaml (gitignored, personal to your
+# machine — real paths/binaries differ per developer) and fill in real values.
+#
+# An entry only IDENTIFIES a tool for the agent — it never restricts which
+# arguments the agent can pass to it. Once registered, the agent gets full
+# access to every flag/argument the tool supports (see ROADMAP.md 2.5.2 / 2.1.5)
+# — there is no "allowed flags" list here, on purpose.
+#
+# Fields:
+#   id                       — unique name the agent refers to this tool by
+#   category                 — recon | scan | exploit | post_exploit
+#   executable                — binary name (resolved via PATH) or full path to your script
+#   requires_allowed_target   — true for exploit/post_exploit tools (enforces ALLOWED_TARGET, see SPECIFICATION.md §8)
+#   full_description          — optional. If the tool has no standard --help output the
+#                                agent can query on its own, paste a full description of
+#                                what it does and how to call it here. If omitted, the
+#                                agent runs `<executable> --help` (falling back to `-h`/`help`)
+#                                the first time it needs the tool, and reads that instead.
+
+- id: example-custom-scanner
+  category: scan
+  executable: /home/user/my-tools/example-scanner.sh
+  requires_allowed_target: false
+  full_description: |
+    Custom scanner that checks a target for exposed .env / config files.
+    Usage: example-scanner.sh --target <host> [--verbose] [--timeout <seconds>]
+
+- id: example-custom-exploit
+  category: exploit
+  executable: /home/user/my-tools/example-exploit.py
+  requires_allowed_target: true

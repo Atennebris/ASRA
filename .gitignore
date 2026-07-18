@@ -1,5 +1,8 @@
-# Planning / working docs (not part of the public hackathon deliverable)
+# Planning / working docs 
 m_Docs/
+
+# Claude Code project rules (local only)
+CLAUDE.md
 
 # Local CLI tool config (not project content)
 .qwen/
@@ -14,9 +17,22 @@ venv/
 # Environment / secrets
 .env
 
+# Personal tool registrations (local paths/binaries differ per machine) — see
+# custom_tools.example.yaml for the committed template
+/custom_tools.yaml
+
 # Runtime session data (file-based storage, not committed)
 data/sessions/*
 !data/sessions/.gitkeep
+
+# Debug logs (see agent/utils/debug.py)
+data/debug.log
+data/debug/*
+!data/debug/.gitkeep
+
+# TTL cache for external lookups (see agent/tools/native.py)
+data/cache/*
+!data/cache/.gitkeep
 
 # Editors / OS
 .vscode/
