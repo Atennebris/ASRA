@@ -35,6 +35,12 @@ register_tool(
         build_command=build_nmap_command,
         requires_allowed_target=False,
         installed_by_default=True,
+        description="Fast TCP port scan with service/version detection (-F -sV) against a host.",
+        parameters_schema={
+            "type": "object",
+            "properties": {"target": {"type": "string", "description": "Hostname or IP to scan"}},
+            "required": ["target"],
+        },
     )
 )
 
@@ -47,6 +53,21 @@ register_tool(
         build_command=build_nuclei_command,
         requires_allowed_target=False,
         installed_by_default=True,
+        description=(
+            "Runs Nuclei vulnerability templates against a URL/host — active checks, not just "
+            "passive banner matching (default tags: cve,vuln,exposure,rce,misconfig)."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "URL or host to scan"},
+                "tags": {
+                    "type": "string",
+                    "description": "Comma-separated Nuclei tags to run; omit to use the default active-check set",
+                },
+            },
+            "required": ["target"],
+        },
     )
 )
 
@@ -59,6 +80,34 @@ register_tool(
         build_command=build_exploit_command,
         requires_allowed_target=True,
         installed_by_default=True,
+        description=(
+            "Runs a real Metasploit module against a target: opens a session, optionally runs one "
+            "confirmation command in it to capture proof, then closes it. Requires the target to be "
+            "in the exploitation allowlist and the session to be human-approved."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "RHOSTS value — the target host/IP"},
+                "module": {
+                    "type": "string",
+                    "description": (
+                        "Metasploit module path, e.g. exploit/unix/ftp/vsftpd_234_backdoor — must be "
+                        "one actually returned by msf_module_search, never guessed from memory"
+                    ),
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Extra module options as key/value pairs (e.g. RPORT, PAYLOAD)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "confirm_command": {
+                    "type": "string",
+                    "description": "One harmless command to run in the opened session to capture proof (e.g. id, whoami)",
+                },
+            },
+            "required": ["target", "module"],
+        },
     )
 )
 
@@ -71,6 +120,12 @@ register_tool(
         build_command=build_msf_module_search_command,
         requires_allowed_target=False,  # read-only module lookup, no action against a target
         installed_by_default=True,
+        description="Searches Metasploit's real module database by CVE ID, service, or keyword — use before picking a module for the exploit tool.",
+        parameters_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "CVE ID, service name, or keyword to search for"}},
+            "required": ["query"],
+        },
     )
 )
 
@@ -83,30 +138,143 @@ register_tool(
         build_command=build_sqlmap_command,
         requires_allowed_target=True,
         installed_by_default=True,
+        description=(
+            "Tests a URL/parameter for SQL injection and lists databases if confirmed (or dumps a "
+            "specific table if dump_table/database are given). Requires the target to be in the "
+            "exploitation allowlist and the session to be human-approved."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Full target URL, including path and query string if relevant"},
+                "data": {
+                    "type": "string",
+                    "description": "POST body to send (e.g. a JSON login payload) if the injection point is in the request body",
+                },
+                "headers": {"type": "string", "description": "Extra HTTP headers, one per line"},
+                "test_parameter": {"type": "string", "description": "Name of the specific parameter to test (-p)"},
+                "level": {"type": "integer", "description": "sqlmap test level 1-5"},
+                "risk": {"type": "integer", "description": "sqlmap risk level 1-3"},
+                "dump_table": {"type": "string", "description": "Table name to dump (second-pass call only, after injection is confirmed)"},
+                "database": {"type": "string", "description": "Database name, required together with dump_table"},
+            },
+            "required": ["target"],
+        },
     )
 )
 
-# Tier-1 native tools: plain Python functions, no subprocess/binary needed.
-_NATIVE_RECON_TOOLS = {
-    "crt_sh_lookup": crt_sh_lookup,
-    "wayback_urls": wayback_urls,
-    "whois_lookup": whois_lookup,
-    "dns_lookup": dns_lookup,
+# Tier-1 native tools: plain Python functions, no subprocess/binary needed. Each entry is
+# (function, description, parameters_schema) — every one of these is hand-written Python, so
+# unlike autodiscovered/custom tools there's no --help to fall back on; a schema is mandatory.
+_DOMAIN_SCHEMA = {
+    "type": "object",
+    "properties": {"domain": {"type": "string", "description": "Domain name, e.g. example.com"}},
+    "required": ["domain"],
 }
-_NATIVE_SCAN_TOOLS = {
-    "http_request": http_request,
-    "tcp_port_check": tcp_port_check,
-    "ssl_cert_info": ssl_cert_info,
-    "common_exposure_scan": common_exposure_scan,
-    "favicon_hash": favicon_hash,
-    "security_headers_audit": security_headers_audit,
-    "jwt_decode": jwt_decode,
-    "exploit_db_lookup": exploit_db_lookup,
-    "cve_lookup": cve_lookup,
-    "view_source": view_source,
+_URL_TARGET_SCHEMA = {
+    "type": "object",
+    "properties": {"target": {"type": "string", "description": "Full URL to request"}},
+    "required": ["target"],
 }
 
-for _name, _fn in _NATIVE_RECON_TOOLS.items():
+_NATIVE_RECON_TOOLS = {
+    "crt_sh_lookup": (
+        crt_sh_lookup,
+        "Finds subdomains via Certificate Transparency logs (crt.sh, falls back to certspotter.com) for a domain.",
+        _DOMAIN_SCHEMA,
+    ),
+    "wayback_urls": (
+        wayback_urls,
+        "Finds historical URLs for a domain via the Wayback Machine CDX API — can reveal forgotten endpoints.",
+        _DOMAIN_SCHEMA,
+    ),
+    "whois_lookup": (whois_lookup, "Raw WHOIS lookup for a domain.", _DOMAIN_SCHEMA),
+    "dns_lookup": (dns_lookup, "Resolves a domain to its IP addresses.", _DOMAIN_SCHEMA),
+}
+_NATIVE_SCAN_TOOLS = {
+    "http_request": (
+        http_request,
+        "Makes a GET request to a URL and returns status code, security headers, and a body preview.",
+        _URL_TARGET_SCHEMA,
+    ),
+    "tcp_port_check": (
+        tcp_port_check,
+        "Checks whether a specific TCP port on a host is open.",
+        {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Host to check"},
+                "port": {"type": "integer", "description": "TCP port number"},
+                "timeout": {"type": "number", "description": "Connect timeout in seconds, default 5"},
+            },
+            "required": ["target", "port"],
+        },
+    ),
+    "ssl_cert_info": (
+        ssl_cert_info,
+        "Fetches and parses the TLS certificate presented by a host.",
+        {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Host to connect to"},
+                "port": {"type": "integer", "description": "TLS port, default 443"},
+            },
+            "required": ["target"],
+        },
+    ),
+    "common_exposure_scan": (
+        common_exposure_scan,
+        "Checks a base URL for commonly exposed sensitive paths (.git/config, .env, backups, etc.).",
+        _URL_TARGET_SCHEMA,
+    ),
+    "favicon_hash": (
+        favicon_hash,
+        "Fetches a site's favicon and computes its mmh3 hash (Shodan-style fingerprint) to help identify the CMS/framework.",
+        _URL_TARGET_SCHEMA,
+    ),
+    "security_headers_audit": (
+        security_headers_audit,
+        "Checks which standard security headers (CSP, HSTS, X-Frame-Options, etc.) a URL sends.",
+        _URL_TARGET_SCHEMA,
+    ),
+    "jwt_decode": (
+        jwt_decode,
+        "Decodes a JWT's header and payload (no signature verification) to inspect its claims/algorithm.",
+        {
+            "type": "object",
+            "properties": {"token": {"type": "string", "description": "The JWT string to decode"}},
+            "required": ["token"],
+        },
+    ),
+    "exploit_db_lookup": (
+        exploit_db_lookup,
+        "Searches a local Exploit-DB metadata index by product/CVE/keyword — returns EDB-ID, title, CVE, PoC path. Never executes any PoC code.",
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Product name, CVE ID, or keyword to search for"}},
+            "required": ["query"],
+        },
+    ),
+    "cve_lookup": (
+        cve_lookup,
+        "Looks up known CVE IDs for a product/vendor via a public CVE database.",
+        {
+            "type": "object",
+            "properties": {
+                "product": {"type": "string", "description": "Product name, e.g. vsftpd"},
+                "vendor": {"type": "string", "description": "Vendor name; defaults to the product name if omitted"},
+            },
+            "required": ["product"],
+        },
+    ),
+    "view_source": (
+        view_source,
+        "Fetches a page's raw HTML and extracts comments, hidden inputs, script/link paths, and meta tags — good for finding forgotten endpoints/notes.",
+        _URL_TARGET_SCHEMA,
+    ),
+}
+
+for _name, (_fn, _description, _schema) in _NATIVE_RECON_TOOLS.items():
     register_tool(
         ToolSpec(
             name=_name,
@@ -117,10 +285,12 @@ for _name, _fn in _NATIVE_RECON_TOOLS.items():
             native_function=_fn,
             requires_allowed_target=False,
             installed_by_default=True,
+            description=_description,
+            parameters_schema=_schema,
         )
     )
 
-for _name, _fn in _NATIVE_SCAN_TOOLS.items():
+for _name, (_fn, _description, _schema) in _NATIVE_SCAN_TOOLS.items():
     register_tool(
         ToolSpec(
             name=_name,
@@ -131,6 +301,8 @@ for _name, _fn in _NATIVE_SCAN_TOOLS.items():
             native_function=_fn,
             requires_allowed_target=False,
             installed_by_default=True,
+            description=_description,
+            parameters_schema=_schema,
         )
     )
 
@@ -145,6 +317,19 @@ register_tool(
         native_function=default_creds_check,
         requires_allowed_target=True,
         installed_by_default=True,
+        description=(
+            "Tries a short list of default username/password pairs against a login endpoint (POST JSON). "
+            "Requires the target to be in the exploitation allowlist and the session to be human-approved."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Login endpoint URL"},
+                "username_field": {"type": "string", "description": "JSON field name for the username, default 'email'"},
+                "password_field": {"type": "string", "description": "JSON field name for the password, default 'password'"},
+            },
+            "required": ["target"],
+        },
     )
 )
 

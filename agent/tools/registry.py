@@ -27,6 +27,13 @@ class ToolSpec:
     # instead of running `<executable> --help` to learn the tool's capabilities — for scripts with
     # no standard --help output. Hardcoded tools (nmap/nuclei/exploit/sqlmap) leave this None.
     full_description: str | None = None
+    # LLM-facing function-calling metadata. description: short one-liner shown to the model;
+    # left "" for autodiscovered/custom tools, whose schema builder (agent/core.py) fetches a
+    # live --help instead (get_tool_help) since no one hand-wrote a summary for them.
+    description: str = ""
+    # OpenAI function-calling "parameters" JSON schema. None falls back to the generic
+    # {target, extra_args} shape every autodiscovered/custom tool uses (2.5.2 in the project plan).
+    parameters_schema: dict | None = None
 
     # requires_allowed_target=True is the default expectation for exploit/post_exploit tools,
     # but not an absolute rule: msf_module_search is category="exploit"
