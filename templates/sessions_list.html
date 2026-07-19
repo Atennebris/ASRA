@@ -1,1 +1,32 @@
 <!-- GET /sessions: list of past scans from data/sessions/*.json -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ASRA &mdash; Sessions</title>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a> | <a href="/settings">Settings</a>
+  </nav>
+  <h1>Past sessions</h1>
+
+  {% if sessions %}
+    <ul>
+      {% for s in sessions %}
+        <li>
+          <a href="/session/{{ s.session_id }}">{{ s.session_id }}</a>
+          &mdash; {{ s.target }} &mdash; {{ s.status }} &mdash; {{ s.findings_count }} finding(s) &mdash; {{ s.created_at }}
+          {% if s.status == "interrupted" %}
+            <form method="post" action="/api/session/{{ s.session_id }}/resume" style="display: inline">
+              <button type="submit">Resume from {{ s.resumable_from }}</button>
+            </form>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No sessions yet. <a href="/">Start a scan</a>.</p>
+  {% endif %}
+</body>
+</html>

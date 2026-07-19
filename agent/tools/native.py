@@ -15,6 +15,7 @@ import socket
 import ssl
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import mmh3
@@ -143,6 +144,25 @@ def dns_lookup(params: dict) -> dict:
     return {"status": "ok", "ips": sorted({r[4][0] for r in results})}
 
 
+# Chars that only matter here if they'd actually change how the response is parsed (break out of
+# an HTML attribute/tag/string) — flags real injection probes, not benign echoed search terms.
+_HTML_BREAKOUT_CHARS = ('<', '>', '"', "'")
+
+
+def _detect_reflected_payload(url: str, body: str) -> dict | None:
+    """Deterministic check for whether a query-param value came back unescaped in the response —
+    the exact signal that confirms reflected XSS/injection, catching it whether or not the model
+    itself thinks to compare its own payload against the response body (it doesn't always).
+    """
+    query_params = parse_qsl(urlsplit(url).query)
+    for name, value in query_params:
+        if len(value) < 4 or not any(c in value for c in _HTML_BREAKOUT_CHARS):
+            continue
+        if value in body:
+            return {"param": name, "value": value}
+    return None
+
+
 def http_request(params: dict) -> dict:
     url = params["target"]
     try:
@@ -152,12 +172,16 @@ def http_request(params: dict) -> dict:
         return {"status": "error", "error": str(exc)}
 
     security_headers = {h: resp.headers.get(h) for h in _SECURITY_HEADERS_CHECKLIST if h in resp.headers}
-    return {
+    result = {
         "status": "ok",
         "status_code": resp.status_code,
         "security_headers": security_headers,
         "body_preview": resp.text[:2000],
     }
+    reflected = _detect_reflected_payload(url, resp.text)
+    if reflected is not None:
+        result["reflected_payload_detected"] = reflected
+    return result
 
 
 def tcp_port_check(params: dict) -> dict:
@@ -415,6 +439,45 @@ _DEFAULT_CREDENTIAL_PAIRS = [
     ("admin", ""),
     ("test", "test"),
 ]
+
+
+_VALID_SEVERITIES = {"Critical", "High", "Medium", "Low"}
+_VALID_VERIFICATIONS = {"verified", "inferred", "needs_verification"}
+
+
+# --- session recording: the LLM calls these the instant it identifies something, not batched
+# into a final answer — the caller (agent/core.py's execute_tool closure in _run_recon/
+# _run_analyze) persists the returned "recorded" dict into the session immediately. These
+# functions only validate/normalize the model's input; they know nothing about sessions. ---
+
+
+def record_finding(params: dict) -> dict:
+    severity = params["severity"]
+    if severity not in _VALID_SEVERITIES:
+        return {"status": "error", "error": f"severity must be one of {sorted(_VALID_SEVERITIES)}, got {severity!r}"}
+    verification = params.get("verification", "needs_verification")
+    if verification not in _VALID_VERIFICATIONS:
+        return {"status": "error", "error": f"verification must be one of {sorted(_VALID_VERIFICATIONS)}, got {verification!r}"}
+
+    recorded = {
+        "title": params["title"],
+        "severity": severity,
+        "description": params.get("description", ""),
+        "verification": verification,
+        "evidence_ref": params.get("evidence_ref"),
+    }
+    return {"status": "ok", "recorded": recorded}
+
+
+def record_target(params: dict) -> dict:
+    port = params.get("port")
+    recorded = {
+        "host": params["host"],
+        "port": int(port) if port is not None else None,
+        "service": params.get("service"),
+        "version": params.get("version"),
+    }
+    return {"status": "ok", "recorded": recorded}
 
 
 def default_creds_check(params: dict) -> dict:

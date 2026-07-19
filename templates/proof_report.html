@@ -1,1 +1,42 @@
 <!-- Export Proof: deterministic render of findings[], no LLM call -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ASRA Proof Report &mdash; {{ session.target }}</title>
+</head>
+<body>
+  <h1>ASRA Proof Report</h1>
+  <p><strong>Target:</strong> {{ session.target }}</p>
+  <p><strong>Session:</strong> {{ session.session_id }}</p>
+  <p><strong>Generated:</strong> {{ generated_at }}</p>
+
+  <h2>Findings ({{ session.findings | length }})</h2>
+  {% for finding in session.findings %}
+    <section>
+      <h3>{{ finding.title }} &mdash; {{ finding.severity }}</h3>
+      <p>{{ finding.description }}</p>
+      <p><strong>Verification:</strong> {{ finding.verification }}</p>
+      <p><strong>Exploited:</strong> {{ finding.exploited }}</p>
+      {% if finding.poc_command %}
+        <h4>PoC command</h4>
+        <pre>{{ finding.poc_command }}</pre>
+      {% endif %}
+      {% if finding.evidence %}
+        <h4>Evidence</h4>
+        <pre>{{ finding.evidence }}</pre>
+      {% endif %}
+      {% if finding.advisory_note %}<p><em>{{ finding.advisory_note }}</em></p>{% endif %}
+    </section>
+  {% endfor %}
+
+  {% if session.approvals %}
+    <h2>Exploit approvals</h2>
+    <ul>
+      {% for approval in session.approvals %}
+        <li>{{ approval.finding_title }} &mdash; {{ approval.outcome }} &mdash; {{ approval.at }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</body>
+</html>

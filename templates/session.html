@@ -1,1 +1,19 @@
 <!-- Session view: HTMX + SSE, includes partials/session_fragment.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ASRA &mdash; Session {{ session.session_id }}</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a> | <a href="/sessions">Sessions</a> | <a href="/settings">Settings</a>
+  </nav>
+  <h1>Session {{ session.session_id }}</h1>
+  <div hx-ext="sse" sse-connect="/api/session/{{ session.session_id }}/stream" sse-swap="message" hx-swap="innerHTML">
+    {% include "partials/session_fragment.html" %}
+  </div>
+</body>
+</html>

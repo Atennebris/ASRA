@@ -24,7 +24,8 @@ from agent.utils.logger import get_logger
 
 logger = get_logger("LLM")
 
-_DEFAULT_PROVIDER = "opencode-zen"
+# Public: main.py's web layer reads this to show the configured default in the scan form.
+DEFAULT_PROVIDER = "opencode-zen"
 # The openai SDK requires a non-empty api_key string even against endpoints that don't check it
 # (opencode-zen's free models work with no key at all).
 _PLACEHOLDER_API_KEY = "not-needed"
@@ -91,7 +92,7 @@ def get_provider(provider_id: str | None = None) -> LLMProvider:
     a single session (e.g. a per-request choice from the web UI); omit it to use the configured
     default.
     """
-    resolved_id = provider_id or os.getenv("LLM_PROVIDER", _DEFAULT_PROVIDER)
+    resolved_id = provider_id or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
     config = PROVIDER_REGISTRY.get(resolved_id)
     if config is None:
         raise ValueError(f"Unknown LLM provider {resolved_id!r}. Known providers: {list(PROVIDER_REGISTRY)}")

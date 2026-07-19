@@ -14,6 +14,8 @@ from agent.tools.native import (
     favicon_hash,
     http_request,
     jwt_decode,
+    record_finding,
+    record_target,
     security_headers_audit,
     ssl_cert_info,
     tcp_port_check,
@@ -159,6 +161,74 @@ register_tool(
                 "database": {"type": "string", "description": "Database name, required together with dump_table"},
             },
             "required": ["target"],
+        },
+    )
+)
+
+# Live-recording tools: the LLM calls these the instant it identifies something, not batched
+# into a final answer — agent/core.py's execute_tool closures (_run_recon/_run_analyze) persist
+# the result into the session file immediately, so a target/finding survives a crash the moment
+# it's reported, not just once the whole sub-phase finishes.
+register_tool(
+    ToolSpec(
+        name="record_target",
+        category="recon",
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=record_target,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Records one discovered target (host/port/service/version) the moment you confirm "
+            "it — call this as soon as you find something, do not wait until recon is done to "
+            "report everything at once."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Hostname or IP"},
+                "port": {"type": "integer", "description": "Port number, if applicable"},
+                "service": {"type": "string", "description": "Service name, e.g. http, ssh"},
+                "version": {"type": "string", "description": "Service/software version string, if known"},
+            },
+            "required": ["host"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="record_finding",
+        category="scan",
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=record_finding,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Records one vulnerability finding the moment you're confident enough to report it "
+            "— call this as soon as you find something, do not wait until you're done analyzing "
+            "to report everything at once."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short descriptive title of the vulnerability"},
+                "severity": {"type": "string", "enum": ["Critical", "High", "Medium", "Low"]},
+                "description": {"type": "string", "description": "What the issue is and why it matters"},
+                "verification": {
+                    "type": "string",
+                    "enum": ["verified", "inferred", "needs_verification"],
+                    "description": (
+                        "verified: an active check confirmed it. inferred: guessed from a "
+                        "banner/version. needs_verification: not yet confirmed either way."
+                    ),
+                },
+                "evidence_ref": {"type": "string", "description": "Supporting tool output detail, or omit if none"},
+            },
+            "required": ["title", "severity", "description"],
         },
     )
 )

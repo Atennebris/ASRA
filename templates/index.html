@@ -1,1 +1,40 @@
 <!-- Scan launch form + Settings block (max_iterations, llm_provider) -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ASRA &mdash; New Scan</title>
+</head>
+<body>
+  <nav>
+    <a href="/sessions">Sessions</a> | <a href="/settings">Settings</a>
+  </nav>
+  <h1>Autonomous Security Research Agent</h1>
+
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <form method="post" action="/api/scan">
+    <label>
+      Target
+      <input type="text" name="target" value="{{ target }}" placeholder="example.com" required>
+    </label>
+    <button type="submit">Start scan</button>
+
+    <details>
+      <summary>Settings</summary>
+      <label>
+        Max iterations
+        <input type="number" name="max_iterations" min="5" max="40" value="{{ max_iterations_default }}">
+      </label>
+      <label>
+        LLM Provider
+        <select name="llm_provider">
+          {% for provider_id in provider_ids %}
+            <option value="{{ provider_id }}" {% if provider_id == llm_provider_default %}selected{% endif %}>{{ provider_id }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </details>
+  </form>
+</body>
+</html>

@@ -1,1 +1,60 @@
 <!-- HTMX fragment: logs, findings, approve/export buttons rendered by status -->
+<div id="session-content" data-status="{{ session.status }}">
+  <p><strong>Target:</strong> {{ session.target }}</p>
+  <p><strong>Status:</strong> {{ session.status }}</p>
+
+  <h3>Logs</h3>
+  {% if session.logs %}
+    <ul class="log-list">
+      {% for entry in session.logs %}
+        <li>
+          <strong>[{{ entry.phase }}]</strong>
+          {% if entry.command %}<code>{{ entry.command }}</code>{% endif %}
+          &mdash; {{ entry.status }}
+          {% if entry.error %}<span class="error">{{ entry.error }}</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% elif session.status in ("pending", "processing") %}
+    <p>Starting scan...</p>
+  {% endif %}
+
+  <h3>Findings</h3>
+  {% if session.findings %}
+    <ul class="findings-list">
+      {% for finding in session.findings %}
+        <li>
+          <strong>{{ finding.title }}</strong> ({{ finding.severity }})
+          <p>{{ finding.description }}</p>
+          {% if finding.poc_command %}<pre><code>{{ finding.poc_command }}</code></pre>{% endif %}
+          <p>Verification: {{ finding.verification }}{% if finding.exploited %}, exploited{% endif %}</p>
+          {% if finding.evidence %}<pre><code>{{ finding.evidence }}</code></pre>{% endif %}
+          {% if finding.advisory_note %}<p><em>{{ finding.advisory_note }}</em></p>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% elif session.status == "completed" %}
+    <p>No vulnerabilities found.</p>
+  {% else %}
+    <p>No findings yet.</p>
+  {% endif %}
+
+  {% if session.status == "interrupted" %}
+    <form method="post" action="/api/session/{{ session.session_id }}/resume">
+      <p>Session interrupted &mdash; resume from <strong>{{ session.resumable_from }}</strong>?</p>
+      <button type="submit">Resume</button>
+    </form>
+  {% endif %}
+
+  {% if session.status == "awaiting_approval" %}
+    <form hx-post="/api/session/{{ session.session_id }}/approve-exploit"
+          hx-target="#session-content" hx-swap="outerHTML" hx-disabled-elt="this">
+      <p>Exploitation approval requested for target <strong>{{ session.target }}</strong>.</p>
+      <button type="submit">Approve exploit</button>
+    </form>
+  {% endif %}
+
+  {% if session.status == "completed" and session.findings %}
+    <p><a href="/api/session/{{ session.session_id }}/export">Export Proof</a></p>
+  {% endif %}
+</div>

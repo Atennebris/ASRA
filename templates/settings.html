@@ -1,0 +1,42 @@
+<!-- GET /settings: exploitation allowlist editor (data/allowed_targets.json) -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ASRA &mdash; Settings</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+<body>
+  <nav>
+    <a href="/">Home</a> | <a href="/sessions">Sessions</a>
+  </nav>
+  <h1>Settings &mdash; Exploitation allowlist</h1>
+  <p>Only targets listed here can be exploited (Metasploit/sqlmap). Recon/scan tools work against any target from the scan form regardless of this list.</p>
+
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <form method="post" action="/api/settings/allowed-targets">
+    <label>
+      Add target
+      <input type="text" name="target" placeholder="example.com" required>
+    </label>
+    <button type="submit">Add</button>
+  </form>
+
+  <h2>Allowed targets</h2>
+  {% if allowed_targets %}
+    <ul id="allowed-targets-list">
+      {% for allowed_target in allowed_targets %}
+        <li>
+          {{ allowed_target }}
+          <button hx-delete="/api/settings/allowed-targets/{{ allowed_target }}"
+                  hx-target="closest li" hx-swap="outerHTML"
+                  hx-confirm="Remove {{ allowed_target }} from the allowlist?">Remove</button>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No targets added yet.</p>
+  {% endif %}
+</body>
+</html>

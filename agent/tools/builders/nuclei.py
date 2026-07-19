@@ -13,7 +13,13 @@ _DEFAULT_TAGS = "cve,vuln,exposure,rce,misconfig"
 
 def build_nuclei_command(params: dict) -> list[str]:
     target = validate_target(params["target"])
-    tags = validate_safe_value(params.get("tags", _DEFAULT_TAGS))
+    tags = params.get("tags", _DEFAULT_TAGS)
+    # The schema asks for a comma-separated string, but tool-calling models frequently send a
+    # JSON array of tags instead (a very natural way to represent "multiple tags") — accepting
+    # both avoids burning a full retry round-trip on a shape mismatch that isn't a real error.
+    if isinstance(tags, list):
+        tags = ",".join(str(tag) for tag in tags)
+    tags = validate_safe_value(tags)
     return ["nuclei", "-u", target, "-jsonl", "-tags", tags]
 
 

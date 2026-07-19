@@ -8,7 +8,13 @@ import re
 
 import pytest
 
-from agent.prompts import ANALYZE_PROMPT, EXPLOIT_PROMPT, RECON_PROMPT, VALIDATE_PROMPT
+from agent.prompts import (
+    ANALYZE_PROMPT,
+    CONFIRM_EXPLOIT_PROMPT,
+    EXPLOIT_PROMPT,
+    RECON_PROMPT,
+    VALIDATE_PROMPT,
+)
 
 # len // 4 is the same rough chars-per-token estimate used elsewhere in this codebase
 # (agent/utils/debug.py). qwen-plus's real context window is 1,000,000 tokens (see
@@ -23,6 +29,7 @@ _ALL_PROMPTS = {
     "RECON_PROMPT": RECON_PROMPT,
     "ANALYZE_PROMPT": ANALYZE_PROMPT,
     "EXPLOIT_PROMPT": EXPLOIT_PROMPT,
+    "CONFIRM_EXPLOIT_PROMPT": CONFIRM_EXPLOIT_PROMPT,
     "VALIDATE_PROMPT": VALIDATE_PROMPT,
 }
 

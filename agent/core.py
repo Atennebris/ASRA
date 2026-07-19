@@ -1,14 +1,31 @@
-"""ReAct-cycle orchestrator: Recon -> Analyze -> Exploit -> Validate & Confirm.
+"""ReAct-cycle orchestrator: Recon -> Analyze -> Exploit -> Validate.
 
 Each sub-phase is one LLM<->tools conversation (_run_llm_tool_loop): the model gets a system
-prompt (agent/prompts.py) plus whatever tools its registry category exposes, calls tools until
-it has enough to answer, then replies with the sub-phase's JSON contract. Tool selection is by
-category, never by a hardcoded name — a new registry entry (built-in, autodiscovered, or from
-custom_tools.yaml) is picked up automatically the next time its category is used.
+prompt (agent/prompts.py) plus whatever tools its registry category exposes, and calls tools
+until it's done. Tool selection is by category, never by a hardcoded name — a new registry entry
+(built-in, autodiscovered, or from custom_tools.yaml) is picked up automatically the next time
+its category is used.
+
+Recon/Analyze report structured data live: record_target/record_finding tool calls persist into
+session["recon_result"]/session["findings"] the instant the model reports them (see the execute
+closures in _run_recon/_run_analyze), not batched into a final JSON answer at phase end — a
+process crash mid-phase loses nothing already found. Exploit mutates each finding's schema
+fields (exploited/evidence/poc_command/advisory_note) in place, persisted right after that one
+finding is resolved — no parallel "exploit_records" structure to reconcile later. Validate runs
+once at the end purely to deduplicate; it is no longer the sole creator of finding data, so a
+session that never reaches Validate (crash, budget cutoff) still ends with real, schema-complete
+findings, just not deduplicated.
+
+entry_point (run_session's parameter) picks where a run starts — "recon" (default, full
+pipeline), "analyze" (skips Recon, needs session["recon_result"] already present), or "exploit"
+(skips Recon+Analyze, needs session["findings"] already present). It's chosen once at the start
+of a run, not a live state machine — after entering at that point, the remaining sub-phases still
+run in their normal order.
 
 Every LLM call in a session (sub-phase conversations, exploit-approval-gated calls, 1-step
-retry corrections) goes through RunContext/_llm_complete, the single place that counts against
-MAX_ITERATIONS and raises MaxIterationsReached once the session's LLM-call budget is spent.
+retry corrections, exploit-result confirmation) goes through RunContext/_llm_complete, the single
+place that counts against MAX_ITERATIONS and raises MaxIterationsReached once the session's
+LLM-call budget is spent.
 """
 from __future__ import annotations
 
@@ -18,10 +35,17 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from agent.llm_client import LLMProvider, LLMResponse, ToolCallRequest, get_provider
-from agent.prompts import ANALYZE_PROMPT, EXPLOIT_PROMPT, RECON_PROMPT, VALIDATE_PROMPT
+from agent.prompts import (
+    ANALYZE_PROMPT,
+    CONFIRM_EXPLOIT_PROMPT,
+    EXPLOIT_PROMPT,
+    RECON_PROMPT,
+    VALIDATE_PROMPT,
+)
 from agent.tools.builders.discovered import get_tool_help
 from agent.tools.builders.exploit import parse_exploit_output, parse_msf_module_search
 from agent.tools.builders.nmap import parse_nmap_output
@@ -39,7 +63,7 @@ from sessions.store import create_session, load_session, save_session
 
 logger = get_logger("AGENT")
 
-_MAX_TOOL_ITERATIONS = 8
+_DEFAULT_MAX_TOOL_ITERATIONS = 12
 _TOOL_RESULT_CHAR_LIMIT = 8000
 _DEFAULT_MAX_ITERATIONS = 20
 
@@ -263,9 +287,16 @@ async def _run_llm_tool_loop(
     tool_specs: list[ToolSpec],
     phase: str,
     execute_tool: Callable[[ToolSpec, dict], Awaitable[dict]] | None = None,
+    expect_json_final: bool = True,
 ) -> tuple[dict | None, list[dict]]:
-    """Drives one LLM<->tools conversation for a sub-phase until the model stops calling tools
-    and replies with its final JSON. Returns (parsed_json_or_None, raw_tool_call_trace).
+    """Drives one LLM<->tools conversation for a sub-phase until the model stops calling tools.
+    Returns (parsed_json_or_None, raw_tool_call_trace).
+
+    expect_json_final=True (Exploit/Validate): the final non-tool-call reply must be the
+    sub-phase's JSON contract — a reply that doesn't parse is logged as an error. Recon/Analyze
+    pass False: their real output already landed via record_target/record_finding tool calls
+    (see their execute closures), so the final reply is just an optional wrap-up sentence, not
+    something to parse or complain about.
     """
     tools_schema = [_tool_to_openai_schema(spec) for spec in tool_specs]
     specs_by_name = {spec.name: spec for spec in tool_specs}
@@ -274,11 +305,18 @@ async def _run_llm_tool_loop(
         {"role": "user", "content": task_content},
     ]
     trace: list[dict] = []
+    max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS_PER_PHASE", str(_DEFAULT_MAX_TOOL_ITERATIONS)))
 
-    for _iteration in range(_MAX_TOOL_ITERATIONS):
+    for _iteration in range(max_tool_iterations):
         response = await _llm_complete(ctx, messages, tools_schema)
 
         if not response.tool_calls:
+            if not expect_json_final:
+                # Real output already landed via record_target/record_finding tool calls — this
+                # reply is just a free-text wrap-up, never attempt to parse it as JSON (that would
+                # log a misleading "failed to parse" line for completely normal operation).
+                _append_log(ctx, phase, response.content, None, "success", None)
+                return None, trace
             parsed = _parse_json_response(response.content)
             _append_log(
                 ctx, phase, response.content, None,
@@ -311,7 +349,11 @@ async def _run_llm_tool_loop(
             _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
 
-    logger.debug("core: session=%s %s phase hit max tool iterations (%d), forcing a final answer", ctx.session_id, phase, _MAX_TOOL_ITERATIONS)
+    if not expect_json_final:
+        logger.debug("core: session=%s %s phase hit max tool iterations (%d), stopping", ctx.session_id, phase, max_tool_iterations)
+        return None, trace
+
+    logger.debug("core: session=%s %s phase hit max tool iterations (%d), forcing a final answer", ctx.session_id, phase, max_tool_iterations)
     messages.append({"role": "user", "content": "Stop calling tools now and reply with the final JSON only."})
     response = await _llm_complete(ctx, messages, None)
     return _parse_json_response(response.content), trace
@@ -320,42 +362,73 @@ async def _run_llm_tool_loop(
 async def _run_recon(ctx: RunContext, target: str) -> dict:
     tools = get_tools_by_category("recon")
     logger.debug("core: session=%s starting recon phase (%d tools available)", ctx.session_id, len(tools))
+    ctx.session.setdefault("recon_result", {"targets": []})
+
+    async def execute(spec: ToolSpec, arguments: dict) -> dict:
+        result = await _run_tool_with_retry(ctx, spec, arguments)
+        if spec.name == "record_target" and result.get("status") == "ok" and "recorded" in result:
+            ctx.session["recon_result"]["targets"].append(result["recorded"])
+            save_session(ctx.session_id, ctx.session)
+            logger.debug("core: session=%s recon: recorded target host=%r", ctx.session_id, result["recorded"].get("host"))
+        return result
+
     task = f"Target: {target}\nGather recon data using the tools available to you."
-    result, _trace = await _run_llm_tool_loop(ctx, RECON_PROMPT, task, tools, "recon")
-    if result is None:
-        logger.debug("core: session=%s recon phase produced no parseable result, falling back to empty targets", ctx.session_id)
-        return {"targets": [], "summary": "recon failed to produce a parseable result"}
-    logger.debug("core: session=%s recon phase found %d target(s)", ctx.session_id, len(result.get("targets", [])))
-    return result
+    await _run_llm_tool_loop(ctx, RECON_PROMPT, task, tools, "recon", execute_tool=execute, expect_json_final=False)
+    recon_result = ctx.session["recon_result"]
+    logger.debug("core: session=%s recon phase found %d target(s)", ctx.session_id, len(recon_result["targets"]))
+    return recon_result
 
 
-async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> dict:
+async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list[dict]:
     tools = get_tools_by_category("scan")
     logger.debug("core: session=%s starting analyze phase (%d tools available)", ctx.session_id, len(tools))
+    ctx.session.setdefault("findings", [])
+
+    async def execute(spec: ToolSpec, arguments: dict) -> dict:
+        result = await _run_tool_with_retry(ctx, spec, arguments)
+        if spec.name == "record_finding" and result.get("status") == "ok" and "recorded" in result:
+            ctx.session["findings"].append(result["recorded"])
+            save_session(ctx.session_id, ctx.session)
+            logger.debug("core: session=%s analyze: recorded finding title=%r", ctx.session_id, result["recorded"].get("title"))
+        elif "reflected_payload_detected" in result:
+            # A model can see a signal buried in a result dict and still not act on it in the same
+            # turn, especially deep in a long tool-call conversation — a loud, adjacent hint closes
+            # that gap without auto-recording anything (the model still decides/confirms).
+            result["hint"] = "reflected_payload_detected confirms a real vulnerability — call record_finding for it now, before calling any other tool."
+        return result
+
     task = (
         f"Target: {target}\n"
         f"Recon results:\n{json.dumps(recon_result)}\n\n"
         "Analyze these for vulnerabilities using the tools available to you."
     )
-    result, _trace = await _run_llm_tool_loop(ctx, ANALYZE_PROMPT, task, tools, "analyze")
-    if result is None:
-        logger.debug("core: session=%s analyze phase produced no parseable result, falling back to empty findings", ctx.session_id)
-        return {"findings": [], "summary": "analyze failed to produce a parseable result"}
-    logger.debug("core: session=%s analyze phase found %d finding(s)", ctx.session_id, len(result.get("findings", [])))
-    return result
+    await _run_llm_tool_loop(ctx, ANALYZE_PROMPT, task, tools, "analyze", execute_tool=execute, expect_json_final=False)
+    findings = ctx.session["findings"]
+    logger.debug("core: session=%s analyze phase found %d finding(s)", ctx.session_id, len(findings))
+    return findings
 
 
 def _severity_key(finding: dict) -> int:
     return _SEVERITY_RANK.get(str(finding.get("severity", "")).lower(), len(_SEVERITY_RANK))
 
 
-async def _await_exploit_approval(ctx: RunContext) -> bool:
+def _record_approval(ctx: RunContext, finding: dict, outcome: str) -> None:
+    ctx.session.setdefault("approvals", []).append(
+        {
+            "finding_title": finding.get("title"),
+            "outcome": outcome,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+async def _await_exploit_approval(ctx: RunContext, finding: dict) -> bool:
     """Waits for a human to approve exploitation this session (see get_approval_event — the
-    Phase 4 approve-exploit endpoint sets that event). No endpoint exists yet in this phase, so
-    this always times out today, correctly, and the finding is skipped rather than the session
-    hanging — that is the expected behavior until the web layer exists. Approval is per session,
-    not per finding: once granted (session["exploit_approved"]), later findings in the same
-    session skip the wait entirely; a timeout never sets that flag, so the next finding asks again.
+    Phase 4 approve-exploit endpoint sets that event). Approval is per session, not per finding:
+    once granted (session["exploit_approved"]), later findings in the same session skip the wait
+    entirely; a timeout never sets that flag, so the next finding asks again. Every outcome
+    (approved or timed out) is recorded in session["approvals"] — the audit trail Export Proof
+    relies on to show exploitation was a deliberate human decision, not an automatic one.
     """
     if ctx.session.get("exploit_approved"):
         return True
@@ -370,11 +443,13 @@ async def _await_exploit_approval(ctx: RunContext) -> bool:
     except asyncio.TimeoutError:
         logger.debug("core: session=%s exploit approval timed out after %ds", ctx.session_id, timeout_seconds)
         ctx.session["status"] = "processing"
+        _record_approval(ctx, finding, "timeout")
         save_session(ctx.session_id, ctx.session)
         return False
 
     ctx.session["exploit_approved"] = True
     ctx.session["status"] = "processing"
+    _record_approval(ctx, finding, "approved")
     save_session(ctx.session_id, ctx.session)
     logger.debug("core: session=%s exploit approved", ctx.session_id)
     return True
@@ -401,7 +476,7 @@ async def _run_exploit_for_finding(ctx: RunContext, target: str, finding: dict, 
         if state["attempted"]:
             return {"status": "skipped", "reason": "one exploitation attempt already used for this finding"}
 
-        approved = await _await_exploit_approval(ctx)
+        approved = await _await_exploit_approval(ctx, finding)
         state["attempted"] = True
         if not approved:
             return {"status": "skipped", "reason": "exploit not approved in time"}
@@ -420,75 +495,157 @@ async def _run_exploit_for_finding(ctx: RunContext, target: str, finding: dict, 
     return await _run_llm_tool_loop(ctx, EXPLOIT_PROMPT, task, exploit_tools, "exploit", execute_tool=execute)
 
 
-async def _run_exploit(ctx: RunContext, target: str, findings: list[dict]) -> list[dict]:
+def _apply_skip_outcome(finding: dict, action: dict) -> None:
+    """Deterministic, no LLM call needed: exploit was never actually attempted for this
+    finding (skipped for lack of a fitting tool, missing verification, allowlist, or approval
+    timeout) — there is no real tool output to judge, so there's nothing for an LLM to confirm.
+    """
+    finding["exploited"] = False
+    finding["evidence"] = None
+    finding.setdefault("poc_command", None)
+    reason = action.get("reasoning")
+    if reason:
+        finding["advisory_note"] = reason
+
+
+async def _confirm_exploit_result(ctx: RunContext, finding: dict, action: dict, trace: list[dict]) -> dict:
+    """The one case that does need an LLM judgment call: exploit reported "exploit_attempted",
+    so a human-readable read of the real tool trace decides whether it actually succeeded and
+    what the real evidence was (catches a model that claims success with no real tool call
+    behind it — see the honesty guard documented in ROADMAP.md 3.7.2).
+    """
+    messages = [
+        {"role": "system", "content": CONFIRM_EXPLOIT_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Finding:\n{json.dumps(finding)}\n\n"
+                f"Exploit phase action:\n{json.dumps(action)}\n\n"
+                f"Real tool call trace from the attempt:\n{json.dumps(trace)}"
+            ),
+        },
+    ]
+    response = await _llm_complete(ctx, messages, None)
+    parsed = _parse_json_response(response.content)
+    if parsed is None:
+        logger.debug("core: session=%s confirm-exploit produced no parseable result for finding=%r", ctx.session_id, finding.get("title"))
+        return {"exploited": False, "evidence": None, "poc_command": None, "advisory_note": "Could not parse exploit confirmation"}
+    return parsed
+
+
+async def _run_exploit(ctx: RunContext, target: str) -> None:
+    findings = ctx.session["findings"]
     if os.getenv("ENABLE_EXPLOIT", "true").lower() != "true":
         logger.debug("core: session=%s ENABLE_EXPLOIT=false, skipping exploit phase entirely (%d findings)", ctx.session_id, len(findings))
-        return []
+        return
 
     exploit_tools = get_tools_by_category("exploit")
     logger.debug(
         "core: session=%s starting exploit phase, %d finding(s) by descending severity (%d exploit tools available)",
         ctx.session_id, len(findings), len(exploit_tools),
     )
-    records = []
     for finding in sorted(findings, key=_severity_key):
         logger.debug(
             "core: session=%s exploit: evaluating finding=%r severity=%s verification=%s",
             ctx.session_id, finding.get("title"), finding.get("severity"), finding.get("verification"),
         )
         action, trace = await _run_exploit_for_finding(ctx, target, finding, exploit_tools)
-        logger.debug("core: session=%s exploit: finding=%r resolved action=%s", ctx.session_id, finding.get("title"), (action or {}).get("action"))
-        records.append({"finding": finding, "action": action, "tool_calls": trace})
-    return records
+
+        if action and action.get("action") == "exploit_attempted":
+            confirmed = await _confirm_exploit_result(ctx, finding, action, trace)
+            finding["exploited"] = confirmed.get("exploited", False)
+            finding["evidence"] = confirmed.get("evidence")
+            finding["poc_command"] = confirmed.get("poc_command")
+            finding["advisory_note"] = confirmed.get("advisory_note")
+        else:
+            _apply_skip_outcome(finding, action or {"reasoning": "Exploit phase produced no parseable decision"})
+
+        # finding is the same dict object living inside ctx.session["findings"] (sorted()
+        # reorders references, it doesn't copy them) — mutating it above already updated the
+        # session in memory; this just makes it durable before moving to the next finding.
+        save_session(ctx.session_id, ctx.session)
+        logger.debug(
+            "core: session=%s exploit: finding=%r resolved exploited=%s",
+            ctx.session_id, finding.get("title"), finding.get("exploited"),
+        )
 
 
-async def _run_validate(ctx: RunContext, findings: list[dict], exploit_records: list[dict]) -> dict:
-    logger.debug("core: session=%s starting validate phase (%d findings, %d exploit records)", ctx.session_id, len(findings), len(exploit_records))
-    task = (
-        f"Analyze findings:\n{json.dumps(findings)}\n\n"
-        f"Exploit phase results:\n{json.dumps(exploit_records)}\n\n"
-        "Produce the final findings list."
+async def _run_validate(ctx: RunContext) -> list[dict]:
+    findings = ctx.session["findings"]
+    logger.debug("core: session=%s starting validate phase (%d findings)", ctx.session_id, len(findings))
+    if len(findings) <= 1:
+        return findings  # nothing to deduplicate
+
+    task = f"Findings:\n{json.dumps(findings)}"
+    messages = [
+        {"role": "system", "content": VALIDATE_PROMPT},
+        {"role": "user", "content": task},
+    ]
+    response = await _llm_complete(ctx, messages, None)
+    parsed = _parse_json_response(response.content)
+    _append_log(
+        ctx, "validate", response.content, None,
+        "success" if parsed is not None else "error",
+        None if parsed is not None else "could not parse a final JSON response from the model",
     )
-    # No tools here — Validate reasons over data already collected, it doesn't gather new data.
-    result, _trace = await _run_llm_tool_loop(ctx, VALIDATE_PROMPT, task, [], "validate")
-    return result or {"findings": findings}
+    if parsed is None or not isinstance(parsed.get("findings"), list):
+        logger.debug("core: session=%s validate phase produced no parseable result, keeping pre-dedup findings", ctx.session_id)
+        return findings
+    return parsed["findings"]
 
 
-async def run_session(session_id: str, provider_id: str | None = None) -> None:
+_VALID_ENTRY_POINTS = {"recon", "analyze", "exploit"}
+
+
+async def run_session(
+    session_id: str,
+    provider_id: str | None = None,
+    max_iterations: int | None = None,
+    entry_point: str = "recon",
+) -> None:
+    if entry_point not in _VALID_ENTRY_POINTS:
+        raise ValueError(f"Unknown entry_point {entry_point!r}, expected one of {sorted(_VALID_ENTRY_POINTS)}")
+
     session = load_session(session_id)
     if session is None:
         raise ValueError(f"Unknown session {session_id!r}")
 
     target = session["target"]
     session["status"] = "processing"
+    session["entry_point"] = entry_point
     save_session(session_id, session)
-    logger.debug("core: session=%s target=%s starting", session_id, target)
+    logger.debug("core: session=%s target=%s starting (entry_point=%s)", session_id, target, entry_point)
 
-    max_iterations = int(os.getenv("MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS)))
-    ctx = RunContext(llm=get_provider(provider_id), session=session, session_id=session_id, max_iterations=max_iterations)
+    resolved_max_iterations = max_iterations if max_iterations is not None else int(os.getenv("MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS)))
+    ctx = RunContext(llm=get_provider(provider_id), session=session, session_id=session_id, max_iterations=resolved_max_iterations)
 
-    findings: list[dict] = []
     try:
-        recon_result = await _run_recon(ctx, target)
-        analyze_result = await _run_analyze(ctx, target, recon_result)
-        findings = analyze_result.get("findings", [])
-        exploit_records = await _run_exploit(ctx, target, findings)
-        validate_result = await _run_validate(ctx, findings, exploit_records)
+        if entry_point == "recon":
+            recon_result = await _run_recon(ctx, target)
+        else:
+            recon_result = session.get("recon_result") or {"targets": []}
 
-        session["findings"] = _normalize_findings(validate_result.get("findings", findings))
+        if entry_point in ("recon", "analyze"):
+            await _run_analyze(ctx, target, recon_result)
+        # entry_point == "exploit": session["findings"] already holds what's already known —
+        # nothing to gather, go straight to exploiting it.
+
+        await _run_exploit(ctx, target)
+        session["findings"] = await _run_validate(ctx)
+
+        session["findings"] = _normalize_findings(session["findings"])
         session["status"] = "completed"
         save_session(session_id, session)
         logger.debug("core: session=%s completed with %d findings", session_id, len(session["findings"]))
     except MaxIterationsReached:
         # Not an error: a hard, configured budget ran out. Report whatever was already
-        # established rather than losing it — completed if Analyze got that far, failed if the
-        # budget ran out before any finding existed at all. Still schema-normalized: these are
-        # raw Analyze findings, never Validate-finalized, so the poc_command/exploited/evidence/
-        # advisory_note fields wouldn't exist otherwise.
-        logger.debug("core: session=%s stopped: MAX_ITERATIONS=%d reached", session_id, max_iterations)
-        _append_log(ctx, "session", None, None, "failed", f"stopped: MAX_ITERATIONS ({max_iterations}) reached before completion")
-        session["findings"] = _normalize_findings(findings)
-        session["status"] = "completed" if findings else "failed"
+        # established rather than losing it — session["findings"] already holds everything
+        # record_finding/Exploit persisted before the budget ran out (no batch step to miss),
+        # so "completed" here is a real, if unpolished, result whenever any finding exists.
+        logger.debug("core: session=%s stopped: MAX_ITERATIONS=%d reached", session_id, resolved_max_iterations)
+        _append_log(ctx, "session", None, None, "failed", f"stopped: MAX_ITERATIONS ({resolved_max_iterations}) reached before completion")
+        session["findings"] = _normalize_findings(session.get("findings", []))
+        session["status"] = "completed" if session["findings"] else "failed"
         save_session(session_id, session)
     except Exception:
         logger.debug("core: session=%s failed", session_id, exc_info=True)
@@ -499,14 +656,26 @@ async def run_session(session_id: str, provider_id: str | None = None) -> None:
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Run one ASRA scan session from the command line.")
-    parser.add_argument("--target", required=True, help="Target host/URL to scan.")
+    parser.add_argument("--target", default=None, help="Target host/URL to scan. Required unless --session-id is given.")
     parser.add_argument("--provider", default=None, help="Override LLM_PROVIDER for this run.")
+    parser.add_argument(
+        "--entry-point", default="recon", choices=sorted(_VALID_ENTRY_POINTS),
+        help="Skip earlier sub-phases, using data already recorded in the session (needs --session-id for anything but 'recon').",
+    )
+    parser.add_argument("--session-id", default=None, help="Resume an existing session by ID instead of creating a new one.")
     args = parser.parse_args()
 
-    session_id = create_session(args.target)
-    print(f"Session {session_id} started for target {args.target}")
+    if args.session_id:
+        session_id = args.session_id
+        if load_session(session_id) is None:
+            raise SystemExit(f"Unknown session {session_id!r}")
+    else:
+        if not args.target:
+            raise SystemExit("--target is required unless --session-id is given")
+        session_id = create_session(args.target)
+        print(f"Session {session_id} started for target {args.target}")
 
-    asyncio.run(run_session(session_id, provider_id=args.provider))
+    asyncio.run(run_session(session_id, provider_id=args.provider, entry_point=args.entry_point))
 
     session = load_session(session_id)
     print(f"Status: {session['status']}")

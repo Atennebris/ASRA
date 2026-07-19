@@ -27,6 +27,7 @@ def create_session(target: str) -> str:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "logs": [],
         "findings": [],
+        "approvals": [],
     }
     save_session(session_id, session)
     logger.debug("create_session: id=%s target=%s", session_id, target)
