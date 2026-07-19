@@ -69,10 +69,14 @@ Rules:
   banner/version with no active confirmation; "needs_verification" means not yet confirmed
   either way. Do not mark something "verified" without a real confirming result.
 - If two tools clearly report the same underlying issue, call record_finding once, not twice.
-- http_request's result includes "reflected_payload_detected" whenever a query-param value you
-  sent came back unescaped in the response body — that field alone confirms reflected XSS/
-  injection. Treat its presence as an immediate "verified" finding; call record_finding for it
-  before doing anything else, don't let it get lost among other tool calls in the same turn.
+- http_request's result can include one of several deterministic detection fields —
+  "reflected_payload_detected" (your query-param value came back unescaped: reflected XSS),
+  "sql_error_detected" (a real database error signature after a quote-character probe: SQL
+  injection), "open_redirect_detected" (a redirect-target param you sent ended up as the actual
+  Location header), "command_injection_detected" (real command/file output — an /etc/passwd
+  dump, an id/whoami result — after a shell-metacharacter probe). Any of these alone confirms a
+  "verified" finding; call record_finding for it before doing anything else, don't let it get
+  lost among other tool calls in the same turn.
 
 When you have nothing more to check, stop calling tools and reply with a short plain-text
 sentence confirming you are done — no JSON needed for that final reply, record_finding already

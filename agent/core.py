@@ -67,6 +67,16 @@ _DEFAULT_MAX_TOOL_ITERATIONS = 12
 _TOOL_RESULT_CHAR_LIMIT = 8000
 _DEFAULT_MAX_ITERATIONS = 20
 
+# Tool-result fields that mean "a deterministic check in agent/tools/native.py already confirmed a
+# real vulnerability" (see http_request's detectors) — any one of these firing gets a loud hint
+# injected into the tool result, not just left for the model to maybe notice on its own.
+_DETERMINISTIC_DETECTION_FIELDS = (
+    "reflected_payload_detected",
+    "sql_error_detected",
+    "open_redirect_detected",
+    "command_injection_detected",
+)
+
 _GENERIC_DISCOVERED_SCHEMA = {
     "type": "object",
     "properties": {
@@ -390,11 +400,16 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
             ctx.session["findings"].append(result["recorded"])
             save_session(ctx.session_id, ctx.session)
             logger.debug("core: session=%s analyze: recorded finding title=%r", ctx.session_id, result["recorded"].get("title"))
-        elif "reflected_payload_detected" in result:
-            # A model can see a signal buried in a result dict and still not act on it in the same
-            # turn, especially deep in a long tool-call conversation — a loud, adjacent hint closes
-            # that gap without auto-recording anything (the model still decides/confirms).
-            result["hint"] = "reflected_payload_detected confirms a real vulnerability — call record_finding for it now, before calling any other tool."
+        else:
+            fired = [field for field in _DETERMINISTIC_DETECTION_FIELDS if field in result]
+            if fired:
+                # A model can see a signal buried in a result dict and still not act on it in the
+                # same turn, especially deep in a long tool-call conversation — a loud, adjacent
+                # hint closes that gap without auto-recording anything (the model still decides).
+                result["hint"] = (
+                    f"{', '.join(fired)} confirms a real vulnerability — call record_finding for it now, "
+                    "before calling any other tool."
+                )
         return result
 
     task = (

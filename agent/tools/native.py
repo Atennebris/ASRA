@@ -148,18 +148,96 @@ def dns_lookup(params: dict) -> dict:
 # an HTML attribute/tag/string) — flags real injection probes, not benign echoed search terms.
 _HTML_BREAKOUT_CHARS = ('<', '>', '"', "'")
 
+# Query-param names that conventionally hold a redirect target — checked against the Location
+# header of an actual redirect response, not just present-in-URL.
+_REDIRECT_PARAM_NAMES = frozenset({"url", "redirect", "redirect_uri", "next", "return", "continue", "dest", "destination"})
+
+# Real, narrow signatures for actual DB error output — not a heuristic "looks like an error".
+_SQL_ERROR_PATTERNS = (
+    ("mysql", re.compile(r"you have an error in your sql syntax", re.IGNORECASE)),
+    ("mysql", re.compile(r"warning:\s*mysqli?_", re.IGNORECASE)),
+    ("postgresql", re.compile(r"pg_query\(\)|pg_exec\(\)", re.IGNORECASE)),
+    ("postgresql", re.compile(r"syntax error at or near", re.IGNORECASE)),
+    ("mssql", re.compile(r"unclosed quotation mark after the character string", re.IGNORECASE)),
+    ("mssql", re.compile(r"microsoft ole db provider for sql server", re.IGNORECASE)),
+    ("oracle", re.compile(r"ora-\d{5}")),
+    ("sqlite", re.compile(r"sqlite3?\.OperationalError|sqlite_(step|prepare)", re.IGNORECASE)),
+)
+
+# Output signatures for a real command/path-injection result — the effect, not the payload echoed
+# back (which would just be _detect_reflected_payload's job).
+_COMMAND_INJECTION_OUTPUT_PATTERNS = (
+    ("etc_passwd", re.compile(r"root:.*:0:0:")),
+    ("shell_id_output", re.compile(r"uid=\d+\([^)]*\)\s*gid=\d+")),
+)
+# Chars/sequences that mark a query value as an actual command/path-injection probe, not benign
+# input — gates the output-pattern check so a coincidental match on an unrelated response doesn't
+# get attributed to an injection that was never attempted.
+_COMMAND_INJECTION_PROBE_MARKERS = (';', '|', '&&', '`', '$(', '../')
+
+
+def _query_params(url: str) -> list[tuple[str, str]]:
+    return parse_qsl(urlsplit(url).query)
+
 
 def _detect_reflected_payload(url: str, body: str) -> dict | None:
     """Deterministic check for whether a query-param value came back unescaped in the response —
     the exact signal that confirms reflected XSS/injection, catching it whether or not the model
     itself thinks to compare its own payload against the response body (it doesn't always).
     """
-    query_params = parse_qsl(urlsplit(url).query)
-    for name, value in query_params:
+    for name, value in _query_params(url):
         if len(value) < 4 or not any(c in value for c in _HTML_BREAKOUT_CHARS):
             continue
         if value in body:
             return {"param": name, "value": value}
+    return None
+
+
+def _detect_sql_error(url: str, body: str) -> dict | None:
+    """Deterministic check for a real DB error signature appearing after a request that actually
+    carried a SQLi-shaped probe (a quote character in some query value) — narrow signature bank,
+    not a heuristic guess at what "looks like" an error.
+    """
+    if not any("'" in value or '"' in value for _, value in _query_params(url)):
+        return None
+    for engine, pattern in _SQL_ERROR_PATTERNS:
+        match = pattern.search(body)
+        if match:
+            return {"engine": engine, "matched": match.group(0)}
+    return None
+
+
+def _detect_open_redirect(url: str, response: httpx.Response) -> dict | None:
+    """Deterministic check: did a query param that looks like a redirect target actually end up as
+    the Location header of a real redirect response? Checked against resp.history (the
+    intermediate 3xx hops httpx.Client(follow_redirects=True) still records), not the body.
+    """
+    if not response.history:
+        return None
+    for name, value in _query_params(url):
+        if name.lower() not in _REDIRECT_PARAM_NAMES or not value:
+            continue
+        for hop in response.history:
+            location = hop.headers.get("location", "")
+            if value == location or (value in location and len(value) > 8):
+                return {"param": name, "value": value, "location": location}
+    return None
+
+
+def _detect_command_injection(url: str, body: str) -> dict | None:
+    """Deterministic check for real command/path-injection *output* (an /etc/passwd dump, a shell
+    id/whoami result) after a request that carried an actual injection-shaped probe — gated the
+    same way as _detect_sql_error, to avoid attributing a coincidental match to nothing.
+    """
+    if not any(
+        any(marker in value for marker in _COMMAND_INJECTION_PROBE_MARKERS)
+        for _, value in _query_params(url)
+    ):
+        return None
+    for name, pattern in _COMMAND_INJECTION_OUTPUT_PATTERNS:
+        match = pattern.search(body)
+        if match:
+            return {"signature": name, "matched": match.group(0)}
     return None
 
 
@@ -178,9 +256,16 @@ def http_request(params: dict) -> dict:
         "security_headers": security_headers,
         "body_preview": resp.text[:2000],
     }
-    reflected = _detect_reflected_payload(url, resp.text)
-    if reflected is not None:
-        result["reflected_payload_detected"] = reflected
+
+    detectors = {
+        "reflected_payload_detected": _detect_reflected_payload(url, resp.text),
+        "sql_error_detected": _detect_sql_error(url, resp.text),
+        "open_redirect_detected": _detect_open_redirect(url, resp),
+        "command_injection_detected": _detect_command_injection(url, resp.text),
+    }
+    for field, value in detectors.items():
+        if value is not None:
+            result[field] = value
     return result
 
 
