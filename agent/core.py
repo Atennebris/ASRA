@@ -410,7 +410,12 @@ async def _run_exploit_for_finding(ctx: RunContext, target: str, finding: dict, 
     task = (
         f"Target: {target}\n"
         f"Finding to evaluate:\n{json.dumps(finding)}\n\n"
-        "Decide whether and how to attempt exploitation of this single finding."
+        "If the finding is verified and a fitting tool is available, call that tool now through "
+        "function-calling and report its real result — do not just describe what you would do. "
+        "The allowlist/approval gates are enforced automatically on the call itself; if it comes "
+        "back skipped, that is a real, valid outcome to report, but you only find out by actually "
+        "calling it. Only answer skipped_needs_verification/skipped_no_suitable_tool without "
+        "calling a tool if that's genuinely the situation (not verified yet, or nothing fits)."
     )
     return await _run_llm_tool_loop(ctx, EXPLOIT_PROMPT, task, exploit_tools, "exploit", execute_tool=execute)
 
