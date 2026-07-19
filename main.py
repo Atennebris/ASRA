@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from agent.core import get_approval_event, run_session
@@ -26,6 +27,7 @@ from sessions.store import SESSIONS_DIR, create_session, load_session, save_sess
 logger = get_logger("API")
 
 app = FastAPI(title="ASRA")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 # Sanity bounds on the max_iterations form override (4.1.6) — out-of-range or unparsable input is

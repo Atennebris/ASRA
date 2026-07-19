@@ -1,0 +1,127 @@
+/* Self-hosted IBM Plex Mono (4.2.13) — no CDN/runtime network dependency. font-display: swap
+   means text renders in the fallback stack immediately and swaps in once the file loads, so a
+   slow/offline connection never blocks first paint. */
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/fonts/IBMPlexMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/fonts/IBMPlexMono-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/fonts/IBMPlexMono-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/fonts/IBMPlexMono-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Theme tokens (4.2.4/4.2.5) — one source of truth, consumed by templates via Tailwind classes
+   (see the tailwind.config color mapping in base.html), never hardcoded hex per-page. */
+
+:root[data-theme="light"] {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-elevated: #f1f5f9;
+  --border: #e2e8f0;
+  --text-primary: #0f172a;
+  --text-secondary: #64748b;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  /* RGB triplets, not hex — Tailwind's opacity modifiers (border-severity-high/40 etc, see
+     tailwind.config in base.html) need "R G B" channels to build rgb(var(--x) / alpha) at
+     generation time; a plain hex/var() value silently drops the modifier instead of erroring. */
+  --severity-critical: 220 38 38;
+  --severity-high: 234 88 12;
+  --severity-medium: 217 119 6;
+  --severity-low: 37 99 235;
+  --severity-unknown: 100 116 139;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-elevated: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --accent: #58a6ff;
+  --accent-hover: #79c0ff;
+  --severity-critical: 248 81 73;
+  --severity-high: 255 157 92;
+  --severity-medium: 238 187 85;
+  --severity-low: 88 166 255;
+  --severity-unknown: 139 148 158;
+}
+
+:root[data-theme="glass"] {
+  --bg: #14102b;
+  --surface: rgb(255 255 255 / 8%);
+  --surface-elevated: rgb(255 255 255 / 14%);
+  --border: rgb(255 255 255 / 18%);
+  --text-primary: #f5f3ff;
+  --text-secondary: #c4b5fd;
+  --accent: #a78bfa;
+  --accent-hover: #c4b5fd;
+  /* Brighter than the light/dark severity set on purpose — these sit on a translucent surface
+     over a busy gradient, a muted tone would disappear into the background. */
+  --severity-critical: 255 107 107;
+  --severity-high: 255 169 77;
+  --severity-medium: 255 212 59;
+  --severity-low: 116 192 252;
+  --severity-unknown: 196 181 253;
+}
+
+/* Glass theme gets a fixed gradient backdrop behind the translucent surfaces; light/dark just
+   use a flat --bg, painted through the bg-bg utility class in templates directly. */
+:root[data-theme="glass"] body {
+  background-color: var(--bg);
+  background-image: radial-gradient(circle at 15% 10%, rgb(167 139 250 / 25%), transparent 45%),
+    radial-gradient(circle at 85% 90%, rgb(96 165 250 / 20%), transparent 50%);
+  background-attachment: fixed;
+}
+
+:root[data-theme="glass"] .bg-surface,
+:root[data-theme="glass"] .bg-surface-elevated {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* Anti-FOUC (4.2.6): the inline script in base.html sets data-theme before first paint, so this
+   fallback only ever shows if that script fails to run at all. */
+:root:not([data-theme]) {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-elevated: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --accent: #58a6ff;
+  --accent-hover: #79c0ff;
+  --severity-critical: 248 81 73;
+  --severity-high: 255 157 92;
+  --severity-medium: 238 187 85;
+  --severity-low: 88 166 255;
+  --severity-unknown: 139 148 158;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text-primary);
+  font-family: "IBM Plex Mono", ui-monospace, Consolas, "SF Mono", monospace;
+  transition: background-color 0.2s, color 0.2s;
+}

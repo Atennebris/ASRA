@@ -1,42 +1,107 @@
-<!-- GET /settings: exploitation allowlist editor (data/allowed_targets.json) -->
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>ASRA &mdash; Settings</title>
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-</head>
-<body>
-  <nav>
-    <a href="/">Home</a> | <a href="/sessions">Sessions</a>
-  </nav>
-  <h1>Settings &mdash; Exploitation allowlist</h1>
-  <p>Only targets listed here can be exploited (Metasploit/sqlmap). Recon/scan tools work against any target from the scan form regardless of this list.</p>
+{% extends "base.html" %}
+{% block title %}ASRA &mdash; Settings{% endblock %}
+{% block head %}
+  <style>
+    /* The default cross-fade would fight with the JS-driven clip-path circle below — kill it so
+       only the circular reveal shows. */
+    ::view-transition-old(root),
+    ::view-transition-new(root) {
+      animation: none;
+      mix-blend-mode: normal;
+    }
+  </style>
+{% endblock %}
+{% block content %}
+  <h1 class="text-xl font-semibold mb-4">Settings</h1>
 
-  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <section class="bg-surface border border-default rounded-lg p-4 mb-6">
+    <h2 class="text-sm font-semibold text-secondary uppercase tracking-wide mb-3">Appearance</h2>
+    <div class="flex gap-2" id="theme-buttons">
+      <button type="button" data-theme-choice="light" class="theme-btn text-sm rounded px-3 py-2 border border-default">Light</button>
+      <button type="button" data-theme-choice="dark" class="theme-btn text-sm rounded px-3 py-2 border border-default">Dark</button>
+      <button type="button" data-theme-choice="glass" class="theme-btn text-sm rounded px-3 py-2 border border-default">Glass</button>
+    </div>
+  </section>
 
-  <form method="post" action="/api/settings/allowed-targets">
-    <label>
-      Add target
-      <input type="text" name="target" placeholder="example.com" required>
+  <h2 class="text-lg font-semibold mb-2">Exploitation allowlist</h2>
+  <p class="text-secondary mb-4">Only targets listed here can be exploited (Metasploit/sqlmap). Recon/scan tools work against any target from the scan form regardless of this list.</p>
+
+  {% if error %}
+    <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high break-words">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/api/settings/allowed-targets" class="bg-surface border border-default rounded-lg p-4 mb-4 flex items-end gap-3">
+    <label class="block flex-1">
+      <span class="block text-sm text-secondary mb-1">Add target</span>
+      <input type="text" name="target" placeholder="example.com" required
+             class="w-full bg-elevated border border-default rounded px-3 py-2 text-primary placeholder:text-secondary focus:outline-none focus:border-accent">
     </label>
-    <button type="submit">Add</button>
+    <button type="submit" class="bg-accent hover:bg-accent-hover text-white rounded px-4 py-2 font-medium">Add</button>
   </form>
 
-  <h2>Allowed targets</h2>
+  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mb-2">Allowed targets</h3>
   {% if allowed_targets %}
-    <ul id="allowed-targets-list">
+    <ul id="allowed-targets-list" class="space-y-2">
       {% for allowed_target in allowed_targets %}
-        <li>
-          {{ allowed_target }}
+        <li class="bg-surface border border-default rounded-lg px-3 py-2 flex items-center justify-between">
+          <span class="break-words">{{ allowed_target }}</span>
           <button hx-delete="/api/settings/allowed-targets/{{ allowed_target }}"
                   hx-target="closest li" hx-swap="outerHTML"
-                  hx-confirm="Remove {{ allowed_target }} from the allowlist?">Remove</button>
+                  hx-confirm="Remove {{ allowed_target }} from the allowlist?"
+                  class="text-xs text-severity-high hover:opacity-80 border border-severity-high/40 rounded px-2 py-1">Remove</button>
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>No targets added yet.</p>
+    <p class="text-secondary italic">No targets added yet.</p>
   {% endif %}
-</body>
-</html>
+
+  <script>
+    (function () {
+      var buttons = document.querySelectorAll(".theme-btn");
+
+      function markActive() {
+        var current = document.documentElement.dataset.theme;
+        buttons.forEach(function (btn) {
+          var active = btn.dataset.themeChoice === current;
+          btn.className = "theme-btn text-sm rounded px-3 py-2 border " +
+            (active ? "border-accent bg-accent text-white" : "border-default");
+        });
+      }
+      markActive();
+
+      function applyTheme(theme) {
+        localStorage.setItem("asra-theme", theme);
+        document.documentElement.dataset.theme = theme;
+        markActive();
+      }
+
+      buttons.forEach(function (btn) {
+        btn.addEventListener("click", function (event) {
+          var theme = btn.dataset.themeChoice;
+          if (theme === document.documentElement.dataset.theme) return;
+
+          var reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+          if (!document.startViewTransition || reduceMotion) {
+            applyTheme(theme);
+            return;
+          }
+
+          var x = event.clientX;
+          var y = event.clientY;
+          var endRadius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+
+          var transition = document.startViewTransition(function () {
+            applyTheme(theme);
+          });
+          transition.ready.then(function () {
+            document.documentElement.animate(
+              { clipPath: ["circle(0px at " + x + "px " + y + "px)", "circle(" + endRadius + "px at " + x + "px " + y + "px)"] },
+              { duration: 500, easing: "ease-in-out", pseudoElement: "::view-transition-new(root)" }
+            );
+          });
+        });
+      });
+    })();
+  </script>
+{% endblock %}

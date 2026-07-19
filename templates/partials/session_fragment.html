@@ -1,60 +1,69 @@
-<!-- HTMX fragment: logs, findings, approve/export buttons rendered by status -->
+<!-- HTMX/SSE fragment: logs, findings, approve/export buttons rendered by status.
+     Escaping rule (4.2.2): Jinja2 autoescape stays on everywhere here — logs/findings/thought
+     text comes straight from the target/LLM, never mark it |safe or wrap it in Markup(). -->
 <div id="session-content" data-status="{{ session.status }}">
-  <p><strong>Target:</strong> {{ session.target }}</p>
-  <p><strong>Status:</strong> {{ session.status }}</p>
+  <p class="truncate" title="{{ session.target }}"><span class="text-secondary">Target:</span> <strong>{{ session.target }}</strong></p>
+  <p><span class="text-secondary">Status:</span> <strong>{{ session.status }}</strong></p>
 
-  <h3>Logs</h3>
+  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mt-4 mb-2">Logs</h3>
   {% if session.logs %}
-    <ul class="log-list">
+    <ul id="session-log-list" class="max-h-80 overflow-y-auto bg-elevated border border-default rounded font-mono text-sm divide-y divide-default">
       {% for entry in session.logs %}
-        <li>
-          <strong>[{{ entry.phase }}]</strong>
-          {% if entry.command %}<code>{{ entry.command }}</code>{% endif %}
-          &mdash; {{ entry.status }}
-          {% if entry.error %}<span class="error">{{ entry.error }}</span>{% endif %}
+        <li class="px-3 py-2">
+          <strong class="text-accent">[{{ entry.phase }}]</strong>
+          {% if entry.command %}<code class="block whitespace-pre-wrap break-words text-secondary">{{ entry.command }}</code>{% endif %}
+          <span class="text-secondary">&mdash; {{ entry.status }}</span>
+          {% if entry.error %}<span class="block break-words text-severity-high">{{ entry.error }}</span>{% endif %}
         </li>
       {% endfor %}
     </ul>
   {% elif session.status in ("pending", "processing") %}
-    <p>Starting scan...</p>
+    <p class="text-secondary italic">Starting scan&hellip;</p>
   {% endif %}
 
-  <h3>Findings</h3>
+  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mt-4 mb-2">Findings</h3>
   {% if session.findings %}
-    <ul class="findings-list">
+    <ul class="space-y-3">
       {% for finding in session.findings %}
-        <li>
-          <strong>{{ finding.title }}</strong> ({{ finding.severity }})
-          <p>{{ finding.description }}</p>
-          {% if finding.poc_command %}<pre><code>{{ finding.poc_command }}</code></pre>{% endif %}
-          <p>Verification: {{ finding.verification }}{% if finding.exploited %}, exploited{% endif %}</p>
-          {% if finding.evidence %}<pre><code>{{ finding.evidence }}</code></pre>{% endif %}
-          {% if finding.advisory_note %}<p><em>{{ finding.advisory_note }}</em></p>{% endif %}
+        {% set sev_key = finding.severity | lower if finding.severity in ["Critical", "High", "Medium", "Low"] else "unknown" %}
+        <li class="bg-surface border border-default rounded-lg p-3">
+          <div class="flex items-center gap-2">
+            <strong class="break-words">{{ finding.title }}</strong>
+            <span class="text-xs px-2 py-0.5 rounded border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ finding.severity }}</span>
+          </div>
+          <p class="break-words text-secondary mt-1">{{ finding.description }}</p>
+          {% if finding.poc_command %}<pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mt-2 text-sm"><code>{{ finding.poc_command }}</code></pre>{% endif %}
+          <p class="text-sm text-secondary mt-1">Verification: {{ finding.verification }}{% if finding.exploited %}, exploited{% endif %}</p>
+          {% if finding.evidence %}<pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mt-2 text-sm break-words whitespace-pre-wrap"><code>{{ finding.evidence }}</code></pre>{% endif %}
+          {% if finding.advisory_note %}<p class="break-words italic text-secondary mt-1">{{ finding.advisory_note }}</p>{% endif %}
         </li>
       {% endfor %}
     </ul>
   {% elif session.status == "completed" %}
-    <p>No vulnerabilities found.</p>
+    <p class="text-secondary">No vulnerabilities found.</p>
+  {% elif session.status == "failed" %}
+    <p class="text-secondary">Scan stopped before finding anything (see the error in Logs above) &mdash; not the same as a clean "no vulnerabilities" result.</p>
   {% else %}
-    <p>No findings yet.</p>
+    <p class="text-secondary italic">No findings yet.</p>
   {% endif %}
 
   {% if session.status == "interrupted" %}
-    <form method="post" action="/api/session/{{ session.session_id }}/resume">
-      <p>Session interrupted &mdash; resume from <strong>{{ session.resumable_from }}</strong>?</p>
-      <button type="submit">Resume</button>
+    <form method="post" action="/api/session/{{ session.session_id }}/resume" class="mt-4 bg-elevated border border-default rounded-lg p-3">
+      <p class="mb-2">Session interrupted &mdash; resume from <strong>{{ session.resumable_from }}</strong>?</p>
+      <button type="submit" class="bg-accent hover:bg-accent-hover text-white rounded px-4 py-2 font-medium">Resume</button>
     </form>
   {% endif %}
 
   {% if session.status == "awaiting_approval" %}
     <form hx-post="/api/session/{{ session.session_id }}/approve-exploit"
-          hx-target="#session-content" hx-swap="outerHTML" hx-disabled-elt="this">
-      <p>Exploitation approval requested for target <strong>{{ session.target }}</strong>.</p>
-      <button type="submit">Approve exploit</button>
+          hx-target="#session-content" hx-swap="outerHTML" hx-disabled-elt="this"
+          class="mt-4 bg-elevated border border-severity-medium/40 rounded-lg p-3">
+      <p class="mb-2">Exploitation approval requested for target <strong class="break-words">{{ session.target }}</strong>.</p>
+      <button type="submit" class="bg-severity-medium hover:opacity-90 text-white rounded px-4 py-2 font-medium">Approve exploit</button>
     </form>
   {% endif %}
 
   {% if session.status == "completed" and session.findings %}
-    <p><a href="/api/session/{{ session.session_id }}/export">Export Proof</a></p>
+    <p class="mt-4"><a href="/api/session/{{ session.session_id }}/export" class="text-accent hover:text-accent-hover underline">Export Proof</a></p>
   {% endif %}
 </div>

@@ -1,0 +1,78 @@
+<!-- Shared layout (4.2.1) — every page extends this, exports <head> setup exactly once. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}ASRA{% endblock %}</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
+
+  <!-- Anti-FOUC (4.2.6): must run synchronously, before Tailwind/CSS, so the page never paints
+       the wrong theme for a frame. Default "dark" is a deliberate choice, not prefers-color-scheme. -->
+  <script>
+    (function () {
+      var theme = localStorage.getItem("asra-theme") || "dark";
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
+
+  <link rel="stylesheet" href="/static/css/themes.css">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          textColor: {
+            primary: "var(--text-primary)",
+            secondary: "var(--text-secondary)",
+            accent: "var(--accent)",
+          },
+          backgroundColor: {
+            base: "var(--bg)",
+            surface: "var(--surface)",
+            elevated: "var(--surface-elevated)",
+            accent: "var(--accent)",
+            "accent-hover": "var(--accent-hover)",
+          },
+          borderColor: {
+            default: "var(--border)",
+          },
+          colors: {
+            // rgb(var(...) / <alpha-value>) — not a plain var() — so opacity modifiers
+            // (bg-severity-high/10, border-severity-medium/40, etc.) actually generate CSS.
+            // The channels for these live in static/css/themes.css as "R G B", not hex.
+            severity: {
+              critical: "rgb(var(--severity-critical) / <alpha-value>)",
+              high: "rgb(var(--severity-high) / <alpha-value>)",
+              medium: "rgb(var(--severity-medium) / <alpha-value>)",
+              low: "rgb(var(--severity-low) / <alpha-value>)",
+              unknown: "rgb(var(--severity-unknown) / <alpha-value>)",
+            },
+          },
+          fontFamily: {
+            mono: ['"IBM Plex Mono"', "ui-monospace", "Consolas", '"SF Mono"', "monospace"],
+          },
+        },
+      },
+    };
+  </script>
+
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+  {% block head %}{% endblock %}
+</head>
+<body class="font-mono bg-base text-primary min-h-screen">
+  <header class="border-b border-default bg-surface">
+    <nav class="max-w-4xl mx-auto px-4 py-3 flex items-center gap-4 text-sm">
+      <span class="font-semibold text-primary">ASRA</span>
+      <a href="/" class="text-secondary hover:text-accent">Home</a>
+      <a href="/sessions" class="text-secondary hover:text-accent">Sessions</a>
+      <a href="/settings" class="text-secondary hover:text-accent">Settings</a>
+    </nav>
+  </header>
+  <main class="max-w-4xl mx-auto px-4 py-6">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

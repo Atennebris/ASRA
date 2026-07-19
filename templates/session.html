@@ -1,19 +1,42 @@
-<!-- Session view: HTMX + SSE, includes partials/session_fragment.html -->
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>ASRA &mdash; Session {{ session.session_id }}</title>
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
-</head>
-<body>
-  <nav>
-    <a href="/">Home</a> | <a href="/sessions">Sessions</a> | <a href="/settings">Settings</a>
-  </nav>
-  <h1>Session {{ session.session_id }}</h1>
-  <div hx-ext="sse" sse-connect="/api/session/{{ session.session_id }}/stream" sse-swap="message" hx-swap="innerHTML">
+{% extends "base.html" %}
+{% block title %}ASRA &mdash; Session {{ session.session_id }}{% endblock %}
+{% block content %}
+  <div class="flex items-center justify-between mb-4">
+    <h1 class="text-xl font-semibold">Session {{ session.session_id }}</h1>
+    <span id="sse-indicator" class="text-xs px-2 py-1 rounded border border-default text-secondary">connecting&hellip;</span>
+  </div>
+
+  <div id="session-stream" hx-ext="sse" sse-connect="/api/session/{{ session.session_id }}/stream"
+       sse-swap="message" hx-swap="innerHTML">
     {% include "partials/session_fragment.html" %}
   </div>
-</body>
-</html>
+
+  <script>
+    (function () {
+      var stream = document.getElementById("session-stream");
+      var indicator = document.getElementById("sse-indicator");
+      var wasAtBottom = false;
+
+      stream.addEventListener("htmx:sseOpen", function () {
+        indicator.textContent = "live";
+        indicator.className = "text-xs px-2 py-1 rounded border border-default text-severity-low";
+      });
+      stream.addEventListener("htmx:sseError", function () {
+        indicator.textContent = "reconnecting…";
+        indicator.className = "text-xs px-2 py-1 rounded border border-default text-severity-medium";
+      });
+
+      // Only auto-scroll the log if the user was already at the bottom — never yank the view
+      // away from someone deliberately scrolled up reading earlier lines.
+      stream.addEventListener("htmx:beforeSwap", function () {
+        var log = document.getElementById("session-log-list");
+        wasAtBottom = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 20;
+      });
+      stream.addEventListener("htmx:afterSwap", function () {
+        if (!wasAtBottom) return;
+        var log = document.getElementById("session-log-list");
+        if (log) log.scrollTop = log.scrollHeight;
+      });
+    })();
+  </script>
+{% endblock %}

@@ -1,32 +1,28 @@
-<!-- GET /sessions: list of past scans from data/sessions/*.json -->
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>ASRA &mdash; Sessions</title>
-</head>
-<body>
-  <nav>
-    <a href="/">Home</a> | <a href="/settings">Settings</a>
-  </nav>
-  <h1>Past sessions</h1>
+{% extends "base.html" %}
+{% block title %}ASRA &mdash; Sessions{% endblock %}
+{% block content %}
+  <h1 class="text-xl font-semibold mb-4">Past sessions</h1>
 
   {% if sessions %}
-    <ul>
+    <ul class="space-y-2">
       {% for s in sessions %}
-        <li>
-          <a href="/session/{{ s.session_id }}">{{ s.session_id }}</a>
-          &mdash; {{ s.target }} &mdash; {{ s.status }} &mdash; {{ s.findings_count }} finding(s) &mdash; {{ s.created_at }}
+        <li class="bg-surface border border-default rounded-lg p-3">
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+            <a href="/session/{{ s.session_id }}" class="text-accent hover:text-accent-hover font-medium">{{ s.session_id }}</a>
+            <span class="text-secondary truncate max-w-xs" title="{{ s.target }}">{{ s.target }}</span>
+            <span class="text-secondary">&mdash; {{ s.status }}</span>
+            <span class="text-secondary">&mdash; {{ s.findings_count }} finding(s)</span>
+            <span class="text-secondary">&mdash; {{ s.created_at }}</span>
+          </div>
           {% if s.status == "interrupted" %}
-            <form method="post" action="/api/session/{{ s.session_id }}/resume" style="display: inline">
-              <button type="submit">Resume from {{ s.resumable_from }}</button>
+            <form method="post" action="/api/session/{{ s.session_id }}/resume" class="mt-2 inline-block">
+              <button type="submit" class="text-xs bg-accent hover:bg-accent-hover text-white rounded px-3 py-1">Resume from {{ s.resumable_from }}</button>
             </form>
           {% endif %}
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>No sessions yet. <a href="/">Start a scan</a>.</p>
+    <p class="text-secondary">No sessions yet. <a href="/" class="text-accent hover:text-accent-hover underline">Start a scan</a>.</p>
   {% endif %}
-</body>
-</html>
+{% endblock %}
