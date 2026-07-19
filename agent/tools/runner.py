@@ -68,7 +68,17 @@ def _run_subprocess(spec: ToolSpec, params: dict) -> dict:
         if risk != "default":
             logger.debug("run_tool: %s classified risk=%s params=%s", spec.name, risk, params)
 
-    command = spec.build_command(params)
+    try:
+        command = spec.build_command(params)
+    except Exception as exc:
+        # An LLM-supplied argument can violate a builder's expectations in ways the JSON schema
+        # alone doesn't stop (e.g. a string field arriving as a list) — build_command() isn't
+        # guaranteed exception-safe the way native_function calls already are (_run_native
+        # above); without this, one malformed tool call crashes the whole session instead of
+        # coming back as a normal, retryable {"status": "error"} result.
+        logger.debug("run_tool: %s build_command raised %s", spec.name, exc)
+        return {"status": "error", "tool": spec.name, "error": str(exc)}
+
     timeout_seconds = _timeout_for(spec)
     step_id = f"{spec.name}_{int(time.time() * 1000)}"
 
