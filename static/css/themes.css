@@ -37,6 +37,9 @@
   --bg: #f8fafc;
   --surface: #ffffff;
   --surface-elevated: #f1f5f9;
+  /* 4th elevation level (4.8.1) — for hover/popover states specifically, so they read as
+     distinct from the static card surface they sit on top of, not just "the same card again". */
+  --overlay: #e2e8f0;
   --border: #e2e8f0;
   --text-primary: #0f172a;
   --text-secondary: #64748b;
@@ -56,6 +59,7 @@
   --bg: #0d1117;
   --surface: #161b22;
   --surface-elevated: #21262d;
+  --overlay: #2d333b;
   --border: #30363d;
   --text-primary: #e6edf3;
   --text-secondary: #8b949e;
@@ -72,6 +76,7 @@
   --bg: #14102b;
   --surface: rgb(255 255 255 / 8%);
   --surface-elevated: rgb(255 255 255 / 14%);
+  --overlay: rgb(255 255 255 / 20%);
   --border: rgb(255 255 255 / 18%);
   --text-primary: #f5f3ff;
   --text-secondary: #c4b5fd;
@@ -96,7 +101,8 @@
 }
 
 :root[data-theme="glass"] .bg-surface,
-:root[data-theme="glass"] .bg-surface-elevated {
+:root[data-theme="glass"] .bg-elevated,
+:root[data-theme="glass"] .bg-overlay {
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
 }
@@ -107,6 +113,7 @@
   --bg: #0d1117;
   --surface: #161b22;
   --surface-elevated: #21262d;
+  --overlay: #2d333b;
   --border: #30363d;
   --text-primary: #e6edf3;
   --text-secondary: #8b949e;

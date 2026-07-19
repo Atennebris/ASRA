@@ -7,6 +7,8 @@ CLAUDE.md
 # Local CLI tool config (not project content)
 .qwen/
 
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
