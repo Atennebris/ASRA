@@ -13,10 +13,13 @@ _CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 
 # Loose hostname/IP/URL shape check — just enough to reject obviously malformed input
 # (empty string, whitespace-only, shell metacharacters). Allows query strings (?, =, &, %)
-# since sqlmap targets are full URLs with an injectable parameter, not just a hostname.
-# Not a strict RFC validator — real injection protection is the argv-list barrier (2.1.5),
-# this only rejects shapes that couldn't be a legitimate target/URL in the first place.
-_TARGET_SHAPE_PATTERN = re.compile(r"^[A-Za-z0-9.\-:_/?=&%]+$")
+# since sqlmap targets are full URLs with an injectable parameter, not just a hostname. [ and ]
+# cover bracketed IPv6 host literals in a URL (http://[2001:db8::1]:8080/); bare IPv6 (no
+# brackets) already fits the existing hex-digit + ":" set.
+# Not a strict RFC validator — real injection protection is the argv-list barrier (subprocess
+# calls take a list, never a shell string), this only rejects shapes that couldn't be a
+# legitimate target/URL in the first place.
+_TARGET_SHAPE_PATTERN = re.compile(r"^[A-Za-z0-9.\-:_/?=&%\[\]]+$")
 
 
 def validate_safe_value(value: str) -> str:

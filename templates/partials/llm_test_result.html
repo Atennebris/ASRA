@@ -1,0 +1,4 @@
+{# Result of the Settings "Test" button (main.py's /api/settings/test-llm) — through a real
+   template like everywhere else in this project, not a hand-built HTML string, so autoescape
+   covers the exception-message/finish_reason branches without a special case. #}
+<span class="{{ 'text-severity-low' if ok else 'text-severity-high' }}">{{ message }}</span>

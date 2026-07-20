@@ -10,6 +10,8 @@ CATEGORY_COLORS: dict[str, str] = {
     "LLM": "\033[33m",  # yellow
     "AGENT": "\033[32m",  # green
     "API": "\033[34m",  # blue
+    "CHAT": "\033[31m",  # red
+    "PROJECTS": "\033[92m",  # bright green
 }
 _RESET = "\033[0m"
 _FALLBACK_COLOR = "\033[37m"  # white, for a category missing from CATEGORY_COLORS

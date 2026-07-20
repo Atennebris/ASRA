@@ -68,6 +68,17 @@ def get_model_capabilities(provider_id: str, model_id: str) -> dict | None:
     return capabilities
 
 
+def list_models(provider_id: str) -> list[str]:
+    """Every model id the catalog lists under a provider — powers the Settings model dropdown
+    (populated per-provider, not a fixed list). Empty (not an error) if the catalog is
+    unreachable or the provider isn't in it; callers fall back to just the one .env-configured
+    model in that case."""
+    catalog = _fetch_catalog()
+    if catalog is None:
+        return []
+    return sorted(catalog.get(provider_id, {}).get("models", {}))
+
+
 def validate_model_known(provider_id: str, model_id: str) -> None:
     """Startup fail-fast: raises ValueError if the catalog was reachable but doesn't list this
     provider/model pair (almost always a typo in the configured model name). Silently returns if

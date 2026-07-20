@@ -548,6 +548,8 @@ def record_finding(params: dict) -> dict:
         "title": params["title"],
         "severity": severity,
         "description": params.get("description", ""),
+        "technology": params.get("technology"),
+        "reproduction_steps": params.get("reproduction_steps"),
         "verification": verification,
         "evidence_ref": params.get("evidence_ref"),
     }

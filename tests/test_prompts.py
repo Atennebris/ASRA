@@ -10,6 +10,8 @@ import pytest
 
 from agent.prompts import (
     ANALYZE_PROMPT,
+    CHAT_COMPACTION_PROMPT,
+    CHAT_PROMPT,
     CONFIRM_EXPLOIT_PROMPT,
     EXPLOIT_PROMPT,
     RECON_PROMPT,
@@ -33,19 +35,29 @@ _ALL_PROMPTS = {
     "VALIDATE_PROMPT": VALIDATE_PROMPT,
 }
 
+# Chat prompts are structurally different — CHAT_PROMPT's contract is tool-calling or
+# plain text, never a JSON blob; CHAT_COMPACTION_PROMPT explicitly forbids JSON output. Same
+# general sanity checks apply (substantial/English/token budget), but not the JSON-contract one.
+_FREE_TEXT_PROMPTS = {
+    "CHAT_PROMPT": CHAT_PROMPT,
+    "CHAT_COMPACTION_PROMPT": CHAT_COMPACTION_PROMPT,
+}
 
-@pytest.mark.parametrize("name,text", _ALL_PROMPTS.items())
+_ALL_SYSTEM_PROMPTS = {**_ALL_PROMPTS, **_FREE_TEXT_PROMPTS}
+
+
+@pytest.mark.parametrize("name,text", _ALL_SYSTEM_PROMPTS.items())
 def test_prompt_is_substantial(name, text):
     assert isinstance(text, str)
     assert len(text) >= _MIN_PROMPT_CHARS, f"{name} looks too short to be a real system prompt ({len(text)} chars)"
 
 
-@pytest.mark.parametrize("name,text", _ALL_PROMPTS.items())
+@pytest.mark.parametrize("name,text", _ALL_SYSTEM_PROMPTS.items())
 def test_prompt_is_english(name, text):
     assert not _CYRILLIC_PATTERN.search(text), f"{name} contains Cyrillic characters — prompts must be English"
 
 
-@pytest.mark.parametrize("name,text", _ALL_PROMPTS.items())
+@pytest.mark.parametrize("name,text", _ALL_SYSTEM_PROMPTS.items())
 def test_prompt_within_token_budget(name, text):
     estimated_tokens = len(text) // 4
     assert estimated_tokens <= _MAX_TOKENS_PER_PROMPT, f"{name} is ~{estimated_tokens} tokens, over the {_MAX_TOKENS_PER_PROMPT} budget"
@@ -55,6 +67,10 @@ def test_prompt_within_token_budget(name, text):
 def test_prompt_declares_json_output_contract(name, text):
     assert "JSON" in text, f"{name} must instruct the model to answer with a specific JSON shape"
     assert "{" in text and "}" in text, f"{name} must show the expected JSON shape inline"
+
+
+def test_chat_compaction_prompt_forbids_json():
+    assert "not JSON" in CHAT_COMPACTION_PROMPT
 
 
 def test_prompts_never_name_a_fixed_exploit_tool_set():

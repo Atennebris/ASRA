@@ -1,0 +1,5 @@
+{# Swapped into the model <select> whenever the provider <select> changes (hx-get, see
+   settings.html) — the list of valid models depends entirely on which provider is picked. #}
+{% for model_id in provider_models %}
+  <option value="{{ model_id }}" {% if model_id == current_model %}selected{% endif %}>{{ model_id }}</option>
+{% endfor %}

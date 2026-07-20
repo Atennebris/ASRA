@@ -218,6 +218,18 @@ register_tool(
                 "title": {"type": "string", "description": "Short descriptive title of the vulnerability"},
                 "severity": {"type": "string", "enum": ["Critical", "High", "Medium", "Low"]},
                 "description": {"type": "string", "description": "What the issue is and why it matters"},
+                "technology": {
+                    "type": "string",
+                    "description": "The specific product/plugin/library + version this finding is actually in, "
+                    "from a real banner/header/response — 'unknown' only if nothing identifies it",
+                },
+                "reproduction_steps": {
+                    "type": "string",
+                    "description": "Concrete steps (including the literal payload/request, if the vulnerability "
+                    "class has one) a human could run right now to reproduce this alone, actively or passively "
+                    "— not an attack that needs a victim to act (phishing/MITM/social engineering); say so "
+                    "explicitly instead if this finding genuinely is that kind",
+                },
                 "verification": {
                     "type": "string",
                     "enum": ["verified", "inferred", "needs_verification"],

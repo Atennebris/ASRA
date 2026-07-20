@@ -1,14 +1,38 @@
 {% extends "base.html" %}
-{% block title %}ASRA &mdash; Session {{ session.session_id }}{% endblock %}
+{% block title %}ASRA &mdash; {{ session.name or session.session_id }}{% endblock %}
+{% block main_class %}max-w-none{% endblock %}
 {% block content %}
-  <div class="flex items-center justify-between mb-4">
-    <h1 class="text-xl font-semibold">Session {{ session.session_id }}</h1>
-    <span id="sse-indicator" class="text-xs px-2 py-1 rounded border border-default text-secondary">connecting&hellip;</span>
+  <div class="flex items-center justify-between py-3.5 border-b border-default mb-4">
+    <div class="min-w-0">
+      <h1 class="text-[13px] font-semibold text-primary truncate">{{ session.name or session.session_id }}</h1>
+      {% if session.name %}<p class="text-[11px] text-secondary truncate">{{ session.session_id }}</p>{% endif %}
+    </div>
+    {# Always connects, regardless of status at page load — a session that looks finished can
+       still come back to life later (the Deep dive button can flip a completed session back to
+       processing). Skipping the connection for an already-terminal session used to avoid the
+       reconnect-flap bug, but it meant an already-open tab had no way to ever see a Deep dive
+       run's progress without a manual reload. main.py's stream_session never voluntarily closes
+       the connection either (see that file), which is the actual fix for the flapping — this
+       doesn't need to also skip connecting in the first place. #}
+    <span id="sse-indicator" class="text-[11px] px-2 py-1 rounded border border-default text-secondary shrink-0">connecting&hellip;</span>
   </div>
 
-  <div id="session-stream" hx-ext="sse" sse-connect="/api/session/{{ session.session_id }}/stream"
-       sse-swap="message" hx-swap="innerHTML">
-    {% include "partials/session_fragment.html" %}
+  {# Main session content (left) + chat panel (right, 4.9) — a fixed 2-column split, not
+     resizable (the resizable-panel pattern from the Piligrim reference was explicitly declined
+     for ASRA in 4.8/4.9's planning, there's no multi-panel workspace concept here to justify it).
+     Chat is sticky + full viewport height — it stays pinned and visible while the log on the
+     left scrolls past it, not a small box you lose track of. .session-layout/.session-log-column/
+     .session-chat-column are a real container query (themes.css), not a Tailwind viewport
+     breakpoint — see the comment there for why that distinction matters here specifically. #}
+  <div class="session-layout">
+    <div id="session-stream" class="session-log-column w-full"
+         hx-ext="sse, morph" sse-connect="/api/session/{{ session.session_id }}/stream" sse-swap="message" hx-swap="morph">
+      {% include "partials/session_fragment.html" %}
+    </div>
+
+    <div class="session-chat-column w-full">
+      {% include "partials/chat_panel.html" %}
+    </div>
   </div>
 
   <script>
@@ -19,15 +43,19 @@
 
       stream.addEventListener("htmx:sseOpen", function () {
         indicator.textContent = "live";
-        indicator.className = "text-xs px-2 py-1 rounded border border-default text-severity-low";
+        indicator.className = "text-[11px] px-2 py-1 rounded border border-default text-severity-low";
       });
       stream.addEventListener("htmx:sseError", function () {
         indicator.textContent = "reconnecting…";
-        indicator.className = "text-xs px-2 py-1 rounded border border-default text-severity-medium";
+        indicator.className = "text-[11px] px-2 py-1 rounded border border-default text-severity-medium";
       });
 
-      // Only auto-scroll the log if the user was already at the bottom — never yank the view
-      // away from someone deliberately scrolled up reading earlier lines.
+      // With hx-swap="morph" (Idiomorph, see base.html), a swap only touches nodes that actually
+      // changed — an unrelated new log line no longer destroys/recreates the whole list, so a
+      // manually-opened <details> card and the list's own scroll position both survive on their
+      // own without any save/restore code here. The one thing still worth doing manually is a
+      // deliberate UX choice, not a workaround: auto-follow new lines when the user was already
+      // at the bottom, same as a tail -f.
       stream.addEventListener("htmx:beforeSwap", function () {
         var log = document.getElementById("session-log-list");
         wasAtBottom = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 20;
@@ -36,6 +64,26 @@
         if (!wasAtBottom) return;
         var log = document.getElementById("session-log-list");
         if (log) log.scrollTop = log.scrollHeight;
+      });
+
+      // Separate bug from the SSE-swap scroll fix above: clicking a <summary> to expand a
+      // tool-call card, on its own, was teleporting the log list's scroll position to the top
+      // ~90% of the time — the browser's native focus/scroll-into-view handling for a newly
+      // revealed <details> body fights with the container's own scroll. Delegated on
+      // #session-stream (stable across SSE swaps, unlike #session-log-list which gets replaced)
+      // rather than attached per-<summary>, so it keeps working after every re-render. Capture
+      // the scroll position at click time and force it back after the browser's own toggle
+      // handling has run, instead of trying to figure out and prevent whatever native behavior
+      // is causing the jump.
+      stream.addEventListener("click", function (event) {
+        var summary = event.target.closest("summary");
+        if (!summary) return;
+        var log = document.getElementById("session-log-list");
+        if (!log) return;
+        var scrollTop = log.scrollTop;
+        requestAnimationFrame(function () {
+          log.scrollTop = scrollTop;
+        });
       });
     })();
   </script>

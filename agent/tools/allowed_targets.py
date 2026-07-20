@@ -1,9 +1,11 @@
 """Exploitation allowlist storage.
 
 Backs the run_tool() guardrail for requires_allowed_target tools (Metasploit, sqlmap,
-default_creds_check). Deliberately NOT sourced from .env or the scan form: the list is empty
-by default and only grows when a human explicitly adds a target through the /settings screen —
-see README.md "Test scope / Legal notice" for why.
+default_creds_check). Deliberately NOT sourced from .env, and never implied by just submitting a
+scan target: the list is empty by default and only grows through an explicit, off-by-default
+opt-in — the "authorize exploitation" checkbox on the New Project form. Recon/scan tools are
+unaffected either way; only exploitation is gated by this list — see README.md
+"Test scope / Legal notice" for why.
 """
 from __future__ import annotations
 
@@ -51,13 +53,6 @@ def add_allowed_target(target: str) -> list[str]:
         targets.append(target)
         _write_allowed_targets(targets)
         logger.debug("allowed_targets: added %r (total=%d)", target, len(targets))
-    return targets
-
-
-def remove_allowed_target(target: str) -> list[str]:
-    targets = [t for t in load_allowed_targets() if t != target]
-    _write_allowed_targets(targets)
-    logger.debug("allowed_targets: removed %r (total=%d)", target, len(targets))
     return targets
 
 

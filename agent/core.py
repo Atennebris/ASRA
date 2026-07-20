@@ -24,8 +24,17 @@ run in their normal order.
 
 Every LLM call in a session (sub-phase conversations, exploit-approval-gated calls, 1-step
 retry corrections, exploit-result confirmation) goes through RunContext/_llm_complete, the single
-place that counts against MAX_ITERATIONS and raises MaxIterationsReached once the session's
-LLM-call budget is spent.
+choke point that counts and logs them — no cap on the total, and no cap on tool-calling rounds
+within a phase either. A fixed count cap (either one) has the same flaw regardless of where it
+sits: it cuts off legitimate work the moment a scope is big enough to need more calls than
+whatever number seemed reasonable in isolation — a scan covering many subdomains/targets can
+legitimately need far more tool calls than one covering a single host, and a count cap can't tell
+the difference between "still making progress" and "actually stuck". _run_llm_tool_loop instead
+detects an actual stall directly: the same tool call (name + arguments) repeated identically
+_STALL_REPEAT_THRESHOLD times in a row ends that phase — real, distinct work never trips it no
+matter how much of it there is. A generous, non-configurable wall-clock backstop per phase
+(_PHASE_WALLCLOCK_LIMIT_SECONDS) exists purely as a last-resort safety valve for a genuine bug
+that produces endless non-repeating garbage; it is not meant to be reachable by legitimate use.
 """
 from __future__ import annotations
 
@@ -34,6 +43,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -63,9 +73,11 @@ from sessions.store import create_session, load_session, save_session
 
 logger = get_logger("AGENT")
 
-_DEFAULT_MAX_TOOL_ITERATIONS = 12
 _TOOL_RESULT_CHAR_LIMIT = 8000
-_DEFAULT_MAX_ITERATIONS = 20
+# Loop/stall protection for _run_llm_tool_loop — see the module docstring for why this replaced
+# a fixed per-phase call-count cap.
+_STALL_REPEAT_THRESHOLD = 6
+_PHASE_WALLCLOCK_LIMIT_SECONDS = 7200
 
 # Tool-result fields that mean "a deterministic check in agent/tools/native.py already confirmed a
 # real vulnerability" (see http_request's detectors) — any one of these firing gets a loud hint
@@ -91,7 +103,7 @@ _GENERIC_DISCOVERED_SCHEMA = {
 }
 
 # Structured parsers for the hand-written subprocess tools (agent/tools/builders/*) — reused as-is
-# from Phase 2 rather than asking the LLM to re-derive them from raw, ANSI-laden CLI output.
+# rather than asking the LLM to re-derive them from raw, ANSI-laden CLI output.
 # Autodiscovered/custom tools deliberately have no entry here: their raw stdout goes to the model
 # unparsed, by design (agent/tools/builders/discovered.py).
 _OUTPUT_PARSERS: dict[str, Callable[[str], object]] = {
@@ -112,18 +124,21 @@ _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 # The session schema (sessions/store.py) promises every finding has all of these keys.
 # Analyze's own output only carries a subset (title/severity/description/verification/
-# evidence_ref) — normally Validate fills in the rest, but a session can end (MAX_ITERATIONS
-# cutoff, a parse failure) before Validate ever runs. Without this, downstream consumers
-# (Phase 4's export/UI) would hit missing keys instead of a real, if incomplete, finding.
+# evidence_ref) — normally Validate fills in the rest, but a session can end early (an unhandled
+# error, a parse failure) before Validate ever runs. Without this, downstream consumers
+# (the export/UI) would hit missing keys instead of a real, if incomplete, finding.
 _FINDING_DEFAULTS = {
     "title": "Untitled finding",
     "severity": "Low",
     "description": "",
+    "technology": None,
+    "reproduction_steps": None,
     "poc_command": None,
     "exploited": False,
     "evidence": None,
     "verification": "needs_verification",
     "advisory_note": None,
+    "found_at": None,
 }
 
 
@@ -132,8 +147,8 @@ def _normalize_findings(findings: list[dict]) -> list[dict]:
 
 _JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 
-# Module-level per-session approval signal: set by the web layer's approve-exploit endpoint
-# (Phase 4), waited on here. Lives here rather than in main.py since core.py owns the
+# Module-level per-session approval signal: set by the web layer's approve-exploit endpoint,
+# waited on here. Lives here rather than in main.py since core.py owns the
 # wait/timeout mechanics; the web layer only ever needs to call .set() on it.
 _approval_events: dict[str, asyncio.Event] = {}
 
@@ -142,33 +157,105 @@ def get_approval_event(session_id: str) -> asyncio.Event:
     return _approval_events.setdefault(session_id, asyncio.Event())
 
 
+# Same pattern and same honest tradeoff as _approval_events above, for a different purpose: chat
+# (agent/chat.py) queues short operator directives here instead of writing them into
+# the session file — run_session() already owns that file's read-modify-write cycle, a second
+# writer would race it. In-memory only, so a directive queued right as the process dies is lost —
+# acceptable, since it is a live nudge, not data (findings/recon stay durable regardless).
+_instruction_queues: dict[str, asyncio.Queue] = {}
+
+
+def get_instruction_queue(session_id: str) -> asyncio.Queue:
+    return _instruction_queues.setdefault(session_id, asyncio.Queue())
+
+
+def _drain_pending_guidance(session_id: str) -> list[str]:
+    """Non-blocking drain of any add_guidance directives the chat layer queued for this
+    session — checked at the top of every tool-loop iteration, the natural point between LLM
+    turns to inject one. skip_finding directives are left in the queue (put back below) — those
+    are matched separately, per finding title, at the per-finding boundary in _run_exploit
+    (a title not yet reached in the exploit loop must survive to be seen on a later finding).
+    """
+    queue = get_instruction_queue(session_id)
+    guidance: list[str] = []
+    deferred: list[dict] = []
+    while not queue.empty():
+        instruction = queue.get_nowait()
+        if instruction.get("type") == "add_guidance":
+            guidance.append(instruction["text"])
+        else:
+            deferred.append(instruction)
+    for instruction in deferred:
+        queue.put_nowait(instruction)
+    return guidance
+
+
+def _pop_skip_instruction(session_id: str, finding_title: str) -> bool:
+    """Non-blocking check: was exactly this finding queued to be skipped? Consumes only a
+    matching instruction — everything else (skip_finding for a different, not-yet-reached
+    finding; any add_guidance) goes back into the queue untouched for a later drain to see.
+    """
+    queue = get_instruction_queue(session_id)
+    matched = False
+    deferred: list[dict] = []
+    while not queue.empty():
+        instruction = queue.get_nowait()
+        if not matched and instruction.get("type") == "skip_finding" and instruction.get("finding_title") == finding_title:
+            matched = True
+        else:
+            deferred.append(instruction)
+    for instruction in deferred:
+        queue.put_nowait(instruction)
+    return matched
+
+
+def _pop_deep_dive_instruction(session_id: str) -> str | None:
+    """Non-blocking: was a "focus on this finding now" directive queued (the finding-detail
+    modal's Deep dive button, main.py's /deep-dive route, for a session that's already live)?
+    Unlike skip_finding this isn't matched against a specific title by the caller — _run_exploit
+    checks it once per loop iteration and reorders its own remaining work, so whichever finding
+    was most recently requested (if any) always wins the reorder. Consumed either way once
+    popped, same as add_guidance — a stale request for a finding already processed just no-ops.
+    """
+    queue = get_instruction_queue(session_id)
+    found_title: str | None = None
+    deferred: list[dict] = []
+    while not queue.empty():
+        instruction = queue.get_nowait()
+        if instruction.get("type") == "deep_dive":
+            found_title = instruction.get("finding_title")
+        else:
+            deferred.append(instruction)
+    for instruction in deferred:
+        queue.put_nowait(instruction)
+    return found_title
+
+
 @dataclass
 class RunContext:
     """Shared, mutable state for one run_session() call — threaded through every sub-phase
-    instead of passing (llm, session, session_id) separately everywhere, since MAX_ITERATIONS
-    (below) needs exactly one counter shared across all of them.
+    instead of passing (llm, session, session_id) separately everywhere. iteration_count is a
+    running total for logging only (see _llm_complete) — no budget attached to it.
+    current_finding_title is set for the duration of one finding's exploit attempt
+    (_run_exploit_for_finding) so _append_log can tag that finding's log entries — lets the UI
+    show a per-finding scoped log instead of just the whole session's undifferentiated stream.
     """
 
     llm: LLMProvider
     session: dict
     session_id: str
-    max_iterations: int = _DEFAULT_MAX_ITERATIONS
     iteration_count: int = field(default=0)
-
-
-class MaxIterationsReached(Exception):
-    """Raised when a session's LLM-call budget (MAX_ITERATIONS) runs out mid-flight."""
+    current_finding_title: str | None = field(default=None)
 
 
 async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
     """The single choke point every LLM call in a session goes through — sub-phase conversations,
-    1-step retry corrections, all of it — so MAX_ITERATIONS counts the true total, not just the
-    top-level per-phase calls.
+    1-step retry corrections, all of it. No cap here: loop/stall protection lives in
+    _run_llm_tool_loop's stall detector instead, which stops a phase on genuine repetition
+    without capping how much distinct work a whole scan can do overall.
     """
-    if ctx.iteration_count >= ctx.max_iterations:
-        raise MaxIterationsReached()
     ctx.iteration_count += 1
-    logger.debug("core: session=%s llm call %d/%d", ctx.session_id, ctx.iteration_count, ctx.max_iterations)
+    logger.debug("core: session=%s llm call %d", ctx.session_id, ctx.iteration_count)
     return await asyncio.to_thread(ctx.llm.complete, messages, tools)
 
 
@@ -243,6 +330,7 @@ def _append_log(ctx: RunContext, phase: str, thought: str | None, command: str |
             "command": command,
             "status": status,
             "error": error,
+            "finding_title": ctx.current_finding_title,
         }
     )
     save_session(ctx.session_id, ctx.session)
@@ -315,9 +403,20 @@ async def _run_llm_tool_loop(
         {"role": "user", "content": task_content},
     ]
     trace: list[dict] = []
-    max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS_PER_PHASE", str(_DEFAULT_MAX_TOOL_ITERATIONS)))
+    recent_call_signatures: list[str] = []
+    phase_started_at = time.monotonic()
+    stop_reason: str | None = None
 
-    for _iteration in range(max_tool_iterations):
+    while True:
+        elapsed = time.monotonic() - phase_started_at
+        if elapsed > _PHASE_WALLCLOCK_LIMIT_SECONDS:
+            stop_reason = f"exceeded the {_PHASE_WALLCLOCK_LIMIT_SECONDS}s wall-clock backstop"
+            break
+
+        for hint in _drain_pending_guidance(ctx.session_id):
+            messages.append({"role": "user", "content": f"[Operator note] {hint}"})
+            logger.debug("core: session=%s %s phase: operator guidance applied: %r", ctx.session_id, phase, hint)
+
         response = await _llm_complete(ctx, messages, tools_schema)
 
         if not response.tool_calls:
@@ -359,11 +458,24 @@ async def _run_llm_tool_loop(
             _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
 
+            # Stall detection, not a work-count cap: only the exact same call (name + arguments)
+            # repeated back-to-back trips this — any different call in between resets progress
+            # toward the threshold, so a scan doing real, varied work across many targets never
+            # comes close no matter how many tool calls that legitimately takes.
+            signature = f"{call.name}:{json.dumps(call.arguments, sort_keys=True)}"
+            recent_call_signatures.append(signature)
+            del recent_call_signatures[:-_STALL_REPEAT_THRESHOLD]
+            if len(recent_call_signatures) == _STALL_REPEAT_THRESHOLD and len(set(recent_call_signatures)) == 1:
+                stop_reason = f"{call.name!r} called identically {_STALL_REPEAT_THRESHOLD} times in a row"
+
+        if stop_reason:
+            break
+
     if not expect_json_final:
-        logger.debug("core: session=%s %s phase hit max tool iterations (%d), stopping", ctx.session_id, phase, max_tool_iterations)
+        logger.debug("core: session=%s %s phase stopped: %s", ctx.session_id, phase, stop_reason)
         return None, trace
 
-    logger.debug("core: session=%s %s phase hit max tool iterations (%d), forcing a final answer", ctx.session_id, phase, max_tool_iterations)
+    logger.debug("core: session=%s %s phase stopped: %s — forcing a final answer", ctx.session_id, phase, stop_reason)
     messages.append({"role": "user", "content": "Stop calling tools now and reply with the final JSON only."})
     response = await _llm_complete(ctx, messages, None)
     return _parse_json_response(response.content), trace
@@ -372,7 +484,8 @@ async def _run_llm_tool_loop(
 async def _run_recon(ctx: RunContext, target: str) -> dict:
     tools = get_tools_by_category("recon")
     logger.debug("core: session=%s starting recon phase (%d tools available)", ctx.session_id, len(tools))
-    ctx.session.setdefault("recon_result", {"targets": []})
+    ctx.session.setdefault("recon_result", {"targets": [], "cves": []})
+    ctx.session["recon_result"].setdefault("cves", [])
 
     async def execute(spec: ToolSpec, arguments: dict) -> dict:
         result = await _run_tool_with_retry(ctx, spec, arguments)
@@ -382,7 +495,10 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
             logger.debug("core: session=%s recon: recorded target host=%r", ctx.session_id, result["recorded"].get("host"))
         return result
 
-    task = f"Target: {target}\nGather recon data using the tools available to you."
+    # "target" can be a comma-separated scope (multiple URLs/hosts/IPs from the New Project
+    # form) — phrased as free text here on purpose, no special-casing needed: the model reads
+    # "a, b, c" as a multi-host scope and record_target already supports recording many.
+    task = f"Target(s): {target}\nGather recon data using the tools available to you."
     await _run_llm_tool_loop(ctx, RECON_PROMPT, task, tools, "recon", execute_tool=execute, expect_json_final=False)
     recon_result = ctx.session["recon_result"]
     logger.debug("core: session=%s recon phase found %d target(s)", ctx.session_id, len(recon_result["targets"]))
@@ -393,13 +509,31 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     tools = get_tools_by_category("scan")
     logger.debug("core: session=%s starting analyze phase (%d tools available)", ctx.session_id, len(tools))
     ctx.session.setdefault("findings", [])
+    # cve_lookup is a "scan"-category tool (get_tools_by_category("scan") above) — Analyze is the
+    # only phase that actually has it available, matching ANALYZE_PROMPT's own instruction to use
+    # it ("a service+version string calls for a CVE lookup"). It used to be hooked in _run_recon's
+    # execute() instead, where the model never had this tool in its schema at all and so could
+    # never trigger the hook — moved here to where it's actually reachable. setdefault here too,
+    # not just in _run_recon: an entry_point="analyze" resume skips recon entirely and builds its
+    # own recon_result fallback (run_session) without a "cves" key.
+    ctx.session.setdefault("recon_result", {"targets": [], "cves": []})
+    ctx.session["recon_result"].setdefault("cves", [])
 
     async def execute(spec: ToolSpec, arguments: dict) -> dict:
         result = await _run_tool_with_retry(ctx, spec, arguments)
         if spec.name == "record_finding" and result.get("status") == "ok" and "recorded" in result:
+            # Stamped here, not asked of the model — a timestamp is a fact about when ASRA
+            # recorded it, not something the LLM has any business guessing at.
+            result["recorded"]["found_at"] = datetime.now(timezone.utc).isoformat()
             ctx.session["findings"].append(result["recorded"])
             save_session(ctx.session_id, ctx.session)
             logger.debug("core: session=%s analyze: recorded finding title=%r", ctx.session_id, result["recorded"].get("title"))
+        elif spec.name == "cve_lookup" and result.get("status") == "ok" and result.get("cve_ids"):
+            existing = set(ctx.session["recon_result"]["cves"])
+            existing.update(result["cve_ids"])
+            ctx.session["recon_result"]["cves"] = sorted(existing)
+            save_session(ctx.session_id, ctx.session)
+            logger.debug("core: session=%s analyze: cve_lookup returned %s, total known now %d", ctx.session_id, result["cve_ids"], len(existing))
         else:
             fired = [field for field in _DETERMINISTIC_DETECTION_FIELDS if field in result]
             if fired:
@@ -439,7 +573,7 @@ def _record_approval(ctx: RunContext, finding: dict, outcome: str) -> None:
 
 async def _await_exploit_approval(ctx: RunContext, finding: dict) -> bool:
     """Waits for a human to approve exploitation this session (see get_approval_event — the
-    Phase 4 approve-exploit endpoint sets that event). Approval is per session, not per finding:
+    web layer's approve-exploit endpoint sets that event). Approval is per session, not per finding:
     once granted (session["exploit_approved"]), later findings in the same session skip the wait
     entirely; a timeout never sets that flag, so the next finding asks again. Every outcome
     (approved or timed out) is recorded in session["approvals"] — the audit trail Export Proof
@@ -507,7 +641,13 @@ async def _run_exploit_for_finding(ctx: RunContext, target: str, finding: dict, 
         "calling it. Only answer skipped_needs_verification/skipped_no_suitable_tool without "
         "calling a tool if that's genuinely the situation (not verified yet, or nothing fits)."
     )
-    return await _run_llm_tool_loop(ctx, EXPLOIT_PROMPT, task, exploit_tools, "exploit", execute_tool=execute)
+    # Tag every log entry this finding's attempt produces with its title, so the UI can show a
+    # scoped log for this one finding — reset in finally so a later finding never inherits it.
+    ctx.current_finding_title = finding.get("title")
+    try:
+        return await _run_llm_tool_loop(ctx, EXPLOIT_PROMPT, task, exploit_tools, "exploit", execute_tool=execute)
+    finally:
+        ctx.current_finding_title = None
 
 
 def _apply_skip_outcome(finding: dict, action: dict) -> None:
@@ -527,7 +667,7 @@ async def _confirm_exploit_result(ctx: RunContext, finding: dict, action: dict, 
     """The one case that does need an LLM judgment call: exploit reported "exploit_attempted",
     so a human-readable read of the real tool trace decides whether it actually succeeded and
     what the real evidence was (catches a model that claims success with no real tool call
-    behind it — see the honesty guard documented in ROADMAP.md 3.7.2).
+    behind it).
     """
     messages = [
         {"role": "system", "content": CONFIRM_EXPLOIT_PROMPT},
@@ -559,7 +699,31 @@ async def _run_exploit(ctx: RunContext, target: str) -> None:
         "core: session=%s starting exploit phase, %d finding(s) by descending severity (%d exploit tools available)",
         ctx.session_id, len(findings), len(exploit_tools),
     )
-    for finding in sorted(findings, key=_severity_key):
+    # A plain "for finding in sorted(...)" can't react to a deep_dive request that arrives
+    # mid-phase (the finding-detail modal's Deep dive button, for a session that's already live)
+    # — remaining is a real mutable work queue instead, checked for a reorder before every pop,
+    # so "prioritize this one now" actually jumps the queue instead of only taking effect next
+    # time exploit runs from scratch. Whatever's left keeps going in its normal order afterward.
+    remaining = sorted(findings, key=_severity_key)
+    while remaining:
+        deep_dive_title = _pop_deep_dive_instruction(ctx.session_id)
+        if deep_dive_title:
+            match = next((f for f in remaining if f.get("title") == deep_dive_title), None)
+            if match:
+                remaining.remove(match)
+                remaining.insert(0, match)
+                logger.debug("core: session=%s operator instruction applied: deep_dive(%r) — prioritized next", ctx.session_id, deep_dive_title)
+            else:
+                logger.debug("core: session=%s deep_dive(%r) requested but not in the remaining queue — ignoring", ctx.session_id, deep_dive_title)
+
+        finding = remaining.pop(0)
+        title = finding.get("title")
+        if _pop_skip_instruction(ctx.session_id, title):
+            logger.debug("core: session=%s operator instruction applied: skip_finding(%r)", ctx.session_id, title)
+            _apply_skip_outcome(finding, {"reasoning": "Skipped at the operator's request via chat."})
+            save_session(ctx.session_id, ctx.session)
+            continue
+
         logger.debug(
             "core: session=%s exploit: evaluating finding=%r severity=%s verification=%s",
             ctx.session_id, finding.get("title"), finding.get("severity"), finding.get("verification"),
@@ -583,6 +747,49 @@ async def _run_exploit(ctx: RunContext, target: str) -> None:
             "core: session=%s exploit: finding=%r resolved exploited=%s",
             ctx.session_id, finding.get("title"), finding.get("exploited"),
         )
+
+
+async def run_focused_exploit(session_id: str, finding_title: str, provider_id: str | None = None) -> None:
+    """The Deep dive button's path for a session that ISN'T currently live (main.py's
+    /deep-dive route) — a bounded, single-finding re-attempt safe to run as its own
+    BackgroundTask precisely because nothing else is touching this session file at the same
+    time (the live case instead queues a deep_dive instruction for the already-running loop to
+    pick up — see _pop_deep_dive_instruction/_run_exploit — rather than risking two writers).
+    Reuses _run_exploit_for_finding/_confirm_exploit_result unchanged, same as a normal exploit
+    pass would for this one finding; everything else in the session is left exactly as it was.
+    """
+    session = load_session(session_id)
+    if session is None:
+        logger.debug("run_focused_exploit: unknown session %r", session_id)
+        return
+
+    matching = [f for f in session.get("findings", []) if f.get("title") == finding_title]
+    if not matching:
+        logger.debug("run_focused_exploit: session=%s no finding titled %r", session_id, finding_title)
+        return
+    finding = matching[0]
+
+    resume_status = session["status"]
+    session["status"] = "processing"
+    save_session(session_id, session)
+    logger.debug("run_focused_exploit: session=%s target=%s finding=%r starting", session_id, session["target"], finding_title)
+
+    ctx = RunContext(llm=get_provider(provider_id), session=session, session_id=session_id)
+    exploit_tools = get_tools_by_category("exploit")
+    try:
+        action, trace = await _run_exploit_for_finding(ctx, session["target"], finding, exploit_tools)
+        if action and action.get("action") == "exploit_attempted":
+            confirmed = await _confirm_exploit_result(ctx, finding, action, trace)
+            finding["exploited"] = confirmed.get("exploited", False)
+            finding["evidence"] = confirmed.get("evidence")
+            finding["poc_command"] = confirmed.get("poc_command")
+            finding["advisory_note"] = confirmed.get("advisory_note")
+        else:
+            _apply_skip_outcome(finding, action or {"reasoning": "Deep dive produced no parseable decision"})
+        logger.debug("run_focused_exploit: session=%s finding=%r resolved exploited=%s", session_id, finding_title, finding.get("exploited"))
+    finally:
+        session["status"] = resume_status if resume_status in ("completed", "failed", "interrupted") else "completed"
+        save_session(session_id, session)
 
 
 async def _run_validate(ctx: RunContext) -> list[dict]:
@@ -615,7 +822,6 @@ _VALID_ENTRY_POINTS = {"recon", "analyze", "exploit"}
 async def run_session(
     session_id: str,
     provider_id: str | None = None,
-    max_iterations: int | None = None,
     entry_point: str = "recon",
 ) -> None:
     if entry_point not in _VALID_ENTRY_POINTS:
@@ -631,8 +837,7 @@ async def run_session(
     save_session(session_id, session)
     logger.debug("core: session=%s target=%s starting (entry_point=%s)", session_id, target, entry_point)
 
-    resolved_max_iterations = max_iterations if max_iterations is not None else int(os.getenv("MAX_ITERATIONS", str(_DEFAULT_MAX_ITERATIONS)))
-    ctx = RunContext(llm=get_provider(provider_id), session=session, session_id=session_id, max_iterations=resolved_max_iterations)
+    ctx = RunContext(llm=get_provider(provider_id), session=session, session_id=session_id)
 
     try:
         if entry_point == "recon":
@@ -652,16 +857,6 @@ async def run_session(
         session["status"] = "completed"
         save_session(session_id, session)
         logger.debug("core: session=%s completed with %d findings", session_id, len(session["findings"]))
-    except MaxIterationsReached:
-        # Not an error: a hard, configured budget ran out. Report whatever was already
-        # established rather than losing it — session["findings"] already holds everything
-        # record_finding/Exploit persisted before the budget ran out (no batch step to miss),
-        # so "completed" here is a real, if unpolished, result whenever any finding exists.
-        logger.debug("core: session=%s stopped: MAX_ITERATIONS=%d reached", session_id, resolved_max_iterations)
-        _append_log(ctx, "session", None, None, "failed", f"stopped: MAX_ITERATIONS ({resolved_max_iterations}) reached before completion")
-        session["findings"] = _normalize_findings(session.get("findings", []))
-        session["status"] = "completed" if session["findings"] else "failed"
-        save_session(session_id, session)
     except Exception:
         logger.debug("core: session=%s failed", session_id, exc_info=True)
         session["status"] = "failed"

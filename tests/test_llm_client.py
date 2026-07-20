@@ -113,6 +113,14 @@ def test_inject_tool_instructions_inserts_new_system_message_when_none_exists():
 # --- get_provider(): resolution/validation logic, no network (models_dev mocked out) ---
 
 
+@pytest.fixture(autouse=True)
+def _no_saved_llm_settings(monkeypatch):
+    """get_provider() consults data/llm_settings.json (Settings-screen choice) before .env — these
+    tests exercise the .env/arg fallback layers specifically, so a real saved-settings file (once
+    someone actually uses the Settings UI) must never leak in and change their outcome."""
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {})
+
+
 def test_get_provider_unknown_provider_raises():
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         get_provider("nonexistent-provider")
@@ -139,6 +147,31 @@ def test_get_provider_defaults_to_env_llm_provider(monkeypatch):
     assert provider._provider_id == "opencode-zen"
 
 
+def test_get_provider_uses_saved_settings_over_env(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "opencode-zen")
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {"provider": "qwen", "model": "qwen-plus"})
+    monkeypatch.setenv("QWEN_API_KEY", "test-key")
+    with patch("agent.llm_client.validate_model_known"):
+        provider = get_provider()
+    assert provider._provider_id == "qwen"
+    assert provider._model == "qwen-plus"
+
+
+def test_get_provider_explicit_arg_wins_over_saved_settings(monkeypatch):
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {"provider": "qwen", "model": "qwen-plus"})
+    with patch("agent.llm_client.validate_model_known"):
+        provider = get_provider("opencode-zen")
+    assert provider._provider_id == "opencode-zen"
+
+
+def test_get_provider_ignores_saved_model_for_a_different_provider(monkeypatch):
+    # Saved settings name a model for qwen; resolving opencode-zen must not inherit it.
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {"provider": "qwen", "model": "qwen-plus"})
+    with patch("agent.llm_client.validate_model_known"):
+        provider = get_provider("opencode-zen")
+    assert provider._model == "big-pickle"
+
+
 # --- OpenAICompatProvider.complete(): mock chat.completions.create directly, not httpx ---
 
 
@@ -152,8 +185,23 @@ def _make_provider(**overrides):
         model=config.model_default,
     )
     kwargs.update(overrides)
-    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": True}):
+    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": True, "context_limit": 128000}):
         return OpenAICompatProvider(**kwargs)
+
+
+def test_provider_exposes_context_limit_from_capabilities():
+    provider = _make_provider()
+    assert provider.context_limit == 128000
+
+
+def test_provider_context_limit_is_none_when_catalog_unreachable():
+    config = PROVIDER_REGISTRY["opencode-zen"]
+    with patch("agent.llm_client.get_model_capabilities", return_value=None):
+        provider = OpenAICompatProvider(
+            provider_id="opencode-zen", models_dev_id=config.models_dev_id,
+            base_url=config.base_url_default, api_key="", model=config.model_default,
+        )
+    assert provider.context_limit is None
 
 
 def test_complete_native_mode_returns_parsed_response():

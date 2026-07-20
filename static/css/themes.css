@@ -45,6 +45,12 @@
   --text-secondary: #64748b;
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
+  /* Native <select>/<option> popups: browsers don't reliably render translucent backgrounds on
+     the popup list (it composites against an OS-drawn backdrop, not the page), so it needs an
+     always-opaque pairing separate from --surface-elevated. Equal to it here since light/dark/
+     purple's --surface-elevated is already opaque — only glass (below) actually needs to differ. */
+  --control-bg: var(--surface-elevated);
+  --control-text: var(--text-primary);
   /* RGB triplets, not hex — Tailwind's opacity modifiers (border-severity-high/40 etc, see
      tailwind.config in base.html) need "R G B" channels to build rgb(var(--x) / alpha) at
      generation time; a plain hex/var() value silently drops the modifier instead of erroring. */
@@ -65,6 +71,8 @@
   --text-secondary: #8b949e;
   --accent: #58a6ff;
   --accent-hover: #79c0ff;
+  --control-bg: var(--surface-elevated);
+  --control-text: var(--text-primary);
   --severity-critical: 248 81 73;
   --severity-high: 255 157 92;
   --severity-medium: 238 187 85;
@@ -72,18 +80,21 @@
   --severity-unknown: 139 148 158;
 }
 
-:root[data-theme="glass"] {
-  --bg: #14102b;
-  --surface: rgb(255 255 255 / 8%);
-  --surface-elevated: rgb(255 255 255 / 14%);
-  --overlay: rgb(255 255 255 / 20%);
-  --border: rgb(255 255 255 / 18%);
-  --text-primary: #f5f3ff;
-  --text-secondary: #c4b5fd;
+/* Purple — its own named, opaque theme (not glass, no blur/translucency). This is where "the
+   purple theme" lives now; it used to be bolted onto glass, which is why glass read as "purple"
+   instead of "glass" — the two are fully separate themes now, on purpose. */
+:root[data-theme="purple"] {
+  --bg: #170f26;
+  --surface: #221733;
+  --surface-elevated: #2c1f42;
+  --overlay: #382a52;
+  --border: #3a2b54;
+  --text-primary: #f3ecff;
+  --text-secondary: #b8a6d9;
   --accent: #a78bfa;
   --accent-hover: #c4b5fd;
-  /* Brighter than the light/dark severity set on purpose — these sit on a translucent surface
-     over a busy gradient, a muted tone would disappear into the background. */
+  --control-bg: var(--surface-elevated);
+  --control-text: var(--text-primary);
   --severity-critical: 255 107 107;
   --severity-high: 255 169 77;
   --severity-medium: 255 212 59;
@@ -91,20 +102,114 @@
   --severity-unknown: 196 181 253;
 }
 
-/* Glass theme gets a fixed gradient backdrop behind the translucent surfaces; light/dark just
-   use a flat --bg, painted through the bg-bg utility class in templates directly. */
-:root[data-theme="glass"] body {
-  background-color: var(--bg);
-  background-image: radial-gradient(circle at 15% 10%, rgb(167 139 250 / 25%), transparent 45%),
-    radial-gradient(circle at 85% 90%, rgb(96 165 250 / 20%), transparent 50%);
-  background-attachment: fixed;
+/* Glass — a real port of the aurora-glassmorphism technique from another of the user's own
+   projects (Project Assistant, src/ui/renderer/styles.css), not a from-scratch guess this time.
+   The numbers below (fill alpha, border-top brightness, blur radius, aurora colors/animation)
+   are taken directly from that stylesheet. Two things that project does that the earlier ASRA
+   attempt didn't: (1) fill alpha is LOW (5.5-14%) — glass reads as glass from the border/blur/
+   sheen doing the work, not from a heavy tinted fill; (2) there's real, rich, animated color
+   behind the panels for the blur to actually distort — a colorless/flat backdrop leaves blur
+   with nothing to do, which is why the previous version looked like plain dark panels. */
+:root[data-theme="glass"] {
+  --bg: #0b0c14;
+  --surface: rgb(255 255 255 / 5.5%);
+  --surface-elevated: rgb(255 255 255 / 9.5%);
+  --overlay: rgb(255 255 255 / 14%);
+  --border: rgb(255 255 255 / 14%);
+  --border-top: rgb(255 255 255 / 38%);
+  --text-primary: #f2f4fb;
+  --text-secondary: #a6acc4;
+  --accent: #7c6cf5;
+  --accent-hover: #9686ff;
+  /* A native <select> popup can't reliably render a translucent background (it composites
+     against the OS, not the page) — always opaque here, same idea as the reference's
+     --glass-input, just flattened to a solid color instead of a semi-transparent black. */
+  --control-bg: #14161f;
+  --control-text: #f2f4fb;
+  --severity-critical: 255 107 129;
+  --severity-high: 255 169 77;
+  --severity-medium: 245 183 84;
+  --severity-low: 95 227 255;
+  --severity-unknown: 166 172 196;
 }
 
+/* The aurora backdrop: fixed, oversized (inset -12% so the drift animation never shows an edge),
+   sits behind all content (z-index -1) via body::before rather than a dedicated element, so no
+   template changes were needed to wire it in. Colors/positions/animation timing match the
+   reference exactly. Turbulence noise on top is the same trick — a faint grain that makes flat
+   gradients read as physical/textured instead of a smooth digital blob. */
+:root[data-theme="glass"] body {
+  background-color: var(--bg);
+}
+:root[data-theme="glass"] body::before {
+  content: "";
+  position: fixed;
+  inset: -12%;
+  z-index: -2;
+  pointer-events: none;
+  background:
+    radial-gradient(38% 42% at 18% 20%, rgb(124 108 245 / 50%), transparent 70%),
+    radial-gradient(42% 46% at 84% 14%, rgb(51 217 200 / 38%), transparent 72%),
+    radial-gradient(46% 50% at 72% 90%, rgb(238 95 176 / 26%), transparent 70%),
+    radial-gradient(58% 58% at 10% 92%, rgb(58 160 224 / 30%), transparent 72%),
+    var(--bg);
+  animation: asra-aurora-drift 80s ease-in-out infinite alternate;
+}
+:root[data-theme="glass"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.05;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+@keyframes asra-aurora-drift {
+  0% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50% { transform: translate3d(-2%, 2%, 0) rotate(2deg) scale(1.05); }
+  100% { transform: translate3d(2%, -1.5%, 0) rotate(-1.5deg) scale(1.02); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="glass"] body::before { animation: none; }
+}
+
+/* saturate() on top of blur pulls color from the aurora showing through — without it the panel
+   just looks like a blurred gray smudge instead of tinted glass. The combined shadow (real drop
+   shadow + inset top highlight) is the reference's --shadow-panel pattern verbatim; the bright
+   inset top line is what actually reads as "glass edge catching light" at a glance, more than the
+   blur itself does. */
 :root[data-theme="glass"] .bg-surface,
 :root[data-theme="glass"] .bg-elevated,
 :root[data-theme="glass"] .bg-overlay {
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 38%), inset 0 1px 0 0 var(--border-top);
+}
+
+/* Primary buttons (macros/ui.html button()) use a solid bg-accent fill — under glass that read
+   as just another opaque colored block, not glass. Same treatment as the panels above.
+   !important is deliberate and scoped to this one selector: Tailwind's CDN build injects its
+   utility CSS at runtime, after this stylesheet in the cascade, so a same-specificity override
+   here would otherwise lose to Tailwind's own .bg-accent rule depending on injection order. */
+:root[data-theme="glass"] .bg-accent {
+  background-color: rgb(124 108 245 / 30%) !important;
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  box-shadow: 0 4px 16px rgb(124 108 245 / 25%), inset 0 1px 0 0 var(--border-top);
+  border: 1px solid rgb(255 255 255 / 20%);
+}
+:root[data-theme="glass"] .hover\:bg-accent-hover:hover {
+  background-color: rgb(124 108 245 / 44%) !important;
+}
+
+/* Native <select>/<option> popups — always the opaque --control-bg/--control-text pairing (see
+   the per-theme definitions above), never the translucent --surface-elevated used for panels.
+   Applies to every theme, not just glass: relying on a browser to render a translucent popup
+   consistently is fragile everywhere, this just makes all 4 themes equally reliable. */
+select, option {
+  background-color: var(--control-bg);
+  color: var(--control-text);
 }
 
 /* Anti-FOUC (4.2.6): the inline script in base.html sets data-theme before first paint, so this
@@ -119,6 +224,8 @@
   --text-secondary: #8b949e;
   --accent: #58a6ff;
   --accent-hover: #79c0ff;
+  --control-bg: #21262d;
+  --control-text: #e6edf3;
   --severity-critical: 248 81 73;
   --severity-high: 255 157 92;
   --severity-medium: 238 187 85;
@@ -126,9 +233,140 @@
   --severity-unknown: 139 148 158;
 }
 
+/* Focus ring (4.8.9) — only on keyboard focus (:focus-visible), not on every mouse click, so
+   clicking a button doesn't leave a ring sitting on it. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Custom scrollbar (4.8.9) for the scrollable containers (log list, PoC/evidence <pre> blocks) —
+   thin and theme-aware instead of the OS default. Webkit-only property; Firefox/other browsers
+   just keep their native scrollbar, a degradation, not a break. */
+.asra-scroll::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.asra-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.asra-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+.asra-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+html {
+  /* Always reserves scrollbar space, whether or not it's actually needed at a given moment —
+     without this, opening/closing a native <dialog> (New Project, a finding's detail modal) can
+     toggle whether the page itself scrolls, which shifts every fixed/sticky-positioned column a
+     scrollbar-width's worth sideways right when a scan starts (right after the New Project
+     dialog closes on submit) — the sticky chat column visibly "jumping further right" was this. */
+  scrollbar-gutter: stable;
+}
+
+html, body {
+  /* Hard guarantee: the page itself never scrolls sideways, no matter what a piece of content
+     inside it does — a long finding title/command/URL should scroll *within its own box* (every
+     such element already has its own overflow-x-auto) or wrap, never blow out the whole page and
+     drag the sticky chat column off-screen with it. This is a backstop on top of actually fixing
+     the specific cause (a flexbox min-width:0 gap on the finding-card title, session_fragment.html)
+     — content that finds some other way to overflow gets clipped here instead of breaking layout,
+     not a substitute for fixing it at the source when a new instance turns up. */
+  overflow-x: hidden;
+}
+
 body {
   background-color: var(--bg);
   color: var(--text-primary);
   font-family: "IBM Plex Mono", ui-monospace, Consolas, "SF Mono", monospace;
   transition: background-color 0.2s, color 0.2s;
+}
+
+/* Session layout (log + chat column) — a plain viewport media query, not a container query.
+   A container query was tried first (asking "how much room does <main> actually have", correctly
+   excluding the 224px sidebar a Tailwind lg:/md: viewport breakpoint doesn't know about) but
+   container-type implies CSS containment on that element, which put <main> in the containing-
+   block chain in a way that made the chat column's position: sticky below stop tracking the
+   right scroll ancestor — sticky held for the first screenful and then scrolled away with the
+   rest of the page instead of staying pinned. Plain media queries have no such interaction with
+   sticky, so back to one, just with a threshold picked to actually clear the sidebar: 1100px
+   comfortably covers 224px sidebar + 26rem chat column + a readable log column, well under what
+   an ordinary (non-maximized) desktop browser window provides, unlike the ~1250px an unadjusted
+   lg: breakpoint effectively needed once the sidebar was accounted for. */
+.session-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: flex-start;
+}
+@media (min-width: 1100px) {
+  .session-layout {
+    flex-direction: row;
+  }
+  .session-layout > .session-log-column {
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+  }
+  .session-layout > .session-chat-column {
+    width: 26rem;
+    flex-shrink: 0;
+    position: sticky;
+    top: 1.5rem;
+    height: calc(100vh - 3rem);
+  }
+  .session-layout > .session-chat-column #chat-panel {
+    height: 100%;
+  }
+}
+
+/* Plays once, automatically, only on a genuinely NEW finding card — morph (base.html) only
+   creates a fresh DOM node for a finding that didn't exist before, an already-shown card is left
+   untouched and never replays this. That's what makes a live-appearing finding actually visible
+   instead of silently landing in a section the user has no reason to be looking at when a scan
+   is busy streaming logs elsewhere on the page. */
+.finding-card {
+  animation: finding-appear 2.2s ease-out;
+}
+@keyframes finding-appear {
+  0% {
+    background-color: rgb(var(--severity-high) / 25%);
+    box-shadow: 0 0 0 1px rgb(var(--severity-high) / 50%);
+  }
+  100% {
+    background-color: var(--surface);
+    box-shadow: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .finding-card {
+    animation: none;
+  }
+}
+
+/* Working indicator (pending/processing/awaiting_approval) — a plain status badge alone was easy
+   to miss ("непонятно сколько работает и когда"); a spinning ring next to it makes "the agent is
+   actively doing something right now" unmistakable at a glance, everywhere a session/project
+   status shows up (session page, the Projects list, the sidebar's active-session badge). */
+.asra-spinner {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid rgb(var(--severity-medium) / 30%);
+  border-top-color: rgb(var(--severity-medium));
+  border-radius: 50%;
+  animation: asra-spin 0.7s linear infinite;
+}
+@keyframes asra-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .asra-spinner {
+    animation: none;
+  }
 }

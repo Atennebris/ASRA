@@ -9,6 +9,8 @@ LOG_CATEGORIES: set[str] = {
     "LLM",
     "AGENT",
     "API",
+    "CHAT",
+    "PROJECTS",
 }
 
 _configured: set[str] = set()

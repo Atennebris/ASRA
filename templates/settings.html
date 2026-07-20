@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros/ui.html" import page_header, section_label %}
 {% block title %}ASRA &mdash; Settings{% endblock %}
 {% block head %}
   <style>
@@ -12,49 +13,51 @@
   </style>
 {% endblock %}
 {% block content %}
-  <h1 class="text-xl font-semibold mb-4">Settings</h1>
+  {{ page_header("Settings") }}
+
+  {% if error %}
+    <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ error }}</p>
+  {% endif %}
 
   <section class="bg-surface border border-default rounded-lg p-4 mb-6">
-    <h2 class="text-sm font-semibold text-secondary uppercase tracking-wide mb-3">Appearance</h2>
+    {{ section_label("Appearance") }}
     <div class="flex gap-2" id="theme-buttons">
       <button type="button" data-theme-choice="light" class="theme-btn text-sm rounded px-3 py-2 border border-default">Light</button>
       <button type="button" data-theme-choice="dark" class="theme-btn text-sm rounded px-3 py-2 border border-default">Dark</button>
+      <button type="button" data-theme-choice="purple" class="theme-btn text-sm rounded px-3 py-2 border border-default">Purple</button>
       <button type="button" data-theme-choice="glass" class="theme-btn text-sm rounded px-3 py-2 border border-default">Glass</button>
     </div>
   </section>
 
-  <h2 class="text-lg font-semibold mb-2">Exploitation allowlist</h2>
-  <p class="text-secondary mb-4">Only targets listed here can be exploited (Metasploit/sqlmap). Recon/scan tools work against any target from the scan form regardless of this list.</p>
-
-  {% if error %}
-    <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high break-words">{{ error }}</p>
-  {% endif %}
-
-  <form method="post" action="/api/settings/allowed-targets" class="bg-surface border border-default rounded-lg p-4 mb-4 flex items-end gap-3">
-    <label class="block flex-1">
-      <span class="block text-sm text-secondary mb-1">Add target</span>
-      <input type="text" name="target" placeholder="example.com" required
-             class="w-full bg-elevated border border-default rounded px-3 py-2 text-primary placeholder:text-secondary focus:outline-none focus:border-accent">
-    </label>
-    <button type="submit" class="bg-accent hover:bg-accent-hover text-white rounded px-4 py-2 font-medium">Add</button>
-  </form>
-
-  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mb-2">Allowed targets</h3>
-  {% if allowed_targets %}
-    <ul id="allowed-targets-list" class="space-y-2">
-      {% for allowed_target in allowed_targets %}
-        <li class="bg-surface border border-default rounded-lg px-3 py-2 flex items-center justify-between">
-          <span class="break-words">{{ allowed_target }}</span>
-          <button hx-delete="/api/settings/allowed-targets/{{ allowed_target }}"
-                  hx-target="closest li" hx-swap="outerHTML"
-                  hx-confirm="Remove {{ allowed_target }} from the allowlist?"
-                  class="text-xs text-severity-high hover:opacity-80 border border-severity-high/40 rounded px-2 py-1">Remove</button>
-        </li>
-      {% endfor %}
-    </ul>
-  {% else %}
-    <p class="text-secondary italic">No targets added yet.</p>
-  {% endif %}
+  <section class="bg-surface border border-default rounded-lg p-4 mb-6">
+    {{ section_label("AI Provider & Model") }}
+    <p class="text-[11px] text-secondary mb-3">Applies everywhere &mdash; new scans and the session chat both use this, not just one project.</p>
+    <form method="post" action="/api/settings/llm" class="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
+      <label class="flex-1 min-w-0 block">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Provider</span>
+        <select id="provider-select" name="provider"
+                hx-get="/api/settings/model-options" hx-target="#model-select" hx-trigger="change"
+                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {% for provider_id in provider_ids %}
+            <option value="{{ provider_id }}" {% if provider_id == current_provider %}selected{% endif %}>{{ provider_id }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="flex-1 min-w-0 block">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model</span>
+        <select id="model-select" name="model"
+                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {% include "partials/model_options.html" %}
+        </select>
+      </label>
+      {% from "macros/ui.html" import button %}
+      {{ button("Save", variant="primary", type="submit") }}
+      <button type="button" hx-post="/api/settings/test-llm" hx-include="closest form" hx-target="#llm-test-result" hx-swap="innerHTML" hx-disabled-elt="this"
+              hx-on::before-request="this.textContent='Testing…'" hx-on::after-request="this.textContent='Test'"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm shrink-0">Test</button>
+    </form>
+    <p id="llm-test-result" class="text-[11px] text-secondary mt-2"></p>
+  </section>
 
   <script>
     (function () {

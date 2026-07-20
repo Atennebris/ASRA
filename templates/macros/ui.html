@@ -1,0 +1,86 @@
+{# Reusable Jinja macros for base UI elements (4.8.3) — one source of class recipes, not the same
+   button/badge/card classes copy-pasted per template. Import the names needed from this file at
+   the top of a template. card() wraps arbitrary child content via a call block, not an argument.
+   Jinja comment syntax on purpose here, not an HTML comment — an HTML comment does not stop Jinja
+   from parsing {% %} tags inside it, which self-imports this exact file into infinite recursion. #}
+
+{# Plain buttons only (submit/reset/button, no hx-* attributes) — a button that needs HTMX wiring
+   stays written out directly in its own template, next to the hx-target/hx-swap it's paired with.
+   Keeps this macro free of any raw-attribute-string/|safe path, so there's no future foot-gun
+   where something session-derived could end up unescaped through it. #}
+{% macro button(text, variant="primary", size="md", type="button", extra_classes="") %}
+  {% set variants = {
+    "primary": "bg-accent hover:bg-accent-hover text-white",
+    "secondary": "bg-elevated text-primary border border-default hover:bg-overlay",
+    "ghost": "text-secondary hover:bg-elevated hover:text-primary",
+    "danger": "bg-severity-high/10 text-severity-high border border-severity-high/20 hover:bg-severity-high/20",
+  } %}
+  {% set sizes = {"sm": "h-7 px-2 text-[11px]", "md": "h-9 px-3 text-sm", "lg": "h-11 px-4 text-sm"} %}
+  <button type="{{ type }}"
+          class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed {{ variants[variant] }} {{ sizes[size] }} {{ extra_classes }}">{{ text }}</button>
+{% endmacro %}
+
+{% macro badge(text, severity=none) %}
+  {% set sev_key = severity | lower if severity in ["Critical", "High", "Medium", "Low"] else "unknown" %}
+  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ text }}</span>
+{% endmacro %}
+
+{# Session status is a different domain from finding severity (state, not how-bad) — its own tone
+   mapping onto the same severity color tokens, not the badge() severity lookup. A spinner for the
+   actively-working statuses is baked in here rather than added per-template — every place that
+   already calls status_badge() (session page, Projects list, recent-projects on the home page)
+   gets "the agent is working right now" made obvious for free, not just a status word that's easy
+   to skim past. #}
+{% macro status_badge(status) %}
+  {% set tone_by_status = {
+    "completed": "low",
+    "processing": "medium",
+    "pending": "medium",
+    "awaiting_approval": "medium",
+    "interrupted": "high",
+    "failed": "critical",
+  } %}
+  {% set tone = tone_by_status.get(status, "unknown") %}
+  <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ tone }} border-severity-{{ tone }}/40 bg-severity-{{ tone }}/10">
+    {% if status in ("processing", "pending", "awaiting_approval") %}<span class="asra-spinner"></span>{% endif %}
+    {{ status }}
+  </span>
+{% endmacro %}
+
+{% macro input_field(name, label, type="text", value="", placeholder="", required=false, error=none, min=none, max=none) %}
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">{{ label }}</span>
+    <input type="{{ type }}" name="{{ name }}" value="{{ value }}" placeholder="{{ placeholder }}"
+           {% if required %}required{% endif %} {% if min is not none %}min="{{ min }}"{% endif %} {% if max is not none %}max="{{ max }}"{% endif %}
+           class="w-full bg-elevated border rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1
+             {% if error %}border-severity-high focus:border-severity-high focus:ring-severity-high/20{% else %}border-default focus:border-accent focus:ring-accent/20{% endif %}">
+  </label>
+  {% if error %}<p class="text-[11px] text-severity-high mt-1">{{ error }}</p>{% endif %}
+{% endmacro %}
+
+{% macro card(extra_classes="") %}
+  <div class="bg-surface border border-default rounded-lg p-4 {{ extra_classes }}">
+    {{ caller() }}
+  </div>
+{% endmacro %}
+
+{% macro section_label(text) %}
+  <h3 class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-2">{{ text }}</h3>
+{% endmacro %}
+
+{% macro empty_state(title, subtitle="") %}
+  <div class="flex flex-col items-center justify-center py-12 text-center border border-dashed border-default rounded-lg">
+    <svg class="w-8 h-8 text-secondary/40 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <circle cx="12" cy="12" r="9"></circle>
+      <path d="M9 12h6M12 9v6" stroke-linecap="round"></path>
+    </svg>
+    <p class="text-sm font-medium text-primary">{{ title }}</p>
+    {% if subtitle %}<p class="text-[11px] text-secondary mt-1">{{ subtitle }}</p>{% endif %}
+  </div>
+{% endmacro %}
+
+{% macro page_header(title) %}
+  <div class="flex items-center gap-2 py-3.5 border-b border-default mb-4">
+    <h1 class="text-[13px] font-semibold text-primary">{{ title }}</h1>
+  </div>
+{% endmacro %}

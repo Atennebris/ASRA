@@ -19,6 +19,7 @@ import openai
 from openai import Omit
 
 from agent.providers.models_dev import get_model_capabilities, validate_model_known
+from agent.settings import load_llm_settings
 from agent.utils.debug import truncate_for_log
 from agent.utils.logger import get_logger
 
@@ -49,6 +50,8 @@ class LLMResponse:
 
 
 class LLMProvider(Protocol):
+    context_limit: int | None
+
     def complete(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse: ...
 
 
@@ -87,12 +90,16 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 }
 
 
-def get_provider(provider_id: str | None = None) -> LLMProvider:
-    """Builds an LLMProvider from PROVIDER_REGISTRY + env. provider_id overrides LLM_PROVIDER for
-    a single session (e.g. a per-request choice from the web UI); omit it to use the configured
-    default.
+def get_provider(provider_id: str | None = None, model: str | None = None) -> LLMProvider:
+    """Builds an LLMProvider from PROVIDER_REGISTRY + env, with the Settings-screen choice
+    (data/llm_settings.json) as the default between explicit args and .env. Resolution order,
+    most to least specific: explicit provider_id/model arg (a one-off override) > saved Settings
+    choice > .env > PROVIDER_REGISTRY's hardcoded default. A saved model is only trusted when it
+    was saved for the SAME provider being resolved — otherwise switching providers in Settings
+    could leak a stale model name from the previous one.
     """
-    resolved_id = provider_id or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
+    saved = load_llm_settings()
+    resolved_id = provider_id or saved.get("provider") or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
     config = PROVIDER_REGISTRY.get(resolved_id)
     if config is None:
         raise ValueError(f"Unknown LLM provider {resolved_id!r}. Known providers: {list(PROVIDER_REGISTRY)}")
@@ -101,19 +108,20 @@ def get_provider(provider_id: str | None = None) -> LLMProvider:
     api_key = os.getenv(config.api_key_env) or ""
     if config.api_key_required and not api_key:
         raise ValueError(f"{config.api_key_env} is not set (required for provider {resolved_id!r}).")
-    model = os.getenv(config.model_env) or config.model_default
+    saved_model = saved.get("model") if saved.get("provider") == resolved_id else None
+    resolved_model = model or saved_model or os.getenv(config.model_env) or config.model_default
 
     # Fail fast at startup on a typo'd model name — not mid-session. A models.dev outage is not a
     # reason to fail (validate_model_known() itself no-ops when the catalog is unreachable).
-    validate_model_known(config.models_dev_id, model)
+    validate_model_known(config.models_dev_id, resolved_model)
 
-    logger.debug("get_provider: resolved provider=%s model=%s base_url=%s", resolved_id, model, base_url)
+    logger.debug("get_provider: resolved provider=%s model=%s base_url=%s", resolved_id, resolved_model, base_url)
     return OpenAICompatProvider(
         provider_id=resolved_id,
         models_dev_id=config.models_dev_id,
         base_url=base_url,
         api_key=api_key,
-        model=model,
+        model=resolved_model,
     )
 
 
@@ -210,14 +218,17 @@ class OpenAICompatProvider:
         # the header when no real key was configured.
         self._omit_auth_header = not api_key
         self._client = openai.OpenAI(base_url=base_url, api_key=api_key or _PLACEHOLDER_API_KEY, max_retries=0)
-        self._tool_mode = self._decide_tool_mode(models_dev_id, model)
+        capabilities = get_model_capabilities(models_dev_id, model)
+        self._tool_mode = self._decide_tool_mode(models_dev_id, model, capabilities)
+        # Public: chat.py's compaction budget needs this to size how much history it can
+        # send; None (catalog unreachable/model unlisted) means "unknown", callers must not guess.
+        self.context_limit: int | None = capabilities["context_limit"] if capabilities else None
 
     def _auth_header_override(self) -> dict:
         return {"extra_headers": {"Authorization": Omit()}} if self._omit_auth_header else {}
 
     @staticmethod
-    def _decide_tool_mode(models_dev_id: str, model: str) -> str:
-        capabilities = get_model_capabilities(models_dev_id, model)
+    def _decide_tool_mode(models_dev_id: str, model: str, capabilities: dict | None) -> str:
         if capabilities is None:
             # Catalog unreachable or model unlisted: don't guess at startup — try native
             # tool-calling on the first real request and react if the endpoint rejects it.

@@ -1,56 +1,203 @@
-<!-- HTMX/SSE fragment: logs, findings, approve/export buttons rendered by status.
-     Escaping rule (4.2.2): Jinja2 autoescape stays on everywhere here — logs/findings/thought
-     text comes straight from the target/LLM, never mark it |safe or wrap it in Markup(). -->
+{# HTMX/SSE fragment: logs, findings, approve/export buttons rendered by status.
+   Escaping rule (4.2.2): Jinja2 autoescape stays on everywhere here — logs/findings/thought
+   text comes straight from the target/LLM, never mark it |safe or wrap it in Markup().
+   Swapped in via hx-swap="morph" (Idiomorph, base.html), not innerHTML — stable id attributes
+   on repeated elements (log entries, finding cards) below are what let it match "this node
+   already exists, leave it alone" instead of destroying/recreating everything on every update. #}
+{% from "macros/ui.html" import button, badge, status_badge, section_label, empty_state %}
 <div id="session-content" data-status="{{ session.status }}">
-  <p class="truncate" title="{{ session.target }}"><span class="text-secondary">Target:</span> <strong>{{ session.target }}</strong></p>
-  <p><span class="text-secondary">Status:</span> <strong>{{ session.status }}</strong></p>
+  <p class="text-sm truncate" title="{{ session.target }}"><span class="text-secondary">Target:</span> <strong class="text-primary">{{ session.target }}</strong></p>
+  <p class="text-sm mt-1"><span class="text-secondary">Status:</span> {{ status_badge(session.status) }}</p>
 
-  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mt-4 mb-2">Logs</h3>
-  {% if session.logs %}
-    <ul id="session-log-list" class="max-h-80 overflow-y-auto bg-elevated border border-default rounded font-mono text-sm divide-y divide-default">
-      {% for entry in session.logs %}
-        <li class="px-3 py-2">
-          <strong class="text-accent">[{{ entry.phase }}]</strong>
-          {% if entry.command %}<code class="block whitespace-pre-wrap break-words text-secondary">{{ entry.command }}</code>{% endif %}
-          <span class="text-secondary">&mdash; {{ entry.status }}</span>
-          {% if entry.error %}<span class="block break-words text-severity-high">{{ entry.error }}</span>{% endif %}
-        </li>
-      {% endfor %}
-    </ul>
-  {% elif session.status in ("pending", "processing") %}
-    <p class="text-secondary italic">Starting scan&hellip;</p>
+  {# Recon / asset info — the raw facts recon gathered (host/port/service/version, one entry per
+     record_target call), separate from Findings (vulnerabilities). This is exactly what the
+     agent itself already sees every phase (_run_analyze/_run_exploit get recon_result passed in
+     directly, agent/chat.py's snapshot includes it too) — surfacing it here just makes the same
+     data visible to a human without digging through the raw tool-call log. #}
+  {% set recon_targets = session.get("recon_result", {}).get("targets", []) %}
+  {% set recon_cves = session.get("recon_result", {}).get("cves", []) %}
+  {% if recon_targets or recon_cves %}
+    {{ section_label("Recon / Asset Info") }}
+    {% if recon_targets %}
+      <div class="overflow-x-auto mb-3">
+        <table class="w-full text-sm border border-default rounded-lg overflow-hidden">
+          <thead>
+            <tr class="bg-elevated text-[11px] uppercase tracking-wider text-secondary">
+              <th class="text-left font-semibold px-3 py-2">Host</th>
+              <th class="text-left font-semibold px-3 py-2">Port</th>
+              <th class="text-left font-semibold px-3 py-2">Service</th>
+              <th class="text-left font-semibold px-3 py-2">Version</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-default bg-surface">
+            {% for t in recon_targets %}
+              <tr id="recon-target-{{ loop.index0 }}">
+                <td class="px-3 py-2 break-words text-primary">{{ t.host }}</td>
+                <td class="px-3 py-2 text-secondary">{{ t.port if t.port is not none else "—" }}</td>
+                <td class="px-3 py-2 text-secondary">{{ t.service or "—" }}</td>
+                <td class="px-3 py-2 text-secondary break-words">{{ t.version or "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+    {% if recon_cves %}
+      {# Captured automatically whenever the model calls cve_lookup during recon (agent/core.py's
+         _run_recon execute()) — not a separate record_* call the model has to remember. #}
+      <div class="flex flex-wrap gap-1.5 mb-4">
+        {% for cve in recon_cves %}
+          <a id="recon-cve-{{ loop.index0 }}" href="https://nvd.nist.gov/vuln/detail/{{ cve }}" target="_blank" rel="noopener noreferrer"
+             class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10 hover:bg-severity-medium/20">{{ cve }}</a>
+        {% endfor %}
+      </div>
+    {% endif %}
   {% endif %}
 
-  <h3 class="text-sm font-semibold text-secondary uppercase tracking-wide mt-4 mb-2">Findings</h3>
+  {# Findings above Logs on purpose — a vulnerability is the actual point of a pentest tool, the
+     raw tool-call log is supporting detail. Findings used to sit below a self-scrolling log box,
+     which is what stayed visually "busy" during a scan — a finding recorded mid-scan really was
+     persisted and pushed live (confirmed directly: session file write -> SSE delivery in ~3s in
+     a real test), it just wasn't where attention was, buried under logs. #}
+  {{ section_label("Findings") }}
   {% if session.findings %}
-    <ul class="space-y-3">
+    <ul class="space-y-3 mb-4">
       {% for finding in session.findings %}
-        {% set sev_key = finding.severity | lower if finding.severity in ["Critical", "High", "Medium", "Low"] else "unknown" %}
-        <li class="bg-surface border border-default rounded-lg p-3">
-          <div class="flex items-center gap-2">
-            <strong class="break-words">{{ finding.title }}</strong>
-            <span class="text-xs px-2 py-0.5 rounded border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ finding.severity }}</span>
-          </div>
-          <p class="break-words text-secondary mt-1">{{ finding.description }}</p>
-          {% if finding.poc_command %}<pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mt-2 text-sm"><code>{{ finding.poc_command }}</code></pre>{% endif %}
-          <p class="text-sm text-secondary mt-1">Verification: {{ finding.verification }}{% if finding.exploited %}, exploited{% endif %}</p>
-          {% if finding.evidence %}<pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mt-2 text-sm break-words whitespace-pre-wrap"><code>{{ finding.evidence }}</code></pre>{% endif %}
-          {% if finding.advisory_note %}<p class="break-words italic text-secondary mt-1">{{ finding.advisory_note }}</p>{% endif %}
+        {% set dialog_id = "finding-dialog-" ~ loop.index0 %}
+        <li id="finding-{{ loop.index0 }}" class="finding-card">
+          <button type="button" onclick="document.getElementById('{{ dialog_id }}').showModal()"
+                  class="w-full min-w-0 text-left bg-surface border border-default rounded-lg p-3 hover:border-accent/50 transition-colors cursor-pointer">
+            <div class="flex items-center gap-2 min-w-0">
+              <strong class="text-sm break-words min-w-0 text-primary">{{ finding.title }}</strong>
+              {{ badge(finding.severity, severity=finding.severity) }}
+            </div>
+            <p class="text-sm break-words text-secondary mt-1">{{ finding.description }}</p>
+            <p class="text-[11px] text-secondary mt-1">Verification: {{ finding.verification }}{% if finding.exploited %}, exploited{% endif %}{% if finding.found_at %} &middot; found {{ finding.found_at }}{% endif %}</p>
+          </button>
         </li>
+
+        {# One dialog per finding, server-rendered (same pattern as the New Project dialog in
+           base.html) rather than one shared dialog filled in by JS — keeps this fully working
+           with morph swaps (each dialog has a stable id) and needs no client-side data-binding. #}
+        <dialog id="{{ dialog_id }}" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl backdrop:bg-black/50">
+          <div class="flex items-center justify-between px-4 h-12 border-b border-default min-w-0">
+            <span class="text-[13px] font-semibold break-words min-w-0 truncate">{{ finding.title }}</span>
+            <button type="button" onclick="document.getElementById('{{ dialog_id }}').close()"
+                    class="text-secondary hover:text-primary text-lg leading-none shrink-0 ml-3">&times;</button>
+          </div>
+          <div class="p-4 space-y-3 max-h-[75vh] overflow-y-auto asra-scroll">
+            <div class="flex flex-wrap items-center gap-2">
+              {{ badge(finding.severity, severity=finding.severity) }}
+              <span class="text-[11px] text-secondary">Verification: {{ finding.verification }}</span>
+              <span class="text-[11px] text-secondary">&middot; {{ "Exploited" if finding.exploited else "Not exploited" }}</span>
+              {% if finding.found_at %}<span class="text-[11px] text-secondary">&middot; Found {{ finding.found_at }}</span>{% endif %}
+            </div>
+
+            {% if finding.technology %}
+              {{ section_label("Technology") }}
+              <p class="text-sm break-words text-primary mb-2">{{ finding.technology }}</p>
+            {% endif %}
+
+            {{ section_label("Description") }}
+            <p class="text-sm break-words text-secondary mb-2">{{ finding.description }}</p>
+
+            {% if finding.reproduction_steps %}
+              {{ section_label("Reproduction / Payload") }}
+              <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ finding.reproduction_steps }}</code></pre>
+            {% endif %}
+
+            {% if finding.poc_command %}
+              {{ section_label("Confirmed PoC command") }}
+              <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ finding.poc_command }}</code></pre>
+            {% endif %}
+            {% if finding.evidence %}
+              {{ section_label("Evidence") }}
+              <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ finding.evidence }}</code></pre>
+            {% endif %}
+            {% if finding.advisory_note %}<p class="text-[11px] break-words italic text-secondary mb-2">{{ finding.advisory_note }}</p>{% endif %}
+
+            <div id="deep-dive-{{ loop.index0 }}">
+              <form hx-post="/api/session/{{ session.session_id }}/deep-dive" hx-target="#deep-dive-{{ loop.index0 }}" hx-swap="outerHTML" hx-disabled-elt="this">
+                <input type="hidden" name="finding_title" value="{{ finding.title }}">
+                <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm">
+                  Deep dive &mdash; focus the agent on this finding
+                </button>
+                <p class="text-[11px] text-secondary mt-1">
+                  {% if session.status in ("processing", "awaiting_approval", "pending") %}
+                    Scan is live &mdash; queues as the agent's next priority, then it resumes the rest.
+                  {% else %}
+                    Scan isn't running &mdash; starts a focused re-attempt on just this finding.
+                  {% endif %}
+                </p>
+              </form>
+            </div>
+
+            {# Scoped to just this finding's own exploit-attempt log entries (agent/core.py tags
+               them via RunContext.current_finding_title while _run_exploit_for_finding runs). #}
+            {% set finding_logs = session.get("logs", []) | selectattr("finding_title", "equalto", finding.title) | list %}
+            {% if finding_logs %}
+              {{ section_label("Activity for this finding") }}
+              <div class="bg-elevated border border-default rounded font-mono divide-y divide-default asra-scroll">
+                {% for entry in finding_logs %}
+                  <details>
+                    <summary class="flex items-center gap-2 px-3 py-2 cursor-pointer list-none">
+                      <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-severity-low' if entry.status == 'success' else 'bg-severity-high' }}"></span>
+                      <code class="text-[11px] text-secondary truncate flex-1">{{ (entry.command.split("(")[0] if entry.command else entry.thought) or entry.status }}</code>
+                      <span class="text-[11px] text-secondary shrink-0">{{ entry.status }}</span>
+                    </summary>
+                    <div class="px-3 pb-3 pt-1 border-t border-default">
+                      {% if entry.command %}<code class="block whitespace-pre-wrap break-words text-[11px] text-secondary">{{ entry.command }}</code>{% endif %}
+                      {% if entry.thought and not entry.command %}<p class="break-words text-[11px] text-secondary">{{ entry.thought }}</p>{% endif %}
+                      {% if entry.error %}<p class="break-words text-[11px] text-severity-high mt-1">{{ entry.error }}</p>{% endif %}
+                    </div>
+                  </details>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        </dialog>
       {% endfor %}
     </ul>
   {% elif session.status == "completed" %}
-    <p class="text-secondary">No vulnerabilities found.</p>
+    {{ empty_state("No vulnerabilities found.", "The scan completed cleanly with nothing to report.") }}
   {% elif session.status == "failed" %}
-    <p class="text-secondary">Scan stopped before finding anything (see the error in Logs above) &mdash; not the same as a clean "no vulnerabilities" result.</p>
+    {{ empty_state("Scan stopped before finding anything.", "See the error in Logs above — not the same as a clean \"no vulnerabilities\" result.") }}
   {% else %}
-    <p class="text-secondary italic">No findings yet.</p>
+    <p class="text-sm text-secondary italic mb-4">No findings yet.</p>
+  {% endif %}
+
+  {{ section_label("Logs") }}
+  {% if session.logs %}
+    <div id="session-log-list" class="max-h-80 overflow-y-auto bg-elevated border border-default rounded font-mono divide-y divide-default asra-scroll">
+      {% for entry in session.logs %}
+        {# Tool-execution card (4.8.8): collapsed by default, expand shows the full command/error —
+           <details>/<summary> is the plain-HTML equivalent of a React collapse, no JS needed.
+           entry.thought (the model's own text) is the fallback when there's no entry.command —
+           a phase's final "I'm done" reply has no command at all, and used to render as a bare
+           status word with nothing else, with the model's actual wrap-up text silently dropped. #}
+        <details id="log-step-{{ entry.step }}" data-step="{{ entry.step }}">
+          <summary class="flex items-center gap-2 px-3 py-2 cursor-pointer list-none">
+            <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-severity-low' if entry.status == 'success' else 'bg-severity-high' }}"></span>
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-accent shrink-0">{{ entry.phase }}</span>
+            <code class="text-[11px] text-secondary truncate flex-1">{{ (entry.command.split("(")[0] if entry.command else entry.thought) or entry.status }}</code>
+            <span class="text-[11px] text-secondary shrink-0">{{ entry.status }}</span>
+          </summary>
+          <div class="px-3 pb-3 pt-1 border-t border-default">
+            {% if entry.command %}<code class="block whitespace-pre-wrap break-words text-[11px] text-secondary">{{ entry.command }}</code>{% endif %}
+            {% if entry.thought and not entry.command %}<p class="break-words text-[11px] text-secondary">{{ entry.thought }}</p>{% endif %}
+            {% if entry.error %}<p class="break-words text-[11px] text-severity-high mt-1">{{ entry.error }}</p>{% endif %}
+          </div>
+        </details>
+      {% endfor %}
+    </div>
+  {% elif session.status in ("pending", "processing") %}
+    <p class="text-sm text-secondary italic">Starting scan&hellip;</p>
   {% endif %}
 
   {% if session.status == "interrupted" %}
     <form method="post" action="/api/session/{{ session.session_id }}/resume" class="mt-4 bg-elevated border border-default rounded-lg p-3">
-      <p class="mb-2">Session interrupted &mdash; resume from <strong>{{ session.resumable_from }}</strong>?</p>
-      <button type="submit" class="bg-accent hover:bg-accent-hover text-white rounded px-4 py-2 font-medium">Resume</button>
+      <p class="text-sm mb-2">Session interrupted &mdash; resume from <strong class="text-primary">{{ session.resumable_from }}</strong>?</p>
+      {{ button("Resume", variant="primary", type="submit") }}
     </form>
   {% endif %}
 
@@ -58,12 +205,12 @@
     <form hx-post="/api/session/{{ session.session_id }}/approve-exploit"
           hx-target="#session-content" hx-swap="outerHTML" hx-disabled-elt="this"
           class="mt-4 bg-elevated border border-severity-medium/40 rounded-lg p-3">
-      <p class="mb-2">Exploitation approval requested for target <strong class="break-words">{{ session.target }}</strong>.</p>
-      <button type="submit" class="bg-severity-medium hover:opacity-90 text-white rounded px-4 py-2 font-medium">Approve exploit</button>
+      <p class="text-sm mb-2">Exploitation approval requested for target <strong class="break-words text-primary">{{ session.target }}</strong>.</p>
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-medium hover:bg-severity-medium/80 text-white h-9 px-3 text-sm">Approve exploit</button>
     </form>
   {% endif %}
 
   {% if session.status == "completed" and session.findings %}
-    <p class="mt-4"><a href="/api/session/{{ session.session_id }}/export" class="text-accent hover:text-accent-hover underline">Export Proof</a></p>
+    <p class="text-sm mt-4"><a href="/api/session/{{ session.session_id }}/export" class="text-accent hover:text-accent-hover underline">Export Proof</a></p>
   {% endif %}
 </div>

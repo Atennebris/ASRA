@@ -1,0 +1,38 @@
+{# Chat panel (4.9) — separate conversation from the session's own tool-call log; never reads
+   session.logs directly, only whatever agent/chat.py's snapshot decided to hand the model.
+   Escaping rule (4.2.2) applies here too: message content can echo back session-derived facts
+   (a finding title, the target) through the LLM's reply — never |safe/Markup() on msg.content. #}
+<div id="chat-panel" class="bg-surface border border-default rounded-lg flex flex-col h-[32rem] lg:h-full">
+  <div class="px-4 h-12 flex items-center gap-2 border-b border-default shrink-0">
+    <svg class="w-4 h-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+    <p class="text-sm font-semibold text-primary">Chat</p>
+    <span class="ml-auto text-[10px] text-secondary">ask anything about this session</span>
+  </div>
+
+  {# Sessions created before 4.9 have no "chat" field at all — default to empty rather than a
+     Jinja UndefinedError, same defensive-default spirit as the setdefault() calls in agent/core.py. #}
+  {% set chat_messages = session.get("chat", {}).get("messages", []) %}
+  <div id="chat-messages" class="flex-1 overflow-y-auto asra-scroll p-4 space-y-3">
+    {% for msg in chat_messages %}
+      <div class="text-sm {{ 'text-right' if msg.role == 'user' else 'text-left' }}">
+        <span class="inline-block px-3 py-2 rounded-lg max-w-[90%] break-words text-left {{ 'bg-accent/10 text-primary' if msg.role == 'user' else 'bg-elevated text-primary' }}">{{ msg.content }}</span>
+      </div>
+    {% else %}
+      <div class="h-full flex flex-col items-center justify-center text-center px-4">
+        <p class="text-sm font-medium text-primary">Ask about this session</p>
+        <p class="text-[11px] text-secondary mt-1">Findings, progress, or a hint like "skip the CORS finding" or "focus on redirects" &mdash;
+          available any time, even while the scan is still running.</p>
+      </div>
+    {% endfor %}
+  </div>
+
+  <form hx-post="/api/session/{{ session.session_id }}/chat" hx-target="#chat-panel" hx-swap="outerHTML"
+        hx-disabled-elt="this" hx-on::after-swap="document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight"
+        class="border-t border-default p-3 flex gap-2 shrink-0">
+    <input type="text" name="message" placeholder="Ask or instruct&hellip;" required autocomplete="off"
+           class="flex-1 min-w-0 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:ring-accent/20 focus:border-accent">
+    <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm shrink-0">Send</button>
+  </form>
+</div>

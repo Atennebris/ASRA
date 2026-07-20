@@ -1,0 +1,68 @@
+{# Shared by index.html (direct nav to "/", e.g. no-JS/back-button) and the New Project dialog in
+   base.html (the normal path, opened from the sidebar) — one form, not two copies to keep in
+   sync. error/target/name are per-request and default to falsy/empty when a route doesn't pass
+   them. LLM provider/model + max iterations live in Settings/nowhere respectively now — see
+   settings.html and agent/core.py's docstring (no session-wide call cap anymore).
+   Imports its own macros rather than relying on the includer having already imported them —
+   {% include %} context-sharing for macro names is real in Jinja but not worth depending on. #}
+{% from "macros/ui.html" import button, input_field %}
+{% if error %}
+  <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/api/scan" class="bg-surface border border-default rounded-lg p-4 space-y-4">
+  {{ input_field("name", "Project name", value=name, placeholder="Acme Corp — External Pentest", required=true) }}
+
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Target(s)</span>
+    <input type="text" name="target" value="{{ target }}" required autocomplete="off"
+           class="target-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+           placeholder="example.com">
+    <span class="block text-[11px] text-secondary mt-1">URL, domain, host, IPv4, or IPv6. Multiple targets (a scope)? Separate with a comma, e.g.
+      <code class="text-[10px]">example.com, 10.0.0.5, https://app.example.com, [2001:db8::1]</code></span>
+    <div class="target-chips flex flex-wrap gap-1.5 mt-2"></div>
+  </label>
+
+  <label class="flex items-start gap-2.5 px-3 py-2.5 rounded border border-default bg-elevated cursor-pointer">
+    <input type="checkbox" name="authorize_exploit" value="on" class="mt-0.5 accent-accent" checked>
+    <span class="text-sm">
+      <span class="block text-primary">Authorize exploitation</span>
+      <span class="block text-[11px] text-secondary mt-0.5">Allows Metasploit/sqlmap against every target above. Recon always runs either way. Uncheck for recon/detection only.</span>
+    </span>
+  </label>
+
+  {{ button("Start scan", variant="primary", type="submit") }}
+</form>
+
+<script>
+  (function () {
+    // Live visual confirmation that each comma-separated entry parsed the way the user expects,
+    // before they submit — the same shape check as validate_target() (agent/tools/builders/
+    // validators.py), so a chip already flagged red here would also fail server-side.
+    // Scoped via currentScript, not a global id: this partial can appear twice on one page (the
+    // New Project dialog in base.html is on every page, and index.html inlines a second copy of
+    // this same form on a validation-error redisplay) — a global id would only ever wire up
+    // whichever copy happens to be first in the DOM.
+    var shapePattern = /^[A-Za-z0-9.\-:_/?=&%[\]]+$/;
+    var form = document.currentScript.previousElementSibling;
+    var input = form ? form.querySelector(".target-input") : null;
+    var chipsContainer = form ? form.querySelector(".target-chips") : null;
+    if (!input || !chipsContainer) return;
+
+    function render() {
+      var parts = input.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+      chipsContainer.innerHTML = "";
+      parts.forEach(function (part) {
+        var ok = shapePattern.test(part);
+        var chip = document.createElement("span");
+        chip.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border " +
+          (ok ? "text-severity-low border-severity-low/40 bg-severity-low/10" : "text-severity-high border-severity-high/40 bg-severity-high/10");
+        chip.textContent = part;
+        chipsContainer.appendChild(chip);
+      });
+    }
+
+    input.addEventListener("input", render);
+    render();
+  })();
+</script>

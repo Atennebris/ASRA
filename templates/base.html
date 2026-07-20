@@ -5,7 +5,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}ASRA{% endblock %}</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
+  {# ?v=1 is a deliberate cache-bust, not decoration: the origin's favicon used to be an inline
+     data:image/svg+xml URI (no real file at all) — browsers cache a resolved favicon per-origin
+     quite aggressively and don't reliably notice just because this tag's href text changed to a
+     real file on a later deploy. A change in the URL itself forces a genuine re-fetch instead of
+     relying on a hard refresh/cache-clear to notice. Bump this number again if the icon changes. #}
+  <link rel="icon" type="image/png" href="/static/favicon.png?v=1">
 
   <!-- Anti-FOUC (4.2.6): must run synchronously, before Tailwind/CSS, so the page never paints
        the wrong theme for a frame. Default "dark" is a deliberate choice, not prefers-color-scheme. -->
@@ -61,19 +66,78 @@
 
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+  {# Idiomorph (htmx morph extension) — the session log/findings SSE swap uses hx-swap="morph"
+     instead of innerHTML: a real DOM diff that only touches nodes that actually changed, instead
+     of destroying and recreating the whole fragment on every update. innerHTML was the root
+     cause of two separate reported bugs (scroll position resetting, manually-opened <details>
+     cards closing themselves) every time a new log line arrived during an active scan — both
+     were symptoms of the same thing (nothing about an unrelated new log entry should touch DOM
+     nodes for entries that didn't change), so morph fixes the actual cause instead of adding a
+     third manual save/restore workaround on top of the first two. #}
+  <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="font-mono bg-base text-primary min-h-screen">
-  <header class="border-b border-default bg-surface">
-    <nav class="max-w-4xl mx-auto px-4 py-3 flex items-center gap-4 text-sm">
-      <span class="font-semibold text-primary">ASRA</span>
-      <a href="/" class="text-secondary hover:text-accent">Home</a>
-      <a href="/sessions" class="text-secondary hover:text-accent">Sessions</a>
-      <a href="/settings" class="text-secondary hover:text-accent">Settings</a>
-    </nav>
-  </header>
-  <main class="max-w-4xl mx-auto px-4 py-6">
-    {% block content %}{% endblock %}
-  </main>
+  {# Dashboard shell (sidebar + content), not the old top-nav bar — see macros/nav.html for the
+     link list this renders (single source, not repeated per nav item here and in mobile markup). #}
+  <div class="flex h-screen overflow-hidden">
+    {% from "macros/nav.html" import nav_icon %}
+    <aside class="w-56 shrink-0 bg-surface border-r border-default flex flex-col">
+      <a href="/" class="flex items-center gap-2.5 px-4 h-12 border-b border-default shrink-0 hover:bg-elevated transition-colors">
+        <div class="w-6 h-6 rounded-md bg-accent/15 flex items-center justify-center shrink-0 overflow-hidden">
+          <img src="/static/favicon.png" alt="ASRA" class="w-full h-full object-cover">
+        </div>
+        <span class="text-sm font-semibold text-primary tracking-tight">ASRA</span>
+      </a>
+
+      <nav class="flex flex-col flex-1 overflow-y-auto asra-scroll p-2 gap-0.5">
+        <button type="button" onclick="document.getElementById('new-project-modal').showModal()"
+                class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors text-secondary hover:bg-elevated hover:text-primary text-left">
+          {{ nav_icon("plus") }}
+          New project
+        </button>
+
+        <a href="/sessions"
+           class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/sessions') or request.url.path.startswith('/session/') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("projects") }}
+          Projects
+        </a>
+
+        <div class="h-px bg-default my-1"></div>
+
+        <a href="/settings"
+           class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/settings') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("settings") }}
+          Settings
+        </a>
+
+        {# Active-session quick-return (polled, not tied to whatever page you're on) — opening the
+           New Project dialog or navigating around never touches this; each scan is its own
+           independent FastAPI BackgroundTask keyed by session_id, nothing here can interrupt one
+           that's already running. #}
+        <div class="mt-auto pt-2" hx-get="/api/active-session" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+      </nav>
+
+      <div class="px-3 py-2.5 border-t border-default flex items-center gap-2 shrink-0">
+        <div class="w-1.5 h-1.5 rounded-full bg-severity-low shrink-0"></div>
+        <span class="text-[11px] text-secondary">local &middot; no cloud</span>
+      </div>
+    </aside>
+
+    <main class="{% block main_class %}max-w-4xl{% endblock %} flex-1 min-w-0 overflow-y-auto asra-scroll mx-auto px-6 py-6 w-full">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <dialog id="new-project-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">New project</span>
+      <button type="button" onclick="document.getElementById('new-project-modal').close()"
+              class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
+    </div>
+    <div class="p-4">
+      {% include "partials/new_project_form.html" %}
+    </div>
+  </dialog>
 </body>
 </html>

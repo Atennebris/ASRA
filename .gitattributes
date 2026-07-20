@@ -1,0 +1,7 @@
+# Shell scripts must always check out with LF, regardless of a contributor's core.autocrlf —
+# Git for Windows defaults autocrlf=true, which silently rewrites them to CRLF on checkout and
+# breaks them inside WSL2/Linux/macOS ("$'\r': command not found", or a straight-up exec failure).
+*.sh text eol=lf
+
+# Windows batch files are the one thing here that actually wants CRLF.
+*.bat text eol=crlf

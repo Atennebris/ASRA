@@ -1,0 +1,16 @@
+{# Polled every few seconds from the sidebar (hx-trigger="load, every 5s") — renders nothing when
+   no session is running, so it stays invisible until there's actually something to jump back to. #}
+{% if active_sessions %}
+  {% set s = active_sessions[0] %}
+  <a href="/session/{{ s.session_id }}"
+     class="flex items-center gap-2 px-2.5 py-2 rounded border border-severity-medium/30 bg-severity-medium/10 hover:bg-severity-medium/20 transition-colors">
+    <span class="relative flex h-2 w-2 shrink-0">
+      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-severity-medium opacity-75"></span>
+      <span class="relative inline-flex rounded-full h-2 w-2 bg-severity-medium"></span>
+    </span>
+    <span class="min-w-0 flex-1">
+      <span class="block text-[11px] font-medium text-primary truncate">{{ s.target }}</span>
+      <span class="block text-[10px] text-secondary truncate">{{ s.phase or s.status }}{% if active_sessions | length > 1 %} &middot; +{{ active_sessions | length - 1 }} more{% endif %}</span>
+    </span>
+  </a>
+{% endif %}

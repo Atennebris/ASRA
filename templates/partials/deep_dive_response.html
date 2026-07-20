@@ -1,0 +1,5 @@
+{# Replaces the Deep dive form (session_fragment.html) after it's submitted — same id so the
+   swap lands in the right place, whichever finding's dialog it came from. #}
+<div id="deep-dive-{{ finding_index }}">
+  <p class="text-sm text-severity-low">{{ message }}</p>
+</div>

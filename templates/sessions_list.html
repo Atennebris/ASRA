@@ -1,28 +1,52 @@
 {% extends "base.html" %}
-{% block title %}ASRA &mdash; Sessions{% endblock %}
+{% from "macros/ui.html" import button, status_badge, page_header, empty_state %}
+{% block title %}ASRA &mdash; Projects{% endblock %}
 {% block content %}
-  <h1 class="text-xl font-semibold mb-4">Past sessions</h1>
+  {{ page_header("Projects") }}
 
   {% if sessions %}
+    {% set completed_count = sessions | selectattr("status", "equalto", "completed") | list | length %}
+    {% set in_progress_count = sessions | selectattr("status", "in", ["pending", "processing", "awaiting_approval"]) | list | length %}
+    {% set total_findings = sessions | sum(attribute="findings_count") %}
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+      {% for label, value in [("Total sessions", sessions | length), ("Completed", completed_count), ("In progress", in_progress_count), ("Total findings", total_findings)] %}
+        <div class="bg-surface border border-default rounded-lg p-4">
+          <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">{{ label }}</p>
+          <p class="text-2xl font-semibold tabular-nums text-primary">{{ value }}</p>
+        </div>
+      {% endfor %}
+    </div>
+
     <ul class="space-y-2">
       {% for s in sessions %}
-        <li class="bg-surface border border-default rounded-lg p-3">
-          <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-            <a href="/session/{{ s.session_id }}" class="text-accent hover:text-accent-hover font-medium">{{ s.session_id }}</a>
-            <span class="text-secondary truncate max-w-xs" title="{{ s.target }}">{{ s.target }}</span>
-            <span class="text-secondary">&mdash; {{ s.status }}</span>
-            <span class="text-secondary">&mdash; {{ s.findings_count }} finding(s)</span>
-            <span class="text-secondary">&mdash; {{ s.created_at }}</span>
+        <li class="bg-surface border border-default rounded-lg p-3 flex items-center gap-3">
+          <div class="w-8 h-8 rounded bg-elevated flex items-center justify-center shrink-0">
+            <svg class="w-4 h-4 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 2 3 6v6c0 5 4 9 9 10 5-1 9-5 9-10V6z" stroke-linejoin="round"></path>
+            </svg>
           </div>
+          <a href="/session/{{ s.session_id }}" class="flex-1 min-w-0 group">
+            <p class="text-sm font-medium text-primary group-hover:text-accent truncate">{{ s.name }}</p>
+            <p class="text-[11px] text-secondary truncate" title="{{ s.target }}">{{ s.target }} &middot; {{ s.findings_count }} finding(s) &middot; {{ s.created_at }}</p>
+            {% if s.folder %}
+              <p class="text-[11px] text-secondary/70 truncate" title="{{ s.folder }}">&#128193; {{ s.folder }}</p>
+            {% endif %}
+          </a>
+          {{ status_badge(s.status) }}
           {% if s.status == "interrupted" %}
-            <form method="post" action="/api/session/{{ s.session_id }}/resume" class="mt-2 inline-block">
-              <button type="submit" class="text-xs bg-accent hover:bg-accent-hover text-white rounded px-3 py-1">Resume from {{ s.resumable_from }}</button>
+            <form method="post" action="/api/session/{{ s.session_id }}/resume">
+              {{ button("Resume from " ~ s.resumable_from, variant="secondary", size="sm", type="submit") }}
             </form>
           {% endif %}
+          <form method="post" action="/api/session/{{ s.session_id }}/delete"
+                onsubmit="return confirm('Delete this project? This cannot be undone.');">
+            {{ button("Delete", variant="danger", size="sm", type="submit") }}
+          </form>
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <p class="text-secondary">No sessions yet. <a href="/" class="text-accent hover:text-accent-hover underline">Start a scan</a>.</p>
+    {{ empty_state("No sessions yet.", "Start a scan to see it here.") }}
+    <p class="text-center mt-2"><a href="/" class="text-accent hover:text-accent-hover text-sm underline">Start a scan</a></p>
   {% endif %}
 {% endblock %}

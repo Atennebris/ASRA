@@ -32,8 +32,14 @@ venv/
 data/sessions/*
 !data/sessions/.gitkeep
 
+# Maps session_id -> its real project folder (see sessions/store.py) — machine-specific paths
+data/sessions_index.json
+
 # Exploitation allowlist (managed only via the /settings UI, see agent/tools/allowed_targets.py)
 data/allowed_targets.json
+
+# Global LLM provider/model choice (managed via the /settings UI, see agent/settings.py)
+data/llm_settings.json
 
 # Debug logs (see agent/utils/debug.py) — dir is created on demand, no .gitkeep needed
 data/debug.log
