@@ -40,6 +40,8 @@
       var stream = document.getElementById("session-stream");
       var indicator = document.getElementById("sse-indicator");
       var wasAtBottom = false;
+      var baseTitle = document.title;
+      var titleFlashTimer = null;
 
       stream.addEventListener("htmx:sseOpen", function () {
         indicator.textContent = "live";
@@ -48,6 +50,27 @@
       stream.addEventListener("htmx:sseError", function () {
         indicator.textContent = "reconnecting…";
         indicator.className = "text-[11px] px-2 py-1 rounded border border-default text-severity-medium";
+      });
+
+      // A background/unfocused tab is never repainted by the browser until it's visible again —
+      // that's the browser's own power-saving behavior, not something a web app can override. The
+      // SSE update still lands in the DOM immediately either way; what's missing is any signal the
+      // user can actually see without switching back. Flashing the tab title (which the OS taskbar
+      // and browser tab strip *do* update even when hidden) gives that signal without needing a
+      // switch to notice new activity landed.
+      stream.addEventListener("htmx:afterSwap", function () {
+        if (document.visibilityState !== "hidden") return;
+        var flashOn = false;
+        clearInterval(titleFlashTimer);
+        titleFlashTimer = setInterval(function () {
+          document.title = flashOn ? baseTitle : "● new activity";
+          flashOn = !flashOn;
+        }, 1000);
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState !== "visible") return;
+        clearInterval(titleFlashTimer);
+        document.title = baseTitle;
       });
 
       // With hx-swap="morph" (Idiomorph, see base.html), a swap only touches nodes that actually
@@ -85,6 +108,25 @@
           log.scrollTop = scrollTop;
         });
       });
+
+      // textContent (not innerText) deliberately — a collapsed <details> still has its body in
+      // the DOM, just not painted, and innerText respects that rendered/hidden state while
+      // textContent doesn't, so this is the only way to grab every entry's full text regardless
+      // of which cards are expanded on screen right now.
+      window.asraCopyLogs = function () {
+        var log = document.getElementById("session-log-list");
+        var btn = document.getElementById("copy-logs-btn");
+        if (!log) return;
+        var lines = Array.prototype.map.call(log.querySelectorAll("details"), function (entry) {
+          return entry.textContent.replace(/\s+/g, " ").trim();
+        });
+        navigator.clipboard.writeText(lines.join("\n\n")).then(function () {
+          if (!btn) return;
+          var original = btn.textContent;
+          btn.textContent = "Copied!";
+          setTimeout(function () { btn.textContent = original; }, 1500);
+        });
+      };
     })();
   </script>
 {% endblock %}

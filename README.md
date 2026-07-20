@@ -1,6 +1,8 @@
 # ASRA
 Autonomous Security Research Agent - ASRA
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An autonomous pentesting agent: point it at an authorized target, and it recons, analyzes,
 detects, and (with your explicit approval) exploits — driven by an LLM through a ReAct tool-calling
 loop, with everything shown live in the browser. Runs entirely locally, no cloud/database — session

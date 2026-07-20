@@ -166,7 +166,13 @@
     <p class="text-sm text-secondary italic mb-4">No findings yet.</p>
   {% endif %}
 
-  {{ section_label("Logs") }}
+  <div class="flex items-center justify-between mb-2">
+    <h3 class="text-[11px] font-semibold uppercase tracking-wider text-secondary">Logs</h3>
+    {% if session.logs %}
+      <button type="button" id="copy-logs-btn" onclick="window.asraCopyLogs()"
+              class="text-[11px] px-2 py-1 rounded border border-default text-secondary hover:bg-elevated hover:text-primary transition-colors">Copy logs</button>
+    {% endif %}
+  </div>
   {% if session.logs %}
     <div id="session-log-list" class="max-h-80 overflow-y-auto bg-elevated border border-default rounded font-mono divide-y divide-default asra-scroll">
       {% for entry in session.logs %}

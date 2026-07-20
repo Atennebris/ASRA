@@ -31,7 +31,13 @@ def validate_safe_value(value: str) -> str:
 
 def validate_target(target: str) -> str:
     """Validates a target string is a plausible hostname/IP/URL token, free of injection characters."""
-    target = target.strip()
+    # Tool-calling models frequently send a single-item JSON array instead of a bare string
+    # for a "target" argument (the same shape mismatch already handled for nuclei's tags) —
+    # accepting it here avoids a hard crash (AttributeError on .strip()) that silently drops
+    # that tool call's result for the rest of the phase.
+    if isinstance(target, list):
+        target = target[0] if target else ""
+    target = str(target).strip()
     if not target:
         raise ValueError("Target must not be empty.")
 

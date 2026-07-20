@@ -79,6 +79,21 @@ Rules:
   banner/version with no active confirmation; "needs_verification" means not yet confirmed
   either way. Do not mark something "verified" without a real confirming result.
 - If two tools clearly report the same underlying issue, call record_finding once, not twice.
+- A 503 / "Application Error" / connection-refused / timeout response is NOT the same thing as
+  "target has no vulnerabilities" — it means the target wasn't actually reachable for that one
+  check. This is common on free-tier hosting (Heroku free dynos sleep after idling and take up to
+  ~30 seconds to wake on the first request, and can also crash-loop under load) — a single failed
+  request proves nothing either way. Retry the same check (plain http_request against the base
+  URL) at least 4-5 times before treating the target as unreachable; do not spend those retries on
+  unrelated checks (favicon, wayback, robots.txt) instead of just re-hitting the app and waiting
+  for it to come up. Once you get one real 200 response, immediately go after the actual
+  application surface it exposes (login, search, product/item pages, any API routes it reveals) —
+  that is where real vulnerabilities live, not in a cold-start error page.
+- Never conclude "no findings" on the strength of a target that was mostly or entirely
+  unreachable during this phase. If you exhausted your retries and it never came up, say so
+  explicitly in your final reply as a blocked/inconclusive result — not as a clean "nothing to
+  report", which reads as "this target was tested and is secure" when it was never actually
+  tested.
 - http_request's result can include one of several deterministic detection fields —
   "reflected_payload_detected" (your query-param value came back unescaped: reflected XSS),
   "sql_error_detected" (a real database error signature after a quote-character probe: SQL
