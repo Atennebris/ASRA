@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header %}
+{% block title %}ASRA &mdash; Chat{% endblock %}
+
+{% block content %}
+{# Top-level, project-less Quick Chat: a fast question about security, or how ASRA itself works,
+   with no target/scope/project behind it (main.py's GET /chat, get_or_create_quick_chat_session).
+   Visually/logically the exact same chat widget a project's own sidebar has -- same threads
+   (/new, /resume), same provider/model picker, same slash commands -- {% include %}'d here as-is
+   rather than reimplemented, just filling this page's own bounded-height column (.quick-chat-page,
+   themes.css) instead of sitting in session.html's narrower sticky sidebar. hide_chat_collapse
+   suppresses the collapse button/edge-tab chat_panel.html normally shows: there's nothing beside
+   this panel on its own dedicated page for collapsing it to reveal, so a "collapse" here would just
+   slide the whole page's own content off past the viewport edge with nothing behind it.
+
+   Full width (no max-w/mx-auto), same as Dashboard/Settings/every other page -- real, explicit
+   operator ask: the previous narrower max-w-3xl reading column (a deliberate choice when this page
+   had one single chat panel) left the same kind of large, unused side gutters other pages had
+   already moved away from, especially now that the tab strip above the panel wants the extra room. #}
+<div class="quick-chat-page w-full flex flex-col">
+  {{ page_header("Quick Chat") }}
+  <p class="text-[11px] text-secondary -mt-2 mb-4">
+    Not tied to any project — ask a quick security question, look something up, or think an idea
+    through. Testing a real target still needs its own project (scope/authorization live there).
+  </p>
+  <div class="flex-1 min-h-0">
+    {% set hide_chat_collapse = true %}
+    {# Real, explicit operator ask: browser-style tabs for switching between recent threads here,
+       on top of (not instead of) the history-icon dialog every chat panel already has -- see
+       partials/chat_thread_tabs.html's own comment for why this is Quick-Chat-only. #}
+    {% set show_chat_tabs = true %}
+    {# .quick-chat-page above carries a real, unconditional viewport-bound height (themes.css) at
+       every window width -- tells chat_panel.html its own #chat-panel can always fill it (h-full)
+       instead of falling back to a fixed 32rem below Tailwind's lg: breakpoint. See that file's
+       own comment on #chat-panel for the real bug this fixes. #}
+    {% set chat_panel_bounded_height = true %}
+    {% include "partials/chat_panel.html" %}
+  </div>
+</div>
+{% endblock %}

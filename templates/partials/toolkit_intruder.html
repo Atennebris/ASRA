@@ -1,0 +1,48 @@
+{# Intruder: automated §...§ payload-substitution attack (sniper/pitchfork). Root div's own id is
+   the stable hx-target/hx-swap="outerHTML" anchor for the form's own submit, same self-contained
+   container convention as toolkit_repeater.html/toolkit_decoder.html/toolkit_comparer.html. #}
+{% from "macros/toolkit.html" import method_field %}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-intruder-container">
+  <form hx-post="{{ toolkit_base_url }}/intruder/run" hx-target="#toolkit-intruder-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="flex gap-2">
+      {{ method_field("intruder-method-list", method) }}
+      <input type="text" name="url" value="{{ url | default('') }}" placeholder="https://example.com/user/§1§"
+             class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    </div>
+    <textarea name="headers_text" rows="4" placeholder="Header-Name: value&#10;Cookie: session=§abc§"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ headers_text | default('') }}</textarea>
+    <textarea name="body" rows="3" placeholder="Request body (leave empty for none) -- wrap an attack position in §...§"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ body | default('') }}</textarea>
+    <p class="text-[11px] text-secondary italic">Wrap each attack position in §...§ (e.g. <code>id=§1§</code>) anywhere in the URL, headers, or body.</p>
+
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-3 text-[11px] text-secondary">
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="mode" value="sniper" {% if mode == "sniper" or not mode %}checked{% endif %}> Sniper
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="mode" value="pitchfork" {% if mode == "pitchfork" %}checked{% endif %}> Pitchfork
+        </label>
+      </div>
+      {{ button("Start attack", type="submit", size="sm") }}
+    </div>
+    <textarea name="payload_text" rows="5"
+              placeholder="Sniper: one payload per line, applied to every position in turn.&#10;Pitchfork: N tab-separated values per line (N = number of §...§ positions), one line per attempt."
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ payload_text | default('') }}</textarea>
+  </form>
+
+  {% if error %}
+    <div class="bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">
+      {{ error }}
+    </div>
+  {% elif run_id %}
+    {# Lazy-loaded via its own self-swapping hx-get -- see toolkit_intruder_results.html's own
+       comment for why it needs full outerHTML replacement (not Site Map's morph:innerHTML). #}
+    <div id="toolkit-intruder-results"
+         hx-get="{{ toolkit_base_url }}/intruder/results/{{ run_id }}?expected={{ expected }}"
+         hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Starting attack&hellip;</p>
+    </div>
+  {% endif %}
+</div>

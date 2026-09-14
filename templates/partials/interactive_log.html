@@ -1,0 +1,53 @@
+{# Interactive/Reverse-Engineering-mode activity log -- the chronological trace of every tool the
+   chat agent ran this session, PLUS (for RE mode) agent/core.py's run_re_triage baseline-triage
+   trace and any reward ("+1 finding recorded") events, all flattened and time-sorted by main.py's
+   _interactive_log_entries and handed here as `entries`. Fetched fresh each time the modal opens
+   (session.html's shared Interactive/RE branch), not live-streamed -- a review view, not a
+   running feed. #}
+{% if not entries %}
+  <div class="flex flex-col items-center justify-center text-center py-12 px-6">
+    <svg class="w-7 h-7 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M4 6h16M4 12h10M4 18h7" stroke-linecap="round"/>
+    </svg>
+    <p class="text-sm font-medium text-primary mt-3">No tool activity yet</p>
+    <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[18rem]">
+      This fills up as the agent runs tools in the chat — every request, browser action, and
+      subagent delegation is recorded here in order.
+    </p>
+  </div>
+{% else %}
+  <p class="text-[11px] text-secondary mb-3">
+    {{ entries | length }} tool call{{ "s" if entries | length != 1 else "" }} this session, in order.
+  </p>
+  <ol class="space-y-1.5">
+    {% for e in entries %}
+      <li>
+        {# id is a stable, position-based key (main.py's _interactive_log_entries), not loop.index --
+           it has to survive unchanged across repeated renders of this same list for morph (see
+           re_triage_tab.html) to match this card to its own previous version and leave .open alone
+           when a NEW entry lands after it; loop.index alone would already do that here too, but a
+           real id is also what base.html's global Idiomorph guard (the "don't let morph strip a
+           manually-opened <details>'s open attribute" fix, already load-bearing for Agent mode's own
+           log cards) keys off of. #}
+        <details id="interactive-log-{{ e.idx }}" class="w-full rounded-lg border text-[11px] overflow-hidden {{ 'border-severity-high/40' if e.error else 'border-default' }} bg-elevated">
+          <summary class="flex items-center gap-2 px-3 py-2 cursor-pointer list-none hover:bg-overlay transition-colors">
+            <span class="font-mono text-secondary/60 tabular-nums shrink-0 w-6 text-right">{{ loop.index }}</span>
+            {% if not e.done %}
+              <span class="asra-spinner shrink-0"></span>
+            {% elif e.error %}
+              <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-high" title="Failed"></span>
+            {% else %}
+              <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-low" title="Done"></span>
+            {% endif %}
+            <span class="font-mono font-semibold text-primary shrink-0">{{ e.name }}</span>
+            {% if e.arg_summary %}<span class="font-mono text-secondary/70 truncate flex-1 min-w-0">{{ e.arg_summary }}</span>{% else %}<span class="flex-1"></span>{% endif %}
+            <span class="text-secondary/60 shrink-0 whitespace-nowrap">{{ e.at | human_dt }}</span>
+          </summary>
+          <div class="border-t border-default px-3 py-2">
+            <pre class="whitespace-pre-wrap break-words text-[10px] font-mono text-secondary max-h-56 overflow-y-auto asra-scroll">{{ e.output or "(no output recorded)" }}</pre>
+          </div>
+        </details>
+      </li>
+    {% endfor %}
+  </ol>
+{% endif %}

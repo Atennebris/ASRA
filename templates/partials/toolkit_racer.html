@@ -1,0 +1,56 @@
+{# Racer: race-condition testing via last-byte synchronization (agent/tools/toolkit_racer.py) --
+   opens every connection first, sends everything but the final byte of each identical request,
+   then releases all of them at once so the server sees them arrive within a fraction of a
+   millisecond of each other. Awaited synchronously (no background-task/polling-results pair the
+   way Intruder needs) -- see main.py's post_toolkit_racer_run for why that's fine here. #}
+{% from "macros/toolkit.html" import method_field %}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-racer-container">
+  <form hx-post="{{ toolkit_base_url }}/racer/run" hx-target="#toolkit-racer-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="flex gap-2">
+      {{ method_field("racer-method", method) }}
+      <input type="text" name="url" value="{{ url | default('') }}" placeholder="https://example.com/redeem-coupon"
+             class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      <input type="number" name="request_count" value="{{ request_count | default(10) }}" min="2" max="50" title="Number of concurrent (or sequential) copies of the request"
+             class="w-20 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    </div>
+    <textarea name="headers_text" rows="3" placeholder="Header-Name: value&#10;one per line"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ headers_text | default('') }}</textarea>
+    <textarea name="body" rows="2" placeholder="Request body (sent identically on every attempt, leave empty for none)"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ body | default('') }}</textarea>
+
+    <div class="flex items-center gap-3 text-[11px] text-secondary">
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="radio" name="strategy" value="last_byte" {% if strategy == "last_byte" or not strategy %}checked{% endif %}>
+        Last-byte sync
+      </label>
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="radio" name="strategy" value="sequential" {% if strategy == "sequential" %}checked{% endif %}>
+        Sequential (baseline)
+      </label>
+    </div>
+
+    {{ button("Race", type="submit", size="sm") }}
+  </form>
+
+  {% if error %}
+    <div class="bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">{{ error }}</div>
+  {% elif result %}
+    <div class="space-y-2">
+      <p class="text-[13px] font-medium text-primary">
+        {{ result.ok }}/{{ result.requests }} attempts completed ({{ result.strategy | replace('_', ' ') }})
+        {% if result.errors %}<span class="text-severity-medium">&mdash; {{ result.errors }} connection error(s)</span>{% endif %}
+      </p>
+      <div class="flex flex-wrap gap-1">
+        {% for code, count in result.response_status_counts.items() %}
+          <span class="px-1.5 py-0.5 rounded text-[10px] font-mono {{ 'bg-severity-high/20 text-severity-high' if count > 1 else 'bg-elevated text-secondary' }}"
+                title="{{ count }} attempt(s) got status {{ code }}">{{ code }} &times;{{ count }}</span>
+        {% endfor %}
+      </div>
+      {% if result.response_status_counts and (result.response_status_counts.values() | max) > 1 %}
+        <p class="text-[11px] text-secondary">Several attempts landed on the same status. For an endpoint that should only allow ONE success (redeeming a coupon, applying a one-time discount, a limited-stock purchase), multiple identical successes here is the actual race win -- compare response bodies in the Site Map to confirm it's not just N idempotent reads.</p>
+      {% endif %}
+      <p class="text-[11px] text-secondary">Inspect individual attempts in the Site Map -- filter <code class="font-mono">source.eq:racer</code>.</p>
+    </div>
+  {% endif %}
+</div>

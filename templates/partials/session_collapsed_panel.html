@@ -1,0 +1,60 @@
+{# Agent-mode's collapsed-chat side panel -- fills the 30rem grid column session.html reserves for
+   chat_panel.html once #chat-panel gets .chat-collapsed (a pure transform slide, themes.css; the
+   column's own width never changes either way, see that rule's own comment) -- that space used to
+   just sit empty behind the slid-off chat panel. Shown/hidden purely by CSS
+   (.session-chat-column:has(#chat-panel.chat-collapsed) .chat-collapsed-panel, themes.css), no
+   JS coupling to the chat collapse toggle needed at all.
+
+   Two halves, split on how often they're allowed to change:
+   - Notes (this file, static) -- a free-text scratchpad, saved on blur/change. Deliberately NEVER
+     part of the polled fragment below: a live poll re-rendering this textarea's value out from
+     under an in-progress, unsaved edit is exactly the class of bug this project avoids elsewhere.
+     Also never threaded into agent/chat.py's _session_snapshot -- purely personal, never seen by
+     the model (see main.py's save_session_notes route for the explicit guarantee).
+   - Pulse + Pinned/Activity tabs (partials/session_side_panel.html, included below for a correct
+     flash-free first paint, then kept live via the SAME hx-get every 3s, main.py's
+     session_side_panel route) -- read-only, safe to re-render on a timer. The tab radios
+     themselves live HERE, outside the polled div, so a poll tick can never reset which tab is
+     selected -- same fix session.html's own main tab bar and RE mode's info-tabs already apply for
+     the identical reason (see session.html's own long comment on why tab state must live outside
+     any morphed/polled subtree). #}
+<div id="chat-collapsed-panel" class="chat-collapsed-panel">
+  <div class="bg-surface border border-default rounded-lg p-3 mb-3 shrink-0">
+    <label class="block">
+      <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Notes</span>
+      <textarea name="operator_notes" rows="4" placeholder="Personal notes for this session — never sent to the agent."
+                hx-post="/api/session/{{ session.session_id }}/notes" hx-trigger="blur changed delay:500ms" hx-swap="none"
+                class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary resize-y focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ session.get("operator_notes", "") }}</textarea>
+    </label>
+  </div>
+
+  <input type="radio" id="side-tab-pinned" name="side-panel-tab" class="sr-only" checked>
+  <input type="radio" id="side-tab-activity" name="side-panel-tab" class="sr-only">
+  {# Anti-FOUC restore, same technique/reason as session.html's own re-info-tab restore script --
+     must run synchronously here, right after the radios above, not deferred to DOMContentLoaded. #}
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("asra-side-panel-tab-" + {{ session.session_id | tojson }});
+        if (!saved) return;
+        var radio = document.getElementById("side-tab-" + saved);
+        if (radio && radio.name === "side-panel-tab") radio.checked = true;
+      } catch (e) {}
+    })();
+  </script>
+  <div class="asra-segmented mb-2 shrink-0">
+    <label for="side-tab-pinned" role="button" class="asra-segment">Pinned</label>
+    <label for="side-tab-activity" role="button" class="asra-segment">Activity</label>
+  </div>
+  <script>
+    document.addEventListener("change", function (event) {
+      if (!event.target.matches || !event.target.matches('input[name="side-panel-tab"]') || !event.target.checked) return;
+      try { localStorage.setItem("asra-side-panel-tab-" + {{ session.session_id | tojson }}, event.target.id.replace(/^side-tab-/, "")); } catch (e) {}
+    });
+  </script>
+
+  <div id="chat-collapsed-live" class="flex-1 min-h-0 flex flex-col"
+       hx-ext="morph" hx-get="/api/session/{{ session.session_id }}/side-panel" hx-trigger="every 3s" hx-swap="morph:innerHTML">
+    {% include "partials/session_side_panel.html" %}
+  </div>
+</div>

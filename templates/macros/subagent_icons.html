@@ -1,0 +1,60 @@
+{# Subagent icons -- simple, hand-drawn, copyright-free worker/agent-themed glyphs, deliberately a
+   SEPARATE set from macros/project_icons.html's own security/target-themed pool (a subagent isn't
+   a project/target, it's a worker -- confirmed live the operator wants the two visually distinct,
+   not just individually customizable). subagent_icon() renders one by name (colored via
+   currentColor + an inline style, same convention project_icon() already uses); the names MUST
+   stay in sync with agent/tools/subagent_icons.py's SUBAGENT_ICON_NAMES. subagent_icon_picker()
+   renders the New/Edit Subagent form's own chooser. #}
+
+{% macro subagent_icon(name, size_class="w-4 h-4", color=none) %}
+  <svg class="{{ size_class }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"{% if color %} style="color: {{ color }}"{% endif %}>
+    {%- if name == "gear" -%}
+      <circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3.2M12 18.3v3.2M4.4 4.4l2.3 2.3M17.3 17.3l2.3 2.3M2.5 12h3.2M18.3 12h3.2M4.4 19.6l2.3-2.3M17.3 6.7l2.3-2.3"/>
+    {%- elif name == "node" -%}
+      <circle cx="12" cy="6" r="2.3"/><circle cx="5" cy="18" r="2.3"/><circle cx="19" cy="18" r="2.3"/><path d="M12 8.3 6.2 15.8M12 8.3l5.8 7.5"/>
+    {%- elif name == "cpu" -%}
+      <rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="10" y="10" width="4" height="4"/><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3"/>
+    {%- elif name == "wrench" -%}
+      <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.8 2.8-2-2z"/>
+    {%- elif name == "brain" -%}
+      <path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5h1a3 3 0 0 0 3-3V7a3 3 0 0 0-1-3z"/><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5h-1a3 3 0 0 1-3-3V7a3 3 0 0 1 1-3z"/>
+    {%- elif name == "compass" -%}
+      <circle cx="12" cy="12" r="9"/><path d="M15.3 8.7 13 13l-4.3 2.3L11 11z"/>
+    {%- elif name == "puzzle" -%}
+      <path d="M6 5h3.3a1.7 1.7 0 0 1 3.4 0H16v3.3a1.7 1.7 0 0 1 0 3.4V15h-3.3a1.7 1.7 0 0 0-3.4 0H6v-3.3a1.7 1.7 0 0 0 0-3.4z"/>
+    {%- elif name == "drone" -%}
+      <circle cx="12" cy="12" r="2.4"/><path d="M12 9.6 6.3 6M12 9.6l5.7-3.6M12 14.4 6.3 18M12 14.4l5.7 3.6"/><circle cx="5" cy="5" r="1.7"/><circle cx="19" cy="5" r="1.7"/><circle cx="5" cy="19" r="1.7"/><circle cx="19" cy="19" r="1.7"/>
+    {%- elif name == "clone" -%}
+      <rect x="4" y="4" width="12" height="12" rx="2"/><rect x="8" y="8" width="12" height="12" rx="2"/>
+    {%- else -%}
+      {# robot -- the default #}
+      <rect x="5" y="9" width="14" height="10" rx="2"/><circle cx="9" cy="14" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="1.2" fill="currentColor" stroke="none"/><path d="M12 9V5M9 5h6"/><path d="M2.5 12.5v3M21.5 12.5v3"/>
+    {%- endif -%}
+  </svg>
+{% endmacro %}
+
+{% macro subagent_icon_picker(selected_icon="", selected_color="", id_prefix="") %}
+  {# Compact icon + color chooser, same shape as macros/project_icons.html's own icon_picker (see
+     that macro's own comment for why id_prefix matters -- this form isn't repeated on one page the
+     way the New-Project wizard's three mode panels are, but scoping ids by call site costs
+     nothing and keeps the two pickers structurally identical if that ever changes). #}
+  {% set default_color = selected_color or "#000000" %}
+  {% set preview_color = "var(--text-secondary)" if default_color == "#000000" else default_color %}
+  <div class="project-icon-picker">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-2">Avatar <span class="text-secondary/60 normal-case">— optional, random if skipped</span></span>
+    <div class="flex items-center gap-2.5">
+      <div class="icon-picker-preview shrink-0" aria-hidden="true">
+        {{ subagent_icon(selected_icon or "robot", size_class="w-5 h-5", color=preview_color) }}
+      </div>
+      <div class="icon-picker-grid min-w-0 flex-1">
+        {% for name in SUBAGENT_ICON_NAMES %}
+          <input type="radio" name="icon" id="{{ id_prefix }}subicon-{{ name }}" value="{{ name }}" class="sr-only" {% if selected_icon == name %}checked{% endif %}>
+          <label for="{{ id_prefix }}subicon-{{ name }}" class="icon-picker-swatch" title="{{ name }}">{{ subagent_icon(name, size_class="w-4 h-4") }}</label>
+        {% endfor %}
+      </div>
+      <label class="icon-picker-colorbtn shrink-0" title="Avatar color — pick any">
+        <input type="color" name="icon_color" value="{{ default_color }}">
+      </label>
+    </div>
+  </div>
+{% endmacro %}

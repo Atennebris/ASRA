@@ -1,0 +1,45 @@
+{# The dynamic part of the home page's "Recent projects" list (index.html) — split out so it can
+   be re-rendered on its own by the polling fragment endpoint (/api/recent-projects/fragment,
+   main.py). Same fix as sessions_list_fragment.html: this used to render once at page load and
+   never again, so a scan finishing while this page was open sat showing a stale status until a
+   manual reload. #}
+{% from "macros/ui.html" import status_badge, empty_state, privacy_toggle_button, privacy_placeholder, privacy_restore_script %}
+{% from "macros/project_icons.html" import project_icon %}
+{% if recent_sessions %}
+  <div class="flex items-center justify-between mb-2">
+    <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary">Recent projects</p>
+    <div class="flex items-center gap-2">
+      {{ privacy_toggle_button("recent-projects") }}
+      <a href="/sessions" class="text-[11px] text-accent hover:text-accent-hover">View all</a>
+    </div>
+  </div>
+  {# Placed after the toggle button (not before) so it already exists in the DOM for this script's
+     label/aria sync -- the anti-flash guarantee itself doesn't depend on this exact position (the
+     ancestor's data-privacy-collapsed attribute -- #recent-projects-fragment in index.html -- is
+     what static/css/themes.css keys off, and nothing in this document has painted yet regardless
+     of where in this synchronous parse it gets set). Same anti-flash technique as macros/ui.html's
+     own tab_bar() restore script. #}
+  {{ privacy_restore_script("recent-projects") }}
+  <ul data-privacy-content class="space-y-2">
+    {% for s in recent_sessions %}
+      {# Stable id, same reasoning as sessions_list_fragment.html's rows — lets Idiomorph match
+         "this row already exists" across a 5s poll instead of tearing the whole list down. #}
+      <li id="recent-project-row-{{ s.session_id }}" class="bg-surface border border-default rounded-lg p-3 flex items-center gap-3">
+        <div class="w-8 h-8 rounded bg-elevated flex items-center justify-center shrink-0">
+          {{ project_icon(s.icon or "shield", size_class="w-4 h-4", color=s.icon_color or "var(--text-secondary)") }}
+        </div>
+        <a href="/session/{{ s.session_id }}" class="flex-1 min-w-0 group">
+          <p class="text-sm font-medium text-primary group-hover:text-accent truncate">{{ s.name }}</p>
+          <p class="text-[11px] text-secondary truncate">{{ s.target }} &middot; {{ s.findings_count }} finding(s) &middot; {{ s.created_at }}</p>
+          {% if s.rescanned_from_name %}
+            <p class="text-[11px] text-secondary/70 truncate">&#8635; Rescan of &ldquo;{{ s.rescanned_from_name }}&rdquo;</p>
+          {% endif %}
+        </a>
+        {{ status_badge(s.status, s.phase) }}
+      </li>
+    {% endfor %}
+  </ul>
+  {{ privacy_placeholder("recent-projects", recent_sessions | length, "project") }}
+{% else %}
+  {{ empty_state("No projects yet.", 'Click "New project" above to start your first scan.') }}
+{% endif %}

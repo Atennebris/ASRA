@@ -20,9 +20,322 @@
           class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed {{ variants[variant] }} {{ sizes[size] }} {{ extra_classes }}">{{ text }}</button>
 {% endmacro %}
 
-{% macro badge(text, severity=none) %}
-  {% set sev_key = severity | lower if severity in ["Critical", "High", "Medium", "Low"] else "unknown" %}
-  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ text }}</span>
+{# Small "Copy" button for a finding/hypothesis/chain/credential card — copy_text is a pre-built,
+   normalized plain-text block (main.py's *_copy_text filters), carried in a data-* attribute so
+   Jinja auto-escaping handles any quotes/newlines in it safely, and copied to the clipboard by
+   static/js's asraCopyCard on click (which also flips the label to "Copied!" briefly). Kept generic
+   (no per-type wiring) so every card type reuses the exact same button and JS. #}
+{% macro copy_button(copy_text, extra_classes="") %}
+  <button type="button" data-copy-text="{{ copy_text }}" onclick="asraCopyCard(this)" aria-label="Copy details"
+          class="shrink-0 inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-default text-secondary hover:bg-elevated hover:text-primary transition-colors {{ extra_classes }}">Copy</button>
+{% endmacro %}
+
+{# muted=true (pass a finding's own false_positive_reason straight through) draws the severity as a
+   crossed-out, colorless chip instead of its normal red/orange/yellow -- a finding cve_lookup's own
+   auto-record path (agent/core.py) already determined is ruled out (installed version outside the
+   CVE's affected range) still carries its ORIGINAL severity field (Critical/High/...) so the raw
+   data stays honest, but showing that in full alarming color right next to false_positive_badge's
+   own "Likely false positive" chip read as a flat contradiction -- a real, confirmed operator
+   complaint ("Critical" in bright red next to "likely fake" in the same card, at a glance looks like
+   the tool doesn't know its own verdict). Muting the FIRST badge to match the second's own "ruled
+   out" visual language (dashed border, no color) makes the two read as one consistent verdict
+   instead of two disagreeing ones. #}
+{% macro badge(text, severity=none, muted=false) %}
+  {% if muted %}
+    <span title="Original severity before this finding was ruled out as a false positive -- see the reason below" class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-secondary border-default/60 bg-transparent line-through decoration-1">{{ text }}</span>
+  {% else %}
+    {% set sev_key = severity | lower if severity in ["Critical", "High", "Medium", "Low", "Info"] else "unknown" %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ text }}</span>
+  {% endif %}
+{% endmacro %}
+
+{# One neutral pill per comma-separated piece of a target/scope string, labeled with its
+   classify_target_type() (agent/tools/builders/validators.py) -- reuses badge()'s own
+   severity=none "unknown"/neutral-gray styling rather than inventing a second pill shape, since a
+   target's TYPE isn't a severity dimension at all. Purely a display label (session_fragment.html's
+   header, program.html's Declared Scope) -- never used for validation/routing. #}
+{% macro target_type_badges(target_string) %}
+  {% set type_labels = {"ip": "IP", "subnet": "Subnet", "domain": "Domain", "host": "Host", "wildcard": "Wildcard", "url": "URL"} %}
+  {% for piece in (target_string or "").split(",") %}
+    {% set piece = piece.strip() %}
+    {% if piece %}
+      <span class="inline-flex items-center gap-1 text-[11px] text-secondary">{{ piece }} {{ badge(type_labels.get(piece | classify_target_type, "?")) }}</span>
+    {% endif %}
+  {% endfor %}
+{% endmacro %}
+
+{# How an attacker would actually have to use a finding, not how bad it is (a separate axis from
+   badge()'s severity) — remote_direct gets the loudest color since it's the one that's actually
+   actionable right now with no victim/positioning needed; everything else fades toward "someone
+   else has to cooperate, or you need to already be in a privileged spot". Renders nothing for a
+   finding that hasn't been classified yet rather than a misleading "unknown" chip. #}
+{% macro scenario_badge(scenario) %}
+  {% set scenario_meta = {
+    "remote_direct": ("Remote — no victim needed", "critical"),
+    "mitm_active": ("MITM required (active)", "medium"),
+    "mitm_passive": ("MITM required (passive)", "medium"),
+    "victim_interaction": ("Requires victim interaction", "low"),
+    "local_only": ("Requires local access", "unknown"),
+  } %}
+  {% if scenario in scenario_meta %}
+    {% set label, sev_key = scenario_meta[scenario] %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">{{ label }}</span>
+  {% endif %}
+{% endmacro %}
+
+{# Only ever set on a finding when the project's own Qualifying/Non-qualifying scope rules were
+   given (session["scope_rules"], New Project form) and the model matched it against them via
+   record_finding's qualifies_for_bounty (agent/tools/native.py) — renders nothing otherwise, same
+   as scenario_badge() for an unclassified finding. #}
+{# A real, confirmed operator complaint this wording fixes: "non_qualifying"'s plain "Non-qualifying"
+   label sat right next to false_positive_badge's own muted-gray "⊘ Likely false positive" chip and
+   read as the same kind of verdict at a glance -- they mean the OPPOSITE thing (this finding is
+   real and independently verified, it just doesn't count for THIS program's bounty) rather than
+   "turned out to be fake". Explicit "Real, but" prefix plus a distinct check icon (vs.
+   false_positive_badge's ⊘) so the two never blur together again. #}
+{% macro bounty_badge(status) %}
+  {% set meta = {
+    "qualifying": ("Qualifying", "critical", "target"),
+    "non_qualifying": ("Real, but non-qualifying", "unknown", "check"),
+    "unclear": ("Scope unclear", "unknown", none),
+  } %}
+  {% if status in meta %}
+    {% set label, sev_key, icon = meta[status] %}
+    {% set tooltip = "Independently verified as real, just outside this program’s bounty scope -- not a false positive." if status == "non_qualifying" else "" %}
+    <span title="{{ tooltip }}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">
+      {%- if icon == "target" -%}
+        <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>
+      {%- elif icon == "check" -%}
+        <svg class="w-3 h-3 shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      {%- endif -%}
+      {{ label }}</span>
+  {% endif %}
+{% endmacro %}
+
+{# Set on a finding either deterministically (agent/core.py's cve_lookup auto-record, once Recon
+   confirms an installed version outside the CVE's affected range) or by the model itself
+   (record_finding's false_positive_reason, agent/tools/native.py) when it has real evidence a
+   finding isn't actually applicable/exploitable — kept in the list for audit-trail completeness
+   rather than dropped, but flagged distinctly so a human skimming findings doesn't mistake it for
+   a live lead. Dashed border, not solid, to read as "ruled out" rather than another severity tier. #}
+{% macro false_positive_badge(reason) %}
+  {% if reason %}
+    <span title="{{ reason }}" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-severity-unknown border-severity-unknown/50 bg-severity-unknown/5">
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="M4 12L12 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      Likely false positive</span>
+  {% endif %}
+{% endmacro %}
+
+{# Set on a finding by agent/core.py's _persist_new_finding when session["program_url"] is a
+   HackerOne/Bugcrowd/YesWeHack program and match_finding_against_disclosed_reports
+   (agent/tools/bugbounty_import.py) found a plausible match in that program's own cached
+   disclosed-reports feed — provisional advisory signal only, never a gate: the finding is always
+   recorded regardless of this check's outcome. Dashed
+   border, same "flagged, not a settled verdict" visual language as false_positive_badge above,
+   but its own distinct color so it doesn't read as an actual false-positive determination. #}
+{% macro possible_duplicate_badge(possible_duplicate) %}
+  {% if possible_duplicate %}
+    <span title="{{ "Possible match in this program's own disclosed-reports feed: " ~ possible_duplicate.matched_title ~ " (confidence: " ~ possible_duplicate.confidence ~ "). Worth a manual check before submitting -- this is an automated guess, not a settled verdict." }}"
+          class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-accent border-accent/40 bg-accent/5">&#9888; Possible duplicate</span>
+  {% endif %}
+{% endmacro %}
+
+{# Distinct from false_positive_badge above: that one means "Recon confirmed a version and it's
+   OUTSIDE this CVE's range" (actively disproved). This means "cve_lookup matched a bare product
+   name and no host running that product was ever confirmed anywhere in scope" (never had a target
+   to check in the first place) — a different epistemic state, so a different label rather than
+   folding it into false_positive's "ruled out" wording, which would overclaim certainty this
+   finding doesn't have. Real incident this exists because of: three High-severity cards that read
+   exactly like live, confirmed holes on the same card/badge styling as a real verified finding,
+   with the only tell being "Verification: inferred" in small print easy to skim past. #}
+{# A finding agent/core.py's _run_reverify reconfirmed still real from a prior scan of this same
+   target (finding.carried_over_from set), vs. one discovered fresh this run — visually distinct
+   so "still there since last time" doesn't read identically to "new this run" at a glance. #}
+{% macro carried_over_badge(carried_over_from) %}
+  {% if carried_over_from %}
+    <span title="Reconfirmed still present from a prior scan of this same target, with fresh evidence gathered this run — not carried forward on trust alone."
+          class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-accent border-accent/40 bg-accent/10">&#8635; Reconfirmed</span>
+  {% endif %}
+{% endmacro %}
+
+{# main.py's rescan_session_in_place seeds session["findings"] from the prior scan's own findings
+   the instant a rescan starts (so the Findings tab count never craters to 0 while agent/core.py's
+   _run_reverify works through them one at a time, which can take 50+ minutes) — each seeded entry
+   carries this transient marker (never part of the finding schema, same "not a real field" contract
+   as _reverified_this_pass elsewhere) until reverify replaces or removes it. Shows the finding
+   exactly as it looked last scan underneath, with this badge on top making clear that verdict is
+   about to be actively re-checked, not a fresh result for this run. #}
+{% macro pending_reverify_badge(pending) %}
+  {% if pending %}
+    <span title="From the prior scan — this session's reverify pass is actively re-checking it with fresh tool calls right now, the verdict below is still the OLD one."
+          class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-accent border-accent/40 bg-accent/10 animate-pulse">&#8635; Re-verifying&hellip;</span>
+  {% endif %}
+{% endmacro %}
+
+{# The finding CARD's own external, at-a-glance verdict — same color convention the finding's
+   detail dialog already established (severity-critical red for a real confirmed compromise,
+   severity-medium yellow for a real attempt that didn't pan out) so an operator triaging many
+   scans a day doesn't have to open a single card to see whether it's worth their attention.
+   Renders nothing for a finding Exploit hasn't reached yet (exploited=False, no advisory_note) --
+   same "nothing to report yet" restraint as scenario_badge/bounty_badge above. #}
+{% macro exploited_badge(finding) %}
+  {% if finding.exploited %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-critical border-severity-critical/40 bg-severity-critical/10">&#9873; Exploited</span>
+  {% elif finding.advisory_note and finding.exploit_outcome == "exploit_attempted" %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10">Not exploitable</span>
+  {% elif finding.advisory_note and finding.exploit_outcome %}
+    {# A real tool never actually ran against this finding (no suitable tool, needs manual
+       verification, operator/scope skip, ...) — distinct from the branch above, which means Exploit
+       genuinely attempted a real test and it didn't pan out. Conflating the two previously made a
+       finding Exploit never had a tool for look exactly like one that was actively disproven. #}
+    <span title="{{ finding.advisory_note }}" class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-severity-unknown border-severity-unknown/50 bg-severity-unknown/5">&#9675; Not attempted</span>
+  {% elif finding.advisory_note %}
+    {# Session predates the exploit_outcome field (agent/core.py's _FINDING_DEFAULTS) — no way to
+       tell attempted-and-failed apart from never-attempted for old data, so keep the prior wording
+       rather than guessing either way. #}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10">Not exploitable</span>
+  {% endif %}
+{% endmacro %}
+
+{# Which of the three ways a credential entered this project (Recon tab's Credentials card,
+   session_fragment.html) — "manual" is the operator typing one in mid-scan (this project's own
+   "Add credential" form), the crack tools are a real, tool-verified positive result against the
+   target, "web_self_register" is the agent creating a brand-new account via the target's own
+   signup form (agent/tools/native.py's web_self_register) rather than finding/cracking an
+   existing one. Distinct colors so "the operator already knows this" (manual, neutral) never reads
+   the same as "the agent proved this against the live target" (the other four, which all carry
+   real exploitation weight even though creating an account isn't quite the same act as cracking
+   one). Renders the raw source_tool string for anything not in this map (forward-compatible with
+   a new source_tool this macro hasn't been taught yet) rather than hiding it. #}
+{% macro credential_source_badge(source_tool) %}
+  {% set meta = {
+    "manual": ("Added manually", "unknown", "pencil"),
+    "default_creds_check": ("Cracked — default creds", "critical", "key"),
+    "hydra": ("Cracked — Hydra", "critical", "key"),
+    "web_login_bruteforce": ("Cracked — brute-force", "critical", "key"),
+    "web_self_register": ("Self-registered by agent", "medium", "user-plus"),
+  } %}
+  {% set label, sev_key, icon = meta.get(source_tool, (source_tool, "unknown", none)) %}
+  <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10">
+    {%- if icon == "key" -%}
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 3l3 3M13 6l3 3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    {%- elif icon == "pencil" -%}
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9" stroke-linecap="round"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    {%- elif icon == "user-plus" -%}
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6" stroke-linecap="round"/></svg>
+    {%- endif -%}
+    {{ label }}</span>
+{% endmacro %}
+
+{# One masked field in the Recon tab's Credentials card (an Identity A/B/etc. row) -- starts as a
+   fixed bullet mask with an eye button; the button's first click fetches the real value via htmx
+   (main.py's reveal_identity_field route), every click after that just flips shown/masked
+   entirely client-side (static/js/identity_reveal.js), no further server round trip. Renders
+   nothing for a field this identity never had set at all (list_identity_field_presence,
+   agent/tools/native.py) -- an empty field isn't a secret to hide, showing a mask for it would
+   just be misleading filler. #}
+{% macro masked_identity_field(session_id, identity_name, field, label) %}
+  <p class="text-[11px] text-secondary flex items-center gap-1">
+    <span class="shrink-0">{{ label }}:</span>
+    <span class="inline-flex items-center gap-1">
+      <span class="font-mono text-primary" data-masked>••••••••</span>
+      <button type="button" hx-post="/api/session/{{ session_id }}/identity/{{ identity_name }}/reveal/{{ field }}"
+              hx-target="closest span" hx-swap="innerHTML" title="Show" aria-label="Show {{ label }}"
+              class="p-0.5 rounded text-secondary hover:bg-elevated hover:text-accent transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </span>
+  </p>
+{% endmacro %}
+
+{# Short reference id (F#/H#/R#) + "Discuss in chat" button, shared by every finding/hypothesis/
+   recon-target card (session_fragment.html) — one macro, not three copy-pasted button blocks, so
+   the icon/behavior can never drift between tabs. ref must be the EXACT id agent/chat.py's
+   _session_snapshot stamps onto the matching entry (F{{ loop.index }}/H{{ loop.index }}/
+   R{{ loop.index }}, 1-indexed in the same list order that function iterates) -- the two sides are
+   never explicitly kept in sync with each other, they just both derive from the same "1-indexed
+   position in this list" rule, so a caller here MUST pass the identical loop.index the snapshot
+   uses or the tag a click inserts silently points at the wrong record.
+   window.asraDiscussInChat (chat_panel.html) does the real work (un-collapses the panel, focuses
+   the input, inserts "[ref] ") -- guarded with `&&` since this macro can in principle render before
+   chat_panel.html's own script has run, though in practice both are on the same page load.
+   event.stopPropagation() on the wrapping span is load-bearing wherever this sits inside a larger
+   clickable card (the findings tab's own dialog-opening button) -- without it, a click meant for
+   this control would also fire the card's own onclick underneath it. event.preventDefault() is the
+   OTHER half of that same protection for the recon tab's own use (inside a <summary> row): a click
+   on ANYTHING inside <summary> triggers the parent <details>'s native open/close as that click
+   event's own default action, a completely separate mechanism from bubbling -- stopPropagation
+   alone does not stop it, only preventDefault does. Both calls are harmless no-ops in the two
+   contexts that don't need them (findings' plain absolutely-positioned sibling, hypotheses' plain
+   div card have no default action to prevent), so one shared macro can safely cover all three. #}
+{% macro chat_ref(ref, pinned=none, session_id=none) %}
+  {# pinned/session_id are optional -- every call site that doesn't pass them (the majority) gets
+     byte-identical output to before. A caller opts into the pin toggle by passing both:
+     pinned=(ref in session.get("pinned_refs", [])), session_id=session.session_id. The button POSTs
+     to main.py's pin_ref route, which returns partials/chat_ref_fragment.html (this exact macro
+     re-rendered with the new state) -- hx-swap="outerHTML" on this whole <span> replaces itself. #}
+  <span class="inline-flex items-center gap-0.5 shrink-0 bg-surface/90 rounded" onclick="event.preventDefault(); event.stopPropagation();">
+    <span class="text-[10px] font-mono text-secondary/60 pl-1" title="Reference this in chat as [{{ ref }}]">{{ ref }}</span>
+    <button type="button" onclick="window.asraDiscussInChat && window.asraDiscussInChat('{{ ref }}')"
+            title="Discuss {{ ref }} in chat" aria-label="Discuss {{ ref }} in chat"
+            class="p-0.5 rounded text-secondary/70 hover:bg-elevated hover:text-accent transition-colors">
+      <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+    </button>
+    {% if pinned is not none %}
+      <button type="button" hx-post="/api/session/{{ session_id }}/pin" hx-vals='{"ref": "{{ ref }}"}'
+              hx-target="closest span" hx-swap="outerHTML"
+              title="{{ 'Unpin' if pinned else 'Pin' }} {{ ref }}" aria-label="{{ 'Unpin' if pinned else 'Pin' }} {{ ref }}"
+              class="p-0.5 rounded transition-colors {{ 'text-accent hover:text-accent-hover' if pinned else 'text-secondary/70 hover:bg-elevated hover:text-accent' }}">
+        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="{{ 'currentColor' if pinned else 'none' }}" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M12 2l2.6 6.6L21 10l-5 4.6L17.4 21 12 17.3 6.6 21 8 14.6 3 10l6.4-1.4z" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </button>
+    {% endif %}
+  </span>
+{% endmacro %}
+
+{# Condensed, deduplicated tool history for a finding/hypothesis card -- NOT a raw dump of every
+   tool call the agent ever made (that would be dozens of lines of low-signal noise); each entry is
+   one distinct real tool, first-use order, tagged with the stage it mattered in (agent/core.py's
+   _extract_tool_timeline_entries/_append_tool_timeline build this list mechanically from the real
+   per-finding exploit trace, or from a model-self-reported single tool for discovery/verification
+   where no scoped trace exists). Tool names get the accent color so they stand out from the
+   surrounding "why" text -- but oncopy overrides the clipboard with plain innerText, so pasting
+   this into a report/ticket never carries the color through, only the plain words. #}
+{% macro tool_timeline_list(entries) %}
+  {% set stage_labels = {"discovery": "flagged this", "exploitation": "used to exploit/confirm this", "verification": "used to verify this"} %}
+  <ol class="text-[11px] text-secondary space-y-0.5 mb-2 list-decimal list-inside"
+      oncopy="event.preventDefault(); event.clipboardData.setData('text/plain', this.innerText);">
+    {% for entry in entries %}
+      <li><span class="font-mono font-semibold text-accent">{{ entry.tool }}</span> &mdash; {{ stage_labels.get(entry.stage, entry.stage) }}</li>
+    {% endfor %}
+  </ol>
+{% endmacro %}
+
+{% macro unconfirmed_target_badge(is_ungrounded) %}
+  {% if is_ungrounded %}
+    <span title="This CVE was matched by product name only — no host in this scan's Recon results was ever confirmed running that product, so there is no real target this applies to (yet)."
+          class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-severity-unknown border-severity-unknown/50 bg-severity-unknown/5">⊘ No confirmed target</span>
+  {% endif %}
+{% endmacro %}
+
+{# Hypotheses tab status marker — same shape/tone family as the badges above, not a new palette:
+   "unconfirmed" reuses unconfirmed_target_badge's own dashed/grey "still pending, no verdict yet"
+   convention; "ruled_out" reuses false_positive_badge's dashed/grey "checked, doesn't hold up"
+   convention (with its own ⊘ glyph so it's still visually distinct from "unconfirmed" at a glance);
+   "confirmed" reuses plan_status_icon's own "done" color (solid severity-low/blue) — this app has
+   no real green anywhere in its palette (see plan_status_icon's own comment), blue is what "settled,
+   good outcome" means here. #}
+{% macro hypothesis_status_badge(status) %}
+  {% if status == "confirmed" %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-low border-severity-low/40 bg-severity-low/10">&#10003; Confirmed</span>
+  {% elif status == "ruled_out" %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-severity-unknown border-severity-unknown/50 bg-severity-unknown/5">⊘ Ruled out</span>
+  {% else %}
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border border-dashed text-secondary/70 border-default bg-elevated">Unconfirmed</span>
+  {% endif %}
 {% endmacro %}
 
 {# Session status is a different domain from finding severity (state, not how-bad) — its own tone
@@ -30,21 +343,65 @@
    actively-working statuses is baked in here rather than added per-template — every place that
    already calls status_badge() (session page, Projects list, recent-projects on the home page)
    gets "the agent is working right now" made obvious for free, not just a status word that's easy
-   to skim past. #}
-{% macro status_badge(status) %}
+   to skim past.
+
+   phase (optional): the CURRENT phase actually producing activity right now — the operator's own
+   real incident this fixes: "Status: processing" alone never says WHICH of Recon/Analyze/Exploit
+   is actually running, so an operator watching the badge has no way to tell "still in Recon" from
+   "already deep into Exploit" without opening the Plan tab and checking which phase card has the
+   spinner. Every caller already has this for free without any extra session read: the full
+   session page passes session.logs[-1].phase (the last real log entry IS the most recent activity,
+   more reliable than trusting the model to have called update_plan at all); the Projects
+   list/recent-projects fragments already carry the identical field from
+   sessions/store.py's own cached summary (_build_summary's "phase" key, computed the exact same
+   way). None when there's no log activity yet, or the status isn't one of the "still working"
+   states — the phase suffix would be meaningless for "completed"/"failed"/etc. #}
+{% macro status_badge(status, phase=none) %}
   {% set tone_by_status = {
     "completed": "low",
     "processing": "medium",
     "pending": "medium",
     "awaiting_approval": "medium",
+    "paused": "medium",
     "interrupted": "high",
     "failed": "critical",
+    "created": "unknown",
   } %}
   {% set tone = tone_by_status.get(status, "unknown") %}
   <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-{{ tone }} border-severity-{{ tone }}/40 bg-severity-{{ tone }}/10">
     {% if status in ("processing", "pending", "awaiting_approval") %}<span class="asra-spinner"></span>{% endif %}
-    {{ status }}
+    {{ status }}{% if phase and status in ("processing", "pending", "awaiting_approval") %} ({{ phase | capitalize }}){% endif %}
   </span>
+{% endmacro %}
+
+{# A real <input type="checkbox"> underneath (sr-only, not display:none -- stays keyboard-focusable
+   and screen-reader-visible) driving a styled pill via Tailwind's peer-* variant, instead of the
+   browser's own default checkbox square. Deliberately does NOT wrap itself in a <label> -- most
+   call sites already have their own outer <label> around the whole row (toggle + description
+   text, so clicking anywhere on the row toggles it), and nesting a second <label> inside that one
+   is invalid HTML that risks a double-toggle (both labels' own implicit checkbox association
+   firing off the same click). Wrap the two elements this macro DOES emit (input + the styled pill
+   span right after it) in whatever container/label the call site already uses. onchange, when
+   given, is emitted verbatim as the input's own onchange="..." attribute (Jinja's normal
+   autoescaping still applies to it, same as any other attribute value here) -- for a caller that
+   needs a confirmation gate or other side effect on flip, same pattern the pre-existing checkboxes
+   already used before switching to this macro. extra_attrs is emitted with |safe (raw, unescaped)
+   -- only ever pass a literal string written at the call site (e.g. a data-* attribute for
+   existing JS to hook into), never session/user data. #}
+{% macro toggle_switch(name, checked=false, value="on", onchange="", id=none, disabled=false, extra_attrs="") %}
+  <input type="checkbox" name="{{ name }}" value="{{ value }}" class="sr-only peer"
+         {% if id %}id="{{ id }}"{% endif %}
+         {% if checked %}checked{% endif %}
+         {% if disabled %}disabled{% endif %}
+         {% if onchange %}onchange="{{ onchange }}"{% endif %}
+         {{ extra_attrs | safe }}>
+  <span class="w-9 h-5 shrink-0 bg-elevated border border-default rounded-full relative
+               transition-colors duration-150 peer-checked:bg-accent peer-checked:border-accent
+               peer-focus-visible:ring-2 peer-focus-visible:ring-accent/40 peer-focus-visible:ring-offset-1
+               {{ 'opacity-50' if disabled else '' }}
+               after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:w-3.5 after:h-3.5
+               after:bg-white after:rounded-full after:shadow after:transition-transform after:duration-150
+               peer-checked:after:translate-x-4"></span>
 {% endmacro %}
 
 {% macro input_field(name, label, type="text", value="", placeholder="", required=false, error=none, min=none, max=none) %}
@@ -58,14 +415,141 @@
   {% if error %}<p class="text-[11px] text-severity-high mt-1">{{ error }}</p>{% endif %}
 {% endmacro %}
 
+{# The <summary> for a <details class="group ..."> — list-none hides the browser's own disclosure
+   triangle (already relied on by every optional New Project form section) so this chevron becomes
+   the only visual cue that it's clickable/expandable at all; group-open:rotate-180 flips it once
+   the parent <details> actually has the open attribute (Tailwind's documented pattern for exactly
+   this element pair, no extra JS needed). #}
+{% macro disclosure_summary(text) %}
+  <summary class="flex items-center justify-between gap-2 px-3 py-2.5 cursor-pointer list-none text-sm text-primary">
+    <span>{{ text }}</span>
+    <svg class="w-4 h-4 shrink-0 text-secondary transition-transform duration-150 group-open:rotate-180" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"></path>
+    </svg>
+  </summary>
+{% endmacro %}
+
 {% macro card(extra_classes="") %}
   <div class="bg-surface border border-default rounded-lg p-4 {{ extra_classes }}">
     {{ caller() }}
   </div>
 {% endmacro %}
 
+{# Every section heading in the app reads as an inline code comment ("// LABEL") rather than a bare
+   caption -- a deliberate typographic signature, not decoration: this app's whole body/display
+   face is already IBM Plex Mono (base.html's font-mono on <body>), and for the security-engineer
+   audience this tool is built for, "//" unambiguously reads as "this heading annotates what
+   follows", the same way it does in the code they read all day. One macro, so the motif is
+   systemic (every page that calls section_label gets it) rather than a one-off flourish. #}
 {% macro section_label(text) %}
-  <h3 class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-2">{{ text }}</h3>
+  <h3 class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-2"><span class="text-accent/70 font-normal normal-case tracking-normal">// </span>{{ text }}</h3>
+{% endmacro %}
+
+{# Small square icon avatar for a list row (a provider, a subagent, ...) -- gives an otherwise
+   text-only row a visual anchor instead of a bare name. The icon set is intentionally tiny (three
+   hand-picked glyphs, not a whole icon library dependency) and hardcoded here as trusted, literal
+   SVG path data -- `| safe` is fine since none of it is ever derived from request/session data,
+   only ever one of this macro's own three fixed keys. #}
+{% macro icon_avatar(icon="chip", size="w-8 h-8", accent=false) %}
+  {% set icons = {
+    "chip": '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" stroke-linecap="round"/>',
+    "chat": '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"/>',
+    "bot": '<rect x="4" y="9" width="16" height="10" rx="2"/><path d="M12 9V5M9 5h6" stroke-linecap="round"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/>',
+  } %}
+  <div class="{{ size }} rounded-lg bg-elevated border border-default flex items-center justify-center shrink-0">
+    <svg class="w-4 h-4 {{ 'text-accent' if accent else 'text-secondary' }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">{{ icons.get(icon, icons["chip"]) | safe }}</svg>
+  </div>
+{% endmacro %}
+
+{# Plain status dot for a named row (a provider, a saved instance) -- deliberately NOT a bordered
+   square/circle "avatar" like icon_avatar above: real, reported feedback went through two rounds
+   -- first that a bordered-square icon avatar read as a second, redundant action button next to
+   Test/Toggle/Delete; then that even a neutral circular WRAPPER behind the dot was an unwanted
+   extra blob with no purpose of its own once the dot itself is the only thing carrying meaning.
+   Just the dot now, no background/border shape around it -- {{ size }} is still applied to an
+   invisible layout box so the row's text column keeps the same fixed left offset as every button
+   sizing elsewhere in this app, without rendering as a visible shape. Green specifically
+   (status-dot-online, themes.css), never severity-low/accent -- this app's own established rule:
+   severity-low is reserved for a resolved/healthy VULNERABILITY state elsewhere in this app, a
+   real green ON/OFF status needs the separate --status-online namespace (see that variable's own
+   comment in themes.css) instead of borrowing blue. #}
+{% macro provider_avatar(active=false, size="w-8 h-8") %}
+  <div class="{{ size }} flex items-center justify-center shrink-0">
+    <span class="w-2.5 h-2.5 rounded-full shrink-0 {{ 'status-dot-online' if active else 'bg-secondary/40' }}"></span>
+  </div>
+{% endmacro %}
+
+{# Privacy/redaction toggle for a list of client-identifying rows (project/target names, links) —
+   real operator request: recording a demo/guide or streaming a session under an NDA needs a way
+   to instantly collapse those rows down to just the aggregate numbers already shown elsewhere on
+   the page (total sessions, total findings, ...), and that choice must survive a reload AND a
+   live htmx poll without ever flashing the real rows open again even for a single frame — a flash
+   mid-stream is exactly the failure these three macros exist to prevent. Always used together on
+   the same key, never one alone:
+     - privacy_restore_script(key): synchronous, MUST be placed immediately after the element
+       carrying data-privacy-key="{{ key }}" opens — same "run before anything below it can paint"
+       placement this file's own tab_bar() macro already uses for its tab-restore script.
+     - privacy_toggle_button(key): the button an operator clicks; flips the ancestor's own
+       data-privacy-collapsed flag live (static/js/privacy_toggle.js) and saves the new choice.
+     - privacy_placeholder(key, count, noun): what shows in place of the real rows while collapsed.
+   The collapsed flag always lives on an ANCESTOR element (the data-privacy-key node), never on the
+   sensitive rows/placeholder themselves (static/css/themes.css keys its show/hide rules off that
+   ancestor) — the Projects list and the home page's Recent projects both htmx-poll and morph their
+   inner rows every 5s (sessions_list.html/index.html); a flag set on a row that gets morphed away
+   would silently reset itself back open on the very next poll. The ancestor itself is never part
+   of that morph (morph:innerHTML only touches its children), so a flag placed there is the one
+   thing a poll can never quietly undo — for those two pages the ancestor is the existing
+   #sessions-list-fragment/#recent-projects-fragment poll target itself (data-privacy-key added
+   directly on it), not a new wrapper div. #}
+{% macro privacy_toggle_button(key) %}
+  <button type="button" data-privacy-toggle="{{ key }}"
+          onclick="window.asraTogglePrivacy && window.asraTogglePrivacy('{{ key }}')"
+          aria-pressed="false"
+          title="Hide names, targets and links in this list -- keeps only the totals above visible. Safe to leave on while recording or streaming."
+          class="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded border border-default text-secondary hover:bg-elevated hover:text-primary transition-colors shrink-0">
+    <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+      <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" stroke-linecap="round" stroke-linejoin="round"></path>
+      <circle cx="12" cy="12" r="3"></circle>
+    </svg>
+    <span data-privacy-label>Hide</span>
+  </button>
+{% endmacro %}
+
+{# No "flex" (or any display-*) utility class on this element -- Tailwind's .flex rule is an
+   AUTHOR stylesheet rule, which always wins over the plain [hidden] UA-stylesheet rule regardless
+   of selector specificity (origin beats specificity in the cascade), so a literal `flex` class here
+   would make this placeholder visible even while its own `hidden` attribute is set, showing it
+   AT THE SAME TIME as the real rows -- real, confirmed bug this comment exists to prevent a repeat
+   of. `display: flex` for the visible (collapsed) state comes ONLY from themes.css's
+   `[data-privacy-collapsed="true"] [data-privacy-placeholder]` rule; items-center/gap-2 below are
+   safe (they don't themselves set `display`, so they're inert while [hidden] still applies). #}
+{% macro privacy_placeholder(key, count, noun="item") %}
+  <div data-privacy-placeholder hidden class="items-center gap-2 py-3 px-3 border border-dashed border-default rounded-lg text-secondary text-[11px]">
+    <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+      <path d="M3 3l18 18M10.6 10.6a3 3 0 0 0 4.24 4.24M9.9 4.24A11 11 0 0 1 12 4c7 0 11 8 11 8a17.9 17.9 0 0 1-3.1 4.14M6.6 6.6A17.7 17.7 0 0 0 1 12s4 8 11 8a10.6 10.6 0 0 0 4.24-.86" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+    <span>{{ count }} {{ noun }}{{ "s" if count != 1 else "" }} hidden for privacy &mdash; click &ldquo;Show&rdquo; above to reveal.</span>
+  </div>
+{% endmacro %}
+
+{% macro privacy_restore_script(key) %}
+  <script>
+    (function () {
+      try {
+        var key = {{ key | tojson }};
+        var state = JSON.parse(localStorage.getItem("asra-privacy-collapsed") || "{}");
+        if (!state[key]) return;
+        var wrap = document.querySelector('[data-privacy-key="' + key + '"]');
+        if (wrap) wrap.setAttribute("data-privacy-collapsed", "true");
+        var btn = document.querySelector('[data-privacy-toggle="' + key + '"]');
+        if (btn) {
+          btn.setAttribute("aria-pressed", "true");
+          var label = btn.querySelector("[data-privacy-label]");
+          if (label) label.textContent = "Show";
+        }
+      } catch (e) {}
+    })();
+  </script>
 {% endmacro %}
 
 {% macro empty_state(title, subtitle="") %}
@@ -79,8 +563,243 @@
   </div>
 {% endmacro %}
 
+{# relative: lets header_light.html (Settings -> Customization -> Header light) hang centered from this
+   bar's own top edge via absolute positioning -- see that partial's own comment for why this is
+   its one shared mount point instead of base.html's sidebar/mobile headers. #}
 {% macro page_header(title) %}
-  <div class="flex items-center gap-2 py-3.5 border-b border-default mb-4">
+  <div class="relative flex items-center gap-2 py-3.5 border-b border-default mb-4">
     <h1 class="text-[13px] font-semibold text-primary">{{ title }}</h1>
+    {% include "macros/header_light.html" %}
   </div>
+{% endmacro %}
+
+{# The pendant-lamp fixture drawn for the header light (Settings -> Customization -> Header light). Kept in
+   one place so the real header (header_light.html) and the Settings style-preview cards draw the exact
+   same lamp. grad_id must be unique per instance on a page -- the shade's metal gradient is referenced
+   by url(#grad_id), and duplicate SVG ids would all resolve to the first one. Metal shade + a glowing
+   bulb whose color/bloom comes from the surrounding currentColor (static/css/themes.css's .hl-* rules).
+
+   viewBox starts at y=-18 (not 0): that extra 18 units above the cap is the "cord runs off past the
+   header bar" effect -- everything below y=0 (shade, bulb, chain) sits at the exact same coordinates
+   as before, only the cap+cord got longer, stretching up into that new headroom. themes.css's
+   .hl-lamp-btn top offset is shifted up by the same 18px so the shade's on-bar position doesn't move. #}
+{% macro header_lamp_svg(grad_id) %}
+<svg class="hl-lamp" viewBox="0 -18 54 78" fill="none" aria-hidden="true">
+  <defs>
+    <linearGradient id="{{ grad_id }}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a4048"/>
+      <stop offset="0.55" stop-color="#14181e"/>
+      <stop offset="1" stop-color="#0a0d12"/>
+    </linearGradient>
+  </defs>
+  <rect class="hl-cap" x="25" y="-18" width="4" height="3" rx="1"/>
+  <path class="hl-cord" d="M27 -15 Q25 1 27 17"/>
+  <path d="M27 16 C22 16 16 26 14 35 C19 40 35 40 40 35 C38 26 32 16 27 16 Z" fill="url(#{{ grad_id }})"/>
+  <path class="hl-shade-rim" d="M14 35 C19 40 35 40 40 35"/>
+  <path class="hl-shade-hi" d="M23.5 19 C21 23 19.2 29 18.6 34"/>
+  <g class="hl-emit">
+    <ellipse class="hl-mouth" cx="27" cy="35.5" rx="10.5" ry="2.8"/>
+    <circle class="hl-bulb" cx="27" cy="38.5" r="4"/>
+    <path class="hl-filament" d="M25 38.5 q2 -2.6 4 0"/>
+  </g>
+  <path class="hl-chain" d="M37 30 L41 50"/>
+  <ellipse class="hl-bead" cx="41.5" cy="52" rx="1.9" ry="2.6"/>
+</svg>
+{% endmacro %}
+
+{# The "garland" header light style (Settings -> Customization -> Header light): a real festoon string --
+   one continuous sagging wire (drawn once, below) with 8 bulbs hung exactly at its low points, not a
+   row of dots floating independently of any string. The wire is an SVG path in a 400x40 viewBox,
+   stretched edge-to-edge with preserveAspectRatio="none" so it always spans the bar's full width and
+   wraps the whole header, per the brief; four gentle catenary-style sags (a repeating cubic-bezier
+   "hang between two nails" shape), nails at x=0/100/200/300/400 (y=4, near the top), dips at
+   x=50/150/250/350 (y=30). The 8 bulbs sit at t=0.5 on each rise/fall of those same curves (worked out
+   by hand from the cubic bezier formula) -- x=25,75,125,175,225,275,325,375 -> as fractions of 400,
+   y=17 -> as a fraction of 40 -- which is exactly where static/css/themes.css's :nth-child rules place
+   each .hl-garland-bulb span. Bulbs are plain HTML spans (not SVG circles) so a non-uniform viewBox
+   stretch never squashes them into ellipses; percentage positioning keeps them locked to the wire
+   regardless of how wide the bar actually renders. Fixed count/shape, drawn purely in CSS from here on
+   -- same "one shared source" reasoning as header_lamp_svg above, so the real header and the Settings
+   style-preview card never draw two different garlands. #}
+{% macro header_garland_bulbs() %}
+<svg class="hl-garland-wire" viewBox="0 0 400 40" preserveAspectRatio="none" fill="none" aria-hidden="true">
+  <path d="M0,4 C25,4 25,30 50,30 C75,30 75,4 100,4 C125,4 125,30 150,30 C175,30 175,4 200,4 C225,4 225,30 250,30 C275,30 275,4 300,4 C325,4 325,30 350,30 C375,30 375,4 400,4" vector-effect="non-scaling-stroke"/>
+</svg>
+{% for _ in range(8) %}<span class="hl-garland-bulb"></span>{% endfor %}
+{% endmacro %}
+
+{# Plan tab (4.9.x) status glyph — "done"/"pending" reuse this file's own thin-stroke SVG icon
+   language (empty_state's circle above is the same stroke-width/viewBox family), "active" reuses
+   the .asra-spinner class status_badge already uses for "this is happening right now" everywhere
+   else in the app (session/project status) rather than inventing a second symbol that would mean
+   the same thing but look different. Colors are severity-low/medium exactly like status_badge's
+   own tone map ("completed"->low, "processing"->medium) — "done" reads as the same blue this app
+   already uses for a finished/healthy state, not a green that doesn't exist anywhere else in this
+   palette. #}
+{% macro plan_status_icon(status) %}
+  {% if status == "done" %}
+    <svg class="w-4 h-4 shrink-0 text-severity-low" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="1.25" y="1.25" width="13.5" height="13.5" rx="3.5" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M4.3 8.3l2.3 2.2 5-5.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  {% elif status == "active" %}
+    <span class="w-4 h-4 shrink-0 inline-flex items-center justify-center" title="In progress">
+      <span class="asra-spinner"></span>
+    </span>
+  {% elif status == "blocked" %}
+    <svg class="w-4 h-4 shrink-0 text-severity-high" viewBox="0 0 16 16" fill="none" aria-hidden="true" title="Blocked — could not be completed (see rationale)">
+      <rect x="1.25" y="1.25" width="13.5" height="13.5" rx="3.5" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    </svg>
+  {% else %}
+    <svg class="w-4 h-4 shrink-0 text-secondary/40" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="1.25" y="1.25" width="13.5" height="13.5" rx="3.5" stroke="currentColor" stroke-width="1.4"/>
+    </svg>
+  {% endif %}
+{% endmacro %}
+
+{# Session view tab bar (4.9.x) — CSS-only (static/css/themes.css's ".session-tabs" rules), no
+   JavaScript, deliberately: see the long comment in session.html above this macro's call site for
+   why a JS-toggled class would get silently reset by Idiomorph on every SSE update mid-scan. Each
+   radio is immediately followed by its own <label> (so themes.css can style the active one via a
+   plain `input:checked + label` rule) — both live inside the same .session-tabs wrapper div
+   rendered here, which is what's actually the sibling of #session-stream in session.html, not the
+   radios directly; themes.css's panel-visibility rules use `.session-tabs:has(#tab-X:checked)` for
+   exactly that reason, reaching through this nesting instead of requiring the radio itself to be a
+   direct sibling. `name="session-tab"` makes every radio in this list one mutually-exclusive group; the
+   first is checked here (Plan opens by default) — session.html has no separate default logic, this
+   macro is the single source of which tab starts active. Summary is deliberately last — the
+   executive-summary/report view, meant to be reached after the technical tabs, not competing with
+   them for attention first. #}
+{# The Findings tab's own count (span id="findings-tab-count") renders correctly on first load
+   here, then static/js/findings_tab_count.js keeps it in sync on every later SSE update -- this
+   macro itself is never re-rendered live (it's a deliberate sibling of #session-stream, outside
+   the SSE morph target, precisely so a live update can't reset whichever tab is currently open),
+   so anything baked into its own label text is otherwise frozen at whatever it was on page load. #}
+{# tabs[8] is "Agent Toolkit", not bare "Toolkit" -- the sidebar's own standalone /toolkit link
+   (base.html) is ALSO just "Toolkit", and the two are easy to conflate at a glance despite being
+   genuinely different: this tab's Site Map shows what THIS session's own agent browser passively
+   captured (mitmproxy) during its real scan, backed by this project's own traffic store, never
+   the sidebar's separate global one. Still fully usable by hand, exactly like the sidebar version
+   (Repeater/Decoder/Comparer/Intruder/Sequencer all work identically here) -- the name change is
+   about which STORE/traffic this instance is scoped to, not about locking a human operator out of
+   it. The Settings page's own "Native toolkit access" toggles are a separate, unrelated concern
+   entirely: whether the AGENT's own reasoning loop can call these same tools itself, nothing to
+   do with whether a human can click around in this tab. #}
+{% macro tab_bar(session) %}
+  {% set tabs = [
+    ("overview", "Overview", none),
+    ("plan", "Plan", none),
+    ("recon", "Recon", none),
+    ("map", "Map", none),
+    ("hypotheses", "Hypotheses", "hypotheses-tab-count"),
+    ("analyze", "Analyze", none),
+    ("exploit", "Exploit", none),
+    ("findings", "Findings", "findings-tab-count"),
+    ("chain", "Chain", none),
+    ("techniques", "Techniques", none),
+    ("logs", "Logs", none),
+    ("toolkit", "Agent Toolkit", none),
+    ("summary", "Summary", none),
+  ] %}
+  {% set unconfirmed_hypotheses_count = (session.hypotheses or []) | selectattr("status", "equalto", "unconfirmed") | list | length %}
+  <div class="session-tabs flex items-center gap-1 border-b border-default mb-3 overflow-x-auto">
+    {% for id, label, count_span_id in tabs %}
+      <input type="radio" id="tab-{{ id }}" name="session-tab" class="sr-only" {% if loop.first %}checked{% endif %}>
+      <label for="tab-{{ id }}" role="button"
+             class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">{{ label }}{% if count_span_id == "findings-tab-count" %}<span id="{{ count_span_id }}">{% if session.findings %} ({{ session.findings | length }}){% endif %}</span>{% elif count_span_id == "hypotheses-tab-count" %}<span id="{{ count_span_id }}">{% if unconfirmed_hypotheses_count %} ({{ unconfirmed_hypotheses_count }}){% endif %}</span>{% endif %}</label>
+    {% endfor %}
+  </div>
+  {# Anti-FOUC, same technique/reason as base.html's own dark/light theme restore (that file's own
+     comment) -- must run synchronously, right here, immediately after the radios just above, NOT
+     deferred to DOMContentLoaded (static/js/session_state.js's own general restore hooks, used for
+     everything else this app remembers) like every other page script. Real, confirmed operator
+     complaint this fixes: a completed scan's session page can be genuinely large (the full Recon/
+     Analyze/Exploit/Findings/Logs content all parsed up front), so DOMContentLoaded -- which only
+     fires once the ENTIRE document has finished parsing -- landed a couple of real seconds after
+     first paint. The server-rendered default (Plan, this macro's own "first tab wins" comment
+     above) stayed visibly on screen that whole time, then visibly snapped to whichever tab was
+     actually saved -- an unmistakable "wrong tab, then the right one" flash, not the instant
+     restore an operator reloading mid-review has every right to expect. Running here instead,
+     immediately after just the tab bar's own small markup, leaves nothing left to visibly flash:
+     the correct radio is already checked before the browser has any real content further down the
+     page worth painting yet. session.session_id is piped through the same tojson filter
+     main.py registers for the Reserve providers row-builder JS -- a real JS string literal, not a
+     raw template substitution that would break if a session id ever needed escaping. #}
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("asra-session-tab-" + {{ session.session_id | tojson }});
+        if (!saved) return;
+        var radio = document.getElementById("tab-" + saved);
+        if (radio && radio.name === "session-tab") radio.checked = true;
+      } catch (e) {}
+    })();
+  </script>
+{% endmacro %}
+
+{# Shared by any picker that needs "an LLM provider actually configured in Settings, or none at
+   all" -- a subagent profile's own provider (subagents.html) and the chat panel's own provider
+   (chat_panel.html) are the two real call sites; moved here (was subagents.html-only) once chat
+   needed the identical picker instead of a second, near-duplicate copy. Context this expects on
+   the caller's render: configured_cloud_provider_ids/configured_local_provider_ids (main.py's
+   _provider_picker_context), the module-load-time Jinja globals provider_display_names/
+   codex_provider_id/codex_display_name/codex_signed_in/copilot_provider_id/copilot_display_name/
+   copilot_signed_in, plus custom_providers/all_provider_display_names (also from
+   _provider_picker_context). #}
+{% macro provider_options(selected) %}
+  <option value="" {% if not selected %}selected{% endif %}>(same as main agent)</option>
+  {% if configured_cloud_provider_ids %}
+    <optgroup label="Cloud">
+      {% for pid in configured_cloud_provider_ids %}
+        <option value="{{ pid }}" {% if pid == selected %}selected{% endif %}>{{ provider_display_names[pid] }}</option>
+      {% endfor %}
+    </optgroup>
+  {% endif %}
+  {% if configured_local_provider_ids %}
+    <optgroup label="Local">
+      {% for pid in configured_local_provider_ids %}
+        <option value="{{ pid }}" {% if pid == selected %}selected{% endif %}>{{ provider_display_names[pid] }}</option>
+      {% endfor %}
+    </optgroup>
+  {% endif %}
+  {% if codex_signed_in %}
+    <optgroup label="ChatGPT sign-in">
+      <option value="{{ codex_provider_id }}" {% if codex_provider_id == selected %}selected{% endif %}>{{ codex_display_name }}</option>
+    </optgroup>
+  {% endif %}
+  {% if copilot_signed_in %}
+    <optgroup label="GitHub Copilot sign-in">
+      <option value="{{ copilot_provider_id }}" {% if copilot_provider_id == selected %}selected{% endif %}>{{ copilot_display_name }}</option>
+    </optgroup>
+  {% endif %}
+  {% if custom_providers %}
+    <optgroup label="Custom">
+      {% for p in custom_providers %}
+        <option value="{{ p.id }}" {% if p.id == selected %}selected{% endif %}>{{ p.name }}</option>
+      {% endfor %}
+    </optgroup>
+  {% endif %}
+  {% set custom_provider_ids = custom_providers | map(attribute="id") | list %}
+  {% if selected and selected not in configured_cloud_provider_ids and selected not in configured_local_provider_ids and selected != codex_provider_id and selected != copilot_provider_id and selected not in custom_provider_ids %}
+    {# Saved provider lost its key (or lost its config entirely, or a custom instance was deleted)
+       since this was last chosen — kept as a fallback option so Save/Send can't silently swap it
+       out from under the operator. #}
+    <option value="{{ selected }}" selected>{{ all_provider_display_names.get(selected, selected) }} (no key set)</option>
+  {% endif %}
+{% endmacro %}
+
+{# selected_provider empty -> the single "(same as main agent)" placeholder (no model list makes
+   sense without a provider chosen first); model_choices is the caller's own pre-fetched list
+   (main.py's _model_choices_with_fallback) so the right options — and the saved model pre-selected
+   — render on first page load, before the provider dropdown's own hx-get
+   (/api/subagents/model-options, shared by every provider_options caller) ever fires. #}
+{% macro model_options(selected_provider, selected_model, model_choices) %}
+  {% if selected_provider %}
+    {% for model_id in model_choices %}
+      <option value="{{ model_id }}" {% if model_id == selected_model %}selected{% endif %}>{{ model_id }}</option>
+    {% endfor %}
+  {% else %}
+    <option value="">(same as main agent)</option>
+  {% endif %}
 {% endmacro %}

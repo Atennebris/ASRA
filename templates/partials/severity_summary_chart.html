@@ -1,0 +1,130 @@
+{# Severity donut+bars+flat list, shared between session_fragment.html's own Summary tab (one
+   session) and program.html's Findings tab (a whole target group's findings) -- extracted rather
+   than duplicated since the two are otherwise identical except for where the finding list comes
+   from and what a row click does. Caller sets these three variables with {% set %} before
+   including this file (Jinja include shares the caller's own scope, no macro call needed):
+     chart_findings        -- the list of findings to summarize.
+     chart_context_label   -- text for "N findings recorded against X" (a session's target, or a
+                               whole target group's).
+     chart_show_source_link -- false: row opens this session's own finding-detail dialog
+                               (asraOpenDialog('finding-dialog-N'), session_fragment.html's own
+                               per-finding <dialog>s). true: row links to
+                               /session/{{ finding._source_session_id }} instead -- program.html's
+                               aggregated findings carry no session-local dialog to open, only a
+                               real origin session to jump to (main.py's
+                               _aggregate_findings_for_sessions tags each with
+                               _source_session_id/_source_session_name/_source_session_created_at).
+
+   Deliberately excludes the richer Findings-tab filter-tile system (exploitation-scenario/
+   qualifying/false-positive chips, the full per-finding dialog) -- that system stays session-only,
+   see main.py's /program route docstring and the plan this came from for why. #}
+{% from "macros/ui.html" import badge, section_label %}
+{% set severity_order = ["Critical", "High", "Medium", "Low", "Info"] %}
+{% set total_findings = chart_findings | length %}
+{% set severity_counts = {} %}
+{% for sev in severity_order %}
+  {% set _ = severity_counts.update({sev: chart_findings | selectattr("severity", "equalto", sev) | list | length}) %}
+{% endfor %}
+{% set max_severity_count = severity_counts.values() | max %}
+
+<p class="text-sm text-secondary mb-4">
+  {{ total_findings }} finding{{ "s" if total_findings != 1 else "" }} recorded against
+  <strong class="text-primary break-words">{{ chart_context_label }}</strong>.
+  {% if severity_counts["Critical"] or severity_counts["High"] %}
+    {{ severity_counts["Critical"] + severity_counts["High"] }} of those are Critical/High severity — the ones worth reading first.
+  {% endif %}
+</p>
+
+{% if chart_findings %}
+  {# Click-to-filter, entirely CSS (radio + :has()) -- see themes.css's own comment on
+     .summary-filter for why this stays CSS-only rather than JS-driven. #}
+  <div class="summary-filter">
+    <input type="radio" id="sumfilter-all" name="summary-severity-filter" class="sr-only" checked>
+    {% for sev in severity_order %}
+      <input type="radio" id="sumfilter-{{ sev | lower }}" name="summary-severity-filter" class="sr-only">
+    {% endfor %}
+
+    <div class="bg-surface border border-default rounded-lg p-3 mb-4">
+      <div class="flex items-center justify-between mb-2">
+        {{ section_label("Findings by severity") }}
+        <label for="sumfilter-all" class="summary-clear-filter hidden text-[11px] text-accent hover:text-accent-hover cursor-pointer">Clear filter &times;</label>
+      </div>
+      <div class="flex flex-col sm:flex-row items-center gap-4">
+        <div class="relative w-28 h-28 shrink-0">
+          <svg viewBox="0 0 36 36" class="w-28 h-28 -rotate-90" aria-hidden="true">
+            <circle cx="18" cy="18" r="15.9155" fill="none" stroke="rgb(var(--border))" stroke-width="4"></circle>
+            {% set cum = namespace(value=0) %}
+            {% for sev in severity_order %}
+              {% set count = severity_counts[sev] %}
+              {% set pct = (count / total_findings * 100) if total_findings else 0 %}
+              {% if count > 0 %}
+                <circle class="summary-donut-seg" data-severity="{{ sev }}" data-summary-viz
+                        cx="18" cy="18" r="15.9155" fill="none" stroke-linecap="butt"
+                        stroke="rgb(var(--severity-{{ sev | lower }}, var(--severity-unknown)))" stroke-width="4"
+                        stroke-dasharray="{{ '%.3f' | format(pct) }} {{ '%.3f' | format(100 - pct) }}"
+                        stroke-dashoffset="{{ '%.3f' | format(-1 * cum.value) }}">
+                  <title>{{ sev }}: {{ count }} finding{{ "s" if count != 1 else "" }} ({{ pct | round(1) }}% of all findings)</title>
+                </circle>
+              {% endif %}
+              {% set cum.value = cum.value + pct %}
+            {% endfor %}
+          </svg>
+          <div class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <span class="text-lg font-semibold text-primary tabular-nums leading-none">{{ total_findings }}</span>
+            <span class="text-[9px] text-secondary uppercase tracking-wider">total</span>
+          </div>
+        </div>
+
+        <div class="flex-1 w-full space-y-2">
+          {% for sev in severity_order %}
+            {% set count = severity_counts[sev] %}
+            {% set pct = (count / total_findings * 100) if total_findings else 0 %}
+            <label for="sumfilter-{{ sev | lower }}" data-severity="{{ sev }}" data-summary-viz
+                   class="summary-bar-row flex items-center gap-2 cursor-pointer rounded px-1 -mx-1 py-0.5"
+                   title="{{ count }} {{ sev }} finding{{ 's' if count != 1 else '' }} — {{ pct | round(1) }}% of all findings. Click to filter the list below.">
+              <span class="w-16 shrink-0 text-[11px] text-secondary">{{ sev }}</span>
+              <div class="flex-1 h-4 bg-elevated rounded-full overflow-hidden">
+                {% if count > 0 %}
+                  <div class="h-full rounded-full bg-severity-{{ sev | lower }}" style="width: {{ (count / max_severity_count * 100) if max_severity_count else 0 }}%"></div>
+                {% endif %}
+              </div>
+              <span class="w-6 shrink-0 text-[11px] text-primary text-right tabular-nums">{{ count }}</span>
+            </label>
+          {% endfor %}
+          <div class="flex items-center gap-2 pl-[4.5rem] pr-8">
+            <div class="flex-1 flex justify-between text-[9px] text-secondary/70 tabular-nums">
+              <span>0</span><span>{{ (max_severity_count / 4) | round | int }}</span><span>{{ (max_severity_count / 2) | round | int }}</span><span>{{ (max_severity_count * 3 / 4) | round | int }}</span><span>{{ max_severity_count }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mb-4">
+      <ul class="space-y-1.5">
+        {% for finding in chart_findings %}
+          <li data-severity="{{ finding.severity }}" data-summary-finding>
+            {% if chart_show_source_link %}
+              <a href="/session/{{ finding._source_session_id }}"
+                 class="block w-full min-w-0 text-left bg-surface border border-default rounded-lg px-2.5 py-1.5 hover:border-accent/50 transition-colors">
+                <div class="flex items-center gap-2 min-w-0">
+                  {{ badge(finding.severity, severity=finding.severity, muted=finding.false_positive_reason) }}
+                  <strong class="text-[13px] break-words min-w-0 text-primary truncate">{{ finding.title }}</strong>
+                </div>
+                <p class="text-[11px] text-secondary mt-0.5 truncate">from session {{ finding._source_session_name }} ({{ finding._source_session_created_at | human_dt }}) &rarr;</p>
+              </a>
+            {% else %}
+              <button type="button" onclick="asraOpenDialog('finding-dialog-{{ loop.index0 }}')"
+                      class="w-full min-w-0 text-left bg-surface border border-default rounded-lg px-2.5 py-1.5 hover:border-accent/50 transition-colors cursor-pointer">
+                <div class="flex items-center gap-2 min-w-0">
+                  {{ badge(finding.severity, severity=finding.severity, muted=finding.false_positive_reason) }}
+                  <strong class="text-[13px] break-words min-w-0 text-primary truncate">{{ finding.title }}</strong>
+                </div>
+              </button>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+{% endif %}

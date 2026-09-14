@@ -1,11 +1,120 @@
-fastapi
-uvicorn[standard]
-jinja2
-pyyaml
-python-multipart
-python-dotenv
-openai
-httpx
-mmh3
-pytest
-ruff
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+jinja2==3.1.6
+pyyaml==6.0.3
+python-multipart==0.0.32
+python-dotenv==1.2.2
+openai==2.46.0
+httpx==0.28.1
+curl_cffi==0.16.0
+mmh3==5.2.1
+arjun==2.2.7
+markdown==3.10.3
+bleach==6.4.0
+pytest==9.1.1
+ruff==0.15.22
+fpdf2==2.8.7
+python-docx==1.2.0
+# >=12 floor, not just a bare "mitmproxy" like most deps above -- confirmed live: resolving the
+# WHOLE requirements.txt together (not mitmproxy alone), pip's resolver backtracks all the way to
+# ancient mitmproxy==6.0.2 to satisfy some other package's constraint chain, pulling in
+# zstandard==0.14.1 (its own pinned dep at that old version) -- which has no prebuilt wheel for
+# Python 3.12 and fails to build from source (old CPython C-API usage, Py_TYPE() not assignable on
+# 3.10+). The floor keeps the resolver in the modern release line, where it picks zstandard 0.25.0
+# (real cp312 wheel) instead.
+mitmproxy>=12
+# Pinned exact (not left floating like most of the above) -- setup_tools.sh's install_playwright()
+# greps this exact line to install the SAME version outside any venv before running
+# `playwright install --with-deps chromium`, so the downloaded browser build and the pip package
+# imported at runtime can never drift apart. Bump both together, never just one.
+playwright==1.61.0
+# Reverse Engineering mode (agent/tools/builders/slither.py, agent/tools/native.py's
+# disassemble_evm_bytecode, agent/tools/builders/semgrep.py) -- pip-installable, unlike
+# radare2/gdb/heimdall (system binaries, provisioned by setup_tools.sh instead).
+# slither-analyzer is DELIBERATELY NOT listed as a plain requirement here -- run.sh/run.bat install
+# it separately, `pip install --no-deps slither-analyzer==0.11.6`, right after this file. Real,
+# confirmed incident this fixes: slither-analyzer 0.11.6 declares eth-abi>=5.0.1; mythril (pinned
+# below) declares eth-abi<5.0.0,>=4.0.0 -- genuinely irreconcilable in one pip resolve
+# (ResolutionImpossible, confirmed live), even though slither-analyzer's OWN actual runtime code
+# works fine against the older eth-abi 4.2.1 mythril's own install already pulls in (confirmed live:
+# `slither --version` and a real `myth analyze` pass both succeed side by side in the exact same
+# venv) -- its declared floor is stricter than what it actually needs. --no-deps is what lets both
+# tools share that one already-proven-working eth-abi instead of pip refusing to install either.
+pyevmasm==0.2.3
+semgrep==1.173.0
+# Manages per-project Solidity compiler versions -- slither shells out to whichever solc version a
+# contract's pragma actually needs, solc-select is what makes that version available on PATH.
+solc-select==1.2.0
+# Symbolic-execution contract analysis (agent/tools/builders/mythril.py) -- pip-installable, unlike
+# the 5 other newest RE tools (upx/osv-scanner/trufflehog/apktool/jadx, all system binaries
+# provisioned by setup_tools.sh instead).
+# Like slither-analyzer above, mythril is DELIBERATELY NOT listed as a plain requirement here --
+# run.sh/run.bat install it separately, `pip install --no-deps mythril==0.24.8`, right after this
+# file. Real, confirmed incident this fixes: mythril's own transitive dependency chain pins several
+# packages to old, narrow floors (eth-abi<5.0.0, MarkupSafe<2.1.0, confirmed live -- there may be
+# more) that conflict with what the REST of this file (jinja2, slither-analyzer, ...) actually
+# needs, and/or have no working wheel for this Python version at all (MarkupSafe 1.0/1.1.x fail to
+# build: `ImportError: cannot import name 'Feature' from 'setuptools'`, ancient setup.py against a
+# modern setuptools). Any full resolve that includes mythril as a normal requirement makes pip
+# backtrack through EACH of these transitive packages' own entire release history hunting for a
+# version that satisfies mythril's stale floor -- confirmed live, each one either never converges
+# (a real, several-minutes-plus hang with zero output under run.sh's own former `pip -q`,
+# indistinguishable from a genuinely frozen install) or hits a hard ResolutionImpossible/build
+# failure. mythril's own actual runtime code works fine against the NEWER versions of these
+# packages the rest of this file already needs (confirmed live: `myth analyze -c <bytecode>`
+# succeeds end-to-end in the exact same venv jinja2/slither-analyzer/etc. are installed into) --
+# its declared floors are stricter than what it actually needs, same situation as slither-analyzer's
+# own eth-abi floor above. --no-deps is what lets mythril share the SAME already-proven-working
+# package set instead of pip trying (and failing) to downgrade half of them on its behalf.
+# mythril's own transitive dependency chain (py-evm's `eth` package) still does a bare
+# `import pkg_resources` at import time -- confirmed live: setuptools>=81 dropped pkg_resources
+# entirely, so mythril crashes with "ModuleNotFoundError: No module named 'pkg_resources'" the
+# moment it's actually run (`myth ...`), not at install time. This IS a real top-level pin (not
+# moved to the --no-deps step above) because it constrains the actual installed environment mythril
+# runs IN, not just how mythril itself gets installed.
+setuptools<81
+# Exploit-primitive/PoC scripting for RE mode's own custom_re_script tool (agent/tools/__init__.py
+# -- reuses custom_exploit_run's native_function) -- ROP chains, format-string exploits, heap
+# primitives, driving a local process. pip-installable, no system binary needed.
+pwntools==4.15.0
+# Dynamic instrumentation for RE mode (agent/tools/builders/frida.py) -- provides the `frida`,
+# `frida-ps`, `frida-trace` CLI commands this project's own builder shells out to. Needs a
+# frida-server binary running on the TARGET device for a remote (Android/iOS) attach -- irrelevant
+# for the common local-process case (spawn/attach on this same machine), which needs nothing extra.
+frida-tools==14.10.4
+# Packet crafting/parsing for RE mode's own custom_re_script tool -- the same custom-script escape
+# hatch pwntools above serves for exploit primitives, but for raw network protocol work (crafting a
+# custom TCP/UDP packet, parsing one field-by-field). tshark_capture/tshark_read_pcap
+# (agent/tools/builders/tshark.py) cover the common case with one clean tool call each; this is for
+# whatever falls outside that (a bespoke protocol scapy's own dissectors don't already know, live
+# packet injection). pip-installable, no system binary needed (unlike tshark itself, a real system
+# package -- see setup_tools.sh's install_tshark).
+scapy
+# Firmware/embedded-image analysis for RE mode (agent/tools/builders/binwalk.py) is NOT listed
+# here -- confirmed live: PyPI's own "binwalk" package (2.1.0) is genuinely broken, missing its own
+# binwalk.core submodule entirely (ModuleNotFoundError the instant the CLI script runs), a known
+# packaging gap in the upstream project, not something a version pin fixes. Installed as a real
+# system binary via apt instead (setup_tools.sh's install_binwalk), which packages it correctly.
+# Public-Suffix-List-aware apex/registrable-domain extraction (agent/tools/allowed_targets.py's
+# authorize_exploit_targets) -- a naive "last two labels" split gets multi-label TLDs like .co.uk/
+# .com.au wrong. Used with suffix_list_urls=() (bundled offline PSL snapshot, no live network
+# fetch) so this never adds a surprise first-call network dependency to an exploitation-scope
+# decision.
+tldextract==5.3.2
+# Library-knowledge source normalization (agent/tools/library_store.py's normalize_source) --
+# turns an uploaded PDF into plain text (page-by-page, so [page N] markers can be stamped in for
+# later citation) before it ever reaches an LLM extraction call. Pure-Python, no system binary.
+pypdf==6.16.2
+# Same normalization step for uploaded .epub sources -- reads the book's own spine (its real
+# reading order) rather than just concatenating every file in the archive in whatever order zip
+# happens to list them.
+ebooklib==0.20
+# ebooklib hands back each spine document as raw XHTML -- this strips the markup down to plain
+# text for the same normalize_source step above. Not pulled in as anyone else's transitive dep
+# already (checked), so pinned here directly.
+beautifulsoup4==4.15.0
+# Fleet mode's dynamic concurrency cap (agent/tools/fleet_store.py) -- real CPU/RAM readings to
+# throttle how many queued sessions auto-start under real host load. Already present transitively
+# (confirmed importable before this was added), pinned directly now that it's a real import, not an
+# incidental transitive dependency this project happens to benefit from.
+psutil==7.2.2

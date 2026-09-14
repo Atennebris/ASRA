@@ -1,0 +1,47 @@
+{# /resume's own picker content (main.py's get_chat_threads_route) -- fetched into
+   #chat-thread-picker-content (chat_panel.html) and shown via .showModal() only once the fetch
+   actually succeeds. Lives inside a <dialog> that's a sibling of #chat-panel, never inside
+   #chat-stream's own SSE/morph subtree, so a live push can never interfere with it while open. #}
+<h3 class="text-sm font-semibold text-primary mb-3">Chat history</h3>
+{% if threads %}
+  <div class="space-y-1 max-h-80 overflow-y-auto asra-scroll">
+    {% for thread in threads %}
+      <div class="flex items-center gap-1">
+        {# Dialog used to wait for switch-thread's own response (hx-on::after-request) before
+           closing -- same "nothing visibly happens until the round trip resolves" gap
+           chat_thread_tabs.html had. The button's onclick below closes it synchronously on click,
+           same frame, before htmx even dispatches the request; #chat-stream's own morph swap still
+           lands whenever the response actually arrives, since the dialog stays in the DOM (just
+           hidden) and isn't part of that swap's target. #}
+        <form class="flex-1 min-w-0" hx-post="/api/session/{{ session_id }}/chat/switch-thread" hx-target="#chat-stream" hx-swap="morph:innerHTML">
+          <input type="hidden" name="thread_id" value="{{ thread.id }}">
+          <button type="submit" onclick="document.getElementById('chat-thread-picker').close()"
+                  class="w-full text-left px-3 py-2 rounded text-[12px] hover:bg-elevated transition-colors {{ 'bg-accent/10 text-accent' if thread.id == active_thread_id else 'text-primary' }}">
+            <span class="block font-medium truncate">{{ thread.title }}{{ ' (current)' if thread.id == active_thread_id else '' }}</span>
+            <span class="block text-[10px] text-secondary mt-0.5">{{ thread.updated_at | human_dt }} &middot; {{ thread.messages | length }} message{{ 's' if thread.messages | length != 1 else '' }}</span>
+          </button>
+        </form>
+        {# hx-confirm's own text is intercepted by confirm_dialog.js's global htmx:confirm hook,
+           replacing the raw browser confirm() with this app's own styled dialog -- same mechanism
+           the Stop-session button already uses, not a bespoke confirmation path just for this. #}
+        <form hx-post="/api/session/{{ session_id }}/chat/delete-thread" hx-target="#chat-thread-picker-content" hx-swap="innerHTML"
+              hx-confirm="Delete '{{ thread.title }}'? This can't be undone."
+              data-confirm-checkbox-key="chat-delete-thread">
+          <input type="hidden" name="thread_id" value="{{ thread.id }}">
+          <button type="submit" title="Delete this chat" aria-label="Delete this chat"
+                  class="shrink-0 p-2 rounded text-secondary hover:bg-severity-high/10 hover:text-severity-high transition-colors">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </button>
+        </form>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="text-[11px] text-secondary">No chat history yet.</p>
+{% endif %}
+<div class="flex justify-end mt-3">
+  <button type="button" onclick="document.getElementById('chat-thread-picker').close()"
+          class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">Close</button>
+</div>

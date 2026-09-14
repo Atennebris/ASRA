@@ -1,0 +1,46 @@
+{# Quick Chat's own #chat-subagents-btn dialog content (chat_panel.html, mode == "standalone"
+   only), fetched fresh into #chat-subagents-picker-content on every open, same "no need for its
+   own SSE connection, only ever open a few seconds" reasoning as chat_thread_picker.html. Narrows
+   session["enabled_subagent_ids"] on Quick Chat's own real, lazily-created session -- the same
+   field a real project's New Project form sets once at creation
+   (partials/new_project_form.html's subagent_project_checklist()) and never needs to touch again,
+   since that project already made its choice up front. Quick Chat has no New Project form of its
+   own at all, so this dialog is the ONLY place it can ever be set -- real, explicit operator ask
+   that this live inside the chat itself (which subagents exist/are enabled changes day to day:
+   added, renamed, deleted, re-enabled), not buried in Settings only an operator would think to
+   visit occasionally. The backing route (main.py's save_session_enabled_subagents) is a plain,
+   session-id-generic endpoint -- nothing here is Quick-Chat-specific at the data layer, only this
+   ONE button's own visibility condition is. Every checkbox defaults to CHECKED when
+   session.enabled_subagent_ids is None (no restriction yet) -- same "unrestricted by default"
+   contract as agent/tools/subagent_store.py's get_enabled_profiles(allowed_ids=None). #}
+{% from "macros/ui.html" import toggle_switch %}
+<h3 class="text-sm font-semibold text-primary mb-2">Subagents for Quick Chat</h3>
+<p class="text-[11px] text-secondary mb-3">
+  Every enabled Subagent is available here by default — uncheck any Quick Chat shouldn't be
+  able to delegate to. Saved instantly. A real project's own subagents are picked separately, once,
+  when that project is created — this only ever affects Quick Chat. Manage the full list on the
+  <a href="/subagents" class="text-accent hover:underline">Subagents tab</a>.
+</p>
+{% if enabled_subagents %}
+  <div data-chat-subagents-checklist>
+    <div class="border border-default rounded-lg overflow-hidden bg-elevated/30">
+      <div class="p-1.5 grid grid-cols-1 gap-x-3 gap-y-0.5 max-h-72 overflow-y-auto asra-scroll">
+        {% set current_ids = session.enabled_subagent_ids %}
+        {% for profile in enabled_subagents %}
+          <label class="flex items-center gap-2.5 rounded-md px-2 py-1.5 cursor-pointer hover:bg-overlay transition-colors">
+            {{ toggle_switch("enabled_subagent_ids", value=profile.id,
+                checked=(current_ids is none or profile.id in current_ids),
+                extra_attrs='hx-post="/api/session/' ~ session.session_id ~ '/enabled-subagents" hx-trigger="change" hx-swap="none" hx-include="closest [data-chat-subagents-checklist]"') }}
+            <span class="min-w-0 truncate text-[12px] text-primary">{{ profile.name }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+{% else %}
+  <p class="text-[11px] text-secondary">No Subagent profile is enabled yet — configure one on the Subagents tab.</p>
+{% endif %}
+<div class="flex justify-end mt-3">
+  <button type="button" onclick="document.getElementById('chat-subagents-picker').close()"
+          class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">Close</button>
+</div>

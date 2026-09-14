@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-backend"
+description = "Enables the launch_backend command without any pre-configured scope."
+commands.allow = ["launch_backend"]
+
+[[permission]]
+identifier = "deny-launch-backend"
+description = "Denies the launch_backend command without any pre-configured scope."
+commands.deny = ["launch_backend"]

@@ -1,68 +1,1494 @@
 {# Shared by index.html (direct nav to "/", e.g. no-JS/back-button) and the New Project dialog in
    base.html (the normal path, opened from the sidebar) — one form, not two copies to keep in
-   sync. error/target/name are per-request and default to falsy/empty when a route doesn't pass
-   them. LLM provider/model + max iterations live in Settings/nowhere respectively now — see
-   settings.html and agent/core.py's docstring (no session-wide call cap anymore).
+   sync. error/target/name (and every other *-prefilled field below) are per-request and default
+   to falsy/empty when a route doesn't pass them. LLM provider/model + max iterations live in
+   Settings/nowhere respectively now — see settings.html and agent/core.py's docstring (no
+   session-wide call cap anymore).
    Imports its own macros rather than relying on the includer having already imported them —
-   {% include %} context-sharing for macro names is real in Jinja but not worth depending on. #}
-{% from "macros/ui.html" import button, input_field %}
-{% if error %}
-  <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ error }}</p>
-{% endif %}
+   {% include %} context-sharing for macro names is real in Jinja but not worth depending on.
 
-<form method="post" action="/api/scan" class="bg-surface border border-default rounded-lg p-4 space-y-4">
+   The whole template's own content lives inside one id="new-project-form-container" wrapper (right
+   below) -- the single swap target both wizard buttons below target (hx-swap="outerHTML"), and the
+   only reason main.py's wizard routes can re-render this exact partial (with prefilled field
+   values) back into either host page (base.html's dialog, or index.html's own inline copy on a
+   validation-error redisplay) without needing two different swap targets for the two call sites. #}
+{% from "macros/ui.html" import button, input_field, disclosure_summary, toggle_switch %}
+{% from "macros/project_icons.html" import icon_picker %}
+{# Per-project Subagent access -- narrows which of the globally-ENABLED subagent profiles
+   (agent/tools/subagent_store.py, configured on the Subagents tab) THIS project's main
+   agent/chat can actually see/delegate to. Shared verbatim by all three modes below (Agent,
+   Interactive, Reverse Engineering) -- every one of them can delegate to a Subagent at run time
+   (agent/core.py's _subagent_delegation_extras for Agent-mode phases, agent/chat.py's
+   _chat_tool_specs for every mode's own chat sidebar, including this same session's Interactive/
+   RE console), so all three need the identical picker, not just the Agent-mode form that
+   happened to have the read-only version first.
+
+   Every checkbox below defaults to CHECKED (every currently-enabled profile) so the common
+   posture -- keep every subagent on globally, never think about this per project -- takes zero
+   clicks; unchecking one here only narrows access for THIS project, it never touches the
+   Subagents tab's own global enable/disable switch. main.py's own _resolve_enabled_subagent_ids
+   stores no restriction at all (None) when every box is left checked, so a profile enabled
+   globally AFTER this project was created still shows up automatically -- only an actual
+   narrowing gets written down (sessions/store.py's create_session, session
+   ["enabled_subagent_ids"]). get_enabled_subagent_profiles is a callable Jinja global (main.py)
+   rather than passed in by each route, since this form is {% include %}'d into base.html's own
+   always-present modal, reachable from every page. #}
+{% macro subagent_project_checklist() %}
+  {% set enabled_subagents = get_enabled_subagent_profiles() %}
+  <div class="block text-left">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Subagents for this project</span>
+    {% if enabled_subagents %}
+      <p class="text-[11px] text-secondary mb-2">
+        {{ enabled_subagents | length }} subagent{{ "s" if enabled_subagents | length != 1 else "" }}
+        enabled globally, available to this project by default — uncheck any the agent shouldn't
+        be able to delegate to here. Manage the full list on the
+        <a href="/subagents" class="text-accent hover:underline">Subagents tab</a>.
+      </p>
+      <div class="border border-default rounded-lg overflow-hidden bg-elevated/30">
+        <div class="p-1.5 grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-0.5">
+          {% for profile in enabled_subagents %}
+            <label class="flex items-center gap-2.5 rounded-md px-2 py-1.5 cursor-pointer hover:bg-overlay transition-colors">
+              {{ toggle_switch("enabled_subagent_ids", value=profile.id, checked=true) }}
+              <span class="min-w-0 truncate text-[12px] text-primary">{{ profile.name }}</span>
+              <span class="text-[10.5px] text-secondary shrink-0">{{ profile.allowed_tools | length }} tool{{ "s" if profile.allowed_tools | length != 1 else "" }}</span>
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+    {% else %}
+      <p class="text-[11px] text-secondary">No subagents enabled — the agent works alone. Configure one on the Subagents tab.</p>
+    {% endif %}
+  </div>
+{% endmacro %}
+{# Two-step wizard: step 1 picks the working mode, step 2 reveals only that mode's fields.
+   selected_mode / start_revealed are computed server-side so a re-render after a validation error
+   or a wizard import (main.py's start_scan / start_interactive / _wizard_form_response) lands the
+   operator back on the fields step with the right mode already chosen, instead of the mode picker.
+   A plain fresh open (base.html's dialog, index route) has none of these set -> step 1, nothing
+   pre-selected. #}
+{% set selected_mode = {"interactive": "interactive", "reverse_engineering": "reverse_engineering"}.get(active_tab, "agent") %}
+{% set start_revealed = active_tab or error or wizard_url or target or qualifying_vulnerabilities or non_qualifying_vulnerabilities or custom_instructions or goal or custom_user_agent or custom_headers %}
+<div id="new-project-form-container" data-np-step="{{ 'fields' if start_revealed else 'mode' }}" data-np-mode="{{ selected_mode }}">
+
+{# Popular reference User-Agents for the dropdown below -- a handful of current, real desktop/
+   mobile browser strings, not a maintained/pinned live feed. They're only ever a convenient
+   starting point the operator can still hand-edit afterward (same as "Insert my browser's UA"
+   below), not a promise of always matching this exact moment's latest browser release. #}
+{% set popular_user_agents = [
+  ("Chrome — Windows", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+  ("Chrome — macOS", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+  ("Firefox — Windows", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"),
+  ("Edge — Windows", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"),
+  ("Safari — macOS", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"),
+  ("Chrome — Android", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"),
+  ("Safari — iOS", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"),
+] %}
+<div class="np-wizard">
+  {# These carry the chosen mode across step 2 AND across a server re-render (checked state is
+     rendered from selected_mode above). Unchecked on a fresh open so step 1 starts with no
+     pre-selection -- the operator must actually pick before Continue enables (JS below). #}
+  <input type="radio" name="np-mode" id="np-mode-agent" class="sr-only" {% if start_revealed and selected_mode == "agent" %}checked{% endif %}>
+  <input type="radio" name="np-mode" id="np-mode-interactive" class="sr-only" {% if start_revealed and selected_mode == "interactive" %}checked{% endif %}>
+  <input type="radio" name="np-mode" id="np-mode-re" class="sr-only" {% if start_revealed and selected_mode == "reverse_engineering" %}checked{% endif %}>
+
+  {% if error %}
+    <p class="mb-4 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ error }}</p>
+  {% endif %}
+
+  {# ---- STEP 1 · pick the working posture ---- #}
+  <section class="np-step np-step-mode">
+    <p class="np-eyebrow">Step 01 · Select mode</p>
+    <h2 class="np-step-title">How do you want to work?</h2>
+    <p class="np-step-lead">Pick a posture for this engagement. You can set everything else on the next step.</p>
+
+    <div class="np-mode-grid">
+      <label for="np-mode-agent" class="np-mode-card">
+        <span class="np-mode-tick">
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        {# Glyph: one origin fanning out to many targets -- an autonomous sweep across the scope. #}
+        <svg class="np-mode-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="4" cy="12" r="2"/>
+          <path d="M6 12h4M10 12l6-6M10 12l6 0M10 12l6 6" stroke-linecap="round"/>
+          <circle cx="18" cy="6" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/><circle cx="18" cy="18" r="1.6"/>
+        </svg>
+        <span class="np-mode-name">Agent</span>
+        <span class="np-mode-desc">Full autonomous run — recon, analysis, and exploitation across the whole scope, hands-off.</span>
+        <span class="np-mode-tags">
+          <span class="np-mode-tag">Recon</span><span class="np-mode-tag">Analyze</span><span class="np-mode-tag">Exploit</span>
+        </span>
+      </label>
+
+      <label for="np-mode-interactive" class="np-mode-card">
+        <span class="np-mode-tick">
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        {# Glyph: a crosshair on a single point -- one target, pinpoint work. #}
+        <svg class="np-mode-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="7"/>
+          <path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+        </svg>
+        <span class="np-mode-name">Interactive</span>
+        <span class="np-mode-desc">Chat-only console — name the target and task in chat, do fast pinpoint actions, no full scan.</span>
+        <span class="np-mode-tags">
+          <span class="np-mode-tag">Chat</span><span class="np-mode-tag">Pinpoint</span><span class="np-mode-tag">Subagents</span>
+        </span>
+      </label>
+
+      <label for="np-mode-re" class="np-mode-card">
+        <span class="np-mode-tick">
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        {# Glyph: a chip/circuit outline -- static analysis of a local binary/contract/source tree. #}
+        <svg class="np-mode-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="7" y="7" width="10" height="10" rx="1"/>
+          <path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4" stroke-linecap="round"/>
+        </svg>
+        <span class="np-mode-name">Reverse Engineering</span>
+        <span class="np-mode-desc">A short automatic baseline pass over a local binary, smart contract, or source repo, then a chat panel to dig deeper.</span>
+        <span class="np-mode-tags">
+          <span class="np-mode-tag">Binaries</span><span class="np-mode-tag">Contracts</span><span class="np-mode-tag">SAST</span>
+        </span>
+      </label>
+    </div>
+
+    <div class="np-step-actions">
+      <button type="button" class="np-continue-btn" disabled>
+        Continue
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </section>
+
+  {# ---- STEP 2 · the chosen mode's fields ---- #}
+  <section class="np-step np-step-fields">
+    <div class="np-step-head">
+      <button type="button" class="np-back-btn">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M11 6l-6 6 6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Change mode
+      </button>
+      <p class="np-eyebrow">Step 02 · <span class="np-mode-label-agent">Agent mode</span><span class="np-mode-label-interactive">Interactive mode</span><span class="np-mode-label-re">Reverse Engineering mode</span></p>
+    </div>
+
+  <div class="np-panel np-panel-agent">
+
+{# Not inside the real <form> below on purpose -- these two buttons each hit their OWN endpoint
+   (agent/tools/bugbounty_import.py's analyze_bugbounty_program/prepare_target_only via main.py),
+   never /api/scan directly, and hx-include="#wizard-url" pulls this input's value into each
+   request regardless of it living outside that <form>. Both responses re-render this entire
+   partial (prefilled) and swap the #new-project-form-container wrapper above -- so a successful
+   import lands back here with the SAME wizard bar still on screen, not just the fields below it. #}
+<div class="bg-surface border border-default rounded-lg p-4 mb-4 space-y-2.5">
+  <div>
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Import from a link (optional)</span>
+    <p class="text-[11px] text-secondary mb-2">
+      Paste a bug-bounty program page (HackerOne/Bugcrowd/YesWeHack/...) to have the agent read its
+      scope table and rules and fill the fields below — or paste a specific web app's own URL to
+      pentest that exact link directly, no program page involved.
+    </p>
+    {# get_provider(None, None) (agent/llm_client.py) is what both wizard routes actually call --
+       the operator's own Settings -> LLM Provider choice (data/llm_settings.json), the EXACT same
+       provider/model Recon/Analyze/Exploit already run on, never the Chat panel's own separately
+       pickable provider. Stated explicitly here since a program-page read + one LLM extraction
+       call is real usage against whatever that provider's own quota/credits are. #}
+    <p class="text-[11px] text-secondary mb-2">
+      Uses the main agent's own LLM provider (<a href="/settings" class="text-accent hover:underline">Settings → LLM Provider</a>) —
+      make sure that provider has working credits/quota before clicking either button below.
+    </p>
+    <input type="text" id="wizard-url" name="url" value="{{ wizard_url }}" autocomplete="off"
+           placeholder="https://hackerone.com/your-program or https://app.example.com"
+           class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+  </div>
+  <div class="flex flex-wrap gap-2">
+    <button type="button" hx-post="/api/scan/wizard/import-program" hx-include="#wizard-url"
+            hx-target="#new-project-form-container" hx-swap="outerHTML" hx-disabled-elt="this"
+            hx-on::before-request="this.querySelector('.wizard-btn-label').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[13px]">
+      <span class="wizard-btn-label">Study program page &amp; fill fields</span>
+      <span class="asra-spinner hidden"></span>
+    </button>
+    <button type="button" hx-post="/api/scan/wizard/target-only" hx-include="#wizard-url"
+            hx-target="#new-project-form-container" hx-swap="outerHTML" hx-disabled-elt="this"
+            hx-on::before-request="this.querySelector('.wizard-btn-label').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[13px]">
+      <span class="wizard-btn-label">Use this link as the target</span>
+      <span class="asra-spinner hidden"></span>
+    </button>
+    {# HackerOne/Bugcrowd/YesWeHack (agent/tools/bugbounty_import.py's check_disclosed_reports,
+       _disclosed_reports_feed_url) -- informational only, swaps its OWN small container below,
+       never the form fields above (this doesn't fill in scope/rules, it just shows an LLM-
+       summarized list of what's already publicly disclosed for this program so the operator can
+       sanity-check for a known duplicate before even creating the project). #}
+    <button type="button" hx-post="/api/scan/wizard/check-disclosed-reports" hx-include="#wizard-url"
+            hx-target="#disclosed-reports-result" hx-swap="innerHTML" hx-disabled-elt="this"
+            hx-on::before-request="this.querySelector('.wizard-btn-label').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[13px]">
+      <span class="wizard-btn-label">Check disclosed reports</span>
+      <span class="asra-spinner hidden"></span>
+    </button>
+  </div>
+  <div id="disclosed-reports-result"></div>
+</div>
+
+{# hx-post/hx-target/hx-swap are the progressive enhancement; method/action stay as a real
+   fallback for no-JS/back-button (index.html's own docstring on why that path still exists).
+   Without the htmx attributes, a validation error (start_scan's 400 path) submitted from INSIDE
+   the New Project dialog used to navigate the whole browser tab away to a bare /api/scan page —
+   closing the dialog and re-showing this same form inline on a fresh index.html render instead of
+   the error appearing where the operator was actually looking. hx-target/hx-swap keep the
+   response inside this exact container (the one the error banner above already lives in) so a
+   validation error redisplays in place, dialog still open; start_scan's own HX-Request branch
+   returns just this partial (not the full index.html) and, on success, an HX-Redirect header
+   instead of a native 303 so htmx still does a real navigation to the new session page. #}
+<form method="post" action="/api/scan" hx-post="/api/scan" hx-target="#new-project-form-container"
+      hx-swap="outerHTML" hx-disabled-elt="this" class="bg-surface border border-default rounded-lg p-4 space-y-4">
   {{ input_field("name", "Project name", value=name, placeholder="Acme Corp — External Pentest", required=true) }}
+
+  {{ icon_picker(selected_icon=icon|default(''), selected_color=icon_color|default(''), id_prefix="agent-") }}
 
   <label class="block">
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Target(s)</span>
     <input type="text" name="target" value="{{ target }}" required autocomplete="off"
-           class="target-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+           class="chip-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
            placeholder="example.com">
     <span class="block text-[11px] text-secondary mt-1">URL, domain, host, IPv4, or IPv6. Multiple targets (a scope)? Separate with a comma, e.g.
       <code class="text-[10px]">example.com, 10.0.0.5, https://app.example.com, [2001:db8::1]</code></span>
-    <div class="target-chips flex flex-wrap gap-1.5 mt-2"></div>
+    <span class="block text-[11px] text-secondary mt-1">A whole address pool? A CIDR block
+      (<code class="text-[10px]">10.0.0.0/24</code>) or an explicit range
+      (<code class="text-[10px]">192.168.1.1 - 192.168.1.254</code>) both work — every real IP
+      inside is treated as in scope.</span>
+    <span class="block text-[11px] text-secondary mt-1">Bug-bounty-style wildcard scope? Write an entry as
+      <code class="text-[10px]">*.example.com</code> to mean the whole subdomain tree — or just check
+      "Enumerate subdomains" below to apply that to every target above without typing it per entry.</span>
+    <span class="block text-[11px] text-secondary mt-1">One domain, many TLDs? Write
+      <code class="text-[10px]">example.(com|de|fr)</code> — the parenthesized, pipe-separated
+      alternatives expand automatically into one target per option (shown below as it's typed), no
+      need to type each one out by hand.</span>
+    <div class="chip-output flex flex-wrap gap-1.5 mt-2"></div>
   </label>
 
-  <label class="flex items-start gap-2.5 px-3 py-2.5 rounded border border-default bg-elevated cursor-pointer">
-    <input type="checkbox" name="authorize_exploit" value="on" class="mt-0.5 accent-accent" checked>
+  {# Optional -- session["program_url"] (sessions/store.py's create_session), blank by default,
+     meaning no program association at all. Prefilled by the wizard bar's own "Study program page"
+     button above (wizard_import_program sets program_url = the page it just read, main.py's
+     _wizard_form_response) but freely editable/clearable here regardless -- also stays editable
+     after creation via the Overview tab's own "Program URL" field (main.py's update_program_url).
+     "Use this link as the target" leaves this blank on purpose (that URL is the pentest target,
+     not a program page). #}
+  {{ input_field("program_url", "Program URL (optional)", value=program_url|default(''), placeholder="https://hackerone.com/your-program") }}
+  <p class="text-[11px] text-secondary -mt-3">Link to this project's bug-bounty/VDP program page, if any — the agent can browse it and check its Hacktivity feed for likely duplicates on its own.</p>
+
+  {# Optional, off by default (blank -> session["out_of_scope"]/["out_of_scope_notes"] both [] ->
+     no exclusion, agent scans exactly as it always has). Each comma-separated entry is checked on
+     its own: one that parses as a host/domain/URL/"*.domain" wildcard (same syntax as Target(s)
+     above) becomes a deterministic exclusion, enforced before every real tool call regardless of
+     what the model does — see agent/core.py's _out_of_scope_target/_run_tool_with_retry and
+     agent/tools/allowed_targets.py's is_target_out_of_scope. An entry that doesn't parse that way
+     — a real scope-table phrase like "All domains or subdomains not listed in the above list of
+     Scopes" is common in the wild, not hypothetical — falls back to a plain-language note shown
+     to the model instead (session["out_of_scope_notes"], agent/core.py's
+     _out_of_scope_notes_task_addendum): the model applies it itself, the same trust level as
+     Custom instructions below, since there's no way to pattern-match free English against a live
+     tool-call target. #}
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Out of scope (optional)</span>
+    <input type="text" name="out_of_scope" value="{{ out_of_scope }}" autocomplete="off"
+           class="chip-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+           placeholder="staging.example.com, *.internal.example.com, All domains or subdomains not listed above">
+    <span class="block text-[11px] text-secondary mt-1">Hosts/domains explicitly excluded from this engagement — same
+      comma-separated syntax as Target(s) above, wildcards included; a matching tool call is skipped automatically.
+      A qualifying phrase instead of a concrete host (e.g. "all domains not listed in the Scopes table") also works —
+      it's shown to the agent as an instruction to apply itself rather than enforced automatically.</span>
+    <div class="chip-output flex flex-wrap gap-1.5 mt-2"></div>
+  </label>
+
+  <label class="flex items-center gap-2.5 px-3 py-2.5 rounded border border-default bg-elevated cursor-pointer">
+    {{ toggle_switch("authorize_exploit", checked=true) }}
     <span class="text-sm">
       <span class="block text-primary">Authorize exploitation</span>
       <span class="block text-[11px] text-secondary mt-0.5">Allows Metasploit/sqlmap against every target above. Recon always runs either way. Uncheck for recon/detection only.</span>
     </span>
   </label>
 
-  {{ button("Start scan", variant="primary", type="submit") }}
+  <label class="flex items-center gap-2.5 px-3 py-2.5 rounded border border-default bg-elevated cursor-pointer">
+    {{ toggle_switch("enumerate_subdomains") }}
+    <span class="text-sm">
+      <span class="block text-primary">Enumerate subdomains</span>
+      <span class="block text-[11px] text-secondary mt-0.5">Off by default — recon stays limited to exactly
+        what's typed above. Check this to actively search for subdomains of every target above (same effect
+        as writing each one as *.example.com, just applied to the whole scope at once) and scan whatever
+        turns up too.</span>
+    </span>
+  </label>
+
+  {# Optional wall-clock work budget (sessions/store.py's create_session, time_budget_seconds) --
+     None (the "No limit" default) is byte-for-byte the existing, unlimited behavior: the pipeline
+     runs once and stops the moment it's genuinely done. Set it and agent/core.py's run_session
+     keeps looping additional full passes (each one re-verifying this pass's own findings and
+     digging for more) for as long as real time remains, instead of stopping at the first natural
+     completion -- session_fragment.html's own "Add more time" control extends it later if this
+     runs out before the operator is ready to stop. Computed server-side (main.py's start_scan) from
+     whichever of these two fields is actually filled in -- the JS below only toggles which one is
+     VISIBLE, never computes the final value itself, so the plain no-JS form fallback still works. #}
+  <div>
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Time budget (optional)</span>
+    <select name="time_budget_preset" onchange="document.getElementById('time-budget-custom-row').classList.toggle('hidden', this.value !== 'custom')"
+            class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      <option value="">No limit — stop as soon as the scan is genuinely done</option>
+      <option value="1800">30 minutes</option>
+      <option value="3600">1 hour</option>
+      <option value="7200">2 hours</option>
+      <option value="14400">4 hours</option>
+      <option value="28800">8 hours</option>
+      <option value="custom">Custom…</option>
+    </select>
+    <div id="time-budget-custom-row" class="hidden mt-2">
+      <input type="number" name="time_budget_custom_minutes" min="1" step="1" placeholder="Minutes"
+             class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    </div>
+    <span class="block text-[11px] text-secondary mt-1">With a budget set, the agent keeps working the full duration even after an early success — deepening confirmed footholds, chaining further, and hunting for additional distinct vulnerabilities — instead of stopping the moment the first pass finishes. It's also a real ceiling, checked continuously while the scan runs, not just between passes: the session pauses at the next safe checkpoint once the budget genuinely runs out, even mid-pass — the Overview tab can then add more time, drop the limit and keep going, or stop the timer without stopping the scan.</span>
+  </div>
+
+  {# Optional, off by default (blank -> session["goal"] "" -> agent behaves exactly as it always
+     has). Distinct from "target": target is WHERE to look (a host/URL), this is WHAT the operator
+     is actually trying to achieve there -- an aspiration to prioritize toward ("deepen an existing
+     foothold", "reach the admin panel", "full compromise"), not a scanning rule or constraint (see
+     Custom instructions below for those). Read by agent/core.py's _goal_task_addendum and appended
+     at every phase that already reads custom_instructions, so it genuinely shapes prioritization
+     throughout the whole engagement, not just a label shown in the UI. #}
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Goal for this engagement (optional)</span>
+    <input type="text" name="goal" value="{{ goal }}" placeholder="e.g. reach the admin panel, deepen an existing foothold, full compromise..."
+           class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    <span class="block text-[11px] text-secondary mt-1">What you're actually trying to achieve, not just where to look — left blank, the agent prioritizes entirely at its own discretion, same as today.</span>
+  </label>
+
+  {# Optional, off by default (both blank -> session["scope_rules"] both "" -> agent scans exactly
+     as it always has, no extra constraint). Real bug-bounty program scope-table language: most
+     programs publish which vulnerability CLASSES they actually pay for ("Qualifying") vs. which
+     they explicitly exclude ("Non-qualifying", e.g. missing security headers, clickjacking without
+     real impact, self-XSS, rate limiting). Read by agent/core.py's _scope_rules_task_addendum and
+     acted on by the model via record_finding's qualifies_for_bounty field (agent/tools/native.py)
+     — not decorative, this actually steers what Analyze prioritizes and what Exploit works first. #}
+  <details class="group rounded border border-default bg-elevated" {% if qualifying_vulnerabilities or non_qualifying_vulnerabilities %}open{% endif %}>
+    {{ disclosure_summary("Bug-bounty scope rules (optional) — Qualifying / Non-qualifying vulnerabilities") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        Paste this program's own scope-table language, if it has one. Left blank, the agent scans
+        entirely at its own discretion, same as today. Filled in, it prioritizes finding Qualifying
+        classes and flags confirmed matches in the session's own Summary tab, included in Export.
+      </p>
+      <label class="block">
+        <div class="flex items-center justify-between gap-2 mb-1">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary">Qualifying vulnerabilities</span>
+          {{ button("Everything else qualifies too", variant="secondary", size="sm", extra_classes="qualifying-catch-all-btn", type="button") }}
+        </div>
+        <textarea name="qualifying_vulnerabilities" rows="3" placeholder="e.g. RCE, SQLi, auth bypass, IDOR/broken access control, SSRF, stored XSS with real impact..."
+                  class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ qualifying_vulnerabilities }}</textarea>
+        <span class="block text-[11px] text-secondary mt-1">"Everything else qualifies too" appends a standing rule to this field: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
+      </label>
+      <label class="block">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Non-qualifying vulnerabilities</span>
+        <textarea name="non_qualifying_vulnerabilities" rows="3" placeholder="e.g. missing security headers, clickjacking with no real impact, self-XSS, rate limiting, version disclosure..."
+                  class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ non_qualifying_vulnerabilities }}</textarea>
+      </label>
+    </div>
+  </details>
+
+  {# Optional, off by default (blank -> no pre-seeded hypotheses -> agent behaves exactly as it
+     always has). Each non-blank line becomes its own session["hypotheses"] entry (source="user",
+     source_phase="pre_scan", status="unconfirmed") — agent/core.py:create_session (sessions/store.py).
+     Distinct from custom_instructions below: this isn't a scanning RULE, it's a concrete SUSPICION
+     ("I think X might be there") that the session-completion gate (_run_hypothesis_resolution_gate)
+     deterministically requires the agent to confirm or rule out with a real check before the scan
+     is considered done — not just a soft nudge it can silently ignore. Visible and extendable live
+     during/after the scan too, on the session's own Hypotheses tab. #}
+  <details class="group rounded border border-default bg-elevated">
+    {{ disclosure_summary("Hypotheses to check (optional) — things you suspect might be there") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        One suspicion per line — a lead you already have (an old endpoint, a known-weak component,
+        "the staging subdomain probably has debug mode on"). The agent must confirm or rule out
+        every one with a real check before the scan is considered finished, not just mention it in
+        passing. Left blank, nothing changes. You can add more of these later too, on the session's
+        own Hypotheses tab — while it's still running, or even after it's done.
+      </p>
+      <p class="text-[11px] text-secondary">
+        Not the place for the program's rules/policy page (testing policy, reward eligibility,
+        disclosure terms) — paste that into "Custom instructions for this program" below instead.
+        Every line typed here becomes its own hypothesis the agent must individually investigate.
+      </p>
+      <textarea name="initial_hypotheses" rows="3" placeholder="e.g. staging.example.com probably still has debug mode on&#10;the old /api/v1 endpoints might still be reachable and unauthenticated"
+                class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+    </div>
+  </details>
+
+  {# Optional, off by default (blank -> session["custom_instructions"] "" -> agent behaves exactly
+     as it always has). Free text, not a fixed taxonomy — most bug-bounty programs publish their
+     own house rules beyond just the qualifying/non-qualifying vuln-class table above (testing
+     hours, no automated scanners against specific paths, use only provided test accounts, focus
+     areas, out-of-scope subdomains not worth a separate scope edit, etc.). Read by
+     agent/core.py's _custom_instructions_task_addendum and appended to every phase's task message
+     (recon/analyze/exploit) — not just Analyze like the scope rules above, since program rules
+     commonly constrain HOW to scan, not just which vulnerability classes pay out. #}
+  <details class="group rounded border border-default bg-elevated" {% if custom_instructions %}open{% endif %}>
+    {{ disclosure_summary("Custom instructions for this program (optional)") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        Paste any program-specific rules from its bug-bounty page that aren't covered by the
+        Qualifying/Non-qualifying lists above — testing restrictions, required test accounts,
+        specific focus areas, anything the agent should keep in mind during recon, analysis, and
+        exploitation. Left blank, the agent behaves exactly as it does today.
+      </p>
+      <textarea name="custom_instructions" rows="4" placeholder="e.g. Only test *.example.com, not the marketing site. No automated scanners against /checkout. Use the provided test account for all authenticated flows. Focus on the mobile API."
+                class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ custom_instructions }}</textarea>
+    </div>
+  </details>
+
+  {# Optional, off by default (blank -> session["custom_user_agent"] "" -> every tool's own normal
+     default User-Agent is used unchanged). A real technical requirement, not a hint to the model:
+     several bug-bounty programs (HackerOne/Bugcrowd/YesWeHack program pages commonly state this)
+     require a specific User-Agent string on every request so their security team can tell real
+     test traffic apart from an actual attack in their logs. agent/core.py's _run_tool_with_retry
+     injects this into every tool call server-side and native.py/the nuclei/sqlmap builders apply
+     it directly to their real HTTP requests — not just text the model might remember to act on. #}
+  <details class="group rounded border border-default bg-elevated" {% if custom_user_agent or ua_snippet %}open{% endif %}>
+    {{ disclosure_summary("Custom User-Agent header (optional)") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        Some bug-bounty programs require a specific User-Agent string on all test traffic — paste
+        it here exactly as the program specifies. Applied to every real HTTP request this agent
+        makes (recon/analyze/exploit), not just something the model is told about. Left blank,
+        every tool sends its own normal default.
+      </p>
+      <input type="text" name="custom_user_agent" value="{{ custom_user_agent }}" autocomplete="off" placeholder="e.g. Mozilla/5.0 (compatible; YourHandle-BugBounty; +mailto:you@example.com)"
+             class="custom-user-agent-input w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+
+      <div class="flex flex-wrap items-center gap-2">
+        {{ button("Insert my browser's UA", variant="secondary", size="sm", extra_classes="ua-detect-browser-btn") }}
+        <select class="ua-popular-select h-7 px-2 text-[11px] rounded bg-elevated text-primary border border-default focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <option value="">Popular User-Agents…</option>
+          {% for label, ua in popular_user_agents %}
+            <option value="{{ ua }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      {# Distinct from "Insert my browser's UA" above: that one is a straight overwrite. This is a
+         MERGE -- some programs don't hand you a full replacement UA, just require one identifying
+         token to appear somewhere in whatever UA you already send (e.g. a handle or a
+         "commissioned by <program>" phrase) -- typing that snippet here and merging keeps the rest
+         of a real, current browser UA intact while still satisfying the program's requirement.
+         Appended as a trailing, space-separated token -- deliberately NOT woven into the UA's own
+         leading "(...)" platform-info block (Windows NT 10.0; Win64; x64; ...), which is exactly
+         the shape many WAFs/bot-detection engines and UA-parsing libraries validate; an unexpected
+         token planted there is more likely to read as an anomalous/spoofed UA, the opposite of what
+         a researcher wants. A trailing append is also how real browsers already extend their OWN
+         UA string with vendor-specific tokens -- "Safari/537.36 Edg/124.0.0.0" (Edge),
+         "Safari/537.36 OPR/133.0.0.0" (Opera) -- so this reads as one more normal token in a
+         position UAs already use for exactly that, not an obviously hand-edited string. #}
+      <div class="flex flex-wrap items-center gap-2">
+        <input type="text" class="ua-snippet-input flex-1 min-w-[200px] bg-surface border border-default rounded px-2.5 py-1.5 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+               placeholder="Program-required snippet, e.g. YourHandle-BugBounty" autocomplete="off" value="{{ ua_snippet }}">
+        {{ button("Merge into my browser's UA", variant="secondary", size="sm", extra_classes="ua-merge-snippet-btn") }}
+      </div>
+      {# Only shown when the wizard (not manual typing) actually filled the snippet above --
+         BUGBOUNTY_PROGRAM_EXTRACTION_PROMPT (agent/prompts.py) standardizes every extracted
+         researcher-placeholder (whatever bracket/name form the program's own page used --
+         "[H1 username]", "HunterName", "YourHandle", ...) on this one exact literal marker, so
+         there's exactly one thing to look for and replace, regardless of which program it came
+         from. #}
+      {# The script below already auto-merges ua_snippet into custom_user_agent the instant this
+         partial renders (real navigator.userAgent is only ever available client-side, never to the
+         wizard's own server-side extraction) -- this note only fires when a placeholder still needs
+         a human's own real handle typed over it; a literal, no-placeholder snippet (a real example:
+         a program requiring the exact fixed token "MCN-Prime-aux-bogues" appended, nothing to
+         substitute) needs no follow-up at all and shows no note. #}
+      {% if ua_snippet and "YOUR_HANDLE" in ua_snippet %}
+        <p class="text-[11px] px-2.5 py-1.5 rounded border border-accent/30 bg-accent/10 text-primary">
+          Auto-merged into the User-Agent field above — replace <code class="text-[10px]">YOUR_HANDLE</code>
+          in it with your real handle/username before starting the scan.
+        </p>
+      {% endif %}
+      <p class="text-[11px] text-secondary">
+        "Insert my browser's UA" copies this browser's real User-Agent as-is. "Merge" takes this
+        browser's real UA and appends the snippet typed above as its own trailing token (same spot
+        real browsers add their own vendor tokens, e.g. "... Safari/537.36 Edg/124.0.0.0"), typed
+        exactly as entered — nothing is stripped, reordered, or inserted into the platform-info
+        section.
+      </p>
+    </div>
+  </details>
+
+  {# Optional, off by default (blank -> session["custom_headers"] "" -> nothing extra sent).
+     Separate from Custom User-Agent above (that field keeps its own dedicated flag on every tool
+     that has one -- e.g. --user-agent -- which is more reliable than sending it as a generic
+     header). This is for everything else: several bug-bounty programs (HackerOne's own "Session
+     Layer" guidance is a real example) ask researchers to add an identifying header such as
+     "X-HackerOne-Research: <handle>" to every request so their team can attribute test traffic to
+     a specific researcher. agent/core.py's _run_tool_with_retry parses and injects every line into
+     every tool call server-side, same as Custom User-Agent -- not just text the model might
+     remember to add. #}
+  <details class="group rounded border border-default bg-elevated" {% if custom_headers %}open{% endif %}>
+    {{ disclosure_summary("Custom HTTP Headers (optional)") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        Some bug-bounty programs ask for an extra header on every request, e.g. one identifying you
+        as the researcher (HackerOne: "X-HackerOne-Research: your_username"). One "Name: Value" pair
+        per line — applied to every real HTTP request this agent makes, not just something the model
+        is told about. For the User-Agent header specifically, use the dedicated field above instead.
+        Left blank, nothing extra is sent.
+      </p>
+      <textarea name="custom_headers" rows="3" autocomplete="off" placeholder="X-HackerOne-Research: your_username&#10;X-Bug-Bounty: your_handle"
+                class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ custom_headers }}</textarea>
+      {# Same YOUR_HANDLE convention as the User-Agent snippet hint above -- one predictable marker
+         regardless of how the program's own page originally wrote its own placeholder. #}
+      {% if custom_headers and "YOUR_HANDLE" in custom_headers %}
+        <p class="text-[11px] px-2.5 py-1.5 rounded border border-accent/30 bg-accent/10 text-primary">
+          Replace <code class="text-[10px]">YOUR_HANDLE</code> above with your real handle/username before starting the scan.
+        </p>
+      {% endif %}
+    </div>
+  </details>
+
+  {# Optional, collapsed by default — most scans need none of this. Two named identities (not
+     one) specifically because IDOR/broken-access-control testing (authenticated_request tool,
+     agent/tools/native.py) needs to compare what two different accounts can each access, not just
+     log in as one. Either login+password (needs a login URL) or a ready-made cookie/token works;
+     leave everything blank for an identity you don't have — the agent simply won't have it
+     available. Stored separately from the session (data/credentials/), never shown again in this
+     UI, never exported, never sent to the model as raw text — see agent/tools/native.py. #}
+  <details class="group rounded border border-default bg-elevated">
+    {{ disclosure_summary("Authenticated testing (optional) — for IDOR / access-control checks") }}
+    <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
+      <p class="text-[11px] text-secondary">
+        Give the agent one or more test accounts and it can compare what each can access —
+        confirmed, remote_direct proof for the highest-value bug-bounty category unauthenticated
+        scanning can never reach. Leave any field blank you don't have.
+      </p>
+      {# user_a/user_b keep their original fixed field names (main.py's start_scan reads them as
+         named Form(...) params, unchanged for backward compatibility with rescan prefill) --
+         "+ Add another account" below adds any number of FURTHER identities beyond these two,
+         each named identity_extra_<n>_<field> and parsed generically from the raw form body
+         (main.py's start_scan), so there is no hardcoded cap on how many an operator can add. #}
+      <div data-identity-cards data-next-index="1">
+        {% for identity, label in [("user_a", "Identity A"), ("user_b", "Identity B")] %}
+          <fieldset class="border border-default rounded p-2.5 space-y-2" data-identity-card>
+            <legend class="text-[11px] font-semibold uppercase tracking-wider text-secondary px-1">{{ label }}</legend>
+            <div class="grid grid-cols-2 gap-2">
+              <input type="text" name="{{ identity }}_username" autocomplete="off" placeholder="Username / nickname"
+                     class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+              <input type="email" name="{{ identity }}_email" autocomplete="off" placeholder="Email"
+                     class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            </div>
+            <div class="grid grid-cols-1 gap-2">
+              <input type="password" name="{{ identity }}_password" autocomplete="off" placeholder="Password"
+                     class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            </div>
+            <input type="text" name="{{ identity }}_login_url" autocomplete="off" placeholder="Login URL (needed for username/password above to work)"
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <input type="text" name="{{ identity }}_cookie" autocomplete="off" placeholder="Or a ready-made session cookie, e.g. sessionid=abc123"
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <input type="text" name="{{ identity }}_authorization_header" autocomplete="off" placeholder="Or a ready-made Authorization header, e.g. Bearer eyJ..."
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </fieldset>
+        {% endfor %}
+      </div>
+      {# Cloned by the script below, never submitted itself (a bare <template> element's contents
+         are inert as far as form submission is concerned) -- each clone's [data-field] inputs get
+         a real name="identity_extra_<n>_<field>" attribute stamped on at clone time. #}
+      <template data-identity-template>
+        <fieldset class="border border-default rounded p-2.5 space-y-2" data-identity-card>
+          <legend class="text-[11px] font-semibold uppercase tracking-wider text-secondary px-1 flex items-center justify-between gap-2">
+            <span data-identity-label>Additional identity</span>
+            <button type="button" data-remove-identity aria-label="Remove this identity" title="Remove this identity"
+                    class="p-0.5 rounded text-secondary hover:bg-elevated hover:text-severity-high transition-colors">
+              <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+            </button>
+          </legend>
+          <div class="grid grid-cols-2 gap-2">
+            <input type="text" data-field="username" autocomplete="off" placeholder="Username / nickname"
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <input type="email" data-field="email" autocomplete="off" placeholder="Email"
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </div>
+          <div class="grid grid-cols-1 gap-2">
+            <input type="password" data-field="password" autocomplete="off" placeholder="Password"
+                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </div>
+          <input type="text" data-field="login_url" autocomplete="off" placeholder="Login URL (needed for username/password above to work)"
+                 class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <input type="text" data-field="cookie" autocomplete="off" placeholder="Or a ready-made session cookie, e.g. sessionid=abc123"
+                 class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <input type="text" data-field="authorization_header" autocomplete="off" placeholder="Or a ready-made Authorization header, e.g. Bearer eyJ..."
+                 class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </fieldset>
+      </template>
+      <button type="button" data-add-identity
+              class="inline-flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded border border-dashed border-default text-secondary hover:border-accent/60 hover:text-accent transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        Add another account
+      </button>
+      <script>
+        (function () {
+          // Scoped the same way the chip-input binder above is (.np-wizard, never a global id) --
+          // this partial can appear twice on one page (base.html's New Project dialog, plus
+          // index.html's own inline copy on a validation-error redisplay).
+          var wizard = document.currentScript.closest(".np-wizard");
+          if (!wizard) return;
+          var container = wizard.querySelector("[data-identity-cards]");
+          var tpl = wizard.querySelector("[data-identity-template]");
+          var addBtn = wizard.querySelector("[data-add-identity]");
+          if (!container || !tpl || !addBtn) return;
+
+          addBtn.addEventListener("click", function () {
+            var index = parseInt(container.getAttribute("data-next-index"), 10) || 1;
+            container.setAttribute("data-next-index", String(index + 1));
+            var clone = tpl.content.cloneNode(true);
+            var label = clone.querySelector("[data-identity-label]");
+            if (label) label.textContent = "Additional identity " + index;
+            clone.querySelectorAll("[data-field]").forEach(function (input) {
+              input.name = "identity_extra_" + index + "_" + input.getAttribute("data-field");
+            });
+            container.appendChild(clone);
+          });
+
+          container.addEventListener("click", function (event) {
+            var removeBtn = event.target.closest("[data-remove-identity]");
+            if (!removeBtn) return;
+            var card = removeBtn.closest("[data-identity-card]");
+            if (card) card.remove();
+          });
+        })();
+      </script>
+      <p class="text-[11px] text-secondary">No MFA/2FA support — an account requiring a one-time code can't be used this way.</p>
+    </div>
+  </details>
+
+  {{ subagent_project_checklist() }}
+
+  {# "Create" only, not "Start" -- main.py's start_scan creates the project (status="created")
+     but no longer schedules the scan itself; the operator starts it explicitly from the new
+     session's own Overview tab (its own "Start" button, POST /api/session/{id}/start), after a
+     chance to review what was just entered. #}
+  {{ button("Create", variant="primary", type="submit") }}
 </form>
 
 <script>
   (function () {
     // Live visual confirmation that each comma-separated entry parsed the way the user expects,
     // before they submit — the same shape check as validate_target() (agent/tools/builders/
-    // validators.py), so a chip already flagged red here would also fail server-side.
+    // validators.py), so a chip already flagged red here would also fail server-side. Shared by
+    // every comma-separated scope field on this form (Target(s) and Out of scope both use
+    // ".chip-input" + a sibling ".chip-output" inside the same <label> — one binder, not one
+    // copy-pasted IIFE per field).
     // Scoped via currentScript, not a global id: this partial can appear twice on one page (the
     // New Project dialog in base.html is on every page, and index.html inlines a second copy of
     // this same form on a validation-error redisplay) — a global id would only ever wire up
     // whichever copy happens to be first in the DOM.
-    var shapePattern = /^[A-Za-z0-9.\-:_/?=&%[\]]+$/;
-    var form = document.currentScript.previousElementSibling;
-    var input = form ? form.querySelector(".target-input") : null;
-    var chipsContainer = form ? form.querySelector(".target-chips") : null;
-    if (!input || !chipsContainer) return;
+    // Ѐ-ӿԀ-ԯ (Cyrillic + Cyrillic Supplement) mirrors
+    // agent/tools/builders/validators.py's own _TARGET_SHAPE_PATTERN exactly — a Cyrillic-script
+    // hostname/URL (e.g. банк.рф) is a real target/scope shape some bug-bounty programs actually
+    // use, not hypothetical, and this preview used to flag every one of them red even though the
+    // server would have accepted the same value.
+    var shapePattern = /^[A-Za-z0-9.\-:_/?=&%[\]Ѐ-ӿԀ-ԯ]+$/;
+    // Same allowlist as shapePattern, plus "*" — mirrors agent/tools/builders/validators.py's own
+    // _WILDCARD_TARGET_SHAPE_PATTERN exactly, used below for any entry containing a wildcard
+    // anywhere, not just as the whole leading label.
+    var wildcardShapePattern = /^[A-Za-z0-9.\-:_/?=&%[\]*Ѐ-ӿԀ-ԯ]+$/;
+    // Was document.currentScript.previousElementSibling (the Agent form specifically, since that's
+    // literally what's adjacent to this script tag in the markup) -- real bug this fixes: the
+    // Reverse Engineering panel's own Target(s) field (added later, its own separate <form>, class
+    // "chip-input") never got bound at all, since "the one form right before this script" was never
+    // IT. Confirmed live: a 10-target program-page extraction filled the field's raw value
+    // correctly (the live-check dot showed "10/10 targets reachable") but rendered zero chip pills
+    // below it -- the underlying wiring that turns a comma-separated value into removable chips
+    // simply never ran for that field. .closest(".np-wizard") still preserves the original reason
+    // previousElementSibling was chosen over a global id in the first place (this partial can
+    // appear twice on one page -- base.html's dialog and index.html's own inline copy on a
+    // validation-error redisplay -- so binding must stay scoped to THIS COPY, not blindly querying
+    // the whole document) while covering every panel's own chip-input fields, not just one
+    // hardcoded form.
+    var wizard = document.currentScript.closest(".np-wizard");
+    if (!wizard) return;
+    // This whole inline script block physically lives inside .np-panel-agent (see the closing
+    // comment right after its own closing script tag) -- the UA-helper/qualifying-catch-all code further down
+    // was written assuming a narrower "form" variable scoped to just the Agent panel's own <form>,
+    // which existed under the script's ORIGINAL position/name before the chip-input fix above
+    // widened lookups to the whole wizard. That rename never touched the later `form.querySelector`
+    // calls, leaving a real, confirmed-live `ReferenceError: form is not defined` firing on every
+    // page load -- silently swallowed by the browser (nothing after the throwing line in this IIFE
+    // ever ran), which is a distinct failure from the chip-input timing bug just above and would
+    // resurface even after that one's fixed. Restored as agentPanel, kept separate from the
+    // wizard-wide chip lookup on purpose: unlike Target(s)/Out of scope (deliberately shared across
+    // every panel), UA detection and the qualifying-vulnerabilities catch-all button are Agent-only
+    // features -- a wizard-wide querySelector would silently bind whichever panel's matching element
+    // happens to come first in the DOM instead of Agent's own, the exact class of cross-panel bug
+    // the chip-input fix above was written to solve, not something to reintroduce here.
+    var agentPanel = wizard.querySelector(".np-panel-agent") || wizard;
 
-    function render() {
-      var parts = input.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
-      chipsContainer.innerHTML = "";
-      parts.forEach(function (part) {
-        var ok = shapePattern.test(part);
-        var chip = document.createElement("span");
-        chip.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border " +
-          (ok ? "text-severity-low border-severity-low/40 bg-severity-low/10" : "text-severity-high border-severity-high/40 bg-severity-high/10");
-        chip.textContent = part;
-        chipsContainer.appendChild(chip);
+    // Drag-and-drop state for moving a chip between Target(s) and Out of scope -- deliberately a
+    // single shared reference (not per-input data) rather than relying on dataTransfer alone: the
+    // drop handler needs to know exactly which input the chip came FROM so it can remove the right
+    // raw entry there, and dataTransfer's own payload is just the dragged text, no back-reference
+    // to its source element. Set on dragstart (below, inside render()), read and cleared on drop
+    // (bindChipDropZone further down).
+    var dragState = null; // { sourceInput: <input>, value: <raw comma-separated part> } | null
+
+    // A "*" anywhere in the entry is valid server-side (validate_scope_entry(),
+    // agent/tools/builders/validators.py) in several real, commonly-seen bug-bounty scope-table
+    // shapes, not just the original "*.example.com" (whole subdomain tree): "prod-*.example.com"
+    // (a wildcard filling out part of one label) and "*-eu.example.com" (a wildcard as a label's
+    // own prefix) are both real conventions that used to be flagged red here (and rejected
+    // server-side too, before validate_scope_entry() was generalized to match) even though they're
+    // legitimate scope-table syntax. "https://*.example.com" / "http://*.example.com" (a real
+    // variant scope tables use, not just the bare form) normalize to the same "*." marker first,
+    // same as validate_scope_entry() does.
+    var schemePrefixedWildcard = /^https?:\/\/\*\./i;
+    // A "start - end" IP range (e.g. "192.168.1.1 - 192.168.1.254") is valid server-side
+    // (allowed_targets.parse_ip_range_or_cidr) but contains spaces around the dash, which the
+    // plain shape pattern above doesn't allow — checked first, before stripping/testing the rest.
+    // A plain CIDR block ("10.0.0.0/24") already passes shapePattern as-is, no special-case needed.
+    var ipRangePattern = /^[^\s-]+\s*-\s*[^\s-]+$/;
+    function isValidEntry(part) {
+      if (ipRangePattern.test(part)) return true;
+      var normalized = part.replace(schemePrefixedWildcard, "*.");
+      if (normalized.indexOf("*") === -1) return shapePattern.test(normalized);
+      return wildcardShapePattern.test(normalized);
+    }
+
+    // Middle-click on a chip opens its target directly in a new background tab -- a quick "let me
+    // eyeball this host" without leaving the wizard or hand-copying the value out first. Only for
+    // entries that are actually one navigable host/URL: a wildcard ("*.example.com"), an explicit
+    // IP range, or a CIDR block has no single page to open, so those chips simply don't respond.
+    var cidrPattern = /^[^\s\/]+\/\d{1,3}$/;
+    function chipNavigableUrl(value) {
+      var v = value.trim();
+      if (!v || v.indexOf("*") !== -1 || ipRangePattern.test(v) || cidrPattern.test(v)) return null;
+      return /^https?:\/\//i.test(v) ? v : "https://" + v;
+    }
+
+    // Mirrors agent/tools/builders/validators.py's expand_target_alternation() exactly (same cap,
+    // same "no '|' inside -> not an alternation, keep the parens literally" rule) so a scope-table
+    // entry like "https://www.vidaxl.(at|be|bg|com|de|...)" — one company, one domain, every ccTLD
+    // it operates under, a real and commonly-seen bug-bounty scope shape — previews here exactly
+    // as the server will actually expand and validate it, instead of showing up as a single chip
+    // that looks broken (parens/pipe fail the plain shapePattern above on their own).
+    var MAX_ALTERNATION_EXPANSIONS = 500;
+    function expandAlternation(value) {
+      var groupPattern = /\(([^()]*)\)/g;
+      var literals = [];
+      var rawGroups = [];
+      var lastIndex = 0;
+      var match;
+      while ((match = groupPattern.exec(value)) !== null) {
+        literals.push(value.slice(lastIndex, match.index));
+        rawGroups.push(match[1]);
+        lastIndex = match.index + match[0].length;
+      }
+      literals.push(value.slice(lastIndex));
+      if (rawGroups.length === 0) return [value];
+
+      var optionsPerGroup = rawGroups.map(function (group) {
+        return group.indexOf("|") !== -1 ? group.split("|") : ["(" + group + ")"];
+      });
+      var total = optionsPerGroup.reduce(function (acc, options) { return acc * options.length; }, 1);
+      if (total > MAX_ALTERNATION_EXPANSIONS) {
+        throw new Error("expands to too many combinations (>" + MAX_ALTERNATION_EXPANSIONS + ")");
+      }
+
+      var combos = [[]];
+      optionsPerGroup.forEach(function (options) {
+        var next = [];
+        combos.forEach(function (combo) {
+          options.forEach(function (option) { next.push(combo.concat([option])); });
+        });
+        combos = next;
+      });
+      return combos.map(function (combo) {
+        var pieces = [literals[0]];
+        combo.forEach(function (value, i) { pieces.push(value, literals[i + 1]); });
+        return pieces.join("");
       });
     }
 
-    input.addEventListener("input", render);
-    render();
+    function bindChipInput(input) {
+      var chipsContainer = input.closest("label") ? input.closest("label").querySelector(".chip-output") : null;
+      if (!chipsContainer) return;
+      // Out of scope alone has a plain-language fallback server-side (main.py's /api/scan: an
+      // entry that fails the shape check becomes an out_of_scope_notes entry instead of a hard
+      // validation error) — Target(s) has no such fallback, it must be a real host. Marking a
+      // free-text out-of-scope entry red here would tell the user their input got rejected when
+      // it's actually accepted, just routed differently.
+      // data-chip-freeform: the Reverse Engineering panel's own Target(s) field opts into this too
+      // -- its real values (a local file path, possibly Windows-style with backslashes the host/URL
+      // shapePattern below was never meant to allow) aren't host/URL-shaped at all, and this field's
+      // own separate live-check status dot (POST /api/re-target/check) is the actual authority on
+      // whether an entry is real, not this shape preview built for network scope entries.
+      var allowFreeText = input.name === "out_of_scope" || input.dataset.chipFreeform === "true";
+
+      // Removes ONE raw comma-separated part (by its own index in input.value, not the expanded
+      // chip's own display text) and re-fires "input" so render() below rebuilds everything from
+      // the now-shorter value -- the single source of truth stays input.value, chips are always
+      // just its own read-back, never a separately-maintained list that could drift from it.
+      function removePart(partIndex) {
+        var parts = input.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+        parts.splice(partIndex, 1);
+        input.value = parts.join(", ");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+
+      function render() {
+        var parts = input.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+        chipsContainer.innerHTML = "";
+        parts.forEach(function (part, partIndex) {
+          var expansions, expansionError = null;
+          try {
+            expansions = expandAlternation(part);
+          } catch (e) {
+            expansions = [part];
+            expansionError = e.message;
+          }
+          expansions.forEach(function (one) {
+            var ok = !expansionError && (allowFreeText || isValidEntry(one));
+            var chip = document.createElement("span");
+            // max-w-full: an unbroken long token (a full URL with a big query string) is a real,
+            // expected input here, not an edge case — without this a single chip can force the
+            // whole .chip-output row (and the <dialog> it sits in, which has no overflow backstop
+            // of its own the way html/body does for the page) wider than its container instead of
+            // wrapping or clipping. min-w-0 lets the truncated text span below actually shrink
+            // inside this flex chip instead of pushing the remove button off the visible edge.
+            chip.className = "inline-flex items-center gap-1 max-w-full min-w-0 pl-2 pr-1 py-0.5 rounded-full text-[11px] font-medium border " +
+              (ok ? "text-severity-low border-severity-low/40 bg-severity-low/10" : "text-severity-high border-severity-high/40 bg-severity-high/10");
+            var label = document.createElement("span");
+            label.className = "truncate";
+            label.textContent = one;
+            label.title = expansionError ? (part + " — " + expansionError) : one;
+            chip.appendChild(label);
+
+            // Drag-and-drop: pick up a chip and drop it on the OTHER scope field (Target(s) <->
+            // Out of scope, see bindChipDropZone below) to move it there without retyping — moves
+            // the whole raw entry that produced this chip, same granularity as the remove button
+            // just below, since a partial alternation ("*.(com|de|fr)") can't be split mid-move any
+            // more sensibly than it can be removed piecemeal.
+            chip.draggable = true;
+            chip.style.cursor = "grab";
+            chip.addEventListener("dragstart", function (event) {
+              dragState = { sourceInput: input, value: part };
+              event.dataTransfer.effectAllowed = "move";
+              event.dataTransfer.setData("text/plain", part);
+              chip.classList.add("opacity-40");
+            });
+            chip.addEventListener("dragend", function () {
+              chip.classList.remove("opacity-40");
+              dragState = null;
+            });
+
+            // Middle-click opens this entry as a real page in a new tab -- chipNavigableUrl()
+            // returns null for a wildcard/CIDR/range entry (nothing single to navigate to), so
+            // those chips just don't respond, no dead/misleading click target.
+            chip.addEventListener("auxclick", function (event) {
+              if (event.button !== 1 || event.target.closest("button")) return;
+              var url = chipNavigableUrl(one);
+              if (!url) return;
+              event.preventDefault();
+              window.asraOpenExternal(url);
+            });
+
+            // One (a|b|c) alternation entry can expand into several chips from the SAME raw part
+            // (expandAlternation above) -- removing any one of them removes the whole typed entry
+            // that produced them, not just that one expansion, since there's no sane way to edit a
+            // "*.(com|de|fr)"-style entry down to a partial alternation from a chip click alone.
+            var removeBtn = document.createElement("button");
+            removeBtn.type = "button";
+            removeBtn.className = "shrink-0 leading-none opacity-60 hover:opacity-100 hover:text-severity-high focus:outline-none";
+            removeBtn.setAttribute("aria-label", "Remove " + one);
+            removeBtn.title = "Remove";
+            removeBtn.textContent = "×";
+            removeBtn.addEventListener("click", function () { removePart(partIndex); });
+            chip.appendChild(removeBtn);
+
+            chipsContainer.appendChild(chip);
+          });
+        });
+      }
+
+      input.addEventListener("input", render);
+      render();
+    }
+
+    // Drop side of the Target(s) <-> Out of scope drag-and-drop above -- wired to the field's own
+    // <label> (the same element bindChipInput already reads chipsContainer off of), so the whole
+    // block including the chip row is one drop target, not just a thin strip. Only ever moves the
+    // entry OUT of dragState.sourceInput, which bindChipInput's own dragstart set to the input the
+    // chip actually came from -- never assumes "the other of these two fields", so dropping a chip
+    // back onto the field it already lives in is a harmless no-op (guarded by the sourceInput ===
+    // targetInput check below) rather than a duplicate or an accidental delete.
+    function bindChipDropZone(targetInput) {
+      if (!targetInput) return;
+      var dropZone = targetInput.closest("label");
+      if (!dropZone) return;
+      var highlightClasses = ["ring-2", "ring-accent"];
+      dropZone.addEventListener("dragover", function (event) {
+        if (!dragState || dragState.sourceInput === targetInput) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        dropZone.classList.add.apply(dropZone.classList, highlightClasses);
+      });
+      dropZone.addEventListener("dragleave", function () {
+        dropZone.classList.remove.apply(dropZone.classList, highlightClasses);
+      });
+      dropZone.addEventListener("drop", function (event) {
+        dropZone.classList.remove.apply(dropZone.classList, highlightClasses);
+        if (!dragState || dragState.sourceInput === targetInput) return;
+        event.preventDefault();
+        var value = dragState.value;
+        var sourceInput = dragState.sourceInput;
+        dragState = null;
+
+        var sourceParts = sourceInput.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+        var partIndex = sourceParts.indexOf(value);
+        if (partIndex !== -1) sourceParts.splice(partIndex, 1);
+        sourceInput.value = sourceParts.join(", ");
+        sourceInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+        var destParts = targetInput.value.split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+        if (destParts.indexOf(value) === -1) destParts.push(value);
+        targetInput.value = destParts.join(", ");
+        targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    bindChipDropZone(agentPanel.querySelector('input[name="target"]'));
+    bindChipDropZone(agentPanel.querySelector('input[name="out_of_scope"]'));
+
+    // Ctrl+V a target in, and a trailing ", " appears automatically so the next paste/typed entry
+    // starts its own chip without the user having to type the separator by hand every time — the
+    // whole point of a comma-separated field is repeated pasting, and forgetting the comma between
+    // two pasted hosts used to silently glue them into one invalid entry (a.comb.com) with nothing
+    // but the (easy to miss) red chip to explain why.
+    function bindPasteComma(input) {
+      input.addEventListener("paste", function (e) {
+        var clipboardData = e.clipboardData || window.clipboardData;
+        if (!clipboardData) return;
+        var pasted = clipboardData.getData("text");
+        if (!pasted) return;
+        // A scope list copied straight from a program's page commonly comes as one host per line —
+        // treat that exactly like a comma-separated paste rather than gluing lines together, since
+        // a raw newline inside one chip would otherwise fail the shape check below it.
+        var normalized = pasted
+          .replace(/\r\n|\r|\n/g, ", ")
+          .replace(/\s*,\s*/g, ", ")
+          .trim()
+          .replace(/,+$/, "");
+        if (!normalized) return;
+        e.preventDefault();
+        var start = input.selectionStart;
+        var end = input.selectionEnd;
+        var before = input.value.slice(0, start);
+        var after = input.value.slice(end);
+        // Don't add a second separator if one is already sitting right after the insertion point
+        // (pasting in front of an existing ", next-target" entry).
+        var needsSeparator = !/^\s*,/.test(after);
+        var insertion = normalized + (needsSeparator ? ", " : "");
+        input.value = before + insertion + after;
+        var cursorPos = before.length + insertion.length;
+        input.setSelectionRange(cursorPos, cursorPos);
+        // Setting .value directly doesn't fire a native "input" event, so bindChipInput's own
+        // listener (the chip preview above) never sees this change unless dispatched explicitly.
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+
+    // Deferred, not called synchronously here -- this script tag sits INSIDE .np-panel-agent,
+    // which comes before the Interactive/Reverse Engineering panels in the document source. On a
+    // real, normal (non-htmx) page load the browser's HTML parser executes a synchronous inline
+    // script element the instant it reaches it, BEFORE parsing anything that follows -- so a same-tick
+    // `wizard.querySelectorAll(".chip-input")` here can only ever see chip-inputs that already
+    // exist earlier in the document (Agent's own Target(s)/Out of scope), never the Reverse
+    // Engineering panel's own Target(s) field, which is parsed only later. Confirmed live: the RE
+    // panel's live-check dot worked (its own script sits right next to its own input, later in the
+    // document, so it's fine), but typing/pasting a value there rendered zero chip pills, because
+    // bindChipInput() was simply never called on that element at all -- not a lookup-scope bug (the
+    // wizard-wide `.closest(".np-wizard")` fix already gets that part right), a document-parse-order
+    // one. A 0ms setTimeout was tried first and confirmed live to still be unreliable: this response
+    // is large enough that the browser's HTML parser genuinely yields back to the event loop
+    // mid-document (network chunking, not one atomic parse), so a macrotask queued this early can
+    // still fire before the parser has reached the RE panel's later HTML -- see bindAllChipInputs'
+    // own call site below for the real, spec-guaranteed fix (DOMContentLoaded).
+    function bindAllChipInputs() {
+      Array.prototype.forEach.call(wizard.querySelectorAll(".chip-input"), function (input) {
+        bindChipInput(input);
+        bindPasteComma(input);
+      });
+    }
+    // A 0ms setTimeout is NOT enough here and was confirmed live to still miss the Reverse
+    // Engineering panel's own Target(s) field -- this response is large enough that the browser's
+    // HTML parser genuinely yields back to the event loop mid-document (network chunking, not a
+    // single atomic parse), so a macrotask queued this early can still run BEFORE the parser has
+    // reached the RE panel's later HTML. document.readyState/DOMContentLoaded is the actual,
+    // spec-guaranteed signal for "every element in this document has been parsed", not a timing
+    // guess -- fires once, after ALL synchronous HTML (RE panel included) is in the DOM, regardless
+    // of how many chunks the response arrived in. Still handles the OTHER case this file's own
+    // comments already establish (an htmx swap re-executing this whole script after the initial
+    // page load): DOMContentLoaded only ever fires once per document, so by the time any htmx swap
+    // happens `document.readyState` is already "complete"/"interactive", not "loading" -- the
+    // `else` branch runs immediately, which is safe there since htmx's own innerHTML-based
+    // insertion already parses the WHOLE swapped fragment atomically before any of its embedded
+    // scripts execute (see this function's own call site comment further up).
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", bindAllChipInputs);
+    } else {
+      bindAllChipInputs();
+    }
+
+    // Custom User-Agent helpers: "Insert my browser's UA" (straight overwrite), the popular-UA
+    // dropdown (also a straight overwrite, picked from popular_user_agents above), and "Merge into
+    // my browser's UA" (weaves a program-required snippet into a real, current browser UA instead
+    // of the operator either hand-typing a whole UA from scratch or typing the snippet as the
+    // entire field value, which target-side bot detection is far more likely to flag as fake).
+    var uaInput = agentPanel.querySelector(".custom-user-agent-input");
+    var uaDetectBtn = agentPanel.querySelector(".ua-detect-browser-btn");
+    var uaPopularSelect = agentPanel.querySelector(".ua-popular-select");
+    var uaSnippetInput = agentPanel.querySelector(".ua-snippet-input");
+    var uaMergeBtn = agentPanel.querySelector(".ua-merge-snippet-btn");
+
+    // Appends `snippet` as its own trailing, space-separated token -- the same position real
+    // browsers already use to extend their own UA with a vendor-specific token ("... Safari/537.36
+    // Edg/124.0.0.0" for Edge, "... Safari/537.36 OPR/133.0.0.0" for Opera), NOT woven into the
+    // leading "(...)" platform-info block. That block is exactly the shape WAFs/bot-detection
+    // engines and UA-parsing libraries commonly validate -- planting an unexpected token inside it
+    // (a real, confirmed bug this once had) is more likely to make the request read as an
+    // anomalous/spoofed UA than as normal traffic, the opposite of what a researcher wants.
+    // Deliberately does nothing to the snippet's own characters (no stripping/reordering) -- typed
+    // exactly as entered, since a required program identifier is exact text the operator does not
+    // want silently mangled. Idempotent: a snippet already present in the base UA is left alone
+    // rather than duplicated, since re-clicking Merge (switching browsers, tweaking the snippet) is
+    // a real, expected flow.
+    function mergeUserAgentSnippet(baseUA, snippet) {
+      var trimmedBase = baseUA.trim();
+      var trimmedSnippet = snippet.trim();
+      if (!trimmedSnippet) return trimmedBase;
+      if (trimmedBase.indexOf(trimmedSnippet) !== -1) return trimmedBase;
+      return trimmedBase + " " + trimmedSnippet;
+    }
+
+    if (uaDetectBtn && uaInput) {
+      uaDetectBtn.addEventListener("click", function () {
+        uaInput.value = navigator.userAgent;
+      });
+    }
+    if (uaPopularSelect && uaInput) {
+      uaPopularSelect.addEventListener("change", function () {
+        if (uaPopularSelect.value) uaInput.value = uaPopularSelect.value;
+        uaPopularSelect.value = "";
+      });
+    }
+    if (uaMergeBtn && uaInput && uaSnippetInput) {
+      uaMergeBtn.addEventListener("click", function () {
+        uaInput.value = mergeUserAgentSnippet(navigator.userAgent, uaSnippetInput.value);
+      });
+    }
+
+    // Auto-merge the instant a wizard-extracted snippet lands here, instead of leaving the
+    // operator to notice the snippet field and click Merge themselves. Real, confirmed operator
+    // complaint this fixes: the wizard used to leave Custom User-Agent itself empty (by design --
+    // navigator.userAgent is only ever available client-side, the wizard's own server-side
+    // extraction can never see the operator's real browser UA to merge it there directly) with
+    // only the snippet field filled, which read as "the agent gave me nothing" rather than "one
+    // more click away from a real, working UA". Runs every time this partial renders (a fresh page
+    // load AND every wizard hx-swap, since this whole <script> block re-executes on each swap same
+    // as the chip binder above), and only when custom_user_agent is still empty -- never overwrites
+    // a value the operator already typed or already merged themselves.
+    if (uaInput && uaSnippetInput && uaSnippetInput.value && !uaInput.value) {
+      uaInput.value = mergeUserAgentSnippet(navigator.userAgent, uaSnippetInput.value);
+    }
+
+    // Appends the catch-all rule as its own line -- idempotent (checked via indexOf, same pattern
+    // as mergeUserAgentSnippet above) so re-clicking after already having it in the field (e.g.
+    // after a wizard re-render) never duplicates it.
+    var QUALIFYING_CATCH_ALL_TEXT = 'Everything that is not in the list: "Non-qualifying vulnerabilities" will automatically be: "Qualifying vulnerabilities"!';
+    var qualifyingCatchAllBtn = agentPanel.querySelector(".qualifying-catch-all-btn");
+    var qualifyingTextarea = agentPanel.querySelector("textarea[name='qualifying_vulnerabilities']");
+    if (qualifyingCatchAllBtn && qualifyingTextarea) {
+      qualifyingCatchAllBtn.addEventListener("click", function () {
+        if (qualifyingTextarea.value.indexOf(QUALIFYING_CATCH_ALL_TEXT) !== -1) return;
+        qualifyingTextarea.value = qualifyingTextarea.value.trim()
+          ? qualifyingTextarea.value.replace(/\n+$/, "") + "\n" + QUALIFYING_CATCH_ALL_TEXT
+          : QUALIFYING_CATCH_ALL_TEXT;
+      });
+    }
   })();
 </script>
+  </div>{# /.np-panel-agent #}
+
+  {# Interactive mode: a chat-only console. Deliberately minimal -- only a project name; the target
+     (URL/IP/domain) and the actual task are typed into the full-window chat afterward
+     (INTERACTIVE_CHAT_PROMPT, agent/prompts.py). Posts to its own route (main.py's
+     start_interactive), same #new-project-form-container swap + HX-Redirect-on-success contract as
+     the Agent form above. #}
+  <div class="np-panel np-panel-interactive">
+    <form method="post" action="/api/scan/interactive" hx-post="/api/scan/interactive"
+          hx-target="#new-project-form-container" hx-swap="outerHTML" hx-disabled-elt="this"
+          class="np-interactive-card space-y-4">
+      <svg class="np-interactive-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="12" cy="12" r="7"/>
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke-linecap="round"/>
+        <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+      </svg>
+      <div class="text-left">
+        {{ input_field("name", "Project name", value=name, placeholder="CTF — SQLi challenge", required=true) }}
+        {{ icon_picker(selected_icon=icon|default(''), selected_color=icon_color|default(''), id_prefix="interactive-") }}
+      </div>
+      <p class="text-[11px] text-secondary text-left">
+        Start opens a full-window chat. Name the target (a URL, IP, or domain) and the task right
+        there — the agent runs concrete, targeted actions with its own tools and subagents and
+        reports back, instead of launching a long scan. Everything is authorized here; it acts only
+        against targets you name.
+      </p>
+      {{ subagent_project_checklist() }}
+      {{ button("Start", variant="primary", type="submit", extra_classes="w-full justify-center") }}
+    </form>
+  </div>{# /.np-panel-interactive #}
+
+  {# Reverse Engineering mode: a local file/folder/archive path or a public GitHub/GitLab repo URL
+     (the git URL case is cloned into this project's own folder by main.py's start_re route, see
+     agent/tools/builders/re_target.py). The status dot below is a live, debounced server-side
+     check (POST /api/re-target/check) -- a plain client-side regex can't confirm a local path
+     actually exists or a repo is actually reachable, so this always asks the real backend. Start
+     runs a single bounded triage pass (agent/core.py's run_re_triage), not a full scan pipeline. #}
+  <div class="np-panel np-panel-re">
+    {# Program/resource-link analysis -- the RE-mode sibling of the Agent panel's own wizard bar
+       above, restricted to code resources (agent/tools/bugbounty_import.py's analyze_re_program):
+       a GitHub/GitLab repo, an open-source project's own security policy, a program page covering
+       a smart-contract/binary/library rather than a live web app (Agent mode's own wizard button
+       already owns that case). Own #re-wizard-url id -- must not collide with the Agent panel's
+       #wizard-url, both present in the same DOM at once (same lesson as icon_picker's own
+       id_prefix fix: two copies of "the same-looking field" on one page need genuinely unique ids,
+       not just visual separation via CSS show/hide). #}
+    <div class="rounded border border-default bg-elevated p-3 mb-1">
+      <p class="text-[11px] text-secondary mb-2">
+        Paste a bug-bounty/vulnerability-disclosure PROGRAM page (HackerOne/Bugcrowd/YesWeHack/a
+        project's own security policy — the same kind of link the Agent panel's own "Study program
+        page" button reads) to have the agent pull out just the REVERSE-ENGINEERING-relevant scope
+        entries from its scope table (a source repo, a smart-contract address, a downloadable
+        binary/package) — shown below as removable chips, same as Agent mode's own Target(s) field
+        — plus which vulnerability classes actually count here, read from that same page.
+      </p>
+      <p class="text-[11px] text-secondary mb-2">
+        Uses the main agent's own LLM provider (<a href="/settings" class="text-accent hover:underline">Settings → LLM Provider</a>) —
+        make sure that provider has working credits/quota before clicking.
+      </p>
+      <input type="text" id="re-wizard-url" name="url" value="{{ wizard_url|default('') }}" autocomplete="off"
+             placeholder="https://hackerone.com/your-program or a direct repo/resource link"
+             class="w-full bg-surface border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 mb-2">
+      <button type="button" hx-post="/api/scan/wizard/analyze-re-program" hx-include="#re-wizard-url"
+              hx-target="#new-project-form-container" hx-swap="outerHTML" hx-disabled-elt="this"
+              hx-on::before-request="this.querySelector('.wizard-btn-label').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[13px]">
+        <span class="wizard-btn-label">Analyze program/resource link</span>
+        <span class="asra-spinner hidden"></span>
+      </button>
+    </div>
+    <form method="post" action="/api/scan/re" hx-post="/api/scan/re"
+          hx-target="#new-project-form-container" hx-swap="outerHTML" hx-disabled-elt="this"
+          class="space-y-4">
+      <div class="text-left">
+        {{ input_field("name", "Project name", value=name, placeholder="Firmware dump triage", required=true) }}
+        {{ icon_picker(selected_icon=icon|default(''), selected_color=icon_color|default(''), id_prefix="re-") }}
+      </div>
+      <div class="text-left">
+        <label class="block">
+          <span class="block text-xs font-medium text-secondary mb-1">Target(s)</span>
+          <div class="flex items-center gap-2">
+            <input type="text" id="np-re-target" name="target" value="{{ target|default('') }}" required autocomplete="off"
+                   data-chip-freeform="true"
+                   placeholder="/path/to/binary, a project folder, an archive, or https://github.com/org/repo"
+                   class="chip-input flex-1 bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <span id="np-re-target-dot" class="np-re-target-dot" title="Not checked yet" aria-hidden="true"></span>
+          </div>
+          <p id="np-re-target-message" class="text-[11px] text-secondary mt-1">One or more, comma-separated: a local file/folder/archive path, or a public GitHub/GitLab repo URL to clone. Analyzing a program link above fills this in as chips — remove any you don't want reviewed.</p>
+          <div class="chip-output flex flex-wrap gap-1.5 mt-2"></div>
+        </label>
+      </div>
+      <div class="text-left">
+        <label class="block text-xs font-medium text-secondary mb-1" for="np-re-goal">Goal for this engagement (optional)</label>
+        <textarea id="np-re-goal" name="goal" rows="2"
+                  placeholder="e.g. find a way to bypass the licensing check, or: confirm whether user funds can be drained"
+                  class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ goal|default('') }}</textarea>
+      </div>
+      <details class="group rounded border border-default bg-elevated" {% if qualifying_vulnerabilities or non_qualifying_vulnerabilities %}open{% endif %}>
+        {{ disclosure_summary("Qualifying / non-qualifying vulnerabilities (optional)") }}
+        <div class="px-3 pb-3 border-t border-default pt-2 space-y-2 text-left">
+          <p class="text-[11px] text-secondary">
+            Scoped to what a code review can actually find — smart-contract classes (reentrancy,
+            access control, oracle manipulation, ...), binary classes (memory corruption, hardcoded
+            secrets, dangerous calls, ...), or source-audit classes. Not generic web CWEs, unless
+            this target also runs a live web service you want tested that way too.
+          </p>
+          <div>
+            <div class="flex items-center justify-between gap-2 mb-1">
+              <label class="block text-[11px] font-medium text-secondary" for="np-re-qualifying">Qualifying vulnerabilities</label>
+              {{ button("Everything else qualifies too", variant="secondary", size="sm", extra_classes="re-qualifying-catch-all-btn", type="button") }}
+            </div>
+            <textarea id="np-re-qualifying" name="qualifying_vulnerabilities" rows="3"
+                      placeholder="e.g. reentrancy, unchecked external calls, hardcoded private keys, unsafe deserialization..."
+                      class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ qualifying_vulnerabilities|default('') }}</textarea>
+            <span class="block text-[11px] text-secondary mt-1">"Everything else qualifies too" appends a standing rule: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-secondary mb-1" for="np-re-non-qualifying">Non-qualifying vulnerabilities</label>
+            <textarea id="np-re-non-qualifying" name="non_qualifying_vulnerabilities" rows="3"
+                      placeholder="e.g. gas optimization suggestions, style/lint issues, known-accepted design tradeoffs..."
+                      class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ non_qualifying_vulnerabilities|default('') }}</textarea>
+          </div>
+        </div>
+      </details>
+      <div class="text-left">
+        <label class="block text-xs font-medium text-secondary mb-1" for="np-re-custom-instructions">Custom instructions (optional)</label>
+        <textarea id="np-re-custom-instructions" name="custom_instructions" rows="3"
+                  placeholder="e.g. focus on the licensing check, or: this is an unverified contract, no source available"
+                  class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ custom_instructions|default('') }}</textarea>
+      </div>
+      {# session["re_experience_level"] (sessions/store.py) -- read by agent/prompts.py's
+         RE_EXPERIENCE_LEVEL_ADDENDA to adjust how proactive/explanatory (novice) vs. terse/
+         technical (professional) the agent is, in both the baseline triage pass and the follow-up
+         chat. "hobbyist" (the middle option) is the default and pre-checked, matching the base RE
+         prompts' own tone already targeting that tier directly. #}
+      <div class="text-left">
+        <span class="block text-xs font-medium text-secondary mb-1">Your experience level</span>
+        <div class="grid grid-cols-3 gap-2">
+          {% set _re_level = re_experience_level|default('hobbyist') %}
+          {% for level, label, desc in [
+            ("novice", "Novice", "More proactive — suggests techniques and next steps"),
+            ("hobbyist", "Hobbyist", "Neutral — balanced explanation and detail"),
+            ("professional", "Professional", "Terse, technical, no hand-holding"),
+          ] %}
+            <label class="np-re-level-card flex flex-col items-center text-center gap-1 rounded border border-default bg-surface px-2 py-2 cursor-pointer transition-colors">
+              <input type="radio" name="re_experience_level" value="{{ level }}" class="sr-only" {% if _re_level == level %}checked{% endif %}>
+              <span class="text-[12px] font-semibold text-primary">{{ label }}</span>
+              <span class="text-[10px] text-secondary leading-snug">{{ desc }}</span>
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <p class="text-[11px] text-secondary text-left">
+        Start runs a short automatic baseline pass (file-type ID, static analysis, and — for a
+        binary — a decompile of the functions most worth a look), then opens a chat panel with the
+        same tools for anything deeper.
+      </p>
+      {{ subagent_project_checklist() }}
+      {{ button("Start", variant="primary", type="submit", extra_classes="w-full justify-center") }}
+    </form>
+  </div>{# /.np-panel-re #}
+  </section>{# /.np-step-fields #}
+
+<script>
+  (function () {
+    var targetInput = document.getElementById("np-re-target");
+    var dot = document.getElementById("np-re-target-dot");
+    var message = document.getElementById("np-re-target-message");
+    if (!targetInput || !dot || !message) return;
+    var debounceTimer = null;
+    var defaultMessage = message.textContent;
+
+    function setState(state, text) {
+      dot.className = "np-re-target-dot np-re-target-dot-" + state;
+      dot.title = text;
+      message.textContent = text;
+    }
+
+    function checkTarget() {
+      var value = targetInput.value.trim();
+      if (!value) { setState("idle", defaultMessage); return; }
+      setState("checking", "Checking…");
+      var body = new URLSearchParams({ target: value });
+      fetch("/api/re-target/check", { method: "POST", body: body })
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          if (targetInput.value.trim() !== value) return; // stale response, a newer keystroke already superseded it
+          setState(data.ok ? "ok" : "error", data.message || (data.ok ? "Reachable." : "Not reachable."));
+        })
+        .catch(function () {
+          if (targetInput.value.trim() !== value) return;
+          setState("error", "Could not reach ASRA's own server to check this target.");
+        });
+    }
+
+    targetInput.addEventListener("input", function () {
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(checkTarget, 500);
+    });
+    if (targetInput.value.trim()) checkTarget();
+
+    // Same idempotent catch-all-rule append as the Agent panel's own qualifying-catch-all-btn
+    // (this file's other <script> block), duplicated rather than shared across panels since each
+    // panel is its own self-contained IIFE scoped to a different <form>.
+    var QUALIFYING_CATCH_ALL_TEXT = 'Everything that is not in the list: "Non-qualifying vulnerabilities" will automatically be: "Qualifying vulnerabilities"!';
+    var reQualifyingCatchAllBtn = document.querySelector(".re-qualifying-catch-all-btn");
+    var reQualifyingTextarea = document.getElementById("np-re-qualifying");
+    if (reQualifyingCatchAllBtn && reQualifyingTextarea) {
+      reQualifyingCatchAllBtn.addEventListener("click", function () {
+        if (reQualifyingTextarea.value.indexOf(QUALIFYING_CATCH_ALL_TEXT) !== -1) return;
+        reQualifyingTextarea.value = reQualifyingTextarea.value.trim()
+          ? reQualifyingTextarea.value.replace(/\n+$/, "") + "\n" + QUALIFYING_CATCH_ALL_TEXT
+          : QUALIFYING_CATCH_ALL_TEXT;
+      });
+    }
+  })();
+</script>
+</div>{# /.np-wizard #}
+
+<script>
+  // Two-step wizard controller (see themes.css's .np-wizard block). Re-runs on every render/hx-swap
+  // of this partial (a wizard import / validation error re-renders the whole #new-project-form-
+  // container), reading the server's chosen step off the container's own data-np-step so it never
+  // snaps back to the mode picker after an error. Deliberately JS (not the CSS-only pattern the
+  // session tabs use): this form isn't inside any SSE-morph subtree, and a "select, then Continue"
+  // gate -- Continue stays disabled until a mode is actually picked -- is genuine two-step state a
+  // pure :checked selector can't express (nothing must advance before a real choice). The mode
+  // radios' own change events are picked up by static/js/debug_events.js's delegated change
+  // listener; this adds one explicit np-wizard event per step change on top.
+  (function () {
+    var container = document.getElementById("new-project-form-container");
+    if (!container) return;
+    var wizard = container.querySelector(".np-wizard");
+    if (!wizard) return;
+    var continueBtn = wizard.querySelector(".np-continue-btn");
+    var backBtns = wizard.querySelectorAll(".np-back-btn");
+    var modeRadios = wizard.querySelectorAll("input[name='np-mode']");
+    var modeCards = wizard.querySelectorAll(".np-mode-card");
+
+    var MODE_IDS = { "np-mode-agent": "agent", "np-mode-interactive": "interactive", "np-mode-re": "reverse_engineering" };
+    function selectedMode() {
+      var r = wizard.querySelector("input[name='np-mode']:checked");
+      return r ? (MODE_IDS[r.id] || "agent") : null;
+    }
+    function showStep(step) {
+      wizard.classList.toggle("np-show-mode", step === "mode");
+      wizard.classList.toggle("np-show-fields", step === "fields");
+      if (window.asraDebugEvent) {
+        window.asraDebugEvent("np-wizard", "step -> " + step + (step === "fields" ? " (" + selectedMode() + ")" : ""));
+      }
+    }
+    function syncContinue() {
+      if (continueBtn) continueBtn.disabled = !selectedMode();
+    }
+
+    // All three mode panels (.np-panel-agent/-interactive/-re) sit in the DOM at once -- CSS alone
+    // decides which one is visible (themes.css's :has(#np-mode-...:checked) rules) -- so nothing
+    // ever clears a panel's own inputs just because it scrolled out of view. That's correct while
+    // working WITHIN one mode, but a mode switch (Change mode -> pick a different card) is meant to
+    // be a clean, independent restart, not a continuation -- so it must reset every field back to
+    // what the server actually rendered (each element's own defaultValue/defaultChecked), the exact
+    // same reset the dialog-close handler below already does, just without touching the np-mode
+    // radios themselves (keepModeSelection=true) since the operator's new pick must survive it.
+    function resetWizardFields(keepModeSelection) {
+      Array.prototype.forEach.call(wizard.querySelectorAll("input, textarea, select"), function (el) {
+        if (keepModeSelection && el.name === "np-mode") return;
+        if (el.type === "radio" || el.type === "checkbox") {
+          el.checked = el.defaultChecked;
+        } else {
+          el.value = el.defaultValue;
+        }
+      });
+      // Chip pills and the RE panel's own live-check dot are pure JS-rendered state driven off each
+      // field's own "input" event (bindChipInput/checkTarget, earlier in this file) -- resetting
+      // .value alone doesn't touch either, so re-firing "input" lets their own existing listeners
+      // rebuild from the now-reset (empty) value instead of duplicating their reset logic here.
+      Array.prototype.forEach.call(wizard.querySelectorAll(".chip-input"), function (input) {
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      var reTargetInput = wizard.querySelector("#np-re-target");
+      if (reTargetInput) reTargetInput.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    Array.prototype.forEach.call(modeRadios, function (r) {
+      r.addEventListener("change", function () {
+        resetWizardFields(true);
+        syncContinue();
+      });
+    });
+    if (continueBtn) {
+      continueBtn.addEventListener("click", function () {
+        if (!selectedMode()) return;
+        showStep("fields");
+      });
+    }
+    Array.prototype.forEach.call(backBtns, function (b) {
+      b.addEventListener("click", function () { showStep("mode"); });
+    });
+    // Double-click a mode card = pick it AND advance, same as a single click (native label-for
+    // check) followed by pressing Continue -- a faster path through the same two actions, not a
+    // separate flow. The single click already checked the radio (native <label for> behavior) by
+    // the time this fires, so selectedMode() below always reflects the just-double-clicked card.
+    Array.prototype.forEach.call(modeCards, function (card) {
+      card.addEventListener("dblclick", function () {
+        if (!selectedMode()) return;
+        showStep("fields");
+      });
+    });
+
+    showStep(container.dataset.npStep === "fields" ? "fields" : "mode");
+    syncContinue();
+
+    // Reset the WHOLE wizard back to a clean Step 1 the moment the dialog actually closes (X
+    // button, Escape, backdrop click, and a plain .close() call all fire this same native "close"
+    // event on a <dialog> -- one listener covers every close path, not just the X button). Real,
+    // confirmed-live gap this fixes: showModal()/close() only ever toggle the dialog's own
+    // visibility -- none of the wizard's own DOM (mode selection, typed field values, JS-rendered
+    // chip pills, the RE panel's own live-check dot) gets touched by that, so closing without
+    // submitting and reopening later showed whatever was typed/selected last time, including
+    // leftover test/draft values a real operator would not expect to still be sitting there days
+    // later. Iterates every input/textarea in the wizard uniformly (not per-<form>.reset() calls,
+    // since the mode radios and each panel's own "Analyze program/resource link" URL field are
+    // deliberately NOT inside any of the 3 field <form>s -- see this file's own comments on why --
+    // so a per-form reset would miss them) back to each element's own defaultValue/defaultChecked
+    // (the value the server actually rendered, exactly what a real page load starts from).
+    var dialog = wizard.closest("dialog");
+    if (dialog) {
+      // This whole <script> re-runs on every wizard-button hx-swap (see the block comment above),
+      // but the <dialog> itself is NOT replaced by that swap -- only #new-project-form-container
+      // inside it is. Without removing the PREVIOUS run's own listener first, every wizard-button
+      // click (success or error, both re-render this container) would stack one more duplicate
+      // "close" listener onto the same persistent dialog, never cleaned up for as long as the
+      // dialog stays open. Stashing the handler on the dialog element itself (survives across
+      // this IIFE's re-executions, unlike a plain closured variable) is what makes the
+      // remove-then-add pair actually work.
+      if (dialog._asraWizardCloseHandler) {
+        dialog.removeEventListener("close", dialog._asraWizardCloseHandler);
+      }
+      dialog._asraWizardCloseHandler = function () {
+        resetWizardFields(false);
+        showStep("mode");
+        syncContinue();
+      };
+      dialog.addEventListener("close", dialog._asraWizardCloseHandler);
+
+      // Side mouse buttons (X1 "back" / X2 "forward", MouseEvent.button 3/4) step through the
+      // wizard the same way Change-mode/Continue do, instead of doing nothing or falling through to
+      // the browser's own history back/forward while this modal is open (jarring: it would navigate
+      // the whole page away with the dialog still conceptually "open"). preventDefault() inside a
+      // "mouseup" handler is what actually cancels Chromium's own built-in back/forward-button
+      // navigation -- confirmed the standard, documented way to do this (mousedown doesn't work,
+      // the navigation itself fires off mouseup). Bound on the <dialog> element itself rather than
+      // document so it only ever fires while THIS dialog is the thing under the cursor -- a
+      // backdrop click's event target is the dialog element per spec, so this also covers side-
+      // button presses anywhere over the dimmed backdrop, not just over the visible card.
+      // Remove-then-add pair for the same re-execution reason as the close handler above.
+      if (dialog._asraWizardMouseNavHandler) {
+        dialog.removeEventListener("mouseup", dialog._asraWizardMouseNavHandler);
+      }
+      dialog._asraWizardMouseNavHandler = function (e) {
+        if (e.button !== 3 && e.button !== 4) return;
+        e.preventDefault();
+        if (e.button === 3 && wizard.classList.contains("np-show-fields")) {
+          showStep("mode");
+        } else if (e.button === 4 && wizard.classList.contains("np-show-mode") && selectedMode()) {
+          showStep("fields");
+        }
+      };
+      dialog.addEventListener("mouseup", dialog._asraWizardMouseNavHandler);
+    }
+  })();
+</script>
+</div>

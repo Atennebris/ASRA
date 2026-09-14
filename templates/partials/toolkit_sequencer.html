@@ -1,0 +1,65 @@
+{# Sequencer: entropy/predictability analysis of a token across several real samples, either
+   pulled from already-captured traffic or collected via fresh live requests. The "live requests"
+   field group is shown/hidden by a local, form-scoped CSS-only radio+:has() rule (static/css/
+   themes.css's own [data-sequencer-mode] block) -- same technique as the outer session tab bar
+   and Toolkit's own sub-tab bar, just scoped to this one <form> instead of the whole page. #}
+{% from "macros/toolkit.html" import method_field %}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-sequencer-container">
+  <form hx-post="{{ toolkit_base_url }}/sequencer/analyze" hx-target="#toolkit-sequencer-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="flex items-center gap-3 text-[11px] text-secondary">
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="radio" name="collect_mode" id="sequencer-mode-stored" value="stored" {% if collect_mode == "stored" or not collect_mode %}checked{% endif %}> From captured traffic
+      </label>
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="radio" name="collect_mode" id="sequencer-mode-live" value="live" {% if collect_mode == "live" %}checked{% endif %}> Live requests
+      </label>
+    </div>
+
+    <input type="text" name="header_name" value="{{ header_name | default('') }}" placeholder="Header name, or cookie:NAME for one cookie"
+           class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+
+    <div data-sequencer-mode="live" class="space-y-2">
+      <div class="flex gap-2">
+        {{ method_field("sequencer-method-list", method) }}
+        <input type="text" name="url" value="{{ url | default('') }}" placeholder="https://example.com/login"
+               class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <input type="number" name="count" value="{{ count | default(20) }}" min="2" max="200" title="Number of live requests to fire"
+               class="w-20 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </div>
+      <textarea name="headers_text" rows="3" placeholder="Header-Name: value&#10;one per line"
+                class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ headers_text | default('') }}</textarea>
+      <textarea name="body" rows="2" placeholder="Request body (leave empty for none)"
+                class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ body | default('') }}</textarea>
+    </div>
+
+    {{ button("Analyze", type="submit", size="sm") }}
+  </form>
+
+  {% if error %}
+    <div class="bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">{{ error }}</div>
+  {% elif result %}
+    <div class="space-y-2">
+      <p class="text-[13px] font-medium
+                {{ 'text-severity-high' if 'weak' in result.verdict else 'text-severity-medium' if 'borderline' in result.verdict else 'text-severity-low' }}">
+        {{ result.verdict }}
+      </p>
+      <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-secondary">
+        <div>Samples: <span class="text-primary">{{ result.sample_count }}</span></div>
+        <div>Duplicates: <span class="text-primary">{{ result.duplicate_count }}</span></div>
+        <div>Length: <span class="text-primary">{{ result.min_length }}{% if result.length_varies %}&ndash;{{ result.max_length }}{% endif %}</span></div>
+        <div>Charset size: <span class="text-primary">{{ result.charset_size }}</span></div>
+        <div>Est. entropy/char: <span class="text-primary">{{ result.overall_entropy_per_char_bits }} bits</span></div>
+        <div>Est. total entropy: <span class="text-primary">{{ result.total_entropy_estimate_bits }} bits</span></div>
+      </div>
+      {% if result.position_entropies %}
+        <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mt-2 mb-1">Entropy by position (bits)</p>
+        <div class="flex flex-wrap gap-1">
+          {% for e in result.position_entropies %}
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-mono {{ 'bg-severity-high/20 text-severity-high' if e < 1 else 'bg-elevated text-secondary' }}" title="position {{ loop.index0 }}">{{ e }}</span>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>

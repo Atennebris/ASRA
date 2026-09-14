@@ -1,0 +1,152 @@
+{# One source's own card -- factored out of library_sources.html so BOTH the full list (looping
+   {% include %} per source) and the single-card self-poll route (GET /api/library/{id}/card,
+   main.py's own _render_library_card) render from the exact same markup, never two copies that
+   can drift apart. Context needed: `s` (the source dict) -- provider_options/model_options are
+   already imported "with context" by library_sources.html, and {% include %} passes the current
+   template context down by default, so this partial sees them too without its own import line.
+
+   hx-get="/api/library/{{ s.id }}/card" self-poll, only while status=="analyzing", targets and
+   syncs against THIS card's own id -- not the whole #library-sources list. Real, confirmed
+   operator complaint this fixes: the OLD self-poll lived on the whole list container, so every
+   2-second tick re-swapped EVERY card's outerHTML, including ones that weren't analyzing at all
+   -- each card's own estimate span (hx-trigger="load, ...") re-fired its "load" trigger on every
+   single one of those re-swaps too, producing a real, visible flicker (brief empty placeholder,
+   then refill) on every unrelated card's chunk-estimate text, plus a GET /estimate request per
+   card per poll tick that had no reason to ever happen. Polling only the ONE card that's actually
+   changing state fixes both at once -- every other card's own DOM subtree, including its estimate
+   span, is never touched at all while it isn't analyzing. #}
+<article id="library-card-{{ s.id }}" class="rounded-lg border border-default bg-elevated p-2.5"
+         {% if s.status == "analyzing" %}hx-get="/api/library/{{ s.id }}/card" hx-trigger="every 2s" hx-target="this" hx-swap="outerHTML" hx-sync="this:replace"{% endif %}>
+  <div class="flex items-start gap-2">
+    <div class="min-w-0 flex-1">
+      <p class="text-[12px] text-primary font-medium truncate" title="{{ s.title }}">{{ s.title }}</p>
+      {% if s.author %}<p class="text-[10.5px] text-secondary truncate">{{ s.author }}</p>{% endif %}
+      <p class="text-[10px] text-secondary/70 mt-0.5">
+        {# Real, direct operator ask: two cards can share the exact same title (a duplicate
+           upload the operator confirmed anyway, or just two sources with similar filenames) --
+           this short id is the only thing telling them apart at a glance without opening each. #}
+        <span class="font-mono" title="Source id — used to tell apart two cards that otherwise look identical">#{{ s.id[:8] }}</span> ·
+        {{ s.format | upper }} · {{ s.filename }}
+        {% if s.source_url %} · <a href="{{ s.source_url }}" target="_blank" rel="noopener noreferrer" class="text-accent hover:underline">source</a>{% endif %}
+        {% if s.fetched_via == "browser" %}
+          {# A plain fetch either failed outright or came back looking like an empty JS-rendered
+             shell (see agent/tools/library_store.py's own _fetch_via_browser docstring) -- ASRA
+             fell back to its own real browser automation to actually get this content. Used to be
+             visible only in debug.log; a real, confirmed operator complaint asked for this to be
+             visible in the UI itself. #}
+          · <span class="text-secondary/70" title="A plain fetch failed or came back empty (blocked, or content only renders after JS runs) -- ASRA retried this one through its own real browser automation to get usable content.">via browser</span>
+        {% endif %}
+      </p>
+    </div>
+    <button type="button" hx-post="/api/library/{{ s.id }}/delete" hx-target="#library-sources" hx-swap="outerHTML"
+            hx-sync="#library-sources:replace"
+            hx-confirm="Remove &quot;{{ s.title }}&quot; from the library? Any entries it already extracted into the playbook stay put -- this only removes the source itself."
+            class="shrink-0 p-1 rounded text-secondary hover:bg-severity-high/15 hover:text-severity-high" title="Remove source">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  {% if s.status == "duplicate_pending" %}
+    {# Real, direct operator ask: the Library used to let the exact same material get uploaded
+       any number of times with no way to tell -- content_hash (agent/tools/library_store.py's
+       _find_duplicate_source) catches an exact-byte match against an existing source and holds
+       here instead of silently normalizing a second copy. "Add anyway" is a real, deliberate
+       choice, not a default -- Delete (the header button above) discards it instead. #}
+    <p class="mt-1.5 inline-flex items-start gap-1 text-[10.5px] text-severity-medium">
+      <svg class="w-3 h-3 shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>This looks like the same material as <strong>{{ s.duplicate_of_title or "an existing source" }}</strong>{% if s.duplicate_of_id %} (<span class="font-mono">#{{ s.duplicate_of_id[:8] }}</span>){% endif %}. Add it again anyway?</span>
+    </p>
+    <button type="button" hx-post="/api/library/{{ s.id }}/confirm-duplicate" hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace"
+            class="mt-1.5 inline-flex items-center gap-1 rounded border border-severity-medium/40 bg-severity-medium/10 hover:bg-severity-medium/20 px-2 py-0.5 text-[10.5px] text-severity-medium transition-colors">
+      Add anyway
+    </button>
+  {% elif s.status == "error" %}
+    <p class="mt-1.5 inline-flex items-center gap-1 text-[10.5px] text-severity-high" title="{{ s.error }}">
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      {{ s.error }}
+    </p>
+  {% elif s.status == "stopped" %}
+    <p class="mt-1.5 inline-flex items-center gap-1 text-[10.5px] text-secondary" title="{{ s.error }}">
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+      {{ s.error }}
+    </p>
+  {% elif s.status == "analyzing" %}
+    <div class="mt-1.5">
+      <div class="flex items-center justify-between gap-2">
+        {# analysis_stage (agent/tools/library_store.py's _run_analysis_chunks) -- real, direct
+           operator ask: the chunk counter alone can only ever show 0% then 100% for the
+           overwhelmingly common case of a source that's a single chunk (a whole real article
+           easily fits in one chunk against any modern context window -- see
+           _chunk_char_budget's own math), with nothing in between to report. This stage label is
+           genuine sub-progress within that one chunk's own analysis pass. #}
+        <p class="text-[10.5px] text-accent">Analyzing… {{ s.chunks_done }}/{{ s.chunks_total or "?" }} chunk{{ "s" if s.chunks_total != 1 else "" }}{% if s.chunks_total %} ({{ ((s.chunks_done / s.chunks_total) * 100) | round(0, 'floor') | int }}%){% endif %}{% if s.analysis_stage %} — {{ s.analysis_stage }}{% endif %}</p>
+        {# Stop is NOT instant -- a real, running LLM call can't be force-killed mid-request, so
+           this takes effect once the CURRENT chunk's call returns (library_store.stop_analysis's
+           own docstring). Whatever chunks already completed keep their real extracted results. #}
+        <button type="button" hx-post="/api/library/{{ s.id }}/stop-analysis" hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace"
+                class="shrink-0 inline-flex items-center gap-1 rounded border border-default bg-elevated hover:bg-overlay hover:border-severity-high hover:text-severity-high px-2 py-0.5 text-[10px] text-secondary transition-colors"
+                title="Stops after the chunk currently in flight finishes -- not instant. Techniques already extracted from completed chunks are kept.">
+          Stop
+        </button>
+      </div>
+      {% if s.chunks_total %}
+        {# Taller + real percentage text -- a real, confirmed operator complaint: the earlier 1px
+           bar with no number was easy to miss entirely, especially on a fast-moving small doc. #}
+        <div class="mt-1.5 h-2 rounded-full bg-overlay overflow-hidden">
+          <div class="h-full bg-accent transition-all duration-300" style="width: {{ ((s.chunks_done / s.chunks_total) * 100) | round(0, 'floor') | int }}%"></div>
+        </div>
+      {% endif %}
+    </div>
+  {% elif s.status == "analyzed" %}
+    <p class="mt-1.5 inline-flex items-center gap-1 text-[10.5px] text-severity-low">
+      <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Analyzed — {{ s.ingested_count }} technique{{ "s" if s.ingested_count != 1 else "" }} extracted (unreviewed)
+    </p>
+    {% if s.ingested_count %}
+      {# Spells out the actual next step in plain terms, not just a button label -- a real,
+         confirmed operator complaint: "Analyzed" + a link alone didn't say what to DO once
+         there, or why it matters. The link itself closes the panel and flips the Playbook
+         list's own "Review" filter to Unreviewed, scoped to THIS source only (real, confirmed
+         operator complaint: without the source_id field, every unreviewed technique from every
+         source landed in one undifferentiated list -- "не все вместе в кашу") by setting the
+         hidden #playbook-filter-source-id field (templates/playbook.html) before dispatching a
+         change on the confidence select, which the toolbar form is already wired to react to. #}
+      <p class="mt-1 text-[10px] text-secondary leading-relaxed">An LLM's own reading of this source, not a tested fact. Open it below, then <strong class="text-secondary">confirm</strong> it if it holds up or <strong class="text-secondary">reject</strong> it if it doesn't — confirmed ones get suggested to the agent on future targets with a matching stack.</p>
+      <a href="#" onclick="window.asraToggleLibraryPanel(false); var sidField = document.getElementById('playbook-filter-source-id'); if (sidField) sidField.value = '{{ s.id }}'; var sel = document.querySelector('select[name=confidence]'); if (sel) { sel.value = 'unreviewed'; sel.dispatchEvent(new Event('change', {bubbles: true})); } return false;"
+         class="mt-1 inline-flex items-center gap-1 text-[10.5px] text-accent hover:underline">
+        Review in Playbook
+        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </a>
+    {% endif %}
+  {% elif s.status == "normalized" %}
+    <p class="mt-1.5 text-[10.5px] text-secondary">Ready to analyze — {{ s.char_count }} chars.</p>
+  {% endif %}
+
+  {% if s.status in ("normalized", "analyzed", "error", "stopped") %}
+    {# Provider/model come from the ONE shared picker at the top of the panel (playbook.html's
+       own #library-provider-shared/#library-model-shared), chosen up front before any source
+       even exists -- not a per-card picker anymore (a real, confirmed operator complaint: the
+       old per-card picker only appeared after uploading something, and required re-picking on
+       every single card). hx-include is htmx's own extended CSS-selector form (not restricted
+       to "closest form" the way a plain form submission is), so both requests below just reach
+       out to those two shared elements directly regardless of where this card sits. #}
+    <div class="mt-2 flex items-center justify-between gap-2">
+      {# hx-target="this" is load-bearing, not decoration -- real, confirmed incident: htmx's
+         hx-target/hx-swap are INHERITED attributes, and an ancestor that sets its own hx-target
+         silently overrides an unset one here, collapsing far more than just this span's own
+         response. #}
+      <span class="text-[10px] text-secondary truncate" id="library-estimate-{{ s.id }}"
+            hx-get="/api/library/{{ s.id }}/estimate"
+            hx-include="#library-provider-shared, #library-model-shared"
+            hx-trigger="load, change from:#library-provider-shared, change from:#library-model-shared"
+            hx-target="this" hx-swap="innerHTML">&nbsp;</span>
+      <button type="button"
+              hx-post="/api/library/{{ s.id }}/analyze"
+              hx-include="#library-provider-shared, #library-model-shared"
+              hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace"
+              class="shrink-0 inline-flex items-center gap-1 rounded bg-accent hover:bg-accent-hover text-white px-2.5 py-1 text-[10.5px] font-medium transition-colors">
+        Analyze
+      </button>
+    </div>
+  {% endif %}
+</article>

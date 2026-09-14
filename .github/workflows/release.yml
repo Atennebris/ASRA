@@ -1,0 +1,154 @@
+name: Release desktop app
+
+# Builds the Tauri desktop shell (desktop/src-tauri) for Windows and Linux (macOS is best-effort --
+# see README.md's own "not verified on physical Mac hardware" caveat) and attaches the binaries to
+# a GitHub Release. Triggered by pushing a tag shaped like v0.1.0 -- the version IN that tag must
+# match desktop/src-tauri/Cargo.toml's own [package] version exactly (check-version below fails the
+# whole run otherwise) since the launcher's own start screen displays cfg.version straight from
+# env!("CARGO_PKG_VERSION") at build time -- a mismatched tag would ship a binary that reports the
+# WRONG version number to the operator, silently.
+#
+# workflow_dispatch (with the same version-shaped input) lets you run this by hand from the Actions
+# tab without pushing a tag first -- useful for a dry run before actually tagging a release.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (must match desktop/src-tauri/Cargo.toml's [package] version), e.g. 0.1.0"
+        required: true
+
+env:
+  # Normalizes both trigger shapes (a real "vX.Y.Z" tag vs. workflow_dispatch's own bare "X.Y.Z"
+  # input) down to one bare version string every later step can compare/use identically.
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.normalize.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: normalize
+        run: |
+          RAW="${RELEASE_VERSION#v}"
+          CARGO_VERSION="$(grep -m1 '^version' desktop/src-tauri/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "Tag/input version: $RAW"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          if [ "$RAW" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag/input version ($RAW) does not match desktop/src-tauri/Cargo.toml's own version ($CARGO_VERSION) -- bump Cargo.toml (and tauri.conf.json's own \"version\" field) first, then tag/re-run."
+            exit 1
+          fi
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: check-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Build
+        working-directory: desktop/src-tauri
+        run: cargo build --release
+      - name: Stage artifact
+        run: |
+          mkdir dist-out
+          copy desktop\src-tauri\target\release\asra-desktop.exe dist-out\asra-desktop-windows-x64.exe
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asra-desktop-windows-x64
+          path: dist-out/asra-desktop-windows-x64.exe
+          if-no-files-found: error
+
+  build-linux:
+    needs: check-version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri v2 Linux build dependencies
+        # Same list README.md's own "Optional: the desktop app" section documents for a manual
+        # build, plus curl/wget/file/libxdo-dev -- Tauri's own officially documented prerequisites
+        # for a v2 Linux build (webview + tray-icon feature this app actually uses).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Build
+        working-directory: desktop/src-tauri
+        run: cargo build --release
+      - name: Stage artifact
+        run: |
+          mkdir -p dist-out
+          cp desktop/src-tauri/target/release/asra-desktop dist-out/asra-desktop-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asra-desktop-linux-x64
+          path: dist-out/asra-desktop-linux-x64
+          if-no-files-found: error
+
+  build-macos:
+    needs: check-version
+    runs-on: macos-latest
+    # Best-effort: README.md is explicit that no one has confirmed a working build on real Mac
+    # hardware yet. A failure here must never block shipping the Windows/Linux binaries that ARE
+    # verified -- this job runs on real macOS (GitHub's own runner), so a successful run here is
+    # actually the first real confirmation, and a failed one is useful signal without being fatal.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Build
+        working-directory: desktop/src-tauri
+        run: cargo build --release
+      - name: Stage artifact
+        run: |
+          mkdir -p dist-out
+          cp desktop/src-tauri/target/release/asra-desktop dist-out/asra-desktop-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asra-desktop-macos-arm64
+          path: dist-out/asra-desktop-macos-arm64
+          if-no-files-found: error
+
+  publish-release:
+    needs: [check-version, build-windows, build-linux, build-macos]
+    # Ships with whatever build-macos produced (nothing, if it failed -- continue-on-error above
+    # means this job still runs) -- always publish the two verified platforms even if macOS didn't
+    # come through this time.
+    if: always() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Checksums
+        run: |
+          cd artifacts
+          find . -type f -exec sha256sum {} \; | sed 's#\./[^/]*/#  #' > ../SHA256SUMS.txt
+          cd ..
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: ASRA v${{ needs.check-version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/asra-desktop-windows-x64/*
+            artifacts/asra-desktop-linux-x64/*
+            artifacts/asra-desktop-macos-arm64/*
+            SHA256SUMS.txt

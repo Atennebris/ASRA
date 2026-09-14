@@ -1,0 +1,3 @@
+{# Result of a Settings API-key Test button (main.py's /api/settings/test-api-key) -- a real
+   template like llm_test_status.html, so autoescape covers the message text automatically. #}
+<span class="{{ 'text-severity-low' if ok else 'text-severity-high' }}">{{ message }}</span>

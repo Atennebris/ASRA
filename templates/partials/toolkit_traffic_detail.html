@@ -1,0 +1,37 @@
+{# Raw request/response for one captured traffic entry -- filled into the shared
+   #toolkit-traffic-detail dialog's content div (partials/toolkit_panel.html) via htmx on row
+   click (main.py's get_toolkit_traffic_detail). One shared dialog, not one per entry -- see that
+   route's own docstring for why (hundreds of entries per real session, some with ~1MB bodies). #}
+{% from "macros/toolkit.html" import body_block %}
+{% from "macros/ui.html" import badge %}
+
+<div class="flex items-center justify-between gap-2 mb-3">
+  <span class="text-[11px] font-mono font-semibold text-accent">{{ entry.method }}</span>
+  <span class="text-sm text-primary break-all flex-1 min-w-0">{{ entry.url }}</span>
+  <span class="text-[11px] font-mono shrink-0
+               {{ 'text-severity-low' if entry.response_status and entry.response_status < 300
+                  else 'text-severity-medium' if entry.response_status and entry.response_status < 400
+                  else 'text-severity-high' if entry.response_status and entry.response_status >= 400
+                  else 'text-secondary' }}">{{ entry.response_status or '—' }}</span>
+</div>
+
+{# Passive detector hits (agent/tools/passive_detectors.py) -- computed once at capture time in
+   toolkit_store.build_traffic_entry, so this is a pure display, no re-detection here. #}
+{% if entry.flags %}
+  <div class="flex flex-wrap gap-1 mb-3">
+    {% for flag in entry.flags %}
+      {{ badge(flag.replace('_', ' '), "High") }}
+    {% endfor %}
+  </div>
+{% endif %}
+
+<p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Request</p>
+{{ body_block(entry.request_headers, request_detail) }}
+
+<p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Response</p>
+{{ body_block(entry.response_headers, response_detail) }}
+
+<div class="flex justify-end mt-3">
+  <button type="button" onclick="document.getElementById('toolkit-traffic-detail').close()"
+          class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">Close</button>
+</div>

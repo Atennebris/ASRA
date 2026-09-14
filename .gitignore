@@ -16,13 +16,22 @@ __pycache__/
 venv/
 .venv/
 
-# Tool caches (ruff/pytest/mypy — self-check tooling from CLAUDE.md)
+# Tool caches (ruff/pytest/mypy — the project's own self-check discipline)
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
 
+# Build artifacts — regenerable, never commit.
+# Rust build cache lives under desktop/src-tauri/target/ (ignored below) and is by far the biggest
+# offender; these catch the rest so no compiled/packaged output ever leaks into the repo.
+*.exe
+node_modules/
+*.rs.bk
+
 # Environment / secrets
 .env
+
+asra.txt
 
 # Personal tool registrations (local paths/binaries differ per machine) — see
 # custom_tools.example.yaml for the committed template
@@ -35,22 +44,128 @@ data/sessions/*
 # Maps session_id -> its real project folder (see sessions/store.py) — machine-specific paths
 data/sessions_index.json
 
+# Cached cheap per-session summary fields (name/target/status/...) — a derived speed-up for the
+# Projects list/sidebar/recent-projects polls, rebuilt automatically from real session data on a
+# cache miss (see sessions/store.py's list_session_summaries), never a source of truth on its own
+data/sessions_summary.json
+
 # Exploitation allowlist (managed only via the /settings UI, see agent/tools/allowed_targets.py)
 data/allowed_targets.json
 
 # Global LLM provider/model choice (managed via the /settings UI, see agent/settings.py)
 data/llm_settings.json
 
+# Operator-supplied interpreter/compiler paths (managed via the /settings UI, see
+# agent/tools/capability_paths.py) — real local filesystem paths, machine-specific
+data/tool_paths.json
+
+# Wordlist catalog: downloaded-wordlist metadata + per-tool assignments (managed via the
+# /settings UI, see agent/tools/wordlist_store.py) — real local WSL file paths, machine-specific
+data/wordlist_assignments.json
+
+# Subagent profiles (managed via the /subagents UI, see agent/tools/subagent_store.py) —
+# operator-authored instructions/personality text, machine-specific tool availability
+data/subagent_profiles.json
+
+# Chat panel's own capability toggles (managed via the /chat-settings UI, see
+# agent/tools/chat_settings_store.py) — machine-specific operator preference
+data/chat_settings.json
+
+# Native toolkit's agent/chat/subagent access toggles (managed via the /settings UI, see
+# agent/tools/toolkit_settings_store.py) — machine-specific operator preference
+data/toolkit_agent_settings.json
+
+# Custom LLM provider instances (managed via the /settings UI, see agent/custom_providers.py) —
+# each entry carries its own real API key in plain JSON (unlike the 6 built-in providers, which
+# have no fixed env var name to live in since an arbitrary number of these can exist)
+data/custom_providers.json
+
+# "Sign in with ChatGPT" OAuth session (agent/codex_oauth.py) — holds a real, working refresh
+# token for the signed-in ChatGPT account
+data/codex_oauth_tokens.json
+
+# "Sign in with GitHub Copilot" OAuth session (agent/copilot_oauth.py) — holds a real, working
+# GitHub OAuth token for the signed-in account
+data/copilot_oauth_tokens.json
+
+# Wordlists downloaded via the /settings UI's "Download wordlist" button (agent/tools/
+# wordlist_download.py) — arbitrary-sized real wordlist files, not project source
+data/wordlists/*
+!data/wordlists/.gitkeep
+
 # Debug logs (see agent/utils/debug.py) — dir is created on demand, no .gitkeep needed
 data/debug.log
 data/debug/*
 
+# THC-Hydra's own interrupted-run state file (agent/tools/background_jobs.py runs hydra with
+# cwd=<session folder>/background-jobs, but a leftover snapshot from before that fix, or any
+# process that still lands in the repo root, must never be committed) — holds the run's real
+# target host/port and progress through a credential list, resumable with `hydra -R`
+/hydra.restore
+
+# Raw whatweb scan output dumped into the repo root (tool writes it next to its own cwd; holds
+# real target hosts/IPs from a real engagement)
+/whatweb.json
+
 # TTL cache for external lookups (see agent/tools/native.py)
 data/cache/*
 !data/cache/.gitkeep
+
+# interactsh session state (see agent/tools/native.py's oob_generate/oob_poll) — each file holds a
+# real RSA private key + secret-key used to poll/decrypt that session's OOB interactions. Never
+# committed: leaking one would let anyone else read interaction data logged for a real engagement.
+data/oob_sessions/*
+!data/oob_sessions/.gitkeep
+
+# Per-project authenticated-identity credentials (New Project form's optional identity fields —
+# see agent/tools/native.py's authenticated_request). Real login passwords/session tokens for a
+# real target account. Never committed, never rendered in any template or Export Proof.
+data/credentials/*
+!data/credentials/.gitkeep
+
+# Cross-session technique playbook (agent/tools/playbook_store.py) -- real exploitation
+# techniques/payloads confirmed against real bug-bounty/pentest targets' fingerprints. Never
+# committed: this is exactly the kind of live-engagement evidence the rest of data/ already
+# protects (credentials, oob_sessions), just accumulated across sessions instead of within one.
+data/playbook/*
+!data/playbook/.gitkeep
+
+# Cross-session asset baseline (agent/tools/asset_baseline_store.py) -- real subdomain/port/
+# endpoint lists discovered against real bug-bounty/pentest targets, accumulated across sessions.
+# Same reasoning as data/playbook/ above: target-identifying live-engagement data, never committed.
+data/asset_baseline/*
+!data/asset_baseline/.gitkeep
+
+# Cross-session tool-selection memory (agent/tools/tool_memory_store.py) -- which scanner/tool
+# actually produced signal against a real target's tech/WAF fingerprint. Same reasoning as
+# data/playbook/ and data/asset_baseline/ above: real target-fingerprint data, never committed.
+data/tool_memory/*
+!data/tool_memory/.gitkeep
+
+# frida-trace's own auto-generated handler .js files (agent/tools/builders/frida.py) -- frida-trace
+# always writes these to ./__handlers__ relative to whatever process's CWD invoked it (no flag to
+# redirect this, confirmed against its own --help), which for ASRA is the repo root itself, not the
+# project folder the trace's own target file lives in. Harmless content (auto-generated JS hook
+# stubs, never anything target-identifying/sensitive), just real repo clutter to keep out of git.
+__handlers__/
 
 # Editors / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Tauri desktop shell (Rust) build artifacts
+desktop/src-tauri/target/
+
+
+# Parked built shell binaries (regenerable — never commit)
+desktop/bin/
+
+# Windows ConPTY bridge (windows-pty-bridge/) build artifacts + its own parked binary -- same
+# "regenerable, never commit" reasoning as the desktop shell entries above.
+windows-pty-bridge/target/
+windows-pty-bridge/bin/
+
+# Tauri build-generated ACL schemas (regenerated on every build)
+desktop/src-tauri/gen/

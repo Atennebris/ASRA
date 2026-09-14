@@ -1,0 +1,39 @@
+{# Live install view for one nuclei template pack -- rendered into #nuclei-pack-output-<key> by the
+   install route, then re-fetched by its own polling trigger while the background
+   `GITHUB_TEMPLATE_REPO=... nuclei -update-templates` run is in flight (agent/tools/
+   nuclei_template_packs.py). Same "self-poll only while running" shape as arsenal_install.html --
+   the returned fragment drops hx-trigger once the process exits, so polling stops on its own. #}
+{% if blocked %}
+  <div class="bg-surface border border-severity-high/40 rounded-lg p-3">
+    <p class="text-[11px] text-severity-high mb-1">Install did not start</p>
+    <p class="text-[11px] text-secondary">{{ blocked_message }}</p>
+  </div>
+{% else %}
+  {% set running = status.running %}
+  <div id="nuclei-pack-install-view-{{ key }}"
+       {% if running %}hx-get="/api/tools/nuclei-packs/{{ key }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+       class="bg-surface border border-default rounded-lg p-3">
+    <div class="flex items-center gap-2 mb-2">
+      {% if running %}
+        <span class="w-1.5 h-1.5 rounded-full bg-severity-medium shrink-0 animate-pulse"></span>
+        <p class="text-[12px] font-semibold text-primary">Syncing templates&hellip;</p>
+      {% elif status.succeeded %}
+        <span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span>
+        <p class="text-[12px] font-semibold text-status-online">Pack installed.</p>
+      {% elif status.returncode is not none %}
+        <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span>
+        <p class="text-[12px] font-semibold text-severity-high">Sync failed (exit code {{ status.returncode }}).</p>
+      {% else %}
+        <span class="w-1.5 h-1.5 rounded-full bg-severity-medium shrink-0"></span>
+        <p class="text-[12px] font-semibold text-primary">State unknown (the server restarted during the sync).</p>
+      {% endif %}
+    </div>
+    <pre class="text-[10.5px] font-mono text-secondary bg-elevated rounded p-2 overflow-x-auto max-h-56 overflow-y-auto whitespace-pre-wrap">{{ status.log or "Waiting for output..." }}</pre>
+    {% if not running %}
+      <button type="button" hx-get="/api/tools/nuclei-packs" hx-target="#nuclei-packs-list" hx-swap="outerHTML"
+              class="mt-2 inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-7 px-3 text-[11px]">
+        Refresh
+      </button>
+    {% endif %}
+  </div>
+{% endif %}

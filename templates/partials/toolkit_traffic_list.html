@@ -1,0 +1,76 @@
+{# Site Map / Proxy History table -- polled by partials/toolkit_panel.html every few seconds.
+   Summary fields only (method/url/status/length) -- full raw request/response is lazy-loaded into
+   the shared #toolkit-traffic-detail dialog on row click (main.py's get_toolkit_traffic_detail),
+   never pre-rendered per row here: a real session can capture hundreds of entries, some with
+   ~1MB bodies (confirmed live), so embedding all of that inline on every poll tick would be
+   wasteful. #}
+{% if query_error %}
+  <p class="text-[11px] text-severity-high font-mono py-2">Invalid filter: {{ query_error }}</p>
+{% elif query_truncated %}
+  <p class="text-[11px] text-severity-medium py-1">Showing partial results -- the filter scanned as far back as it could without reading the whole history. Narrow the query for a complete match set.</p>
+{% endif %}
+{% if entries %}
+  <div id="toolkit-traffic-list-rows" class="divide-y divide-default border border-default rounded-lg overflow-hidden">
+    {% for entry in entries %}
+      <div class="flex items-center bg-surface hover:bg-elevated transition-colors">
+        <button type="button"
+                hx-get="{{ toolkit_base_url }}/traffic/{{ entry.id }}"
+                hx-target="#toolkit-traffic-detail-content" hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('toolkit-traffic-detail').showModal()"
+                class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 text-left">
+          <span class="text-[11px] font-mono font-semibold text-accent shrink-0 w-14">{{ entry.method }}</span>
+          <span class="text-[11px] font-mono shrink-0 w-10
+                       {{ 'text-severity-low' if entry.response_status and entry.response_status < 300
+                          else 'text-severity-medium' if entry.response_status and entry.response_status < 400
+                          else 'text-severity-high' if entry.response_status and entry.response_status >= 400
+                          else 'text-secondary' }}">{{ entry.response_status or '—' }}</span>
+          <span class="text-[11px] text-primary truncate flex-1 min-w-0">{{ entry.url }}</span>
+          {# Passive detector hits (agent/tools/passive_detectors.py, computed once at capture time
+             in toolkit_store.build_traffic_entry) -- a compact count badge rather than one pill per
+             flag, so a row with several hits doesn't blow out this table's fixed row height; the
+             full flag names are in the title tooltip and, in full, in the detail dialog. #}
+          {% if entry.flags %}
+            <span class="inline-flex items-center gap-0.5 text-[10px] font-mono font-semibold text-severity-high shrink-0" title="{{ entry.flags | join(', ') }}"><svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M5 21V4h13l-2 4 2 4H7"/></svg>{{ entry.flags | length }}</span>
+          {% endif %}
+          {# response_content_length -- the real original byte count, not len(entry.response_body):
+             for a base64-encoded binary body (agent/tools/toolkit_proxy.py's _encode_body) the
+             stored string is ~4/3x inflated, so len() alone would show a wrong, misleadingly large
+             number for every image/font/other binary response. #}
+          <span class="text-[11px] text-secondary shrink-0 tabular-nums">{{ entry.get('response_content_length', entry.response_body | length) }} B</span>
+        </button>
+        {# Send to Repeater: switches the outer sub-tab (plain onclick, same "toggle a radio
+           directly" style already used elsewhere -- no dedicated JS module needed for one line)
+           AND loads this entry into the Repeater editor via htmx, same GET route a History row
+           reuses (partials/toolkit_repeater.html). #}
+        <button type="button" title="Send to Repeater" aria-label="Send to Repeater"
+                onclick="document.getElementById('toolkit-subtab-repeater').checked = true"
+                hx-get="{{ toolkit_base_url }}/repeater?entry_id={{ entry.id }}"
+                hx-target="#toolkit-repeater-container" hx-swap="outerHTML"
+                class="shrink-0 px-2.5 py-2 text-secondary hover:text-accent">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        </button>
+        {# Send to Racer: same shape as "Send to Repeater" above -- switch the outer sub-tab, load
+           this entry into the Racer form via htmx (partials/toolkit_racer.html). #}
+        <button type="button" title="Send to Racer" aria-label="Send to Racer"
+                onclick="document.getElementById('toolkit-subtab-racer').checked = true"
+                hx-get="{{ toolkit_base_url }}/racer?entry_id={{ entry.id }}"
+                hx-target="#toolkit-racer-container" hx-swap="outerHTML"
+                class="shrink-0 px-2.5 py-2 text-secondary hover:text-accent">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        </button>
+      </div>
+    {% endfor %}
+  </div>
+{% elif not query_error %}
+  {% if query_active %}
+    <p class="text-sm text-secondary italic py-4">No matches for this filter{{ " in the portion of history scanned" if query_truncated else "" }}.</p>
+  {% elif session_id %}
+    <p class="text-sm text-secondary italic py-4">No traffic captured yet — navigate the agent's browser (browser_navigate, or let the agent browse during Recon) and requests will appear here.</p>
+  {% else %}
+    <p class="text-sm text-secondary italic py-4">No traffic yet — anything sent from Repeater or Intruder on this page shows up here.</p>
+  {% endif %}
+{% endif %}

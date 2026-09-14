@@ -1,0 +1,298 @@
+{% from "macros/ui.html" import badge, scenario_badge, bounty_badge, exploited_badge, false_positive_badge, section_label, disclosure_summary, chat_ref, tool_timeline_list, copy_button %}
+{# Interactive/Reverse-Engineering-mode findings panel (main.py's interactive_findings/re_reverify
+   routes). `findings` is a list of {"index": <1-based position in the ORIGINAL, unreversed
+   session["findings"]>, "finding": <the dict itself>} (main.py's _re_findings_context), newest
+   first for display while keeping each card's own chat_ref tag matched to what typing "[F3]" in
+   chat actually resolves to (agent/chat.py's _session_snapshot numbers from the SAME original
+   order, never the reversed display order).
+
+   session["findings"] holds two different shapes at once for an RE-mode session: the simple
+   chat-bookkeeping shape (title/description/severity/extracted_artifact/found_at,
+   agent/chat.py's _apply_chat_record_finding) from ordinary chat use, and the full native
+   record_finding shape (technology/reproduction_steps/evidence/evidence_ref/exploitation_scenario/
+   qualifies_for_bounty/false_positive_reason/exploited/remediation_advice/tool_timeline/
+   verification/advisory_note) from agent/core.py's run_re_triage/run_re_reverify -- every field
+   below is behind its own `{% if %}` guard for exactly this reason, same discipline
+   session_fragment.html's own Agent-mode finding cards already use for optional fields. #}
+{% if not findings %}
+  <div class="flex flex-col items-center justify-center text-center h-full py-12 px-6">
+    <svg class="w-7 h-7 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M4 21V4h13l-2 4 2 4H6" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <p class="text-sm font-medium text-primary mt-3">No findings yet</p>
+    <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[20rem]">
+      Ask the agent to get or confirm something in the chat — for Reverse Engineering mode, the
+      baseline triage pass also records here directly. The moment something real lands — the
+      value obtained, a confirmed vulnerability, the misconfiguration proven — it shows up as a
+      card, clickable for full detail.
+    </p>
+  </div>
+{% else %}
+  {# Filter tiles -- same OR-group-severity/independent-status-toggle convention and same
+     static/js/findings_filter.js delegated handler as session_fragment.html's own Agent-mode
+     Findings tab (that file's own top-of-block comment explains the mechanics in full; not
+     re-explained here). Real, needed addition for the same reason it was needed there: an RE
+     session can easily carry many findings (slither/mythril/semgrep/osv_scanner/trufflehog can
+     each contribute several), previously rendered as one flat, unfiltered list here with no way to
+     jump straight to just the exploited/qualifying ones. No exploitation-scenario OR-group here
+     (unlike session_fragment.html) -- RE mode's own record_finding path always sets the same fixed
+     "local_only" value (see the dialog's own scenario_badge comment above), so a filter dimension
+     with only ever one possible value would add a control with nothing real to narrow down. #}
+  {% set finding_list = findings | map(attribute="finding") | list %}
+  {% set finding_sev_order = ["Critical", "High", "Medium", "Low", "Info"] %}
+  {% set finding_sev_counts = {} %}
+  {% for sev in finding_sev_order %}
+    {% set _ = finding_sev_counts.update({sev: finding_list | selectattr("severity", "equalto", sev) | list | length}) %}
+  {% endfor %}
+  {% set finding_exploited_count = finding_list | selectattr("exploited") | list | length %}
+  {% set finding_qualifying_count = finding_list | selectattr("qualifies_for_bounty", "equalto", "qualifying") | list | length %}
+  {% set finding_false_positive_count = finding_list | selectattr("false_positive_reason") | list | length %}
+  {% set finding_status_chips = [
+    ("exploited", "true", "Exploited", finding_exploited_count, "critical"),
+    ("qualifying", "qualifying", "Qualifying", finding_qualifying_count, "critical"),
+    ("false_positive", "true", "False positive", finding_false_positive_count, "unknown"),
+  ] %}
+  {% set any_severity_present = (finding_sev_counts.values() | select("greaterthan", 0) | list | length) > 0 %}
+  {% set any_status_chip_present = (finding_exploited_count + finding_qualifying_count + finding_false_positive_count) > 0 %}
+  {% if any_severity_present or any_status_chip_present %}
+    <div class="mb-2.5 flex flex-wrap items-center gap-1.5" data-findings-filter-tiles>
+      {% for sev in finding_sev_order %}
+        {% set count = finding_sev_counts[sev] %}
+        {% if count > 0 %}
+          {% set sev_key = sev | lower %}
+          <button type="button" data-findings-filter-tile data-filter-group="severity" data-filter-value="{{ sev_key }}"
+                  class="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border text-severity-{{ sev_key }} border-severity-{{ sev_key }}/40 bg-severity-{{ sev_key }}/10 hover:bg-severity-{{ sev_key }}/20 transition-colors cursor-pointer">
+            {{ sev }} <span class="tabular-nums">{{ count }}</span>
+          </button>
+        {% endif %}
+      {% endfor %}
+      {% if any_severity_present and any_status_chip_present %}
+        <span class="w-px h-4 bg-default mx-0.5"></span>
+      {% endif %}
+      {% for group, value, label, count, tone in finding_status_chips %}
+        {% if count > 0 %}
+          <button type="button" data-findings-filter-tile data-filter-group="{{ group }}" data-filter-value="{{ value }}"
+                  class="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border text-severity-{{ tone }} border-severity-{{ tone }}/40 bg-severity-{{ tone }}/10 hover:bg-severity-{{ tone }}/20 transition-colors cursor-pointer">
+            {{ label }} <span class="tabular-nums">{{ count }}</span>
+          </button>
+        {% endif %}
+      {% endfor %}
+      {# Hidden by default, shown by static/js/findings_filter.js whenever any tile above is active
+         -- see session_fragment.html's own identical control for the full reasoning (a filter left
+         over from an earlier visit read as a broken/stuck list with no other signal it was active). #}
+      <button type="button" data-findings-clear-filters class="hidden ml-auto text-[11px] text-accent hover:underline whitespace-nowrap">Clear filters</button>
+    </div>
+  {% endif %}
+  <div class="space-y-2.5">
+    {% for entry in findings %}
+      {% set f = entry.finding %}
+      {% set dialog_id = "re-finding-dialog-" ~ entry.index %}
+      {% set finding_cves = (f.title ~ " " ~ (f.description or "")) | extract_cves %}
+      <div class="relative" data-finding-row
+           data-severity="{{ (f.severity or '') | lower }}"
+           data-exploited="{{ 'true' if f.exploited else 'false' }}"
+           data-qualifying="{{ f.qualifies_for_bounty or '' }}"
+           data-false-positive="{{ 'true' if f.false_positive_reason else 'false' }}">
+        <button type="button" onclick="asraOpenDialog('{{ dialog_id }}')"
+                class="w-full min-w-0 text-left rounded-lg border border-default bg-elevated p-3 hover:border-accent/50 transition-colors cursor-pointer">
+          <div class="flex items-start gap-2 pr-7">
+            {% if f.severity %}{{ badge(f.severity, severity=f.severity, muted=f.false_positive_reason) }}{% endif %}
+            <h3 class="text-[13px] font-semibold text-primary leading-snug min-w-0 flex-1 break-words">{{ f.title }}</h3>
+          </div>
+          <div class="flex flex-wrap items-center gap-1 mt-1.5">
+            {{ exploited_badge(f) }}
+            {{ bounty_badge(f.qualifies_for_bounty) }}
+            {{ false_positive_badge(f.false_positive_reason) }}
+            {% if f.verification == "verified" %}
+              {# Set only by agent/core.py's run_re_reverify on a fresh, tool-backed
+                 verification_outcome="confirmed_present" -- the RE-mode equivalent of Agent-mode's
+                 own exploited_badge "Exploited" state. Red/critical, not green: this means the
+                 vulnerability/bug is real and still there right now -- a confirmed BAD outcome for
+                 the target, not a "some check passed" success signal. Same severity-critical tone
+                 exploited_badge itself already uses for the identical semantic. #}
+              <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide border text-severity-critical border-severity-critical/40 bg-severity-critical/10">&#9873; Confirmed</span>
+            {% endif %}
+          </div>
+          {% if finding_cves %}
+            <div class="flex flex-wrap gap-1 mt-1">
+              {% for cve in finding_cves %}
+                <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10">{{ cve }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
+          {% if f.verification == "verified" and f.advisory_note %}
+            {# Real, confirmed operator complaint this fixes: the red "Confirmed" badge above says
+               something bad is real, but the CLOSED card used to only ever show f.description (the
+               original triage-pass description) -- the actually concrete "what this gets you, how"
+               text a fresh re-verify pass writes lives in f.advisory_note/f.reproduction_steps
+               (run_re_reverify, agent/core.py), never surfaced without opening the dialog AND
+               expanding its own "Full evidence" details a second time. Preview it right here
+               instead, in the same alarming red tone as the badge itself -- the operator gets the
+               actual impact at a glance, the dialog is still there for the full text/repro steps. #}
+            <p class="text-[11.5px] text-severity-critical/90 mt-1.5 leading-relaxed break-words line-clamp-2">{{ f.advisory_note }}</p>
+          {% elif f.description %}
+            <p class="text-[11.5px] text-secondary mt-1.5 leading-relaxed break-words line-clamp-2">{{ f.description }}</p>
+          {% endif %}
+          <p class="text-[10px] text-secondary/70 mt-1">{% if f.verification %}Verification: {{ f.verification }}{% endif %}{% if f.found_at %} &middot; {{ f.found_at | human_dt }}{% endif %}</p>
+        </button>
+        <div class="absolute top-2 right-2">{{ chat_ref("F" ~ entry.index) }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  {# Shown/hidden by static/js/findings_filter.js when the active tile combination matches zero
+     cards -- a real, expected outcome, not a broken filter -- same element/behavior as
+     session_fragment.html's own equivalent message. #}
+  <p data-findings-filter-empty class="hidden text-[11px] text-secondary text-center py-4 border border-dashed border-default rounded-lg">No findings match the current filter.</p>
+
+  <form hx-post="/api/session/{{ session_id }}/re-reverify" hx-target="#interactive-findings-content" hx-swap="innerHTML" hx-disabled-elt="this" class="mt-3">
+    <button type="submit" class="w-full inline-flex items-center justify-center gap-2 rounded border border-default hover:border-accent/50 text-secondary hover:text-primary h-8 px-3 text-[11px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed" {{ "disabled" if session_status in ("pending", "processing") else "" }}>
+      {% if session_status in ("pending", "processing") %}
+        <span class="asra-spinner"></span> Re-verifying&hellip;
+      {% else %}
+        Re-verify all findings
+      {% endif %}
+    </button>
+  </form>
+
+  {# Every finding's detail dialog -- direct children of this same fragment root (never nested
+     inside anything else that could go display:none out from under an already-open dialog), which
+     is enough here: unlike Agent-mode's tab-switching page (session_fragment.html's own dialogs
+     have to be hoisted to a page-level sibling for exactly that reason), this whole fragment is
+     ONLY ever inserted into the DOM at the moment its own container (#interactive-findings-content)
+     is already visible (session.html's asraInteractiveCollapse toggles the "findings-open" class
+     BEFORE firing the htmx fetch that inserts this), so there's no stale-hidden-ancestor case to
+     guard against here. #}
+  {% for entry in findings %}
+    {% set f = entry.finding %}
+    {% set dialog_id = "re-finding-dialog-" ~ entry.index %}
+    {% set finding_cves = (f.title ~ " " ~ (f.description or "")) | extract_cves %}
+    <dialog id="{{ dialog_id }}" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl backdrop:bg-black/50">
+      <div class="flex items-center justify-between px-4 h-12 border-b border-default min-w-0">
+        <span class="text-[13px] font-semibold break-words min-w-0 truncate">{{ f.title }}</span>
+        <div class="flex items-center gap-3 shrink-0 ml-3">
+          {{ copy_button(f | finding_copy_text) }}
+          <button type="button" onclick="document.getElementById('{{ dialog_id }}').close()"
+                  class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
+        </div>
+      </div>
+      <div class="p-4 space-y-3 max-h-[75vh] overflow-y-auto asra-scroll">
+        <div class="flex flex-wrap items-center gap-2">
+          {% if f.severity %}{{ badge(f.severity, severity=f.severity, muted=f.false_positive_reason) }}{% endif %}
+          {# RE mode's own record_finding path always sets this (RE_TRIAGE_PROMPT: "no network
+             target, so always set exploitation_scenario='local_only'") -- renders nothing for the
+             plain chat-bookkeeping shape (_apply_chat_record_finding), which never sets it, same
+             as session_fragment.html's own Agent-mode dialog (this exact position, badge -> scenario
+             -> bounty). #}
+          {{ scenario_badge(f.exploitation_scenario) }}
+          {{ bounty_badge(f.qualifies_for_bounty) }}
+          {{ false_positive_badge(f.false_positive_reason) }}
+          {% for cve in finding_cves %}
+            <a href="https://nvd.nist.gov/vuln/detail/{{ cve }}" target="_blank" rel="noopener noreferrer"
+               class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10 hover:bg-severity-medium/20">{{ cve }}</a>
+          {% endfor %}
+          {% if f.verification %}<span class="text-[11px] text-secondary">Verification: {{ f.verification }}</span>{% endif %}
+          {% if f.found_at %}<span class="text-[11px] text-secondary">&middot; Found {{ f.found_at | human_dt }}</span>{% endif %}
+        </div>
+
+        {% if f.exploited %}
+          <div class="rounded border-2 border-severity-critical bg-severity-critical/10 px-2.5 py-2 mb-2">
+            <p class="text-[11px] font-bold uppercase tracking-wide text-severity-critical">&#9873; Confirmed</p>
+            {% if f.extracted_artifact %}<p class="text-sm font-bold text-primary break-words mt-1 font-mono">{{ f.extracted_artifact }}</p>{% endif %}
+          </div>
+        {% endif %}
+
+        {% if f.verification == "verified" and f.advisory_note %}
+          {# Set only by agent/core.py's run_re_reverify on a fresh confirmed_present outcome --
+             the reasoning here was specifically asked (that function's own task text) to be
+             concrete, numbered reproduction steps the operator can run themselves, not just an
+             internal note -- same content also promoted into f.reproduction_steps below, in the
+             "Full evidence" section (open by default), so it's visible both ways. Red/critical, not
+             green -- a confirmed still-present bug is bad news for the target, the same "danger,
+             not success" semantic Agent-mode's own "Exploited" block already uses (real incident
+             this fixes: shipped green the first time, read as "all clear" instead of "still broken"
+             on sight). #}
+          <div class="rounded border-2 border-severity-critical bg-severity-critical/10 px-2.5 py-2 mb-2">
+            <p class="text-[11px] font-bold uppercase tracking-wide text-severity-critical">&#9873; Confirmed — still present</p>
+            <div class="text-[11px] break-words text-secondary mt-1 chat-markdown">{{ f.advisory_note | render_chat_markdown }}</div>
+          </div>
+        {% elif f.advisory_note %}
+          <div class="rounded border border-severity-medium/40 bg-severity-medium/10 px-2 py-1.5 mb-2">
+            <p class="text-[11px] font-semibold text-severity-medium">Re-verification note</p>
+            <div class="text-[11px] break-words text-secondary mt-0.5 chat-markdown">{{ f.advisory_note | render_chat_markdown }}</div>
+          </div>
+        {% endif %}
+
+        {% if f.remediation_advice and not f.false_positive_reason %}
+          <div class="rounded border border-status-online/40 bg-status-online/10 px-2.5 py-2 mb-2">
+            <p class="text-[11px] font-bold uppercase tracking-wide text-status-online">&#10003; How to fix</p>
+            <div class="text-[11px] break-words text-secondary mt-0.5 chat-markdown">{{ f.remediation_advice | render_chat_markdown }}</div>
+          </div>
+        {% endif %}
+
+        {% if f.technology %}
+          {{ section_label("Technology") }}
+          <p class="text-sm break-words text-primary mb-2">{{ f.technology }}</p>
+        {% endif %}
+
+        {% if f.description %}
+          {{ section_label("Description") }}
+          <div class="text-sm break-words text-secondary mb-2 chat-markdown">{{ f.description | render_chat_markdown }}</div>
+        {% endif %}
+
+        {% if f.extracted_artifact and not f.exploited %}
+          {{ section_label("Artifact") }}
+          <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ f.extracted_artifact }}</code></pre>
+        {% endif %}
+
+        {% if f.reproduction_steps or f.evidence or f.evidence_ref or f.evidence_entry_id %}
+          <details class="group rounded-lg border border-default bg-elevated mb-2" open>
+            {{ disclosure_summary("Full evidence / reproduction detail") }}
+            <div class="px-3 pb-3 border-t border-default pt-2">
+              {% if f.reproduction_steps %}
+                {{ section_label("Reproduction") }}
+                <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ f.reproduction_steps }}</code></pre>
+              {% endif %}
+              {% if f.evidence %}
+                {{ section_label("Evidence") }}
+                <pre class="overflow-x-auto bg-elevated border border-default rounded p-2 mb-2 text-[11px] break-words whitespace-pre-wrap asra-scroll"><code>{{ f.evidence }}</code></pre>
+              {% endif %}
+              {% if f.evidence_ref %}
+                {{ section_label("Evidence reference") }}
+                <p class="text-[11px] break-words text-secondary mb-2">{{ f.evidence_ref }}</p>
+              {% endif %}
+              {% if f.evidence_entry_id %}
+                {# Same shared #toolkit-traffic-detail dialog session_fragment.html's own finding
+                   cards use -- toolkit_panel.html is included unconditionally on every session
+                   page, RE-mode included, so this dialog is always present regardless of mode. #}
+                <button type="button"
+                        hx-get="/api/session/{{ session_id }}/toolkit/traffic/{{ f.evidence_entry_id }}"
+                        hx-target="#toolkit-traffic-detail-content" hx-swap="innerHTML"
+                        hx-on::after-request="if(event.detail.successful) document.getElementById('toolkit-traffic-detail').showModal()"
+                        class="text-[11px] text-accent hover:underline">View captured request &rarr;</button>
+              {% endif %}
+            </div>
+          </details>
+        {% endif %}
+        {% if f.false_positive_reason %}
+          <div class="text-[11px] break-words text-secondary mb-2 border-l-2 border-severity-unknown/50 pl-2 chat-markdown">&#8856; {{ f.false_positive_reason | render_chat_markdown }}</div>
+        {% endif %}
+
+        {% if f.tool_timeline %}
+          {{ section_label("Tool timeline") }}
+          {{ tool_timeline_list(f.tool_timeline) }}
+        {% endif %}
+
+        <form hx-post="/api/session/{{ session_id }}/re-reverify" hx-target="#interactive-findings-content" hx-swap="innerHTML" hx-disabled-elt="this">
+          <input type="hidden" name="finding_title" value="{{ f.title }}">
+          <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm disabled:opacity-40 disabled:cursor-not-allowed" {{ "disabled" if session_status in ("pending", "processing") else "" }}>
+            {% if session_status in ("pending", "processing") %}
+              <span class="asra-spinner"></span> Re-verifying&hellip;
+            {% else %}
+              Re-verify &mdash; check this finding still holds
+            {% endif %}
+          </button>
+        </form>
+      </div>
+    </dialog>
+  {% endfor %}
+{% endif %}

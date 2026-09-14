@@ -1,0 +1,84 @@
+{# Project icons -- simple, hand-drawn, copyright-free security/geometric glyphs. project_icon()
+   renders one by name (colored via currentColor + an inline style); the names MUST stay in sync
+   with projects/icons.py's ICON_NAMES. icon_picker() renders the New Project form's chooser. #}
+
+{% macro project_icon(name, size_class="w-4 h-4", color=none) %}
+  <svg class="{{ size_class }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"{% if color %} style="color: {{ color }}"{% endif %}>
+    {%- if name == "target" -%}
+      <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>
+    {%- elif name == "bug" -%}
+      <rect x="8" y="9" width="8" height="10" rx="4"/><path d="M12 9V6M9 6a3 3 0 0 1 6 0M4 11h4M16 11h4M4 16h4M16 16h4M5 21l3-3M19 21l-3-3"/>
+    {%- elif name == "key" -%}
+      <circle cx="8" cy="8" r="4"/><path d="M11 11l9 9M17 17l2-2M19 19l2-2"/>
+    {%- elif name == "lock" -%}
+      <rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+    {%- elif name == "flag" -%}
+      <path d="M5 21V4h13l-2 4 2 4H7"/>
+    {%- elif name == "bolt" -%}
+      <path d="M13 2 4 14h6l-1 8 9-12h-6z"/>
+    {%- elif name == "radar" -%}
+      <circle cx="12" cy="12" r="9"/><path d="M12 12l6-3M12 3a9 9 0 0 1 9 9"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
+    {%- elif name == "globe" -%}
+      <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/>
+    {%- elif name == "server" -%}
+      <rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M8 7.5h.01M8 16.5h.01"/>
+    {%- elif name == "terminal" -%}
+      <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>
+    {%- elif name == "fingerprint" -%}
+      <path d="M12 4a8 8 0 0 1 8 8M12 8a4 4 0 0 1 4 4v4M8 12a4 4 0 0 1 8 0v3M6 12a6 6 0 0 1 6-6"/>
+    {%- elif name == "eye" -%}
+      <path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>
+    {%- elif name == "ghost" -%}
+      <path d="M5 21V10a7 7 0 0 1 14 0v11l-3-2-2 2-2-2-2 2-3-2z"/><path d="M9.5 10h.01M14.5 10h.01"/>
+    {%- elif name == "hexagon" -%}
+      <path d="M12 2l8.5 5v10L12 22 3.5 17V7z"/>
+    {%- elif name == "crosshair" -%}
+      <circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+    {%- elif name == "skull" -%}
+      <path d="M12 2a8 8 0 0 0-8 8c0 3 1.6 4.6 3 5.5V19a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-3.5c1.4-.9 3-2.5 3-5.5a8 8 0 0 0-8-8z"/><circle cx="9" cy="11" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="11" r="1.5" fill="currentColor" stroke="none"/><path d="M10.5 20v-2.5M13.5 20v-2.5"/>
+    {%- else -%}
+      {# shield -- the default #}
+      <path d="M12 2 3 6v6c0 5 4 9 9 10 5-1 9-5 9-10V6z"/>
+    {%- endif -%}
+  </svg>
+{% endmacro %}
+
+{% macro icon_picker(selected_icon="", selected_color="", id_prefix="") %}
+  {# Compact icon + color chooser. Optional: skip it and the server assigns a random icon + color
+     (sessions/store.py). Color is a single full-spectrum <input type="color"> (styled as a round
+     swatch, themes.css) rather than a fixed palette -- ICON_COLORS is now only the pool its random
+     default is drawn from. The live preview is wired by base.html's own delegated input/change
+     listener (works for every copy of this picker on the page). #}
+  {# Color defaults to black -- a neutral starting swatch. Black is treated as "unchosen" on submit
+     (sessions/store.py assigns a random color instead, so a project never gets an invisible black
+     glyph on the dark UI), so the preview shows the muted default color, not literal black. #}
+  {% set default_color = selected_color or "#000000" %}
+  {# Black (the neutral default, or a preserved unchosen color on an error re-render) renders muted
+     in the preview, never as an invisible black glyph. #}
+  {% set preview_color = "var(--text-secondary)" if default_color == "#000000" else default_color %}
+  <div class="project-icon-picker">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-2">Project icon <span class="text-secondary/60 normal-case">— optional, random if skipped</span></span>
+    <div class="flex items-center gap-2.5">
+      <div class="icon-picker-preview shrink-0" aria-hidden="true">
+        {{ project_icon(selected_icon or "shield", size_class="w-5 h-5", color=preview_color) }}
+      </div>
+      <div class="icon-picker-grid min-w-0 flex-1">
+        {# id_prefix keeps ids unique per call -- this macro is rendered once per New Project wizard
+           panel (Agent/Interactive/Reverse Engineering), all three always present in the same DOM at
+           once (CSS-only show/hide, never removed from the page), so an unprefixed id="icon-{{name}}"
+           would collide across all three copies. Real incident this fixes: with duplicate ids, only
+           the FIRST copy in DOM order (Agent's) ever received the :checked highlight/label binding --
+           the underlying radio value still submitted correctly (confirmed: session.json got the
+           right icon), but clicking a swatch in the Interactive/RE panel visibly appeared to do
+           nothing, since the highlighted element was a different, hidden copy of the same id. #}
+        {% for name in PROJECT_ICON_NAMES %}
+          <input type="radio" name="icon" id="{{ id_prefix }}icon-{{ name }}" value="{{ name }}" class="sr-only" {% if selected_icon == name %}checked{% endif %}>
+          <label for="{{ id_prefix }}icon-{{ name }}" class="icon-picker-swatch" title="{{ name }}">{{ project_icon(name, size_class="w-4 h-4") }}</label>
+        {% endfor %}
+      </div>
+      <label class="icon-picker-colorbtn shrink-0" title="Icon color — pick any">
+        <input type="color" name="icon_color" value="{{ default_color }}">
+      </label>
+    </div>
+  </div>
+{% endmacro %}

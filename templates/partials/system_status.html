@@ -1,0 +1,10 @@
+{# Sidebar status row content (base.html) — polled by GET /api/system-health (main.py). A real
+   green/red signal now, not static markup: green + "Online" when the sessions store is readable
+   and at least one LLM provider is usable, red + "Degraded" otherwise. The "local-only" fact
+   (scan data never leaves this machine) is real and worth keeping, just not cluttering the label
+   itself — it's on the row's own title= instead, same "detail on hover" convention already used
+   for badges elsewhere in this app (macros/ui.html). #}
+<div class="flex items-center gap-2" title="{{ reason }}">
+  <div class="w-1.5 h-1.5 rounded-full {{ 'status-dot-online' if healthy else 'status-dot-offline' }} shrink-0"></div>
+  <span class="text-[11px] text-secondary">System &middot; {{ "Online" if healthy else "Degraded" }}</span>
+</div>

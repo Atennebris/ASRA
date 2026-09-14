@@ -1,0 +1,33 @@
+{# Repeater's own History list -- its own included partial (not inlined into toolkit_repeater.html)
+   so deleting a single entry (main.py's delete route) can re-render just this fragment via
+   hx-target="#toolkit-repeater-history", without resetting whatever the operator currently has
+   typed into the request editor above it. #}
+<div id="toolkit-repeater-history">
+  {% if history %}
+    <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">History ({{ history | length }})</p>
+    <div class="divide-y divide-default border border-default rounded-lg overflow-hidden max-h-48 overflow-y-auto asra-scroll">
+      {% for h in history %}
+        <div class="w-full flex items-center gap-2 px-3 py-1.5 bg-surface hover:bg-elevated transition-colors">
+          <button type="button"
+                  hx-get="{{ toolkit_base_url }}/repeater?entry_id={{ h.id }}"
+                  hx-target="#toolkit-repeater-container" hx-swap="outerHTML"
+                  class="flex items-center gap-2 flex-1 min-w-0 text-left">
+            <span class="text-[11px] font-mono font-semibold text-accent shrink-0 w-14">{{ h.method }}</span>
+            <span class="text-[11px] font-mono shrink-0 w-10
+                         {{ 'text-severity-low' if h.response_status and h.response_status < 300
+                            else 'text-severity-medium' if h.response_status and h.response_status < 400
+                            else 'text-severity-high' if h.response_status and h.response_status >= 400
+                            else 'text-secondary' }}">{{ h.response_status or '—' }}</span>
+            <span class="text-[11px] text-primary truncate flex-1 min-w-0">{{ h.url }}</span>
+          </button>
+          <button type="button"
+                  hx-post="{{ toolkit_base_url }}/repeater/history/{{ h.id }}/delete"
+                  hx-target="#toolkit-repeater-history" hx-swap="outerHTML"
+                  hx-confirm="Delete this Repeater history entry? This can't be undone."
+                  title="Delete this entry — also drops it from the method suggestion list above once nothing else uses that method"
+                  class="shrink-0 text-secondary hover:text-severity-high transition-colors px-1.5"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>

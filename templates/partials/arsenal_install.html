@@ -1,0 +1,58 @@
+{# Live install view for the Tools page -- rendered into #arsenal-output by the start route, then
+   re-fetched by its own polling trigger while the background setup_tools.sh run is in flight
+   (agent/tools/arsenal_install.py). The root element self-polls only WHILE running: once the
+   process exits, the returned fragment drops the hx-trigger, so polling stops on its own -- same
+   "the 'on' state only exists in the DOM while it should" discipline the toolkit live-view uses. #}
+{% if blocked %}
+  <div class="bg-surface border border-severity-high/40 rounded-lg p-4">
+    <p class="text-[11px] text-severity-high mb-1.5">Install did not start</p>
+    <p class="text-[11px] text-secondary mb-2">{{ blocked_message }}</p>
+    {% if blocked_command %}
+      <pre class="text-[11px] font-mono text-primary bg-elevated rounded p-2 overflow-x-auto">{{ blocked_command }}</pre>
+    {% endif %}
+  </div>
+{% else %}
+  {% set running = status.state == "running" %}
+  <div id="arsenal-install-view"
+       {% if running %}hx-get="/api/tools/arsenal/install/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+       class="bg-surface border border-default rounded-lg p-4">
+    <div class="flex items-center gap-2 mb-2">
+      {% if running %}
+        <span class="w-2 h-2 rounded-full bg-severity-medium shrink-0 animate-pulse"></span>
+        <p class="text-[13px] font-semibold text-primary">Installing the arsenal&hellip;</p>
+      {% elif status.succeeded %}
+        <span class="w-2 h-2 rounded-full bg-status-online shrink-0"></span>
+        <p class="text-[13px] font-semibold text-status-online">Install finished.</p>
+      {% elif status.returncode is not none %}
+        <span class="w-2 h-2 rounded-full bg-severity-high shrink-0"></span>
+        <p class="text-[13px] font-semibold text-severity-high">Install failed (exit code {{ status.returncode }}).</p>
+      {% elif status.state == "idle" %}
+        <span class="w-2 h-2 rounded-full border border-default shrink-0"></span>
+        <p class="text-[13px] font-semibold text-primary">Install hasn&rsquo;t run yet.</p>
+      {% else %}
+        <span class="w-2 h-2 rounded-full bg-severity-medium shrink-0"></span>
+        <p class="text-[13px] font-semibold text-primary">Install state unknown (the server restarted during the install).</p>
+      {% endif %}
+    </div>
+
+    <p class="text-[10.5px] text-secondary mb-2">
+      {% if status.command %}Command: <span class="font-mono text-primary">{{ status.command }}</span>{% endif %}
+      {% if status.wordlists %} &middot; with large wordlists{% endif %}
+      &middot; log: <span class="font-mono">{{ status.log_path }}</span>
+    </p>
+
+    <pre id="arsenal-install-log" class="text-[11px] font-mono text-secondary bg-elevated rounded p-3 overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap">{{ status.log or "Waiting for output..." }}</pre>
+
+    {% if not running %}
+      <div class="flex items-center gap-2 mt-3">
+        {% if status.succeeded %}
+          <p class="text-[11px] text-secondary">Restart the agent so the new tools are picked up (and the system if needed).</p>
+        {% endif %}
+        <button type="button" hx-get="/api/tools/arsenal/check" hx-target="#arsenal-output" hx-swap="innerHTML"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">
+          Re-check arsenal
+        </button>
+      </div>
+    {% endif %}
+  </div>
+{% endif %}

@@ -1,0 +1,56 @@
+{# Settings -> Updates panel body (inner content of #update-panel). Rendered by
+   /api/updates/status (startup cache), /api/updates/check (fresh git fetch), and
+   /api/updates/apply (after a pull). `u` is an UpdateStatus or None; `result` is the
+   apply result dict or None. #}
+{% if u is none %}
+  <p class="text-[13px] text-secondary">Not checked yet — click “Check for updates”.</p>
+{% else %}
+  {% if u.current_sha %}
+    <p class="text-[12px] text-secondary">Current version:
+      <span class="text-primary font-medium">{{ u.current_sha }}</span>{% if u.current_subject %} — {{ u.current_subject }}{% endif %}
+    </p>
+  {% endif %}
+
+  {% if result %}
+    <div class="mt-2 text-[13px] {{ '' if result.ok else 'text-accent' }}">{{ result.message }}</div>
+    {% for note in result.notes or [] %}
+      <div class="mt-1 text-[12px] text-secondary">• {{ note }}</div>
+    {% endfor %}
+  {% endif %}
+
+  {% if u.error %}
+    <div class="mt-2 text-[13px] text-accent">{{ u.error }}</div>
+  {% elif u.available %}
+    <div class="mt-2 text-[13px] text-primary">{{ u.behind }} update{{ '' if u.behind == 1 else 's' }} available{% if u.upstream %} <span class="text-secondary">(from {{ u.upstream }})</span>{% endif %}</div>
+    {% if u.changelog %}
+      <ul class="mt-2 space-y-0.5 max-h-40 overflow-y-auto asra-scroll">
+        {% for line in u.changelog %}<li class="text-[12px] text-secondary">• {{ line }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+    {% if u.deps_changed %}<div class="mt-1 text-[12px] text-secondary">Dependencies changed — reinstalled automatically on the next launch.</div>{% endif %}
+    {% if u.shell_changed %}<div class="mt-1 text-[12px] text-secondary">Desktop shell (desktop/) changed — rebuild/update the exe.</div>{% endif %}
+    {% if u.dirty %}
+      <div class="mt-2 text-[12px] text-accent">Local uncommitted changes present — commit or stash them before updating.</div>
+    {% elif u.ahead > 0 %}
+      <div class="mt-2 text-[12px] text-accent">You have {{ u.ahead }} local commit(s) not on the remote — a fast-forward update isn't possible.</div>
+    {% endif %}
+  {% elif u.checked %}
+    <div class="mt-2 text-[13px] text-primary">You’re on the latest version.</div>
+  {% endif %}
+
+  <div class="mt-3 flex items-center gap-2">
+    <button type="button"
+      hx-get="/api/updates/check" hx-target="#update-panel" hx-swap="innerHTML"
+      class="px-3 h-8 rounded text-[12px] bg-elevated text-primary hover:bg-surface border border-default transition-colors">
+      Check for updates
+    </button>
+    {% if u.available and not u.dirty and u.ahead == 0 %}
+      <button type="button"
+        hx-post="/api/updates/apply" hx-target="#update-panel" hx-swap="innerHTML"
+        hx-confirm="Update ASRA now (git pull)? Restart afterward to load the new version."
+        class="px-3 h-8 rounded text-[12px] bg-accent text-white font-medium">
+        Update now
+      </button>
+    {% endif %}
+  </div>
+{% endif %}

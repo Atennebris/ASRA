@@ -1,0 +1,30 @@
+{# Standalone Terminal tab (sidebar nav) -- a real system shell (agent/tools/terminal_manager.py's
+   PTY-backed sessions over WebSocket), genuinely independent of "Projects" the same way
+   toolkit_standalone.html is: no project/session is created, required, or implied. Reachable
+   three ways now -- the sidebar nav item (a fresh shell, cwd = the operator's own home
+   directory), a project/session page's own "Open terminal here" link (?cwd=<that project's
+   folder>, read below via initial_cwd and handed to static/js/terminal.js, which auto-opens the
+   first tab there), and session.html's own slide-out terminal drawer (partials/terminal_panel.html
+   embedded there directly, same backend/tab state -- see that partial's own top comment). The
+   actual workspace markup/CSS/JS live in partials/terminal_panel.html, shared by both this page
+   and the drawer, so there's exactly one copy of the tab-strip/xterm.js wiring to maintain. #}
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header %}
+{% block title %}ASRA &mdash; Terminal{% endblock %}
+
+{% block head %}
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+{% endblock %}
+
+{% block content %}
+  {{ page_header("Terminal") }}
+  <p class="text-[11px] text-secondary mb-3 max-w-2xl">
+    A real system shell — exactly what opening a terminal natively would give you. Nothing here
+    goes through the agent: every tool on PATH works with its normal flags/help/output, and
+    anything else you run (another CLI tool, an interactive program) behaves exactly as it would in
+    a native terminal. Each session's own output is also saved to a timestamped log file under
+    Documents/ASRA/console-logs/.
+  </p>
+
+  {% include "partials/terminal_panel.html" %}
+{% endblock %}

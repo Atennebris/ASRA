@@ -1,0 +1,271 @@
+{# The real terminal workspace (tab strip + xterm.js panes + popovers + close-confirm dialog),
+   wired to agent/tools/terminal_manager.py's PTY-backed sessions over /ws/terminal/{id} via
+   static/js/terminal.js. Shared by two callers:
+     - templates/terminal.html -- the standalone Terminal page (sidebar nav).
+     - templates/session.html -- a slide-out drawer next to the chat panel, so a project's own
+       terminal is reachable without leaving the session. static/js/terminal.js restores/ensures
+       this scope's own tab(s) right away on every page load, same as the standalone page -- the
+       drawer PANEL's own visibility (collapsed by default, only opened when the operator actually
+       clicks it) is entirely separate, session.html's own concern, not gated on this at all.
+   Requires the caller's own <head> to load /static/vendor/xterm.css (not done here -- a <link>
+   belongs in <head>, not wherever this partial happens to be included in <body>); the JS
+   (xterm.js/xterm-addon-fit.js/terminal.js) IS included at the bottom of this partial itself, so
+   neither caller has to remember it separately. #}
+{# "new" (default) vs "reuse" -- see static/js/terminal.js's own restoreTabs() comment on cwdMode.
+   terminal.html's standalone page (and its own "Open terminal here" link) always wants a genuinely
+   new tab; session.html's drawer wants to show an already-open tab for the SAME project instead of
+   spawning a duplicate every time the drawer is opened after a fresh page load. #}
+{% set terminal_cwd_mode = terminal_cwd_mode | default("new") %}
+{# Scopes static/js/terminal.js's own localStorage tab-list key to this one caller -- undefined
+   here (terminal.html) keeps the original global, unscoped key, on purpose: that page is
+   deliberately NOT project-scoped. session.html sets this to "session-<session_id>" so each
+   project's drawer keeps its OWN tab list, isolated from every other project's -- see
+   static/js/terminal.js's own TABS_STORAGE_KEY comment for the real bug this fixes. #}
+{% set terminal_storage_scope = terminal_storage_scope | default("") %}
+{# Renders a chat_panel.html-style header row (icon + title + a collapse arrow) above the tab
+   strip -- default false (terminal.html's standalone page: page_header("Terminal") above this
+   partial already covers the title, and there's nothing to "collapse" back to on a full page).
+   session.html's drawer sets this true: real operator ask -- the drawer needs the SAME two ways
+   to close it chat_panel.html already offers (an arrow inside the panel's own header, for anyone
+   who'd rather click that, alongside the drawer's own always-visible edge tab for anyone who'd
+   rather click that instead) -- not just the edge tab alone. #}
+{% set terminal_show_collapse_button = terminal_show_collapse_button | default(false) %}
+{% from "macros/nav.html" import nav_icon %}
+
+<style>
+  /* ---- workspace shell ------------------------------------------------------------------- */
+  .terminal-workspace {
+    display: flex; flex-direction: column;
+    height: calc(100vh - 13rem); min-height: 360px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; box-shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+  }
+
+  /* ---- tab strip --------------------------------------------------------------------------- */
+  /* Deliberately NEVER hidden, even with zero tabs open -- the +/chevron group is a permanent
+     trailing child of this SAME element (see the markup below, not a separate flex sibling),
+     which is what keeps "+" glued to the last tab instead of pinned to the strip's own far edge
+     -- but that also means hiding this whole element hides the ONLY way back in. Real, confirmed
+     bug this fixes: closing every open tab used to hide the strip along with them, leaving
+     "Opening a terminal…" stuck on screen forever with no visible "+" anywhere to click, short
+     of a full page reload. static/js/terminal.js's own updateEmptyState() never sets [hidden] on
+     this element for exactly this reason -- plain unconditional `display: flex` is correct here. */
+  #terminal-tab-bar {
+    display: flex; align-items: stretch; overflow-x: auto; background: var(--surface-elevated);
+    border-bottom: 1px solid var(--border); scrollbar-width: none;
+  }
+  #terminal-tab-bar::-webkit-scrollbar { display: none; }
+
+  /* The WHOLE tab is painted with a custom color now, not just a thin top accent bar (real
+     operator ask: "весь таб должен покрасить"). Two custom properties drive it, both set
+     together by static/js/terminal.js's own setTabColor() from the one hex the operator picks:
+     --terminal-tab-color-dim (a translucent wash, inactive state) and --terminal-tab-color
+     (solid, active state) -- keeps active vs. inactive visually distinguishable even with a
+     custom color instead of both looking identical. --terminal-tab-fg is a THIRD property, a
+     JS-computed black/white text color (perceived-brightness contrast against whatever was
+     picked) -- a fixed foreground literally cannot stay readable against an arbitrary,
+     full-spectrum background color, confirmed live: pale yellow with the app's own default
+     light-gray tab text was close to unreadable before this. Both are simply unset (falling
+     back to the theme's own normal look) for a tab that was never given a custom color. */
+  .terminal-tab {
+    position: relative; display: flex; align-items: center; gap: 6px;
+    padding: 0 6px 0 10px; height: 34px; font-size: 11.5px;
+    color: var(--terminal-tab-fg, var(--text-secondary));
+    background-color: var(--terminal-tab-color-dim, transparent);
+    border: none; border-right: 1px solid var(--border);
+    white-space: nowrap; cursor: pointer; user-select: none; flex-shrink: 0;
+    transition: background-color .12s ease, color .12s ease;
+  }
+  .terminal-tab:hover {
+    color: var(--terminal-tab-fg, var(--text-primary));
+    background-color: var(--terminal-tab-color-dim, rgb(127 127 127 / 0.06));
+  }
+  .terminal-tab-active {
+    color: var(--terminal-tab-fg, var(--text-primary));
+    background-color: var(--terminal-tab-color, var(--surface));
+  }
+  .terminal-tab.is-dragging { opacity: .35; }
+  .terminal-tab.drag-over-left { box-shadow: inset 2px 0 0 var(--accent); }
+  .terminal-tab.drag-over-right { box-shadow: inset -2px 0 0 var(--accent); }
+
+  {# currentColor, not a fixed --text-secondary -- the dead-state dot follows the tab's own
+     computed foreground (--terminal-tab-fg when a custom color is set) so it stays visible
+     against any background; the pulsing "alive" state below stays an unambiguous green
+     regardless, since that's a real status signal that shouldn't get swallowed by a tab color. #}
+  .terminal-tab-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: currentColor; opacity: .45; }
+  {# The leading (status) dot inside a TAB BUTTON only shows for the active tab -- real operator
+     ask. visibility:hidden (not display:none) keeps its own layout space reserved, so a tab
+     doesn't visibly widen/narrow as it becomes active/inactive. Scoped to `.terminal-tab
+     .terminal-tab-dot` specifically so this never touches #terminal-titlebar-dot (the same
+     class, reused for its styling, but living in the breadcrumb bar above the tabs -- always
+     the active tab's own status, unaffected by this rule). #}
+  .terminal-tab .terminal-tab-dot { visibility: hidden; }
+  .terminal-tab-active .terminal-tab-dot { visibility: visible; }
+  .terminal-tab-dot.is-live {
+    background: rgb(var(--status-online)); opacity: 1;
+    animation: terminal-tab-pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes terminal-tab-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgb(var(--status-online) / .5); }
+    50% { box-shadow: 0 0 0 4px rgb(var(--status-online) / 0); }
+  }
+  @media (prefers-reduced-motion: reduce) { .terminal-tab-dot.is-live { animation: none; } }
+
+  .terminal-tab-label { overflow: hidden; text-overflow: ellipsis; max-width: 11rem; }
+  .terminal-tab-label[contenteditable="true"] { outline: none; max-width: none; border-bottom: 1px dashed var(--accent); }
+
+  .terminal-tab-color-btn, .terminal-tab-close {
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    width: 16px; height: 16px; border-radius: 4px; color: inherit; /* follows the tab's own --terminal-tab-fg */
+    opacity: 0; transition: opacity .12s ease, background-color .12s ease;
+  }
+  .terminal-tab:hover .terminal-tab-color-btn, .terminal-tab:hover .terminal-tab-close,
+  .terminal-tab-active .terminal-tab-color-btn, .terminal-tab-active .terminal-tab-close { opacity: .8; }
+  .terminal-tab-color-btn:hover, .terminal-tab-close:hover { opacity: 1; background: rgb(127 127 127 / 0.25); }
+  .terminal-tab-color-btn > span { width: 8px; height: 8px; border-radius: 999px; background: var(--terminal-tab-color, currentColor); }
+
+  .terminal-newtab { display: flex; align-items: stretch; flex-shrink: 0; }
+  .terminal-newtab-btn, .terminal-newtab-chevron {
+    display: flex; align-items: center; justify-content: center; color: var(--text-secondary);
+    background: transparent; border: none; cursor: pointer; transition: background-color .12s ease, color .12s ease;
+  }
+  .terminal-newtab-btn { width: 34px; height: 34px; font-size: 16px; }
+  /* Real, confirmed bug this fixes: the old text-glyph chevron (a unicode ▾ at font-size:8px)
+     rendered as little more than a smudged dot -- basically illegible. A real inline SVG (this
+     project's own icon convention, macros/nav.html) at a clearly visible size instead. */
+  .terminal-newtab-chevron { width: 24px; height: 34px; border-left: 1px solid var(--border); }
+  .terminal-newtab-btn:hover, .terminal-newtab-chevron:hover { color: var(--text-primary); background: rgb(127 127 127 / 0.08); }
+
+  /* ---- breadcrumb title bar ---------------------------------------------------------------- */
+  #terminal-titlebar {
+    align-items: center; gap: 7px; height: 24px; padding: 0 10px;
+    font-size: 10.5px; color: var(--text-secondary); border-bottom: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #terminal-titlebar:not([hidden]) { display: flex; }
+  .terminal-titlebar-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- panes -------------------------------------------------------------------------------- */
+  #terminal-panes { flex: 1; min-height: 0; background: var(--surface); padding: 8px; }
+  .terminal-pane, .terminal-pane .xterm, .terminal-pane .xterm-viewport { height: 100%; }
+  .terminal-pane .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  .terminal-pane .xterm-viewport::-webkit-scrollbar { width: 6px; height: 6px; }
+  .terminal-pane .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+  .terminal-pane .xterm-viewport::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .terminal-pane .xterm-viewport::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+
+  #terminal-empty-state:not([hidden]) { display: flex; }
+  #terminal-empty-state { align-items: center; justify-content: center; height: 100%; color: var(--text-secondary); font-size: 13px; }
+
+  /* ---- popovers (shell picker / color picker) ----------------------------------------------- */
+  {# z-60, not the original 40 -- static/js/terminal.js now reparents this element to a direct
+     child of <body> (its own comment on why), which puts it in the SAME stacking context as
+     session.html's own .session-terminal-drawer (z-45) and edge-tab toggles (z-50). At the
+     original z-40 it was still correctly POSITIONED but rendered entirely BEHIND the drawer's own
+     opaque card -- real, confirmed operator report: the shell-type/color picker looked like it
+     "opened off-screen" because of this, not a genuine viewport-boundary miss. A static value
+     comfortably above every other overlay this app currently has is simpler and just as correct
+     as computing one dynamically, for a purely transient popover like this. #}
+  .terminal-popover {
+    position: fixed; z-index: 60; min-width: 170px; max-width: 260px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 10px 28px rgb(0 0 0 / 0.22); padding: 4px; font-size: 11.5px;
+  }
+  .terminal-popover-item {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px;
+    cursor: pointer; color: var(--text-primary);
+  }
+  .terminal-popover-item:hover { background: var(--surface-elevated); }
+  {# Full-spectrum picker, not a curated swatch set -- reuses the exact same <input type="color">
+     control (and its themes.css .icon-picker-colorbtn styling: a round, full-spectrum swatch)
+     the New Project form's own icon color already uses, so "pick a color" looks and works
+     identically everywhere in this app it appears, real operator ask after the first pass only
+     offered 8 preset chart colors here. #}
+  .terminal-color-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; gap: 8px; }
+  .terminal-color-row > span { font-size: 11px; color: var(--text-secondary); }
+  .terminal-popover-divider { height: 1px; background: var(--border); margin: 4px; }
+  .terminal-popover-label {
+    padding: 4px 8px 2px; font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--text-secondary);
+  }
+  .terminal-popover-badge {
+    margin-left: auto; padding: 1px 5px; border-radius: 999px; font-size: 9px;
+    background: rgb(var(--severity-medium) / .15); color: rgb(var(--severity-medium));
+    flex-shrink: 0;
+  }
+  .terminal-newterm-name {
+    display: block; width: 100%; margin: 4px 0 2px; padding: 6px 8px; box-sizing: border-box;
+    font-size: 11.5px; color: var(--text-primary); background: var(--surface-elevated);
+    border: 1px solid var(--border); border-radius: 5px; outline: none;
+  }
+  .terminal-newterm-name:focus { border-color: var(--accent); }
+</style>
+
+<div class="terminal-workspace">
+  {% if terminal_show_collapse_button %}
+  <div class="px-4 h-12 flex items-center gap-2 border-b border-default shrink-0">
+    <span class="text-secondary shrink-0">{{ nav_icon("terminal") }}</span>
+    <p class="text-sm font-semibold text-primary mr-auto ml-1 truncate">Terminal</p>
+    <button type="button" id="terminal-drawer-collapse-toggle" title="Collapse terminal" aria-label="Collapse terminal"
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M14 5l7 7-7 7M21 12H3" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+    </button>
+  </div>
+  {% endif %}
+  <div id="terminal-tab-bar">
+    {# Always visible, even with zero tabs open -- see this element's own CSS comment above for
+       the real bug that fixed. The +/chevron pair are permanent, static trailing children of the SAME scrollable strip
+       every tab lives in (static/js/terminal.js inserts new tab buttons right before this group
+       via tabBar.insertBefore) -- so "+" always sits immediately after the last tab, like a real
+       browser tab strip, instead of being pinned out at the container's own far edge regardless
+       of how many tabs are actually open. #}
+    <span class="terminal-newtab">
+      <button type="button" id="terminal-new-tab-btn" class="terminal-newtab-btn" title="New terminal">+</button>
+      <button type="button" id="terminal-new-tab-chevron" class="terminal-newtab-chevron" title="New terminal (name, color, type)" aria-haspopup="true">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      </button>
+    </span>
+  </div>
+  <div id="terminal-titlebar" hidden>
+    <span id="terminal-titlebar-dot" class="terminal-tab-dot"></span>
+    <span id="terminal-titlebar-shell"></span>
+    <span>&middot;</span>
+    <span id="terminal-titlebar-path" class="terminal-titlebar-path"></span>
+  </div>
+  <div id="terminal-panes"
+       data-initial-cwd="{{ initial_cwd }}"
+       data-skip-close-confirm="{{ 'true' if initial_skip_close_confirm else 'false' }}"
+       data-cwd-mode="{{ terminal_cwd_mode }}"
+       data-storage-scope="{{ terminal_storage_scope | default('') }}"
+       hidden></div>
+  {# Shown both on first load (briefly, while the initial tab opens) and any time the operator
+     closes every open tab -- worded to stay accurate in both cases, not just the first one. #}
+  <div id="terminal-empty-state">No terminal open &mdash; click + above to start one.</div>
+</div>
+
+<div id="terminal-shell-picker" class="terminal-popover" hidden></div>
+<div id="terminal-color-picker" class="terminal-popover" hidden></div>
+
+<dialog id="terminal-close-confirm" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-sm backdrop:bg-black/50">
+  <div class="p-4">
+    <h2 class="text-[13px] font-semibold mb-1">Close this terminal?</h2>
+    <p class="text-[11px] text-secondary mb-3">The shell process, and anything still running in it, will be stopped.</p>
+    <label class="flex items-center gap-2 text-[11px] text-secondary mb-4 cursor-pointer">
+      <input type="checkbox" id="terminal-close-confirm-skip">
+      Don't ask again
+    </label>
+    <div class="flex justify-end gap-2">
+      <button type="button" id="terminal-close-confirm-cancel"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm">Cancel</button>
+      <button type="button" id="terminal-close-confirm-ok"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-high/10 text-severity-high border border-severity-high/20 hover:bg-severity-high/20 h-9 px-3 text-sm">Close terminal</button>
+    </div>
+  </div>
+</dialog>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
+<script src="/static/js/terminal.js"></script>

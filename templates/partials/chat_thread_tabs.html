@@ -1,0 +1,95 @@
+{# Browser-style tab strip for the standalone Quick Chat page (templates/chat.html's show_chat_tabs)
+   -- real, explicit operator ask: the history-icon dialog (chat_thread_picker.html, kept as-is,
+   still useful for a full list with timestamps/message counts once there are more threads than fit
+   here) is fine for a project's own compact sidebar chat, but switching between a handful of
+   recent Quick Chat threads deserves one click, not open-dialog-then-click. Same underlying data
+   (agent/chat.py's list_chat_threads) and the exact same switch/delete routes chat_thread_picker.html
+   already posts to -- this is a second view onto them, not a second mechanism.
+
+   Rendered two ways: inline on first page load (chat_panel.html's own {% include %}, context vars
+   `threads`/`session` already in scope there), and as an hx-swap-oob fragment (oob=true) appended
+   by every route that can change the thread list or the active one (new-thread/switch-thread/
+   delete-thread/a plain message send, main.py's _render_chat_header_oob) -- so the strip stays
+   correct regardless of which of the two UI surfaces (this strip, or the history dialog) actually triggered the
+   change. Harmless on a page with no #chat-thread-tabs at all (a project's own compact sidebar
+   chat, which never includes this partial) -- htmx skips an oob swap outright when its target id
+   isn't present in the current DOM. #}
+{# Drag-and-drop reordering (real, explicit operator ask) uses the same drag-over-half/insertBefore
+   interaction as the Terminal tab strip (static/js/terminal.js's own wireDragAndDrop). The scoped
+   .chat-tab.is-dragging/drag-over-left/drag-over-right CSS and the drag/drop listeners themselves
+   both live in chat_panel.html instead of here, deliberately -- this partial's whole innerHTML gets
+   wholesale-replaced on every OOB refresh (any switch/new/delete/send), so anything placed inside
+   it (a <style> tag, a dragstart listener bound to a specific button) would need re-adding after
+   every single one of those; chat_panel.html's own container/script survive every swap untouched,
+   so wiring it there means wiring it exactly once. #}
+<div id="chat-thread-tabs" {% if oob %}hx-swap-oob="innerHTML"{% endif %}
+     class="flex items-center gap-1 overflow-x-auto asra-scroll px-2 border-b border-default shrink-0">
+  {% for t in threads %}
+    {% set is_active = t.id == session.active_chat_thread_id %}
+    {# Full parity with the Terminal tab strip (real, explicit operator ask): a live-activity dot
+       (visible only on the active tab, pulses while t.pending -- agent/chat.py's own thread
+       schema, true for as long as a turn is actually in flight for THIS thread, even one running
+       in the background while a different tab is open), a per-tab color (data-color, applied by
+       this file's own script the same way static/js/terminal.js's setTabColor does, since the
+       brightness-contrast math needed for a readable --chat-tab-fg only really belongs in JS, not
+       duplicated in Jinja), and a dblclick-to-rename label -- see chat_panel.html's own script for
+       the wiring, all delegated off #chat-thread-tabs itself so it survives every OOB/SSE swap. #}
+    <div class="chat-tab group relative flex items-center shrink-0 rounded-t {{ 'chat-tab-active' if is_active else '' }}"
+         draggable="true" data-thread-id="{{ t.id }}" data-color="{{ t.color or '' }}">
+      {# A HIDDEN form (no visible button) -- submitted programmatically via .requestSubmit() from
+         the click handler below, deliberately NOT a real <button type=submit> wrapping the label.
+         Real bug that shape had: a contenteditable span nested inside a native <button> can't
+         reliably take focus/caret in Chrome (confirmed live -- dblclick set contentEditable=true
+         and called .focus(), but the caret never actually landed inside it; a follow-up Ctrl+A
+         selected the WHOLE PAGE instead of just the label's own text). The label below is now a
+         plain sibling span, exactly like static/js/terminal.js's own .terminal-tab-label already
+         is -- never nested inside anything else interactive. #}
+      {# data-no-progress-bar: the active tab already flips instantly (chat_panel.html's own
+         markTabActiveOptimistically), so the page-wide loading bar (static/js/progress_bar.js)
+         would only ever announce a "still loading" moment for a switch that's already visually
+         done -- real, confirmed operator complaint this fixes. #}
+      <form hx-post="/api/session/{{ session.session_id }}/chat/switch-thread" hx-target="#chat-stream" hx-swap="morph:innerHTML" data-no-progress-bar class="chat-tab-switch-form hidden">
+        <input type="hidden" name="thread_id" value="{{ t.id }}">
+      </form>
+      <span class="chat-tab-label flex-1 min-w-0 max-w-[9rem] truncate pl-3 py-2 text-[12px] font-medium cursor-pointer {{ 'text-primary' if is_active else 'text-secondary hover:text-primary' }}"
+            data-thread-id="{{ t.id }}" title="{{ t.title }}">{{ t.title }}</span>
+      <span class="chat-tab-dot {{ 'is-live' if t.pending else '' }}"></span>
+      <span class="chat-tab-color-btn" title="Chat color" data-thread-id="{{ t.id }}"><span></span></span>
+      {# Rendered for every tab, not just the active one -- same "close any tab on hover, not just
+         the active one" convention the Terminal tab strip's own .terminal-tab-close already uses
+         (that CSS's own .terminal-tab:hover / .terminal-tab-active rule pair, mirrored below).
+         hx-confirm text matches the picker's own delete button verbatim so the two surfaces never
+         disagree about what this action does -- same shared data-confirm-checkbox-key
+         ("chat-delete-thread", confirm_dialog.js's own htmx:confirm hook) so checking "don't ask
+         again" on either surface suppresses both, real operator ask: deleting several tabs in a
+         row shouldn't mean re-confirming every single one. hx-swap="none" -- unlike the switch form above, this
+         one's REAL response is two out-of-band fragments (main.py's delete_chat_thread_route: an
+         updated #chat-thread-tabs plus an updated #chat-stream), not a primary swap into anything
+         this form itself targets. #}
+      <form hx-post="/api/session/{{ session.session_id }}/chat/delete-thread" hx-swap="none"
+            hx-confirm="Delete '{{ t.title }}'? This can't be undone."
+            data-confirm-checkbox-key="chat-delete-thread" class="contents">
+        <input type="hidden" name="thread_id" value="{{ t.id }}">
+        <button type="submit" title="Delete this chat" aria-label="Delete this chat"
+                class="shrink-0 pr-2 py-2 text-secondary hover:text-severity-high transition-opacity {{ 'opacity-80' if is_active else 'opacity-0 group-hover:opacity-80' }}">
+          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round"></path>
+          </svg>
+        </button>
+      </form>
+    </div>
+  {% endfor %}
+  {# Duplicate of chat_panel.html's own #chat-new-btn (header row) -- same action (POST new-thread,
+     morph #chat-stream), placed here too on the operator's own explicit ask: Terminal's tab strip
+     (terminal_panel.html's own .terminal-newtab) already puts its "new" control right at the end of
+     the tab row itself, not only in a header elsewhere -- this brings the chat tab strip to that
+     same shape/parity every other comment in this file already calls out. A second, differently-
+     placed entry point to the identical action, not a replacement for the header button. #}
+  <button type="button" class="shrink-0 flex items-center justify-center w-7 h-7 my-1 rounded text-secondary hover:bg-elevated hover:text-primary"
+          title="New chat (/new)" aria-label="New chat"
+          hx-post="/api/session/{{ session.session_id }}/chat/new-thread" hx-target="#chat-stream" hx-swap="morph:innerHTML" data-no-progress-bar>
+    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M12 5v14M5 12h14" stroke-linecap="round"></path>
+    </svg>
+  </button>
+</div>

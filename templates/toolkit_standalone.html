@@ -1,0 +1,24 @@
+{# The standalone Toolkit page -- reachable straight from the sidebar (base.html's own nav entry),
+   genuinely native and independent of "Projects": no project/session is created, required, or even
+   implied to use this page -- Site Map/Repeater/Decoder/Comparer/Intruder/Sequencer all work here
+   exactly as they do embedded in a real project's session page, just backed by the standalone
+   global store instead of one project's own folder (agent/tools/toolkit_store.py's own docstring
+   explains the storage split). partials/toolkit_panel.html itself detects this context (no
+   `session` variable in scope here, unlike session_fragment.html's own include of the same
+   partial) and renders accordingly -- no live-view panel (no agent browser to show), a different
+   wrapper id so it's unconditionally visible (no outer session tab bar to gate on, themes.css's
+   own #toolkit-panel-standalone rule). #}
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header %}
+{% block title %}ASRA &mdash; Toolkit{% endblock %}
+
+{% block content %}
+  {{ page_header("Toolkit") }}
+  <p class="text-[11px] text-secondary mb-4 max-w-2xl">
+    Proxy/Repeater/Decoder/Comparer/Intruder/Sequencer for manual work on any URL — send/resend
+    requests, decode values, diff two responses, run a payload sweep, check a token's randomness.
+    Nothing here is tied to a project; nothing you do on this page starts a scan or requires
+    creating one. History captured here is its own standalone store, separate from any project's own.
+  </p>
+  {% include "partials/toolkit_panel.html" %}
+{% endblock %}

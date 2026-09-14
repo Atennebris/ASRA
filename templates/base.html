@@ -1,4 +1,15 @@
-<!-- Shared layout (4.2.1) — every page extends this, exports <head> setup exactly once. -->
+{# Shared layout (4.2.1) — every page extends this, exports <head> setup exactly once. #}
+{# A literal (non-Jinja) HTML comment used to sit here, ahead of <!DOCTYPE html> -- harmless for a
+   normal browser load, but real, confirmed incident: htmx's own "is this response a full HTML
+   document" detection (what makes hx-select/hx-target work correctly on a boosted #sidebar link,
+   see that element's own comment in this same file) apparently keys off the response text
+   starting with <!doctype/<html, and silently mis-parsed the WHOLE response once anything preceded
+   it -- every boosted navigation swapped in genuinely empty content despite the real page HTML
+   being present and correct in the response (verified directly: DOMParser/fetch found it fine,
+   only htmx's own internal extraction came up empty). A Jinja comment achieves the identical
+   "documentation for whoever edits this template" purpose without ever reaching the actual
+   response at all, so this can never trip that check again regardless of what boosted content
+   gets added later. #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -21,9 +32,99 @@
     })();
   </script>
 
-  <link rel="stylesheet" href="/static/css/themes.css">
+  {# Real, confirmed bug this fixes, two layers deep:
+     Every custom radio/checkbox in this app (macros/ui.html's toggle_switch(), the session tab
+     bar, Settings' theme/mascot skin/mascot size cards) is a real <input class="sr-only peer">
+     clipped to 1x1px inside a clickable <label>. Focusing a clipped, near-invisible element makes
+     the browser try to scroll it into view -- and themes.css's own `html, body { overflow: hidden
+     }` (see that rule's comment: "the document itself must NEVER scroll") stops ordinary
+     wheel/scrollbar input from moving window.scrollY, but does NOT stop this specific
+     focus-triggered scroll. Once window.scrollY moves off 0, the whole fixed h-screen shell
+     (sidebar included) slides up and overflow:hidden clips it there -- exactly the "void" that
+     comment already named and thought it had fully closed off.
+     Layer 1 -- reduce how often it's even triggered: a label's default click-focuses-its-input
+     behavior actually happens on mousedown, not click -- preventDefault() on mousedown stops that
+     particular focus (and the scroll it causes) while the click event still fires immediately
+     after and still toggles the input normally (label-to-input click forwarding is a separate,
+     unaffected browser behavior). Keyboard users are unaffected: Tab-key focus goes through a
+     completely different code path this never touches.
+     Checks BOTH label shapes this app actually uses, not just one -- confirmed live a SECOND,
+     until-now-undetected instance of this exact bug (macros/project_icons.html's icon_picker, and
+     macros/subagent_icons.html's later copy of the same pattern): those use `<label for="id">`
+     referencing the input by id as a SIBLING, never nested inside the label the way
+     toggle_switch()'s own `<label><input class="sr-only">...</label>` is. The original check here
+     (`label.querySelector("input.sr-only")`) only ever finds a NESTED input -- a sibling
+     referenced via `for=` was invisible to it, so this protection silently never applied to either
+     icon picker at all. Reproduced live: clicking an icon swatch inside the Edit Subagent dialog
+     (a real overflow-y-auto scroll container of its own, not just the window) focus-scrolled that
+     inner container by ~760px, shoving the entire dialog's content off past its own top edge --
+     visually an empty dialog box, DOM fully intact the whole time (confirmed via
+     getBoundingClientRect on the inner wrapper: a large negative `y`). Layer 2 below only resets
+     the DOCUMENT's own scroll position, so it never touches this -- a scrollable ELEMENT
+     mis-scrolling internally is a different failure than the whole page shell sliding.
+     Layer 2 -- the actual guarantee: layer 1 alone isn't enough. Confirmed live: htmx's
+     hx-disabled-elt="this" (every toggle_switch() row) disables the checkbox mid-request WHILE it
+     still has focus from the click's own label-activation step (a separate, later focus than the
+     one layer 1 blocks) -- browsers move focus off a just-disabled element, here landing on <body>,
+     and THAT focus change reproduced the exact same scroll-the-whole-page bug through a completely
+     different trigger. Rather than chase every possible path that can focus-scroll an
+     effectively-invisible element (there is no reason to believe these two are the only ones),
+     this listens for the document itself actually scrolling at all and snaps it back to 0
+     immediately -- window.scrollY is NEVER supposed to be anything but 0 in this app (<main> is
+     the one and only real scroll container), so unconditionally enforcing that is simply upholding
+     the guarantee themes.css already documents, not a workaround for one specific case. #}
+  <script>
+    document.addEventListener("mousedown", function (event) {
+      var label = event.target.closest("label");
+      if (!label) return;
+      if (label.querySelector("input.sr-only")) { event.preventDefault(); return; }
+      var forId = label.getAttribute("for");
+      if (forId) {
+        var target = document.getElementById(forId);
+        if (target && target.classList.contains("sr-only")) event.preventDefault();
+      }
+    }, true);
+    window.addEventListener("scroll", function () {
+      if (window.scrollY !== 0 || window.scrollX !== 0) window.scrollTo(0, 0);
+    }, { passive: true });
+  </script>
 
-  <script src="https://cdn.tailwindcss.com"></script>
+  {# ?v=4 -- same cache-bust reasoning as the favicon above: StaticFiles serves this with no
+     Cache-Control header at all, so browsers fall back to heuristic freshness on Last-Modified and
+     can keep serving a stale copy across ordinary reloads during active development (confirmed
+     live: a newly-added theme rendered as a plain white/unstyled page until a hard refresh, purely
+     because the browser hadn't re-fetched the edited file). Bump this number whenever themes.css
+     changes so every browser is forced to re-fetch, not just whoever remembers to hard-refresh.
+     Real incident this rule itself caught: the native toolkit's own Site Map/Repeater/Decoder/
+     Comparer sub-tab visibility rules (.toolkit-subtabs, [data-toolkit-subtab], added across
+     several later changes) never bumped this number past 9 despite themes.css changing repeatedly
+     in the meantime -- a browser tab that had cached themes.css BEFORE those rules landed kept
+     serving that stale copy indefinitely, so every sub-tab panel rendered simultaneously
+     (no display:none at all) instead of only the selected one, on that one still-cached tab, even
+     though the rules were correct and present in the real file on disk the whole time. #}
+  <link rel="stylesheet" href="/static/css/themes.css?v=62">
+
+  {# Instant "this sidebar link was just clicked" acknowledgment (tab/nav switching must
+     be visually instant, never gated on the full-page reload that follows) -- classList-only toggle,
+     wired in the delegated listener further down. Plain inline rule (not a themes.css addition) since
+     it's one small self-contained feature local to base.html's own sidebar, same reasoning as the
+     progress bar above. Reuses --accent (already correct across every theme) instead of a second
+     hand-picked color, and color-mix (already used elsewhere in themes.css) instead of a Tailwind
+     opacity utility so it applies identically to both sidebar row shapes -- the left-rail main list
+     and the centered footer group -- without the listener needing to know which one it's on. #}
+  <style>
+    #sidebar a.is-navigating {
+      background-color: color-mix(in srgb, var(--accent) 12%, transparent);
+      color: var(--accent);
+    }
+  </style>
+
+  {# Tailwind, htmx, its SSE extension and Idiomorph are vendored under /static/vendor (downloaded
+     once) rather than pulled from a public CDN on every page load. Two concrete wins: no per-
+     navigation round-trip to unpkg.com/cdn.tailwindcss.com (the dominant cost of a full-page
+     transition here), and the app keeps working with no internet at all -- a flaky connection used
+     to stall or blank every page while it waited on those CDN fetches. #}
+  <script src="/static/vendor/tailwind.js?v=1"></script>
   <script>
     tailwind.config = {
       theme: {
@@ -54,6 +155,34 @@
               medium: "rgb(var(--severity-medium) / <alpha-value>)",
               low: "rgb(var(--severity-low) / <alpha-value>)",
               unknown: "rgb(var(--severity-unknown) / <alpha-value>)",
+              // "Info" (a finding with no direct security impact of its own -- a disclosed banner,
+              // a discovered endpoint) deliberately shares its color with "unknown" via a CSS
+              // fallback rather than a hand-picked hue in every one of themes.css's 40+ themes:
+              // both mean "neutral, not actually dangerous" and read identically at a glance,
+              // which is also how Piligrim's own Info tag rendered (plain neutral gray). A theme
+              // can still opt out later by defining its own --severity-info, no migration needed.
+              info: "rgb(var(--severity-info, var(--severity-unknown)) / <alpha-value>)",
+            },
+            // --status-online is the app's own established "on/healthy" green (sidebar dot,
+            // provider-enabled toggles) — deliberately its own namespace, never severity-low
+            // (that's the color of a resolved/healthy VULNERABILITY, a different meaning). Exposed
+            // as a real Tailwind utility (text-status-online/border-status-online/bg-status-online)
+            // for the finding-card remediation-advice block, which needed a genuine green with
+            // working opacity modifiers the same way severity-* already gets one, not another
+            // raw-CSS-only use of the variable.
+            status: {
+              online: "rgb(var(--status-online) / <alpha-value>)",
+            },
+            // Weak-to-legendary technique rank tiers (Playbook manager, agent/tools/playbook_store.py's
+            // technique_rank) -- its own metallic-hue namespace, deliberately never reusing severity's
+            // red/orange/amber/blue so "how proven is this technique" never reads as "how dangerous is
+            // this finding". Channels live in static/css/themes.css.
+            rank: {
+              bronze: "rgb(var(--rank-bronze) / <alpha-value>)",
+              silver: "rgb(var(--rank-silver) / <alpha-value>)",
+              gold: "rgb(var(--rank-gold) / <alpha-value>)",
+              platinum: "rgb(var(--rank-platinum) / <alpha-value>)",
+              legendary: "rgb(var(--rank-legendary) / <alpha-value>)",
             },
           },
           fontFamily: {
@@ -64,8 +193,8 @@
     };
   </script>
 
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+  <script src="/static/vendor/htmx.min.js?v=1"></script>
+  <script src="/static/vendor/sse.js?v=1"></script>
   {# Idiomorph (htmx morph extension) — the session log/findings SSE swap uses hx-swap="morph"
      instead of innerHTML: a real DOM diff that only touches nodes that actually changed, instead
      of destroying and recreating the whole fragment on every update. innerHTML was the root
@@ -74,69 +203,1015 @@
      were symptoms of the same thing (nothing about an unrelated new log entry should touch DOM
      nodes for entries that didn't change), so morph fixes the actual cause instead of adding a
      third manual save/restore workaround on top of the first two. #}
-  <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
+  <script src="/static/vendor/idiomorph-ext.min.js?v=1"></script>
+  <script>
+    // Real, confirmed bug (not a guess): idiomorph's syncNodeFrom removes any attribute the live
+    // DOM node has that the incoming server-rendered node lacks. A finding-detail <dialog> is
+    // opened client-side via showModal() (open, plus the browser's internal top-layer/inert
+    // state) — the server-rendered template never includes open="" at all, since that's pure JS
+    // state. Without this guard, the very next SSE morph swap (a new log line, a status change —
+    // happens every few seconds during a live scan) strips `open` directly via removeAttribute
+    // instead of the dialog's own .close(), which does NOT run the browser's normal close
+    // cleanup: the rest of the document stays locked in the inert state showModal() put it in,
+    // so nothing anywhere is clickable until a full page reload.
+    //
+    // Same root cause, same fix, for <details> log-entry cards (session_fragment.html's
+    // #session-log-list and each finding's own "Activity for this finding" list): a manually
+    // expanded <details open> is native browser state the server-rendered template never
+    // includes either, so the very next unrelated log line arriving via SSE (e.g. the agent
+    // calling a different tool) morphed every other already-open card closed the instant any
+    // one of them changed. Guarding DETAILS the same way DIALOG already is keeps each card's
+    // open/closed state exactly as the operator left it across any number of live updates.
+    //
+    // Idiomorph.defaults is a real, documented mutable global (idiomorph.js's mergeDefaults reads
+    // it fresh on every morph() call) — the htmx morph extension itself has no config surface of
+    // its own to pass a callback through, so this is the only actual hook point. Scoped to exactly
+    // the one attribute/direction that caused the bug — everything else inside an open
+    // dialog/details (e.g. this finding's own live-updating log) still morphs normally.
+    //
+    // Same root cause, a third instance: idiomorph's syncBooleanAttribute (called for every
+    // INPUT's "checked" state during a morph) diffs the live node's checked PROPERTY against the
+    // freshly-server-rendered node's, exactly like the generic attribute loop above does for
+    // "open" -- it just reaches it through a different code path (INPUT elements go through
+    // syncInputValue/syncBooleanAttribute, not the generic per-attribute loop, but both funnel
+    // through this same beforeAttributeUpdated callback). The Summary tab's severity filter
+    // (session_fragment.html's #sumfilter-* radios, themes.css's .summary-filter rules) is
+    // deliberately CSS-only client state for exactly this reason -- but the server only ever
+    // renders #sumfilter-all as checked, so the instant a user picks a different severity and a
+    // live SSE update morphs #session-content afterward, idiomorph would otherwise silently flip
+    // the selection back to "All" mid-scan. Guarding "checked" the same way "open" is guarded
+    // above keeps whatever the operator currently has selected untouched across any number of
+    // live updates.
+    // Fourth instance of the same root cause, but at the NODE level instead of a single attribute:
+    // the Diagram Builder (session_fragment.html's [data-diagram-builder], static/js/
+    // diagram_builder.js) fills its own <select> elements (data-db-source/-metric/-compare-*) with
+    // <option>s entirely client-side after page load -- the server-rendered markup always emits
+    // them empty, since populating them is real JS state, not something the template can know
+    // ahead of time. That file's own top comment claimed this was safe because "a completed
+    // session's data never changes again, so #session-content's SSE morph never emits another
+    // event for it" -- confirmed FALSE by direct instrumented testing (a real headless-browser
+    // run against a real completed session): main.py's stream_session starts last_hash=None, so it
+    // unconditionally yields ONE immediate render the instant the SSE connection opens, regardless
+    // of session status. That morph swap syncs the live (JS-populated) <select> nodes' CHILDREN
+    // back to the server's own always-empty markup -- a plain attribute guard can't fix this, since
+    // idiomorph's generic child-node diffing (not the per-attribute path beforeAttributeUpdated
+    // hooks into) is what does it. Confirmed live: <select data-db-source> had 3 real <option>s
+    // immediately after DOMContentLoaded's own init ran, then 0 options and no data-db-ready
+    // attribute at all moments later -- permanently stuck empty, since nothing ever re-populates it
+    // after that first wipe (data-diagram-builder.js's own htmx:afterSwap re-init only fires for a
+    // node that's genuinely newly-added or has its data-db-ready attribute freshly stripped, not
+    // reliably for a same-reference node idiomorph patched in place).
+    //
+    // beforeNodeMorphed (unlike beforeAttributeUpdated, which only ever gets a say over ONE
+    // attribute at a time) can return false to skip morphing a node -- and therefore its entire
+    // subtree -- altogether, leaving the live DOM exactly as it is. Scoped to exactly
+    // [data-diagram-builder] once it already exists: the very FIRST time this block appears (a
+    // session transitioning from processing to completed while the page is already open) goes
+    // through beforeNodeAdded instead, completely unaffected by this guard, so it still gets added
+    // and initialized normally the first time.
+    //
+    // Fifth instance of the same root cause, at yet another Idiomorph code path (syncInputValue,
+    // not the generic per-attribute loop the "open"/"checked" guards above hook into): the
+    // Hypotheses tab's own "New hypothesis" text input lives inside #session-content, so it's
+    // subject to the exact same SSE-triggered morph as everything else on this page -- confirmed
+    // live, real operator report: typing into that field while a scan is actively running (SSE
+    // pushes a new morph every few seconds) got the field silently wiped mid-keystroke, because
+    // the server always renders that input's own value="" (there is no persisted draft), and
+    // idiomorph's syncInputValue syncs the live DOM node's value FROM that always-empty
+    // server-rendered one on every single morph. ignoreActiveValue is idiomorph's own built-in,
+    // official answer to exactly this ("don't touch whatever's currently focused"), not a
+    // hand-rolled workaround like the attribute guards above -- checked once per morph, inside
+    // idiomorph's own ignoreAttribute(), scoped automatically to attr==="value" AND
+    // to===document.activeElement, so it can never suppress a value sync for any OTHER,
+    // not-currently-focused input. Set globally (not scoped to one field) since any future text
+    // input added anywhere inside #session-content would hit the identical bug otherwise.
+    if (window.Idiomorph && Idiomorph.defaults && Idiomorph.defaults.callbacks) {
+      Idiomorph.defaults.ignoreActiveValue = true;
+      Idiomorph.defaults.callbacks.beforeAttributeUpdated = function (attributeName, node, updateType) {
+        if (attributeName === "open" && updateType === "remove" && (node.tagName === "DIALOG" || node.tagName === "DETAILS")) {
+          return false;
+        }
+        if (attributeName === "checked" && node.tagName === "INPUT" && node.name === "summary-severity-filter") {
+          return false;
+        }
+        // Same root cause, new element: the Map tab's own Attack Surface / Site Tree sub-tab
+        // radios (session_fragment.html's "map-subtab" group) always render with `checked`
+        // hardcoded on map-subtab-geo (Geopolitical Map, the server-side default) -- there is no
+        // persisted "which sub-tab was open" field to render instead. Confirmed live, real operator
+        // report: clicking "Attack Surface" or "Site Tree" visibly switched the view for a moment,
+        // then snapped back to Geopolitical Map on the next SSE-triggered morph of this same
+        // #session-stream subtree, because idiomorph synced the radio's live (operator-chosen)
+        // checked state back to the server's always-geo markup, same as summary-severity-filter
+        // above already had to be guarded against.
+        if (attributeName === "checked" && node.tagName === "INPUT" && node.name === "map-subtab") {
+          return false;
+        }
+        // Eighth instance of the exact same root cause as the Map tab's Magnetism toggle below --
+        // the Map tab's own "Expand" button (attack_surface_graph.js) toggles a "map-fullscreen"
+        // class on #map-surface-panel entirely client-side; session_fragment.html always renders
+        // it WITHOUT that class (there's nothing server-side to persist it against), so the very
+        // next SSE-triggered morph would otherwise silently drop an operator out of fullscreen
+        // mid-scan.
+        if (attributeName === "class" && node.id === "map-surface-panel") {
+          return false;
+        }
+      };
+      Idiomorph.defaults.callbacks.beforeNodeMorphed = function (oldNode, newContent) {
+        if (oldNode.nodeType === 1 && oldNode.matches && oldNode.matches("[data-diagram-builder]")) {
+          return false;
+        }
+        // Sixth instance of the exact same root cause as the Diagram Builder case above, same fix:
+        // the Map tab's Attack Surface graph (static/js/attack_surface_graph.js) injects a real
+        // cytoscape.js canvas as CHILDREN of #attack-surface-graph-mount, entirely client-side --
+        // the server-rendered markup for that div is always empty (cytoscape's own DOM is not
+        // something a template can know ahead of time). Confirmed live: cytoscape initialized fine
+        // (one real child, a visible graph) immediately after page load, then silently reverted to
+        // zero children moments later with no error anywhere -- session.html's own SSE connection
+        // yields at least one immediate render the instant it opens (same "unconditional first
+        // yield regardless of session status" behavior documented in the Diagram Builder entry
+        // above), and that morph reconciled the live (JS-populated) canvas children back to the
+        // server's always-empty version. Skipping this node's own morph once cytoscape has already
+        // populated it (mount.children.length > 0) leaves the live graph untouched across any
+        // number of further live updates -- the graph's own DATA still updates correctly, via
+        // attack_surface_graph.js's own MutationObserver on the SEPARATE #attack-surface-data JSON
+        // blob, which is a plain text node the server DOES keep rendering, so morphing it is fine
+        // and wanted.
+        if (oldNode.nodeType === 1 && oldNode.id === "attack-surface-graph-mount" && oldNode.children.length > 0) {
+          return false;
+        }
+        // Seventh instance, same root cause, simplest case yet: the Map tab's Magnetism toggle
+        // (attack_surface_graph.js's setMagnetism) rewrites this ONE button's own textContent and
+        // class list entirely client-side the moment the operator clicks it -- session_fragment.html
+        // always renders the same hardcoded "Magnetism: On" text and default (off-looking) classes,
+        // since the operator's own preference lives in localStorage, not session.json. Confirmed
+        // live: clicking the toggle visibly flipped it to "Magnetism: Off" with a filled/pressed
+        // style, then reverted to "Magnetism: On" with the plain default style moments later --
+        // session.html's SSE connection's own unconditional first render (documented above, twice
+        // already) morphed it back before the operator had even let go of the mouse. Unlike the
+        // graph mount above, this node has no children worth diffing at all -- skip its morph
+        // unconditionally, every time, not just after some populated-state check.
+        if (oldNode.nodeType === 1 && oldNode.id === "map-magnetism-toggle") {
+          return false;
+        }
+        // Ninth instance, same root cause as Magnetism right above: the Map tab's own Timeline
+        // toggle (attack_surface_graph.js's wireMapTimeline) rewrites this button's own textContent
+        // and class list client-side, same as Magnetism does -- skip its morph unconditionally too.
+        if (oldNode.nodeType === 1 && oldNode.id === "map-timeline-toggle") {
+          return false;
+        }
+        // Tenth instance: the Timeline scrubber's own <input type="range"> value/disabled state is
+        // entirely client-side (attack_surface_graph.js's mapTimelineState) -- ignoreActiveValue
+        // above only protects a value while the element is actually FOCUSED, and a range input
+        // easily loses focus after a drag ends (varies by browser/input method), unlike a text
+        // field the operator is still actively typing into. Skipping this node's own morph
+        // entirely, same blunt-but-reliable fix as the Magnetism/mount cases above, is simpler than
+        // chasing exactly which internal idiomorph path syncs a range input's value.
+        if (oldNode.nodeType === 1 && oldNode.id === "map-timeline-slider") {
+          return false;
+        }
+        // Eleventh instance, same root cause as the Attack Surface graph mount above: the Map
+        // tab's Geopolitical Map sub-tab (static/js/geo_map.js) injects a real jsvectormap canvas
+        // as CHILDREN of #geo-map-mount, entirely client-side -- the server-rendered markup for
+        // that div is always empty. Its own DATA still updates correctly via a MutationObserver on
+        // the separate #geo-map-data JSON blob, a plain text node the server does keep rendering.
+        if (oldNode.nodeType === 1 && oldNode.id === "geo-map-mount" && oldNode.children.length > 0) {
+          return false;
+        }
+      };
+    }
+  </script>
+  {# ?v=1 -- same cache-bust reasoning as themes.css/favicon.png above (this file's own head
+     comments): StaticFiles serves every static file with no Cache-Control header, so a browser
+     can keep serving an old cached copy of this script across ordinary reloads even after a real
+     bug fix lands on disk. This one had no version tag at all until the document.body-in-<head>
+     crash fix (see debug_events.js's own top-of-file comment) -- confirmed live: a browser that
+     had ever loaded this file before kept silently running the pre-fix, still-broken copy after
+     the fix landed on disk, with a plain reload not enough to pick up the change, because the URL
+     itself (no query string) never changed. Bump the number again the next time debug_events.js
+     actually changes.
+     v=2: window.asraDebugEvent exposed (now a no-op-when-off function, not gated by an early
+     `if (!ASRA_DEBUG) return` at the top of the whole file) so hypotheses_paste_guard.js below can
+     log its own decision points through the same UI-category pipe instead of a bespoke one.
+     v=3: htmx:afterRequest now classifies "ok"/"failed" off event.detail.xhr.status instead of
+     event.detail.successful -- real, confirmed live incident this fixes: v=2 itself already had
+     the successful-based logic, but a browser that cached v=2 BEFORE this exact edit landed kept
+     silently running the pre-fix copy, logging "htmx-response: failed 200 /api/scan" for a
+     genuinely successful HX-Redirect response, exactly the class of bug this version tag exists to
+     prevent -- caught only because the fix itself was made without also bumping this number, the
+     same mistake the v=1 changelog entry above already warns about. #}
+  {# debug_events.js's own top-of-file comment claims "base.html only sets [window.ASRA_DEBUG] when
+     DEBUG=true" -- confirmed live that this assignment never actually existed anywhere in the repo,
+     so window.ASRA_DEBUG was always undefined and every listener in debug_events.js silently
+     no-op'd regardless of the real DEBUG env var. main.py already exposes is_debug_enabled() as the
+     `debug_enabled` Jinja global (main.py's templates.env.globals) specifically for this -- it just
+     wasn't wired up. Must run BEFORE debug_events.js below (same document order both non-deferred
+     <script> tags already execute in), since that file reads window.ASRA_DEBUG synchronously at the
+     top of its own IIFE. #}
+  <script>window.ASRA_DEBUG = {{ "true" if debug_enabled else "false" }};</script>
+  <script src="/static/js/debug_events.js?v=3"></script>
+  {# Settings -> Customization -> Sounds' current state, on every page (not just settings.html) -- static/js/
+     sound_events.js's own event watchers (new finding, session done, approval needed, chat reply)
+     have to fire from session.html/session pages, not just the Settings screen that edits this.
+     Called as a live global (main.py's templates.env.globals["load_sound_settings"]), same pattern
+     as load_display_timezone right below -- always reflects whatever was last saved, no server
+     restart needed. #}
+  <script>window.ASRA_SOUND_SETTINGS = {{ load_sound_settings() | tojson }};</script>
+  {# window.asraCopyCard/asraCopyLogs, used by every finding/hypothesis/credential/chain card's own
+     Copy button (macros/ui.html's copy_button()) on ANY page, Agent mode included -- must be
+     loaded here (page-wide), not inside session.html's own Interactive/RE-only conditional block,
+     which is where these functions used to live and the exact reason Agent-mode copy buttons were
+     silently broken (window.asraCopyCard never existed for that branch at all). #}
+  <script src="/static/js/copy_card.js?v=1"></script>
+  {# window.asraToggleIdentityField, used by the Recon tab's Credentials card (identity fields
+     masked by default, an eye button reveals them) -- same page-wide-load posture as
+     copy_card.js right above, for the identical reason (session_fragment.html is Agent mode's own
+     partial, not loaded from session.html's Interactive/RE-only branch). #}
+  <script src="/static/js/identity_reveal.js?v=1"></script>
+  {# window.asraOpenExternal + a page-wide target="_blank" click interceptor -- desktop shell only
+     (window.__TAURI__ presence-gated, no-op in a real browser). Loaded page-wide, not just on
+     /playbook, since the same "target=_blank does nothing inside the desktop webview" gap showed
+     up in Settings' Codex/Copilot OAuth links too, not only the Library panel's own source links. #}
+  <script src="/static/js/external_links.js?v=2"></script>
+  {# Preserves the Library panel's own scroll position across any #library-sources swap (delete,
+     analyze, stop, self-poll) -- see the file's own top comment for the real bug this fixes. #}
+  <script src="/static/js/library_scroll.js?v=1"></script>
+  {# Depends on window.asraDebugEvent (debug_events.js right above) and localStorage's
+     asra-mascot-skin (Settings -> Customization -> Mascot, settings.html) -- purely decorative, mounts
+     nothing on pages with no [data-mascot-mount] element (only session.html has one). #}
+  <script src="/static/js/mascot.js?v=6"></script>
+  {# Header light -- Settings -> Customization -> Header light. Depends on localStorage only (asra-
+     header-light-*), same client-only convention as mascot.js right above; needs no
+     window.asraDebugEvent hook of its own since debug_events.js's generic click/change delegates
+     already cover this element (a plain clickable span + settings.html's plain inputs). #}
+  <script src="/static/js/header_light.js?v=9"></script>
+  {# ?v=2 -- same cache-bust reasoning as themes.css/favicon.png above (this file's own head
+     comments): StaticFiles serves every static file with no Cache-Control header, so a browser
+     can keep serving an old cached copy of this script across ordinary reloads even after a real
+     bug fix lands on disk. Bump the number again the next time confirm_dialog.js actually changes.
+     v=5: added the htmx:confirm interceptor -- hx-confirm (the Stop-session button) used to fall
+     through to htmx's own default window.confirm() untouched, a real confirmed operator report of
+     a native OS-drawn popup instead of this app's own styled dialog.
+     v=6: added asraConfirmDeleteProject -- the Projects list's per-row Delete confirm now names
+     the actual project instead of a generic message, closing a real incident where a stale click
+     (this list polls every 5s and rows re-sort underneath the mouse) deleted the wrong project
+     with nothing in the confirm dialog to catch it.
+     v=7: added the optional opts.checkboxLabel opt-out checkbox (fallback chain's per-row Remove
+     on Settings) -- see the dialog markup's own comment in base.html. #}
+  <script src="/static/js/confirm_dialog.js?v=7"></script>
+  {# v2: the tooltip now re-parents into the currently open subagent Edit dialog (and switches to
+     position:absolute while doing so) instead of always living fixed-positioned in <body> -- a
+     real, confirmed bug where it rendered invisibly behind the dialog's own content. Same
+     cache-busting discipline as confirm_dialog.js above -- bump again next time this file changes. #}
+  <script src="/static/js/tool_tooltip.js?v=3"></script>
+  <script src="/static/js/summary_filter.js?v=1"></script>
+  {# window.asraTogglePrivacy for macros/ui.html's privacy_toggle_button (Dashboard/Fleet/Projects/
+     Recent projects) -- see that macro's own comment for the full design. #}
+  <script src="/static/js/privacy_toggle.js?v=1"></script>
+  {# v2: default source/metric changed from Findings (empty on any 0-finding session) to Activity
+     (always populated) -- same cache-busting discipline as confirm_dialog.js's own comment above.
+     Bump the number again the next time diagram_builder.js actually changes. #}
+  <script src="/static/js/diagram_builder.js?v=3"></script>
+  <script src="/static/js/live_duration.js?v=1"></script>
+  <script src="/static/js/header_clock.js?v=2"></script>
+  {# Settings -> Appearance's "Neo"/"Mr. Robot" themes only -- every other theme is pure CSS
+     (static/css/themes.css), these two get a real per-frame canvas/typewriter treatment. Loaded
+     unconditionally (theme is a client-side-only choice, localStorage, never known at Jinja render
+     time -- base.html's own anti-FOUC script above sets data-theme before paint) -- the script
+     itself checks document.documentElement's current data-theme and a MutationObserver reacts to
+     Settings' own live theme-switch (applyTheme() in settings.html), so switching themes there
+     shows the new effect immediately without a reload. #}
+  <script src="/static/js/theme_effects.js?v=2"></script>
+  <script src="/static/js/findings_tab_count.js?v=1"></script>
+  {# Depends on window.asraDebugEvent (debug_events.js above) -- loaded after it, same discipline
+     as hypotheses_paste_guard.js's own comment further down. Bump the number next time this file
+     changes. #}
+  <script src="/static/js/live_view_input.js?v=1"></script>
+  {# Shared window.asraSessionState store (localStorage, namespaced per session) -- must load
+     before recon_filter.js/findings_filter.js below, both of which call straight into it to
+     persist their own active filter tile across a reload. See the file's own top comment.
+     v=2: added window.asraOnDomReady, a defensive readyState check before falling back to a bare
+     DOMContentLoaded listener -- cheap insurance for a script loaded this late in <head>, even
+     though the real bug that motivated it (see recon_filter.js/findings_filter.js's own v=5 note
+     below) turned out to be something else entirely.
+     v=3: <details> restore no longer uses getElementById -- log_entry_card() (session_fragment.html)
+     deliberately renders the same log-step-N id more than once (each phase tab plus the unfiltered
+     Logs tab), and getElementById only ever finds the first, often-hidden copy -- a real, confirmed
+     operator report (expanding a Logs-tab entry never survived a reload).
+     v=4: added scroll position persistence (originally targeted window + any [data-scroll-persist]
+     panel) -- a real, confirmed operator report that every scrollable log list, and the page
+     itself, always teleported back to the top on reload.
+     v=5: the "window" half of v=4 was flatly broken -- confirmed live, window.scrollY stayed 0
+     through a real, visible scroll gesture, because base.html's own app shell is a fixed h-screen
+     flex row with overflow-hidden and <main> is what actually carries overflow-y-auto, never
+     window/document. Retargeted at <main>, now keyed per active session tab (mainScrollKey) since
+     <main> is the one scroll box shared across every tab.
+     v=6: the htmx:afterSwap reapply from v=5 was fighting the operator's own live scrolling --
+     confirmed live, this app's SSE stream can keep re-rendering every few seconds, and each one
+     snapped an actively-scrolled <main>/panel straight back to whatever position had been saved
+     BEFORE the operator started scrolling. restoreScrollPositions() now takes a mode: "force" for
+     a real load/tab-switch, "gentle" for afterSwap -- gentle only rescues a container idiomorph
+     just reset to 0, never touches one the operator is genuinely mid-scroll on. #}
+  <script src="/static/js/session_state.js?v=6"></script>
+  {# Depends on window.asraOnDomReady (session_state.js right above) -- must load after it, same
+     discipline as recon_filter.js/findings_filter.js below. See the file's own top comment for the
+     whole sound-notification system. #}
+  <script src="/static/js/sound_events.js?v=4"></script>
+  {# v=5/v=6: the restored filter used to get silently wiped moments after it was applied --
+     confirmed live: main.py's stream_session sends at least one render the instant its SSE
+     connection opens, even for an already-completed session (see this file's own Idiomorph comment
+     above on that same guaranteed-first-render behavior), and can keep sending more afterward; each
+     one morphs #session-content back to the server's own always-unfiltered markup, since nothing
+     told Idiomorph the client-added "hidden" class on each row was supposed to survive. Now
+     re-applied on every "htmx:afterSwap" instead of only once at restore time, so it survives
+     however many of these land, not just the first. #}
+  <script src="/static/js/recon_filter.js?v=5"></script>
+  <script src="/static/js/findings_filter.js?v=6"></script>
+  {# Persists which session tab (Plan/Recon/.../Findings) the operator switches to, so a later
+     reload can restore it -- the actual restore-on-load half lives inline in macros/ui.html's
+     tab_bar() macro instead (has to run synchronously to avoid a visible flash on a large page,
+     see that macro's own long comment), not here.
+     v=3: also re-runs session_state.js's own <main> scroll restore ("force" mode) right after a
+     tab switch, since <main> is shared across every tab and doesn't reset its own scrollTop just
+     because the tab underneath it changed. #}
+  <script src="/static/js/session_tab_memory.js?v=3"></script>
+  {# Real, confirmed incident this guards against: pasting the program's whole rules/policy page
+     into the New Project form's "Hypotheses to check" field splits it line-by-line into a pile of
+     junk hypotheses (main.py's start_scan) that the end-of-session gate can never legitimately
+     resolve. Loaded after confirm_dialog.js/debug_events.js above -- depends on both. #}
+  <script src="/static/js/hypotheses_paste_guard.js?v=1"></script>
+  {# Settings -> Tool API Keys: fills a saved tool-key field with a solid masked value so it
+     always looks saved (server never re-renders the real secret). Progressive enhancement --
+     attribute-driven, covers every current/future tool row with no per-tool code. #}
+  <script src="/static/js/tool_api_key_field.js?v=1"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="font-mono bg-base text-primary min-h-screen">
+  {# Top loading bar (4.x): a thin accent strip pinned to the very top edge, driven by
+     static/js/progress_bar.js. It fills while the initial document is still loading (removed on
+     window 'load') and again during any htmx request (hx-boosted nav, SSE-triggered swaps, form
+     posts), so a slow page transition shows visible progress instead of a frozen window. Pure CSS
+     animation + a few htmx event hooks, no library. #}
+  <div id="asra-progress" class="asra-progress" aria-hidden="true"></div>
+  {# Loaded here at the very top of <body> (not with the other scripts in <head>) so #asra-progress
+     already exists when it runs and it can start the bar as early as possible in the page's life. #}
+  <script src="/static/js/progress_bar.js?v=3"></script>
   {# Dashboard shell (sidebar + content), not the old top-nav bar — see macros/nav.html for the
-     link list this renders (single source, not repeated per nav item here and in mobile markup). #}
+     link list this renders (single source, not repeated per nav item here and in mobile markup).
+     Sidebar is a fixed 224px on every viewport down to the narrowest phone (no responsive
+     collapse existed at all) — below md: (768px) it goes off-canvas by default (fixed + translated
+     out of view) and slides in over a backdrop via the hamburger in main's sticky mobile bar,
+     same "tap outside to dismiss" convention every <dialog> on this site already uses. Nothing
+     about the >=md: desktop layout below changed — the added classes are no-ops there. #}
   <div class="flex h-screen overflow-hidden">
     {% from "macros/nav.html" import nav_icon %}
-    <aside class="w-56 shrink-0 bg-surface border-r border-default flex flex-col">
-      <a href="/" class="flex items-center gap-2.5 px-4 h-12 border-b border-default shrink-0 hover:bg-elevated transition-colors">
-        <div class="w-6 h-6 rounded-md bg-accent/15 flex items-center justify-center shrink-0 overflow-hidden">
+
+    {# JS-toggled only (asraToggleSidebar below) — md:hidden is a hard backstop so this can never
+       show on desktop regardless of what the toggle class ends up being. #}
+    <div id="sidebar-backdrop" onclick="window.asraToggleSidebar(false)" class="hidden md:hidden fixed inset-0 bg-black/50 z-40"></div>
+
+    {# hx-boost on the whole rail: every plain <a href> inside becomes an AJAX nav that swaps only
+       #main-content (hx-select/hx-target below), leaving this <aside> itself untouched -- no full
+       page teardown, no browser loading spinner, no white flash. Real, confirmed operator complaint
+       this fixes: EVERY sidebar click used to be a genuine full-page reload (this app had used none
+       of htmx's boost anywhere, on purpose -- see the now-historical reasoning that used to sit on
+       the pageshow/bfcache listener below), so a click visibly "did nothing" for however long the
+       reload took, even on localhost. Chat/Terminal/Toolkit are explicitly un-boosted below (real
+       reason, not an oversight): each holds a live connection or complex client-side state that a
+       normal full reload's own teardown/reinit is what actually keeps correct today (Chat's own
+       /chat/stream SSE, Terminal's per-tab WebSockets + mounted xterm.js instances, Toolkit's own
+       live traffic capture) -- boosting them would leave that state's old JS closures/listeners
+       orphaned instead of properly torn down, since nothing here re-executes their setup from a
+       clean slate the way a real navigation does. Every other item (Dashboard/New project/Projects
+       list page itself, not an individual /session/<id> page --see below/Fleet/Playbook/Dorks/
+       Subagents/Special Agents/Settings/the brand link/the clock link) has no such state and is
+       safe to boost as-is. #}
+    <aside id="sidebar" hx-boost="true" hx-target="#main-content" hx-select="#main-content" hx-swap="innerHTML"
+           class="w-56 shrink-0 bg-surface border-r border-default flex flex-col fixed md:static inset-y-0 left-0 z-50 -translate-x-full md:translate-x-0 transition-transform duration-200">
+      {# A faint accent wash under the brand row (bg-gradient-to-b from-accent/[8%]) -- real,
+         explicit operator ask for the sidebar to feel more designed, not just functional; this is
+         the one place a little color leads before the rest of the nav settles into its own quiet,
+         line-and-rail language below. Every color here reads off the active theme's own tokens
+         (--accent), so it looks correct in all ~45 themes, not just whichever one this was eyeballed
+         against. #}
+      <a href="/" class="flex items-center gap-2.5 px-4 h-12 border-b border-default shrink-0 bg-gradient-to-b from-accent/[0.08] to-transparent hover:bg-elevated transition-colors">
+        <div class="asra-brand-emblem w-6 h-6 rounded-md bg-accent/15 flex items-center justify-center shrink-0 overflow-hidden">
           <img src="/static/favicon.png" alt="ASRA" class="w-full h-full object-cover">
         </div>
-        <span class="text-sm font-semibold text-primary tracking-tight">ASRA</span>
+        <span class="text-sm font-semibold text-primary tracking-tight asra-wordmark">ASRA</span>
       </a>
 
-      <nav class="flex flex-col flex-1 overflow-y-auto asra-scroll p-2 gap-0.5">
-        <button type="button" onclick="document.getElementById('new-project-modal').showModal()"
-                class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors text-secondary hover:bg-elevated hover:text-primary text-left">
-          {{ nav_icon("plus") }}
-          New project
-        </button>
+      {# Whole-nav redesign pass (real, explicit operator ask: "уродливо... не чувствую гармонию").
+         Two changes run through every item below, replacing what used to be ad-hoc per-item margin
+         nudges with one consistent visual language, same order as before, nothing reshuffled:
 
-        <a href="/sessions"
-           class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/sessions') or request.url.path.startswith('/session/') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
-          {{ nav_icon("projects") }}
-          Projects
+         1. A slim left accent rail (border-l-2, accent when active/transparent at rest) on every
+            real page link -- the same "which one is current" affordance VSCode's own file explorer
+            uses instead of relying on the bg-accent/10 tint alone. Reserved unconditionally (2px of
+            transparent border at rest, not added only once active) so nothing shifts horizontally
+            when a link's active state flips. Footer links (Subagents/Special Agents/Settings,
+            below) deliberately do NOT get this -- they're already centered (a real, separate
+            operator ask) and a left-only bar would visibly skew that centering.
+
+         2. Every "big gap" that used to be a bare mt-6/mb-6 margin (no visual marker at all, which
+            is exactly what read as accidental misalignment rather than a deliberate section break)
+            is now a standalone hairline divider between siblings instead -- same total ~24px of
+            breathing room, split as margin + a real border-default/60 line + margin, so every zone
+            boundary in this sidebar looks the same and reads as intentional. #}
+      <nav class="flex flex-col flex-1 overflow-y-auto asra-scroll p-2 gap-0.5">
+        <a href="/dashboard"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/dashboard') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("dashboard") }}
+          Dashboard
         </a>
 
-        <div class="h-px bg-default my-1"></div>
+        {# New project + Projects grouped as one visual unit -- a VSCode Explorer-style parent/child
+           pair (a thin vertical indent guide + Projects indented under it), not two unrelated
+           top-level entries: real, explicit operator ask for it to read as "New project is what
+           populates Projects", the same "folder -> its own listing" relationship VSCode's own file
+           tree shows between a directory and the files indented under it. Wrapped in one relative
+           div (not two separate flex children of <nav>) specifically so the guide line below can
+           anchor its own left/top/bottom to this pair's own box, not the whole nav column. #}
+        <div class="relative">
+          <button type="button" onclick="asraOpenDialog('new-project-modal')"
+                  class="flex items-center gap-2.5 border-l-2 border-transparent px-2 h-8 rounded text-[13px] transition-colors text-secondary hover:bg-elevated hover:text-primary text-left w-full">
+            {{ nav_icon("plus") }}
+            New project
+          </button>
 
-        <a href="/settings"
-           class="flex items-center gap-2.5 px-2.5 h-8 rounded text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/settings') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
-          {{ nav_icon("settings") }}
-          Settings
+          {# left-[18px] lines up with New project's own icon center (border-l-2 + px-2 padding +
+             half of the w-4 icon = 2px + 8px + 8px). top-8/bottom-4 run it from New project's own
+             bottom edge down to Projects' own icon vertical center -- a plain straight guide, not
+             an L-shaped elbow connector, matching how VSCode's own indent guides actually look
+             today. #}
+          <span class="absolute left-[18px] top-8 bottom-4 w-px bg-default" aria-hidden="true"></span>
+
+          <a href="/sessions"
+             class="flex items-center gap-2.5 border-l-2 pl-5 pr-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/sessions') or request.url.path.startswith('/session/') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+            {{ nav_icon("projects") }}
+            Projects
+          </a>
+        </div>
+
+        {# Fleet + Playbook grouped as their own pair -- real, explicit operator ask: Playbook moved
+           directly under Fleet, and Fleet itself moved down enough to read as its own section, not
+           flush against Projects. #}
+        <div class="my-3 border-t border-default" aria-hidden="true"></div>
+
+        <a href="/fleet"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/fleet') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("sessions") }}
+          Fleet
+        </a>
+
+        <a href="/playbook"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/playbook') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("playbook") }}
+          Playbook
+        </a>
+
+        {# Chat/Terminal/Toolkit/Dorks: a deliberately separated group -- real, confirmed operator
+           ask to move Chat up here, right above Terminal, joining the same "work with your own
+           hands" tools (a real shell, a manual HTTP proxy/repeater/decoder, ad-hoc OSINT lookups)
+           rather than sitting isolated below them: "должно быть интуитивно понятно что это
+           интерактивный рабочий блок". #}
+        <div class="my-3 border-t border-default" aria-hidden="true"></div>
+
+        <a href="/chat" hx-boost="false"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/chat') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("chat") }}
+          Chat
+        </a>
+
+        <a href="/terminal" hx-boost="false"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/terminal') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("terminal") }}
+          Terminal
+        </a>
+
+        {# Deliberately its own top-level entry, not buried inside a project -- the native toolkit
+           (Proxy/Repeater/Decoder/Comparer/Intruder/Sequencer) works standalone on any URL, no
+           project/session required at all (agent/tools/toolkit_store.py's own docstring). #}
+        <a href="/toolkit" hx-boost="false"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/toolkit') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("toolkit") }}
+          Toolkit
+        </a>
+
+        {# Deliberately its own top-level entry, not buried inside a project -- same "works
+           standalone on any target, no project/session required" shape as Terminal/Toolkit above
+           (agent/tools/dork_engine.py's own docstring). #}
+        <a href="/dorks"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/dorks') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("dorks") }}
+          Dorks
         </a>
 
         {# Active-session quick-return (polled, not tied to whatever page you're on) — opening the
            New Project dialog or navigating around never touches this; each scan is its own
            independent FastAPI BackgroundTask keyed by session_id, nothing here can interrupt one
-           that's already running. #}
-        <div class="mt-auto pt-2" hx-get="/api/active-session" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+           that's already running. mt-auto sits on THIS wrapper (not the polled div directly)
+           specifically so the border-t below draws right at the bottom of nav's own free space --
+           real, confirmed bug this fixes: with no session running, that free space used to be a
+           totally bare, unbounded void between Dorks and the Subagents/Special Agents/Settings
+           footer below, reading as broken rather than deliberate. The line now gives that space a
+           real bottom edge, same hairline language as every other zone break above -- pt-2 keeps
+           the (often empty) badge slot from touching the line directly above it. #}
+        <div class="mt-auto border-t border-default pt-2">
+          {# hx-target/hx-select="unset" cancel inheritance from #sidebar's own hx-boost config
+             above -- without them this poller (which wants the normal "swap the response into
+             itself" default) instead inherited hx-target="#main-content"/hx-select="#main-content"
+             from that ancestor, so its own "load"-triggered fetch of a small unrelated fragment
+             (no #main-content anywhere in it) matched nothing and wiped the ENTIRE page content
+             with an empty selection on every single page load. Real, confirmed incident: this was
+             the exact cause of "no page/tab content ever appears" right after hx-boost was added
+             to #sidebar. Any future hx-get/hx-post added inside #sidebar needs this same pair
+             unless it genuinely wants to target #main-content. #}
+          <div hx-get="/api/active-session" hx-trigger="load, every 5s" hx-target="this" hx-select="unset" hx-swap="innerHTML"></div>
+        </div>
       </nav>
 
-      <div class="px-3 py-2.5 border-t border-default flex items-center gap-2 shrink-0">
-        <div class="w-1.5 h-1.5 rounded-full bg-severity-low shrink-0"></div>
-        <span class="text-[11px] text-secondary">local &middot; no cloud</span>
+      {# Subagents / Special Agents / Settings -- moved out of the scrollable nav list into the
+         sidebar footer, sitting directly above the clock row's own border-t line -- real operator
+         request: these read as footer/utility entries (like the clock and system-status rows below
+         them), not more items in the main working-tools nav list above. Special Agents is a real,
+         empty placeholder tab (templates/special_agents.html) -- not a hidden/disabled stub -- for
+         a feature that isn't built yet; deliberately placed directly below Subagents (real,
+         explicit operator swap) as the natural next entry in that same "delegated worker" family
+         once it ships. justify-center on all three (real operator ask): the clock row right below
+         them already centers its own content (justify-center, see that row's own comment) -- these
+         three read as flush-left against that centered time otherwise, not lined up on the same
+         coordinates the way the operator wanted. rounded + bg-accent/10 on the active one now
+         matches the main nav list's own active treatment above (previously text-color-only here,
+         one more small inconsistency in an already-inconsistent sidebar) -- no left accent rail
+         though, unlike that list: these rows are centered, and a left-only bar would visibly skew
+         that centering off from the clock row's own true-center alignment right below them. #}
+      <a href="/subagents"
+         class="flex items-center justify-center gap-2.5 rounded px-3 h-8 shrink-0 text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/subagents') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
+        {{ nav_icon("subagents") }}
+        Subagents
+      </a>
+
+      <a href="/special-agents"
+         class="flex items-center justify-center gap-2.5 rounded px-3 h-8 shrink-0 text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/special-agents') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
+        {{ nav_icon("special_agents") }}
+        Special Agents
+      </a>
+
+      {# Same hairline-divider language as every zone break in the scrollable nav list above
+         (real, explicit operator ask for a BIG, unmistakable gap between Settings and Subagents/
+         Special Agents specifically -- not Special Agents from Subagents, which stay flush as the
+         same "delegated worker" family) -- was a bare mt-6 with no visual marker; now margin + a
+         real line + margin, consistent with the rest of this redesign pass. #}
+      <div class="mx-3 my-3 border-t border-default" aria-hidden="true"></div>
+
+      <a href="/settings"
+         class="flex items-center justify-center gap-2.5 rounded px-3 h-8 shrink-0 text-[13px] transition-colors {{ 'bg-accent/10 text-accent font-medium' if request.url.path.startswith('/settings') else 'text-secondary hover:bg-elevated hover:text-primary' }}">
+        {{ nav_icon("settings") }}
+        Settings
+      </a>
+
+      {# Corner clock, own row so it stays visible on every page (this sidebar footer is the one
+         part of the shell that's never swapped by htmx) -- ticks client-side (static/js/
+         header_clock.js), server only ever renders the operator's saved Settings -> Customization
+         choice into data-tz once per full page load. Linked to /settings#customization so a glance
+         at an unexpected time is one click from actually changing the zone, not just a label. Real,
+         confirmed bug this fixes: this link still pointed at #general -- stale after Timezone (and
+         Appearance/Mascot/Header light) moved into their own "Customization" tab, so clicking the
+         clock landed on General, nowhere near the actual Timezone card.
+         Whether the clock (and, independently, the zone name next to it, and the date underneath)
+         shows at all is itself a Settings -> Customization toggle (agent/timezone_settings.py) --
+         default is clock on, zone name off, date off, real operator request: the corner should show
+         only the time unless asked for more.
+         data-style/.clock-style-* picks one of 3 real display styles (themes.css) -- minimal (this
+         plain look, the default), digital (an LCD-pill readout with seconds and an accent glow),
+         terminal (a bracketed [HH:MM:SS] readout with a blinking cursor bracket). header_clock.js
+         reads data-style itself to decide whether to include seconds.
+         Placed ABOVE the System/Online row below (real operator request: time reads as the more
+         glanceable, more important line of the two, so it belongs on top, not underneath a status
+         line most visits never need to look at). #}
+      {# Always rendered (not wrapped in an {% if %}), so Settings -> Timezone's "Show clock",
+         "Show timezone name" and "Show date" toggles can show/hide it LIVE client-side (settings.html
+         wires their onchange to the ids below) instead of only taking effect on the next full page
+         load. Initial visibility comes from the saved settings via the `hidden` attribute. Stacked
+         flex-col: time (+ optional zone name) on top, date underneath -- real operator request to
+         place the date "under the time", not squeezed onto the same line. justify-center on both
+         rows: with only the clock span (zone label off) the single child still centers rather than
+         sitting at the flex start. #}
+      <a id="asra-clock-row" href="/settings#customization/settings-timezone-section" title="{{ load_display_timezone() }}"
+         class="px-3 py-2 border-t border-default flex flex-col items-center justify-center gap-0.5 shrink-0 hover:bg-elevated transition-colors"
+         {% if not load_clock_show_time() %}hidden{% endif %}>
+        <span class="flex items-center justify-center gap-2">
+          <span id="asra-clock" data-tz="{{ load_display_timezone() }}" data-style="{{ load_clock_style() }}" class="clock-style-{{ load_clock_style() }} text-[11px] font-medium text-primary tabular-nums">--:--</span>
+          <span id="asra-clock-zone" class="text-[10px] text-secondary truncate" {% if not load_clock_show_zone_label() %}hidden{% endif %}>{{ load_display_timezone() }}</span>
+        </span>
+        <span id="asra-clock-date" class="text-[10px] text-secondary truncate" {% if not load_clock_show_date() %}hidden{% endif %}>--</span>
+      </a>
+
+      {# A real green/red signal (static/css/themes.css's --status-online/--status-offline), not
+         severity-low/high -- those stay reserved for a resolved/vulnerable VULNERABILITY state
+         everywhere else in this app, a different meaning than "the app itself is up". Polled
+         (GET /api/system-health, main.py's _check_system_health) so a genuinely broken module
+         (session storage unreadable, no LLM provider configured) actually turns this red instead
+         of a permanently-green static dot. justify-center for the same reason the clock row above
+         needs it -- these two children have nothing to space apart, they just want to sit
+         centered together as one row. #}
+      {# Update-available badge, polled from the startup cache (main.py /api/updates/indicator).
+         Renders blank when up to date, so this row is invisible unless there's actually an update. #}
+      {# hx-target/hx-select="unset" on both divs below -- same fix, same real incident, as the
+         active-session poller above (see its own comment): without them, both inherited
+         hx-target="#main-content"/hx-select="#main-content" from #sidebar's own hx-boost config
+         and wiped the entire page's content with an empty selection on every "load"/interval
+         trigger. #}
+      <div class="px-3 pt-2 flex items-center justify-center shrink-0"
+           hx-get="/api/updates/indicator" hx-trigger="load, every 60s" hx-target="this" hx-select="unset" hx-swap="innerHTML"></div>
+      <div class="px-3 py-2.5 border-t border-default flex items-center justify-center gap-2 shrink-0"
+           hx-get="/api/system-health" hx-trigger="load, every 20s" hx-target="this" hx-select="unset" hx-swap="innerHTML">
+        <div class="w-1.5 h-1.5 rounded-full status-dot-online shrink-0"></div>
+        <span class="text-[11px] text-secondary">System &middot; Online</span>
       </div>
     </aside>
 
-    <main class="{% block main_class %}max-w-4xl{% endblock %} flex-1 min-w-0 overflow-y-auto asra-scroll mx-auto px-6 py-6 w-full">
-      {% block content %}{% endblock %}
+    {# overflow-x-hidden is load-bearing, not decoration: CSS gives overflow-x/overflow-y a paired
+       resolution rule -- an element with overflow-y set to anything but "visible" (overflow-y-auto,
+       right here) and overflow-x left at its "visible" initial value has overflow-x silently
+       computed to "auto" instead, REGARDLESS of html/body's own overflow-x:hidden a few rules up in
+       themes.css (that guard is a different element; this rule is about THIS element's own paired
+       x/y values). <main> is the real scrolling ancestor #chat-panel's sticky column lives inside,
+       so it's the one that actually needs the explicit value -- the chat-collapse transform
+       (#chat-panel.chat-collapsed, themes.css) translateX(110%)s the panel past its own box on
+       purpose (see that rule's own comment), and without this, <main> silently grew a horizontal
+       scrollbar to fit the now-implicitly-auto-overflow-x content instead of clipping it, so
+       "collapse" visibly shoved the whole page sideways instead of just sliding the panel off. #}
+    {# The scroll container is now FULL-WIDTH (max-width lives on the inner content wrapper below,
+       not on <main> itself) -- so the scrollbar sits at the page's true right edge like a normal
+       full page, with real breathing room between it and the centered content, instead of floating
+       mid-viewport tight against a max-w-4xl-centered <main>'s own right edge. #}
+    {# overscroll-y-contain: without it, wheel-scrolling <main> past its own top/bottom edge chains
+       the rest of that scroll gesture to the outer page -- but the app shell (below) is a fixed
+       h-screen flex row with overflow-hidden specifically so <main> is the ONLY thing that ever
+       scrolls (see the session_tab_memory.js comment above: v=5 of that same scroll-position code
+       already had to retarget itself at <main> for exactly this reason). Once that chaining moves
+       window.scrollY off 0, the whole shell (sidebar included) visibly slides up out of the
+       viewport and overflow-hidden then clips it there -- it doesn't un-scroll on its own, so the
+       page stays looking "broken" until a manual reload. Real, confirmed trigger: the Settings ->
+       General page grew tall enough (Mascot section) that scrolling to the very bottom of it with
+       a wheel/trackpad, past where <main>'s own scroll bottoms out, reproduced this every time. #}
+    <main id="main-scroll" class="flex-1 min-w-0 overflow-y-auto overflow-x-hidden overscroll-y-contain asra-scroll w-full">
+      {# Sticky within main's own scroll box, not a separate flex row alongside it — main already
+         owns the one scroll container this needs to stick inside, so this is a plain child, not a
+         new layout wrapper. Padding moved off main itself (was px-6 py-6 directly on it) onto the
+         inner content div below so this bar can sit flush at main's true top edge instead of
+         floating py-6's worth of gap below it. #}
+      <div class="md:hidden sticky top-0 z-10 flex items-center gap-2.5 h-12 px-6 border-b border-default bg-surface">
+        <button type="button" onclick="window.asraToggleSidebar(true)" aria-label="Open menu"
+                class="text-secondary hover:text-primary p-1.5 -ml-1.5 rounded hover:bg-elevated transition-colors">
+          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round"></path>
+          </svg>
+        </button>
+        <span class="text-sm font-semibold text-primary tracking-tight asra-wordmark">ASRA</span>
+      </div>
+      {# max-width lives here off <main> (see the scroll-container note above), not on any individual
+         page. Default is full-width (max-w-none) -- real, confirmed bug this fixes: a max-w-4xl
+         (896px) default here silently clamped every page that didn't explicitly opt out of it back
+         down to a narrow centered column with large empty gutters on both sides, even ones whose own
+         content (tables, card grids, button grids) was built to use the full window. Settings/
+         session.html/terminal.html/Dorks/Toolkit had all separately discovered and worked around
+         this one at a time with their own main_class override before this became the default -- a
+         page that genuinely wants a narrower reading column (dorks_panel.html's target/engine
+         inputs) caps that at the CONTENT level instead (its own max-w-2xl on the actual element),
+         not by clamping this outer wrapper. chat.html's own Quick Chat page used to be an example
+         here too, deliberately -- real, later operator ask reversed that choice specifically: full
+         width like every other page, same reasoning that made max-w-none the default in the first
+         place. #}
+      <div id="main-content" class="{% block main_class %}max-w-none{% endblock %} mx-auto px-6 py-6">
+        {% block content %}{% endblock %}
+      </div>
     </main>
   </div>
 
-  <dialog id="new-project-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl backdrop:bg-black/50">
-    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+  <script>
+    // Real, reproducible class of bug this guards against: Chat/Terminal/Toolkit (deliberately
+    // un-boosted, see #sidebar's own hx-boost comment above) still get here via a genuine full
+    // navigation -- and the browser's back/forward cache (bfcache) can restore a PREVIOUS page
+    // exactly as it was frozen, including mid-flight UI state, instead of a fresh load, when the
+    // operator uses the back/forward button to return to it. Every hx-disabled-elt="this" control
+    // in this app (chat's own Send/compact buttons and provider/model pickers, the interrupt/
+    // approve/deny exploit forms, session_fragment.html's verify-all buttons, ...) disables itself
+    // the instant its request fires and only re-enables on that SAME request's own
+    // htmx:afterRequest -- if the operator navigates away before that response lands, the
+    // in-flight request is aborted by the navigation itself, afterRequest never fires, and bfcache
+    // freezes the page mid-disabled. On returning via Back, that frozen DOM is restored byte-for-
+    // byte (still disabled, still no reply) with no further request ever going to arrive to
+    // un-stick it -- reads exactly like "the button doesn't work any more" with no error anywhere
+    // to explain why. A live server round trip is the only way to know the real, current state
+    // (chat pending, session status, ...), so a bfcache restore forces a fresh reload instead of
+    // trusting the frozen snapshot. Boosted pages (everything else in #sidebar) never hit a real
+    // bfcache freeze this way -- htmx's own history handling replaces this same "frozen stale
+    // snapshot on Back" risk with an equivalent one of its own (its history cache can restore a
+    // cached #main-content snapshot instead of a live one); that risk is closed separately, right
+    // below, by turning that cache off entirely rather than duplicating this reload trick for it.
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) location.reload();
+    });
+
+    // htmx's own history cache (separate from bfcache above) would otherwise let Back/Forward on a
+    // boosted page restore a snapshot it saved from BEFORE the operator last left it, hitting the
+    // identical stale-frozen-DOM risk the pageshow listener above exists to prevent for real
+    // full-page navigations -- same failure shape, different cache. historyCacheSize=0 stops it
+    // from ever saving one; refreshOnHistoryMiss=true then makes every Back/Forward do a real hard
+    // reload of the current URL on that now-guaranteed cache miss, rather than htmx's own
+    // popstate-restore path (whose interaction with a custom hx-select/hx-target, this page's own
+    // #sidebar boost config above, is a narrower-tested corner of htmx than a plain full-body
+    // boost). Back/Forward is therefore a real reload, same as before boost existed here at all --
+    // only a forward CLICK on a sidebar link is the fast/boosted path. Cheap trade: same-origin
+    // localhost makes that reload fast regardless, and correctness beats an unverified shortcut.
+    htmx.config.historyCacheSize = 0;
+    htmx.config.refreshOnHistoryMiss = true;
+
+    window.asraToggleSidebar = function (open) {
+      var sidebar = document.getElementById("sidebar");
+      var backdrop = document.getElementById("sidebar-backdrop");
+      if (!sidebar || !backdrop) return;
+      sidebar.classList.toggle("-translate-x-full", !open);
+      sidebar.classList.toggle("translate-x-0", open);
+      backdrop.classList.toggle("hidden", !open);
+    };
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") window.asraToggleSidebar(false);
+    });
+
+    // Instant pressed/active feedback for the sidebar's own top-level nav links (Dashboard, Projects,
+    // Fleet, Playbook, Chat, Terminal, Toolkit, Dorks, Subagents, Special Agents, Settings, the brand
+    // link, the corner clock) -- every one is a plain <a href> causing a genuine full-page reload (no
+    // hx-boost anywhere in this app, see the pageshow/bfcache comment above), so without this a click
+    // visibly did nothing for however long the next page took to render. classList-only, never
+    // textContent/innerHTML -- doesn't preventDefault, the real navigation proceeds completely
+    // normally right after. static/js/progress_bar.js's top bar already covers "something is loading"
+    // globally; this covers "THIS is the specific thing you clicked", which a page-wide bar can't.
+    // Delegated on #sidebar itself (not document) since this feedback is specific to the sidebar's
+    // own nav surface, not every link in the app.
+    document.getElementById("sidebar").addEventListener("click", function (event) {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      var link = event.target.closest("a[href]");
+      if (!link || (link.target && link.target !== "_self")) return;
+      // asraSyncSidebarActive (declared below -- function declarations hoist, so this call is
+      // valid) does the FULL sync (is-navigating class + the real active/inactive utility classes
+      // together, see its own comment for why both must move as one unit), using the clicked
+      // link's own href as the target path since location.pathname hasn't changed yet at click
+      // time -- a plain full-reload link only updates the URL once the new page actually arrives.
+      var targetPath = link.getAttribute("href").split("#")[0].split("?")[0];
+      if (targetPath) asraSyncSidebarActive(targetPath);
+    });
+
+    // Boosting #sidebar's links (above) means the sidebar itself is never part of the swap, so its
+    // per-link "current page" styling (border-accent/bg-accent/text-accent, computed server-side
+    // from request.url.path at the ORIGINAL full page load) goes stale the moment a boosted nav
+    // changes the URL without a real reload -- the class-toggle click handler above covers the
+    // click case, but not browser Back/Forward (htmx's own popstate re-swap fires with no "click"
+    // event at all). This recomputes it directly from location.pathname, covering both. Mirrors
+    // each link's own Jinja startswith(...) condition (base.html's own copy is the source of truth
+    // for the actual rule; kept deliberately simple/approximate here since every boosted link's
+    // href already IS its own full matching prefix, except Projects, which also matches a
+    // /session/<id> detail page -- those pages are only ever reached via the (un-boosted) list
+    // page's own links, never directly through a boosted swap, so that extra prefix is harmless to
+    // include here too for when it eventually does apply).
+    // The server-rendered active/inactive utility classes (border-accent/bg-accent/10/text-accent/
+    // font-medium vs border-transparent/text-secondary/hover:*) are baked into each link's class
+    // attribute at the moment the SIDEBAR itself last rendered -- which, after a boosted nav, is
+    // stuck at whatever page the last real navigation actually was. Left alone, both the stale
+    // server classes AND this function's own is-navigating class would show a highlight
+    // simultaneously on two different links. Swapping the exact token sets here (not just adding
+    // is-navigating) makes is-navigating the single source of truth for "current page" from the
+    // first boosted nav onward. Two shapes exist -- the main scrollable list (has its own left
+    // accent rail, border-l-2, always present regardless of active state) and the centered footer
+    // group (Subagents/Special Agents/Settings, no rail) -- detected structurally, not by guessing
+    // from href.
+    var SIDEBAR_ACTIVE_TOKENS = ["border-accent", "bg-accent/10", "text-accent", "font-medium"];
+    var SIDEBAR_RAIL_INACTIVE_TOKENS = ["border-transparent", "text-secondary", "hover:bg-elevated", "hover:text-primary"];
+    var SIDEBAR_FOOTER_INACTIVE_TOKENS = ["text-secondary", "hover:bg-elevated", "hover:text-primary"];
+    function asraSyncSidebarActive(overridePath) {
+      var path = overridePath || location.pathname;
+      document.querySelectorAll('#sidebar a[href^="/"]').forEach(function (a) {
+        var href = a.getAttribute("href").split("#")[0].split("?")[0];
+        if (!href) return;
+        var isCurrent = href === "/" ? path === "/" : path.indexOf(href) === 0;
+        if (href === "/sessions" && path.indexOf("/session/") === 0) isCurrent = true;
+        a.classList.toggle("is-navigating", isCurrent);
+        var isRailShape = a.classList.contains("border-l-2");
+        var inactiveTokens = isRailShape ? SIDEBAR_RAIL_INACTIVE_TOKENS : SIDEBAR_FOOTER_INACTIVE_TOKENS;
+        if (isCurrent) {
+          a.classList.remove.apply(a.classList, inactiveTokens);
+          a.classList.add.apply(a.classList, SIDEBAR_ACTIVE_TOKENS);
+        } else {
+          a.classList.remove.apply(a.classList, SIDEBAR_ACTIVE_TOKENS);
+          a.classList.add.apply(a.classList, inactiveTokens);
+        }
+      });
+    }
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+      if (!event.detail || !event.detail.target || event.detail.target.id !== "main-content") return;
+      asraSyncSidebarActive();
+      var scrollBox = document.getElementById("main-scroll");
+      if (scrollBox) scrollBox.scrollTop = 0;
+    });
+
+    // The other half of window.asraPageCleanups (see static/js/terminal.js's own comment on it for
+    // the real incident this prevents) -- fires right BEFORE #main-content's old content is torn
+    // out by any boosted swap (not just #sidebar's own; any current/future boosted link targeting
+    // #main-content shares this), giving a page with real live state (WebSockets, timers, listeners
+    // that would otherwise survive past a real reload) one chance to shut it down first. A page with
+    // no such state simply never pushes onto this array, so this is a no-op for every ordinary page.
+    // An array, not a single slot, so more than one script on the same page (e.g. a future addition
+    // alongside terminal.js's own registration) can each register their own cleanup without one
+    // silently clobbering another's.
+    window.asraPageCleanups = window.asraPageCleanups || [];
+    document.body.addEventListener("htmx:beforeSwap", function (event) {
+      if (!event.detail || !event.detail.target || event.detail.target.id !== "main-content") return;
+      window.asraPageCleanups.splice(0).forEach(function (fn) {
+        try { fn(); } catch (e) {}
+      });
+    });
+
+    // Project icon picker (macros/project_icons.html) -- keep each picker's live preview in sync with
+    // the chosen icon (radio) + color (a full-spectrum <input type="color">). Delegated on document
+    // so it works for every copy of the picker on the page (the New Project dialog is in base.html on
+    // every page; index.html can inline a second copy) and survives htmx swaps. Bound to BOTH input
+    // (fires live while dragging the color picker) and change (radios).
+    function asraSyncIconPreview(event) {
+      var el = event.target;
+      if (!el.name || (el.name !== "icon" && el.name !== "icon_color")) return;
+      var picker = el.closest(".project-icon-picker");
+      if (!picker) return;
+      var preview = picker.querySelector(".icon-picker-preview");
+      if (!preview) return;
+      var checkedIcon = picker.querySelector("input[name='icon']:checked");
+      var colorInput = picker.querySelector("input[name='icon_color']");
+      // Black is the neutral "unchosen" default (the server randomizes it) -- show it muted in the
+      // preview rather than an invisible black glyph.
+      var raw = colorInput ? colorInput.value : "";
+      var color = (!raw || raw.toLowerCase() === "#000000") ? "var(--text-secondary)" : raw;
+      var sourceSvg = checkedIcon ? checkedIcon.nextElementSibling.querySelector("svg") : preview.querySelector("svg");
+      if (sourceSvg) {
+        var clone = sourceSvg.cloneNode(true);
+        clone.setAttribute("class", "w-5 h-5");
+        clone.style.color = color;
+        preview.innerHTML = "";
+        preview.appendChild(clone);
+      }
+    }
+    document.addEventListener("change", asraSyncIconPreview);
+    document.addEventListener("input", asraSyncIconPreview);
+
+    // Click-outside-to-close for every <dialog> in the app (New project, Settings, Edit subagent,
+    // finding detail, confirm) -- native <dialog> does NOT do this on its own; only Escape
+    // auto-closes a modal. Every dialog here is rendered with p-0 (the content fills the box edge
+    // to edge), so a click that lands on the dialog element ITSELF, not a descendant, can only be
+    // a click on the ::backdrop (generated content outside the visible box, which still bubbles to
+    // the <dialog> element as event.target) -- clicking the actual header/body content never
+    // reaches this branch. Delegated on document, not attached per-dialog, so it keeps working for
+    // any dialog added to the DOM later without re-registering anything.
+    //
+    // Real bug this fixes: a "click" event's target is decided by where the mouse comes UP, not
+    // where it went down -- so selecting text inside a dialog (e.g. a long finding description or
+    // a form field's value) and dragging the mouse past the dialog's edge before releasing fired a
+    // click with target == the <dialog> itself, closing it mid-selection even though the user never
+    // intended to click outside at all. Requiring the mousedown to ALSO have started on the
+    // <dialog> element itself (not a descendant) before honoring the close makes a genuine outside
+    // click still close it, while a selection drag that only ends outside no longer does.
+    var dialogMousedownOnBackdrop = false;
+    document.addEventListener("mousedown", function (event) {
+      dialogMousedownOnBackdrop = event.target instanceof HTMLDialogElement;
+    });
+    document.addEventListener("click", function (event) {
+      if (dialogMousedownOnBackdrop && event.target instanceof HTMLDialogElement && event.target.open) {
+        event.target.close();
+      }
+      dialogMousedownOnBackdrop = false;
+    });
+  </script>
+
+  {# flex-col + max-h-[90vh] + overflow-hidden: the dialog sizes to its content up to 90vh, then the
+     BODY (not the whole dialog) becomes the single scroll region with the app's own custom
+     scrollbar (.asra-scroll) -- without this the long Agent step-2 form overflowed the viewport and
+     fell back to the browser's own thin default scrollbar on the <dialog> itself (the "no custom
+     scroll, everything cut off" report). Step 1 (the short mode picker) still shrinks to its own
+     content, since max-height is only a ceiling. The header stays pinned (shrink-0); the body's
+     min-h-0 is what lets it shrink below its content and actually scroll inside the capped column. #}
+  <dialog id="new-project-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
       <span class="text-[13px] font-semibold">New project</span>
       <button type="button" onclick="document.getElementById('new-project-modal').close()"
               class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
     </div>
-    <div class="p-4">
+    <div class="p-4 overflow-y-auto asra-scroll min-h-0">
       {% include "partials/new_project_form.html" %}
+    </div>
+  </dialog>
+
+  {# Shared custom confirm dialog (static/js/confirm_dialog.js's window.asraConfirm/
+     asraConfirmSubmit) — replaces the native browser confirm() popup everywhere in this app
+     (delete project, delete subagent, clear API key, delete-all) with the same styled <dialog>
+     language as New project/Edit subagent/finding-detail above, instead of an inconsistent
+     OS-drawn one. Lives here, outside any SSE-morphed subtree (same placement reasoning as
+     #new-project-modal above), so it's never at risk of being reset mid-scan. Title/message/button
+     label are populated by JS per call, not server-rendered — one dialog, reused for every
+     confirmation in the app. Rescan (session_fragment.html) uses its own dedicated 3-choice
+     dialog below instead, not this one — a plain yes/no confirm has no way to offer "new project"
+     vs. "same project" as genuinely separate actions, not just a single dangerous/not-dangerous
+     toggle. #}
+  <dialog id="asra-confirm-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-md backdrop:bg-black/50">
+    <div class="p-4">
+      <div class="flex items-start gap-3">
+        <svg class="w-5 h-5 shrink-0 text-severity-high mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M12 9v4m0 4h.01M10.29 3.86l-8.18 14.18A2 2 0 0 0 3.82 21h16.36a2 2 0 0 0 1.71-3.03L13.71 3.86a2 2 0 0 0-3.42 0z" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+        <div class="min-w-0">
+          <p id="asra-confirm-title" class="text-sm font-semibold text-primary mb-1"></p>
+          <p id="asra-confirm-message" class="text-[13px] text-secondary break-words"></p>
+          {# Optional per-call opt-out checkbox (asraConfirm's opts.checkboxLabel) -- e.g. "Don't ask
+             again for the rest of this session" on the fallback chain's per-row Remove, so removing
+             many reserve steps in one sitting doesn't mean re-confirming every single one. Hidden by
+             default (most callers pass no checkboxLabel at all); reallyShow() (confirm_dialog.js)
+             shows/hides and resets it per call since this single dialog markup is reused for every
+             confirmation in the app. #}
+          <label id="asra-confirm-checkbox-row" hidden class="flex items-center gap-2 mt-3 text-[13px] text-secondary select-none cursor-pointer">
+            <input type="checkbox" id="asra-confirm-checkbox" class="rounded border-default">
+            <span id="asra-confirm-checkbox-label"></span>
+          </label>
+        </div>
+      </div>
+      <div class="flex items-center justify-end gap-2 mt-4">
+        <button type="button" id="asra-confirm-cancel"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm">Cancel</button>
+        <button type="button" id="asra-confirm-ok"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 h-9 px-3 text-sm">Confirm</button>
+      </div>
+    </div>
+  </dialog>
+
+  {# Rescan's own 3-choice dialog (session_fragment.html's Rescan button, opened via
+     static/js/confirm_dialog.js's window.asraOpenRescanDialog(sessionId, currentGoal,
+     currentTimeBudgetSeconds)) — a genuine 3-way decision (new independent project / re-scan this
+     same project in place / cancel), not a plain yes/no #asra-confirm-modal could express. Lives
+     here, outside session_fragment.html's own SSE-morphed subtree, same placement reasoning as
+     every other dialog on this page — the two <form> actions below are set by JS at open time,
+     since this shared markup has no session_id of its own to render server-side.
+
+     Goal/Time budget: the New Project form's own copies of these two fields are otherwise
+     read-only after creation — this is the ONLY place to set one for a project that predates it,
+     or change a stale one, without that. Neither is wired to either <form> via a real name= (a
+     plain input can only ever belong to one form) — asraSyncRescanExtras (confirm_dialog.js) keeps
+     both forms' own hidden mirrors in sync instead, so whichever button gets clicked submits the
+     same current values. #}
+  <dialog id="asra-rescan-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">Rescan this project?</span>
+      <button type="button" onclick="document.getElementById('asra-rescan-modal').close()"
+              class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
+    </div>
+    <div class="p-4 space-y-2">
+      <label class="block mb-1">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Goal for this engagement (optional)</span>
+        <input type="text" id="asra-rescan-goal-input" oninput="window.asraSyncRescanExtras()"
+               placeholder="e.g. reach the admin panel, deepen an existing foothold, full compromise..."
+               class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <div class="mb-1">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Time budget (optional)</span>
+        <select id="asra-rescan-time-budget-preset"
+                onchange="document.getElementById('asra-rescan-time-budget-custom-row').classList.toggle('hidden', this.value !== 'custom'); window.asraSyncRescanExtras()"
+                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <option value="">No limit — stop as soon as the scan is genuinely done</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600">1 hour</option>
+          <option value="7200">2 hours</option>
+          <option value="14400">4 hours</option>
+          <option value="28800">8 hours</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <div id="asra-rescan-time-budget-custom-row" class="hidden mt-2">
+          <input type="number" id="asra-rescan-time-budget-custom-minutes" min="1" step="1" placeholder="Minutes"
+                 oninput="window.asraSyncRescanExtras()"
+                 class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </div>
+      </div>
+      <form method="post" id="asra-rescan-new-project-form">
+        <input type="hidden" name="goal"><input type="hidden" name="time_budget_preset"><input type="hidden" name="time_budget_custom_minutes">
+        <button type="submit" class="w-full text-left rounded-lg border border-default hover:border-accent hover:bg-elevated transition-colors p-3">
+          <span class="block text-sm font-semibold text-primary">New project</span>
+          <span class="block text-[12px] text-secondary mt-0.5">Creates a brand-new, independent project against the same target (review before it starts). Recon, the plan, and every finding all carry over — findings get actively re-verified, and it builds on what was already found instead of re-scanning from scratch. This project itself is left completely untouched.</span>
+        </button>
+      </form>
+      <form method="post" id="asra-rescan-in-place-form">
+        <input type="hidden" name="goal"><input type="hidden" name="time_budget_preset"><input type="hidden" name="time_budget_custom_minutes">
+        <button type="submit" class="w-full text-left rounded-lg border border-default hover:border-accent hover:bg-elevated transition-colors p-3">
+          <span class="block text-sm font-semibold text-primary">Same project</span>
+          <span class="block text-[12px] text-secondary mt-0.5">Prepares a fresh pass right here instead (review before it starts) — every finding, hypothesis, and target already recorded stays, gets actively re-verified, and the agent keeps digging from where it left off for anything more.</span>
+        </button>
+      </form>
+      <button type="button" onclick="document.getElementById('asra-rescan-modal').close()"
+              class="w-full text-center rounded-lg border border-default hover:bg-elevated transition-colors p-2.5 text-sm text-secondary">Cancel</button>
     </div>
   </dialog>
 </body>

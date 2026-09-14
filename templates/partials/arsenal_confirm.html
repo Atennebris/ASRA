@@ -1,0 +1,64 @@
+{# Confirm/warning step for the Tools page "Install" button -- rendered into #arsenal-output.
+   Nothing is installed until the operator confirms here. preflight (agent/tools/arsenal_install.py's
+   can_autostart) decides whether a real install button is even shown: on a platform/sudo situation
+   where the automatic run cannot work, this shows the honest reason + the exact manual command
+   instead of a button that would only fail after the click. #}
+<div class="bg-surface border border-severity-medium/40 rounded-lg p-4">
+  <p class="text-[13px] font-semibold text-primary mb-2">Install the external arsenal</p>
+
+  {# On-disk footprint, shown prominently as its own badge, never buried in prose. When the arsenal
+     is already (mostly) installed we show the REAL size measured on this machine; on a fresh machine
+     nothing is there to measure yet, so we fall back to a rough estimate and label it as such. #}
+  <div class="flex flex-wrap items-center gap-2 mb-3 rounded border border-severity-medium/40 bg-severity-medium/10 px-3 py-2">
+    {% if measured_gb %}
+      <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Arsenal on disk (measured here)</span>
+      <span class="text-[15px] font-bold text-severity-medium">~{{ measured_gb }} GB</span>
+      <span class="text-[10.5px] text-secondary">of readable install locations on this machine</span>
+    {% else %}
+      <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Rough estimate (fresh install)</span>
+      <span class="text-[15px] font-bold text-severity-medium">~{{ approx_gb }} GB</span>
+      <span class="text-[10.5px] text-secondary">— exact size depends on the distro &amp; already-present shared deps</span>
+    {% endif %}
+  </div>
+
+  <p class="text-[11px] text-secondary leading-relaxed max-w-[46rem] mb-3">
+    Runs the local <code class="font-mono text-primary">setup_tools.sh</code> from this repository.
+    It installs the external tools (nmap, nuclei, sqlmap, metasploit, radare2, wine, apktool and
+    others) via the system package manager and downloads from their official sources. Already-installed
+    tools are skipped, so on a mostly-provisioned machine the actual new download is far smaller than
+    the total above. It runs for several minutes; a restart of the agent (and sometimes the system)
+    may be needed afterwards.
+  </p>
+
+  {% if preflight.ok %}
+    <form hx-post="/api/tools/arsenal/install/start" hx-target="#arsenal-output" hx-swap="innerHTML">
+      <label class="flex items-start gap-2 text-[11px] text-secondary mb-3 cursor-pointer select-none">
+        <input type="checkbox" name="include_wordlists" value="true" class="mt-0.5">
+        <span>Also the large wordlists (rockyou.txt + SecLists, ~60&ndash;70 MB more) &mdash; needed
+          to brute-force genuinely weak passwords, not just default credentials.</span>
+      </label>
+      <p class="text-[10.5px] text-secondary mb-3">
+        Launch method: <span class="text-primary font-mono">{{ preflight.command }}</span>
+        {% if preflight.reason == "root" %}(already root){% elif preflight.reason == "sudo" %}(via sudo){% endif %}
+      </p>
+      <div class="flex items-center gap-2">
+        <button type="submit"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-medium/15 text-severity-medium border border-severity-medium/40 hover:bg-severity-medium/25 h-8 px-4 text-[12px]">
+          Install now
+        </button>
+        <button type="button" onclick="var o=document.getElementById('arsenal-output'); if(o) o.innerHTML='';"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-secondary border border-default hover:bg-overlay h-8 px-4 text-[12px]">
+          Cancel
+        </button>
+      </div>
+    </form>
+  {% else %}
+    <div class="border border-severity-high/40 rounded bg-severity-high/5 p-3">
+      <p class="text-[11px] text-severity-high mb-1.5">Automatic install unavailable here</p>
+      <p class="text-[11px] text-secondary mb-2">{{ preflight.message }}</p>
+      {% if preflight.command %}
+        <pre class="text-[11px] font-mono text-primary bg-elevated rounded p-2 overflow-x-auto">{{ preflight.command }}</pre>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>

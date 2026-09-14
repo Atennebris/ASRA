@@ -1,8 +1,33 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import button, status_badge, page_header, empty_state %}
 {% block title %}ASRA{% endblock %}
 {% block content %}
-  {{ page_header("Autonomous Security Research Agent") }}
+  {# A bespoke hero, not the shared page_header() macro — this is the one page whose title is a
+     thesis statement for the whole tool, not a compact utility-page label like "Projects"/
+     "Settings" (which still use page_header() unchanged). The phase sequence below is real
+     structural information, not decoration: it's the actual recon/analyze/exploit/validate order
+     agent/core.py runs in and the same phase names/labels a live scan's own log entries already
+     show (session_fragment.html) — restated here as the first thing a new visitor sees, not a
+     second invented vocabulary for the same four words. #}
+  {# relative anchors the decorative header light below to this WHOLE hero block -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div class="relative pt-6 pb-5 border-b border-default mb-6">
+    <h1 class="text-xl sm:text-2xl font-semibold text-primary tracking-tight">Autonomous Security Research Agent</h1>
+    <p class="text-sm text-secondary mt-2 max-w-2xl">Point it at an authorized target. It recons, analyzes, and &mdash; with your approval &mdash; exploits, narrating every step live.</p>
+    <div class="flex items-center gap-2 mt-4 text-[11px] font-semibold uppercase tracking-wider text-secondary">
+      <span>Recon</span>
+      <span class="text-secondary/40" aria-hidden="true">&rarr;</span>
+      <span>Analyze</span>
+      <span class="text-secondary/40" aria-hidden="true">&rarr;</span>
+      <span>Exploit</span>
+      <span class="text-secondary/40" aria-hidden="true">&rarr;</span>
+      <span>Validate</span>
+    </div>
+    {% include "macros/header_light.html" %}
+  </div>
 
   {% if error %}
     {# A validation error from a New Project submission lands back here (start_scan's 400 path)
@@ -12,31 +37,36 @@
   {% else %}
     <div class="bg-surface border border-default rounded-lg p-6 mb-6 flex flex-col sm:flex-row items-center justify-between gap-4">
       <div>
-        <p class="text-sm font-medium text-primary">Point it at an authorized target</p>
-        <p class="text-[11px] text-secondary mt-1">Recon, analyze, detect, and (with your approval) exploit &mdash; driven by an LLM, shown live.</p>
+        <p class="text-sm font-medium text-primary">Start a new scan</p>
+        <p class="text-[11px] text-secondary mt-1">Name the project, enter a target, and go &mdash; recon starts the moment you submit.</p>
       </div>
-      <button type="button" onclick="document.getElementById('new-project-modal').showModal()"
+      <button type="button" onclick="asraOpenDialog('new-project-modal')"
               class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-4 text-sm shrink-0">New project</button>
     </div>
 
-    {% if recent_sessions %}
-      <div class="flex items-center justify-between mb-2">
-        <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary">Recent projects</p>
-        <a href="/sessions" class="text-[11px] text-accent hover:text-accent-hover">View all</a>
-      </div>
-      <ul class="space-y-2">
-        {% for s in recent_sessions %}
-          <li class="bg-surface border border-default rounded-lg p-3 flex items-center gap-3">
-            <a href="/session/{{ s.session_id }}" class="flex-1 min-w-0 group">
-              <p class="text-sm font-medium text-primary group-hover:text-accent truncate">{{ s.name }}</p>
-              <p class="text-[11px] text-secondary truncate">{{ s.target }} &middot; {{ s.findings_count }} finding(s) &middot; {{ s.created_at }}</p>
-            </a>
-            {{ status_badge(s.status) }}
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      {{ empty_state("No projects yet.", 'Click "New project" above to start your first scan.') }}
-    {% endif %}
+    {# Polls itself every 5s and morph-swaps the result — a scan finishing or a new finding landing
+       while this page was open used to sit stale until a manual reload (templates/partials/
+       recent_projects_fragment.html, /api/recent-projects/fragment in main.py).
+       morph:innerHTML, not the bare "morph" default: recent_projects_fragment.html's own root is
+       one or more siblings with no id matching this container's ("recent-projects-fragment") —
+       an outerHTML-style morph would rewrite this element's own attributes (id, and critically
+       hx-get/hx-trigger="every 5s" themselves) to match the incoming fragment on the very first
+       poll, permanently killing the polling trigger after just one cycle. Same real bug, same
+       fix, as templates/session.html's SSE stream container. #}
+    {# data-privacy-key/data-privacy-collapsed live on THIS element deliberately -- same reasoning
+       as sessions_list.html's #sessions-list-fragment: morph:innerHTML never touches this div's own
+       attributes, only its children, so a collapse flag set here survives the 5s poll below. #}
+    {# NOT hx-boosted, deliberately, unlike #sidebar/Fleet/Playbook/etc (base.html) -- tried this,
+       reverted. A session page's own size is unbounded by design (chat history, findings, embedded
+       playbook-scale data all accumulate over a real engagement's lifetime) -- confirmed live at
+       ~10MB for one real, large project, and htmx's own client-side hx-select parsing of a boosted
+       response that big produced silently WRONG extracted content (a corrupted mix of unrelated
+       page fragments), not an error -- unlike every other boosted page in this app, which stays
+       comfortably small. Opening a project therefore stays a plain full navigation for now; every
+       OTHER nav surface in this app is still instant. #}
+    <div id="recent-projects-fragment" data-privacy-key="recent-projects" data-privacy-collapsed="false"
+         hx-ext="morph" hx-get="/api/recent-projects/fragment" hx-trigger="every 5s" hx-swap="morph:innerHTML">
+      {% include "partials/recent_projects_fragment.html" %}
+    </div>
   {% endif %}
 {% endblock %}

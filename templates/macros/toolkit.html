@@ -1,0 +1,59 @@
+{# Shared macros for the native toolkit (Proxy/Repeater/Decoder/Comparer) -- imported by both
+   partials/toolkit_traffic_detail.html (Site Map row detail) and partials/toolkit_repeater.html
+   (Repeater's own response pane), so the three-way text/image/binary rendering logic exists in
+   exactly one place. #}
+
+{# Renders one request-or-response body block from a main.py-prepared "detail" dict (see
+   main.py's _prepare_detail_body): one of three shapes --
+   {"kind": "text", "text": ..., "truncated": bool}
+   {"kind": "image", "content_type": ..., "data_uri": ...}
+   {"kind": "binary", "content_type": ..., "content_length": int}
+   Never renders a binary body as raw/decoded text -- a real, confirmed incident this fixes: a
+   JPEG response used to render as decoded mojibake text instead of being recognized as binary. #}
+{# Editable HTTP-method combo (Repeater/Intruder/Sequencer) -- a real <select> of the standard
+   verbs with a literal "CUSTOM" option as the last entry, NOT a locked list: a real pentest need
+   is sending a nonstandard/custom verb (WebDAV methods, a deliberately malformed one to probe
+   method-not-allowed handling). Picking CUSTOM swaps the select for a free-text input in the same
+   spot; clearing that input and blurring it swaps back to the select (defaulting to GET), the same
+   "a real choice is never silently lost, an empty one always falls back cleanly" idiom this field
+   has always used. `field_id` is passed through for a stable, unique DOM id per instance (two
+   Toolkit sub-tabs can exist on the page at once) even though the swap logic below only ever
+   walks nextElementSibling/previousElementSibling, never queries by id itself. #}
+{% macro method_field(field_id, value) %}
+  {% set standard_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"] %}
+  {% set is_custom = value and value not in standard_methods %}
+  <div class="w-24 shrink-0">
+    <select id="{{ field_id }}" name="method"
+            onchange="if (this.value === 'CUSTOM') { this.classList.add('hidden'); var inp = this.nextElementSibling; inp.disabled = false; this.disabled = true; inp.classList.remove('hidden'); inp.value = ''; inp.focus(); } else { this.nextElementSibling.value = this.value; }"
+            class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 {{ 'hidden' if is_custom }}"
+            {{ 'disabled' if is_custom }}>
+      {% for m in standard_methods %}
+        <option value="{{ m }}" {{ 'selected' if value == m or (not value and m == 'GET') }}>{{ m }}</option>
+      {% endfor %}
+      <option value="CUSTOM" {{ 'selected' if is_custom }}>CUSTOM</option>
+    </select>
+    <input type="text" name="method" value="{{ value | default('GET') }}" placeholder="METHOD" autocomplete="off"
+           onblur="if (!this.value) { this.classList.add('hidden'); this.disabled = true; var sel = this.previousElementSibling; sel.disabled = false; sel.classList.remove('hidden'); sel.value = 'GET'; this.value = 'GET'; }"
+           class="{{ '' if is_custom else 'hidden' }} w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono uppercase text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+           {{ '' if is_custom else 'disabled' }}>
+  </div>
+{% endmacro %}
+
+{% macro body_block(headers, detail) %}
+  {% if detail.kind == "text" %}
+    <pre class="text-[11px] font-mono whitespace-pre-wrap break-words bg-elevated border border-default rounded p-2 mb-3 max-h-64 overflow-y-auto asra-scroll">{% for name, value in headers.items() %}{{ name }}: {{ value }}
+{% endfor %}{% if detail.text %}
+{{ detail.text }}{% if detail.truncated %}
+… (truncated -- the stored capture keeps the full body, only this view is capped){% endif %}{% endif %}</pre>
+  {% elif detail.kind == "image" %}
+    <div class="bg-elevated border border-default rounded p-2 mb-3">
+      <p class="text-[11px] font-mono text-secondary mb-2">{% for name, value in headers.items() %}{{ name }}: {{ value }}<br>{% endfor %}</p>
+      <img src="{{ detail.data_uri }}" class="max-w-full max-h-64 rounded border border-default" alt="Captured image body preview">
+    </div>
+  {% else %}
+    <div class="bg-elevated border border-default rounded p-2 mb-3">
+      <p class="text-[11px] font-mono text-secondary mb-2">{% for name, value in headers.items() %}{{ name }}: {{ value }}<br>{% endfor %}</p>
+      <p class="text-[11px] text-secondary italic">(binary content &mdash; {{ detail.content_type }}, {{ detail.content_length }} bytes &mdash; not shown as text)</p>
+    </div>
+  {% endif %}
+{% endmacro %}

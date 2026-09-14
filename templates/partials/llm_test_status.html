@@ -1,0 +1,35 @@
+{# Live status for a Settings/subagent "Test" button (main.py's test-llm start/status/cancel
+   routes, agent/tools/llm_test_job.py) -- rendered into a #{{ target_id }} wrapper. Self-polls
+   only while running (same "the 'on' state only exists in the DOM while it should" discipline
+   partials/arsenal_install.html already uses for a different slow operation), and drops
+   hx-trigger the moment the call finishes, so polling stops on its own.
+
+   target_id doubles as the underlying test job's own key (agent/tools/llm_test_job.py is keyed by
+   it) -- every independent Test button on a page (the main AI Provider & Model picker, Secondary
+   verification, each Reserve providers chain row, a subagent profile's own picker) gets its own
+   real background job under its own key, so there is no shared slot for two of these to collide
+   over any more, and no "someone else's test is running" case for this partial to handle -- it
+   only ever renders the ONE job that belongs to target_id. It still needs to stay unique per
+   widget purely so the DOM id and this Cancel button's own hx-target don't collide with another
+   widget's -- a hardcoded id here would mistarget the moment a second Test button existed on the
+   same page (real bug this already caused once, fixed by threading target_id through).
+#}
+{% set target_id = target_id or "llm-test-status" %}
+{% set running = status.running %}
+<span id="{{ target_id }}"
+      {% if running %}hx-get="/api/settings/test-llm/status?target_id={{ target_id | urlencode }}" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}
+      class="inline-flex items-center gap-2 flex-wrap">
+  {% if running %}
+    <span class="text-secondary">
+      Testing&hellip;{% if status.attempt and status.total_attempts %} (attempt {{ status.attempt }}/{{ status.total_attempts }}{% if status.wait_seconds %}, next retry in ~{{ status.wait_seconds | int }}s{% endif %}){% endif %}
+    </span>
+    <button type="button" hx-post="/api/settings/test-llm/cancel?target_id={{ target_id | urlencode }}" hx-target="#{{ target_id }}" hx-swap="outerHTML"
+            class="text-[11px] text-secondary hover:text-severity-high underline shrink-0">Cancel</button>
+  {% elif status.state == "ok" %}
+    <span class="text-severity-low">{{ status.message }}</span>
+  {% elif status.state == "cancelled" %}
+    <span class="text-secondary">{{ status.message }}</span>
+  {% elif status.state == "error" %}
+    <span class="text-severity-high">{{ status.message }}</span>
+  {% endif %}
+</span>

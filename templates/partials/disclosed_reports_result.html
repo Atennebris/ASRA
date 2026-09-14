@@ -1,0 +1,32 @@
+{# Rendered inline into #disclosed-reports-result (new_project_form.html) by the "Check disclosed
+   reports" wizard button — main.py's wizard_check_disclosed_reports route,
+   agent/tools/bugbounty_import.py's check_disclosed_reports. An LLM-summarized list of already-
+   disclosed report titles (DISCLOSED_REPORTS_SUMMARY_PROMPT), not a raw page dump — the operator
+   is meant to glance at a short, real list, not re-do the reading themselves. The raw scraped text
+   is still available (collapsed, "Show raw page text") for verifying the summary against its own
+   source, same "advisory, always verifiable" posture the rest of this app's LLM-derived output has. #}
+{% if result.status == "ok" %}
+  <div class="mt-2 bg-elevated border border-default rounded-lg p-3">
+    {% if result.reports %}
+      <p class="text-[11px] text-secondary mb-1.5">Already publicly disclosed on this program:</p>
+      <ul class="text-[12px] text-primary space-y-1 mb-2 list-disc list-inside">
+        {% for report in result.reports %}
+          <li>{{ report.title }}{% if report.detail %} <span class="text-secondary">— {{ report.detail }}</span>{% endif %}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="text-[12px] text-primary mb-2">No disclosed reports found on this program's own feed.</p>
+    {% endif %}
+    {% if result.coverage_note %}
+      <p class="text-[11px] text-secondary italic mb-2">{{ result.coverage_note }}</p>
+    {% endif %}
+    <details class="text-[11px]">
+      <summary class="text-secondary cursor-pointer hover:text-primary">Show raw page text</summary>
+      <pre class="text-[11px] text-primary whitespace-pre-wrap max-h-56 overflow-y-auto asra-scroll font-mono mt-1.5">{{ result.text }}</pre>
+    </details>
+  </div>
+{% elif result.status == "error" %}
+  <div class="mt-2 bg-severity-medium/10 border border-severity-medium/30 rounded-lg p-3">
+    <p class="text-[11px] text-severity-medium">{{ result.error }}</p>
+  </div>
+{% endif %}

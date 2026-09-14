@@ -1,0 +1,103 @@
+{# Map tab's Site Tree sub-view -- a real host -> URL-path hierarchy (OWASP ZAP's own "Sites tree"
+   shape) built by main.py's _build_site_map_tree from the SAME captured Toolkit traffic the flat
+   proxy-history table (toolkit_traffic_list.html) already shows -- a different, aggregated view of
+   identical data, not a second capture mechanism. Polled independently (session_fragment.html's
+   own hx-trigger="load, every 4s" on the container this replaces), so this whole partial re-renders
+   fresh each tick rather than trying to patch an existing DOM tree in place -- the SAME simple
+   "just re-render the whole thing" choice the flat Site Map list itself already makes.
+
+   Leaf rows open the exact same #toolkit-traffic-detail dialog a flat Site Map row already does
+   (toolkit_panel.html defines it once, globally -- reachable by element id regardless of which
+   subtree this partial's own container happens to live in).
+
+   Second real design pass on this tree: the first one (bold host rows, a globe glyph, extra
+   padding) was tried and REJECTED live -- "still ugly, I expected something closer to [OWASP
+   ZAP's own Sites tree screenshot]". The actual gap wasn't decoration at all, it was the OPPOSITE
+   direction: this tree had no real folder/file ICONS at all, where a real explorer-style tree
+   (ZAP, Burp, a plain OS file browser) always does -- that's what actually reads as "a tree",
+   not text-only rows differentiated by font-weight. Every folder (host or path segment, no
+   distinction between them now -- ZAP's own tree doesn't draw one either) gets a real closed/open
+   folder icon toggling with its own <details> state; every leaf gets a small file icon and a
+   COMPACT "METHOD name" label (ZAP's own "GET:name" convention) instead of the full URL, since
+   the surrounding folders already spell the path out. Rows are also genuinely tighter (py-0.5, not
+   py-1.5/2) -- a real explorer tree reads as dense, not spacious. #}
+{% macro _tree_node(node, depth) %}
+  <details {% if depth < 1 %}open{% endif %} class="site-tree-node border-b border-default last:border-0">
+    <summary class="cursor-pointer select-none pl-2 pr-2 py-0.5 text-[11px] font-mono text-primary hover:bg-elevated flex items-center gap-1.5">
+      <svg class="folder-icon-closed w-3.5 h-3.5 shrink-0 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+      </svg>
+      <svg class="folder-icon-open w-3.5 h-3.5 shrink-0 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 12.5V8a2 2 0 0 0-2-2h-9l-2-3H4a2 2 0 0 0-2 2v13.5"/>
+        <path d="M2 13l2.3 6.6a1 1 0 0 0 .95.7H19a1 1 0 0 0 .95-.68L22 13.5H4.5a1 1 0 0 0-.95.68z"/>
+      </svg>
+      <span class="truncate">{{ node.name }}</span>
+      <span class="text-secondary text-[10px] shrink-0">({{ node.children | length + node.leaves | length }})</span>
+    </summary>
+    <div class="pl-4 border-l border-default ml-2">
+      {% for child in node.children %}{{ _tree_node(child, depth + 1) }}{% endfor %}
+      {% for leaf in node.leaves %}
+        {% if leaf.confirmed %}
+        <button type="button"
+                hx-get="/api/session/{{ session_id }}/toolkit/traffic/{{ leaf.id }}"
+                hx-target="#toolkit-traffic-detail-content" hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('toolkit-traffic-detail').showModal()"
+                title="{{ leaf.url }}"
+                class="w-full flex items-center gap-1.5 pl-2 pr-2 py-0.5 text-left hover:bg-elevated rounded text-secondary">
+          <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <span class="text-[11px] font-mono truncate flex-1 min-w-0"><span class="text-primary">{{ leaf.method }}</span>:{{ leaf.name }}</span>
+          {% if leaf.status %}<span class="text-[10px] font-mono shrink-0">{{ leaf.status }}</span>{% endif %}
+        </button>
+        {% else %}
+        {# Discovered via wayback_urls/common_crawl_urls (main.py's _build_site_map_tree,
+           candidate_urls) but never actually requested through the proxy or the agent's own
+           browser -- no real traffic-detail record exists for it, so this is a plain, non-
+           interactive row (no hx-get, nothing to open), dashed file icon + a "not requested"
+           badge instead of a method/status pair that would otherwise be lying about a response
+           that never happened. #}
+        <div title="{{ leaf.url }} — found via passive discovery, not yet requested"
+             class="w-full flex items-center gap-1.5 pl-2 pr-2 py-0.5 text-secondary/50">
+          <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="2.2 2.2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <span class="text-[11px] font-mono italic truncate flex-1 min-w-0">{{ leaf.name }}</span>
+          <span class="text-[9px] uppercase tracking-wide shrink-0">not requested</span>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </details>
+{% endmacro %}
+
+{% if tree.in_scope or tree.other %}
+  {% if tree.in_scope %}
+    <div class="border border-default rounded-lg overflow-hidden bg-surface">
+      {% for host_node in tree.in_scope %}{{ _tree_node(host_node, 0) }}{% endfor %}
+    </div>
+  {% endif %}
+  {# Real, confirmed operator complaint this fixes: the target's own real subdomains used to sit
+     alphabetically interleaved with every incidental third-party host a browser tool call or a
+     manual Toolkit visit pulls in along the way (font/analytics/ad CDNs, the bug-bounty platform's
+     own asset hosts, ...) -- no signal/noise separation at all, which read as "this tree is ugly/
+     uncomfortable" even though its actual styling had already gone through a real design pass (see
+     this file's own docstring). Collapsed by default (no `open` attribute) since it's explicitly
+     the LOW-signal half -- still one click away, never hidden entirely. #}
+  {% if tree.other %}
+    <details class="mt-3 border border-default rounded-lg overflow-hidden bg-surface">
+      <summary class="cursor-pointer select-none px-3 py-1.5 text-[11px] text-secondary hover:bg-elevated">
+        Other traffic (not in scope) <span class="text-secondary/70">({{ tree.other | length }} host{{ "s" if tree.other | length != 1 else "" }})</span>
+      </summary>
+      <div class="border-t border-default">
+        {# depth=1 (not 0) -- these hosts start CLOSED even though they're each still top-level
+           within this group; the whole point of collapsing "Other traffic" is staying compact, an
+           operator who expands the group to skim host names shouldn't also get every one of their
+           full path trees dumped open at once the way an in-scope host legitimately should. #}
+        {% for host_node in tree.other %}{{ _tree_node(host_node, 1) }}{% endfor %}
+      </div>
+    </details>
+  {% endif %}
+{% else %}
+  <p class="text-[11px] text-secondary italic py-4 text-center">Nothing here yet -- browse the target through the Toolkit's own Proxy, let the agent's own tool calls capture it, or run wayback_urls/common_crawl_urls for passively-discovered paths, and this tree fills in live.</p>
+{% endif %}

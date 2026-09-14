@@ -1,0 +1,149 @@
+[
+  {
+    "name": "jQuery",
+    "categories": ["JavaScript library"],
+    "base_confidence": 97,
+    "detect_expr": "!!(window.jQuery && window.jQuery.fn)",
+    "version_expr": "(window.jQuery && window.jQuery.fn.jquery) || null"
+  },
+  {
+    "name": "React",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 90,
+    "detect_expr": "!!(window.React || document.querySelector('[data-reactroot], #__next, #root._reactRootContainer'))",
+    "version_expr": "(window.React && window.React.version) || null"
+  },
+  {
+    "name": "Next.js",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 96,
+    "detect_expr": "!!(window.__NEXT_DATA__ || document.getElementById('__NEXT_DATA__'))",
+    "version_expr": "(window.__NEXT_DATA__ && window.__NEXT_DATA__.buildId) ? ('build ' + window.__NEXT_DATA__.buildId) : null"
+  },
+  {
+    "name": "Vue.js",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 92,
+    "detect_expr": "!!(window.Vue || document.querySelector('[data-v-app], [id=\"app\"][data-v-]'))",
+    "version_expr": "(window.Vue && window.Vue.version) || null"
+  },
+  {
+    "name": "Nuxt.js",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 94,
+    "detect_expr": "!!(window.__NUXT__ || window.$nuxt)",
+    "version_expr": "(window.__NUXT__ && window.__NUXT__.config && window.__NUXT__.config._app && window.__NUXT__.config._app.buildId) || null"
+  },
+  {
+    "name": "Angular",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 93,
+    "detect_expr": "!!(window.ng || window.getAllAngularRootElements || document.querySelector('[ng-version]'))",
+    "version_expr": "(document.querySelector('[ng-version]') && document.querySelector('[ng-version]').getAttribute('ng-version')) || null"
+  },
+  {
+    "name": "Svelte",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 80,
+    "detect_expr": "!!document.querySelector('[class*=\"svelte-\"]')",
+    "version_expr": "null"
+  },
+  {
+    "name": "Ember.js",
+    "categories": ["JavaScript framework"],
+    "base_confidence": 90,
+    "detect_expr": "!!(window.Ember || window.Em)",
+    "version_expr": "(window.Ember && window.Ember.VERSION) || null"
+  },
+  {
+    "name": "WordPress",
+    "categories": ["CMS"],
+    "base_confidence": 70,
+    "detect_expr": "!!(document.querySelector('meta[name=\"generator\"][content*=\"WordPress\"]') || document.querySelector('link[href*=\"wp-content\"], script[src*=\"wp-content\"], script[src*=\"wp-includes\"]'))",
+    "version_expr": "(function(){var m=document.querySelector('meta[name=\"generator\"][content*=\"WordPress\"]');if(!m)return null;var s=m.getAttribute('content')||'';var v=s.match(/[\\d.]+/);return v?v[0]:null;})()"
+  },
+  {
+    "name": "Drupal",
+    "categories": ["CMS"],
+    "base_confidence": 70,
+    "detect_expr": "!!(window.Drupal || document.querySelector('meta[name=\"generator\"][content*=\"Drupal\"]'))",
+    "version_expr": "(function(){var m=document.querySelector('meta[name=\"generator\"][content*=\"Drupal\"]');if(!m)return null;var s=m.getAttribute('content')||'';var v=s.match(/[\\d.]+/);return v?v[0]:null;})()"
+  },
+  {
+    "name": "Joomla",
+    "categories": ["CMS"],
+    "base_confidence": 70,
+    "detect_expr": "!!document.querySelector('meta[name=\"generator\"][content*=\"Joomla\"]')",
+    "version_expr": "(function(){var m=document.querySelector('meta[name=\"generator\"][content*=\"Joomla\"]');if(!m)return null;var s=m.getAttribute('content')||'';var v=s.match(/[\\d.]+/);return v?v[0]:null;})()"
+  },
+  {
+    "name": "Shopify",
+    "categories": ["Ecommerce"],
+    "base_confidence": 90,
+    "detect_expr": "!!(window.Shopify || document.querySelector('script[src*=\"cdn.shopify.com\"]'))",
+    "version_expr": "(window.Shopify && window.Shopify.theme && window.Shopify.theme.name) || null"
+  },
+  {
+    "name": "Magento",
+    "categories": ["Ecommerce"],
+    "base_confidence": 75,
+    "detect_expr": "!!(window.Mage || document.querySelector('script[src*=\"/mage/\"], script[type=\"text/x-magento-init\"]'))",
+    "version_expr": "null"
+  },
+  {
+    "name": "Laravel",
+    "categories": ["Web framework"],
+    "base_confidence": 55,
+    "detect_expr": "document.cookie.indexOf('laravel_session') !== -1 || document.cookie.indexOf('XSRF-TOKEN') !== -1",
+    "version_expr": "null"
+  },
+  {
+    "name": "Django",
+    "categories": ["Web framework"],
+    "base_confidence": 50,
+    "detect_expr": "document.cookie.indexOf('csrftoken') !== -1 || !!document.querySelector('input[name=\"csrfmiddlewaretoken\"]')",
+    "version_expr": "null"
+  },
+  {
+    "name": "Google Analytics",
+    "categories": ["Analytics"],
+    "base_confidence": 60,
+    "detect_expr": "!!(window.ga || window.gtag || window.dataLayer)",
+    "version_expr": "(window.gtag ? 'gtag.js' : (window.ga ? 'analytics.js' : null))"
+  },
+  {
+    "name": "Google Tag Manager",
+    "categories": ["Tag manager"],
+    "base_confidence": 65,
+    "detect_expr": "!!(window.google_tag_manager || document.querySelector('script[src*=\"googletagmanager.com/gtm.js\"]'))",
+    "version_expr": "null"
+  },
+  {
+    "name": "Sentry",
+    "categories": ["Error tracking"],
+    "base_confidence": 85,
+    "detect_expr": "!!(window.Sentry || window.__SENTRY__)",
+    "version_expr": "(window.Sentry && window.Sentry.SDK_VERSION) || null"
+  },
+  {
+    "name": "reCAPTCHA",
+    "categories": ["Security"],
+    "base_confidence": 90,
+    "detect_expr": "!!(window.grecaptcha || document.querySelector('script[src*=\"google.com/recaptcha\"], .g-recaptcha'))",
+    "version_expr": "null"
+  },
+  {
+    "name": "Webpack",
+    "categories": ["JavaScript build tool"],
+    "base_confidence": 55,
+    "detect_expr": "!!(window.webpackJsonp || window.__webpack_require__)",
+    "version_expr": "null"
+  },
+  {
+    "name": "Vite",
+    "categories": ["JavaScript build tool"],
+    "base_confidence": 55,
+    "detect_expr": "!!(window.__vite_plugin_react_preamble_installed__ || document.querySelector('script[type=\"module\"][src*=\"/@vite/client\"]'))",
+    "version_expr": "null"
+  }
+]

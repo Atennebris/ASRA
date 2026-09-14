@@ -1,38 +1,1077 @@
-{# Chat panel (4.9) — separate conversation from the session's own tool-call log; never reads
+{% from "macros/ui.html" import provider_options, model_options with context %}
+{# Chat panel — separate conversation from the session's own tool-call log; never reads
    session.logs directly, only whatever agent/chat.py's snapshot decided to hand the model.
-   Escaping rule (4.2.2) applies here too: message content can echo back session-derived facts
-   (a finding title, the target) through the LLM's reply — never |safe/Markup() on msg.content. #}
-<div id="chat-panel" class="bg-surface border border-default rounded-lg flex flex-col h-[32rem] lg:h-full">
-  <div class="px-4 h-12 flex items-center gap-2 border-b border-default shrink-0">
-    <svg class="w-4 h-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+   Several independent, named THREADS per project now (agent/chat.py's chat_threads/
+   active_chat_thread_id) -- this panel always shows the currently active one; /new, /resume
+   (history button/dialog), /compact are how the operator moves between and manages them.
+
+   #chat-stream is the ONE stable SSE/morph target both live pushes (main.py's chat_stream route,
+   /api/session/{id}/chat/stream) AND this panel's own form POST/new-thread/switch-thread/compact
+   requests use — same hx-target/hx-swap ("morph:innerHTML") either way, so none of them ever tear
+   down and reopen the SSE connection (a plain outerHTML swap of the whole panel would destroy
+   #chat-stream's own hx-ext/sse-connect attributes along with it — see session.html's own
+   #session-stream comment for the real incident that class of bug caused elsewhere). The form
+   (input + provider/model pickers) is a sibling OUTSIDE #chat-stream, on purpose — an in-progress
+   typed draft or an open dropdown must never get reset by a live push, same reasoning
+   session.html's tab bar sits outside its own morph target. #}
+{# chat_panel_bounded_height -- set by an include site whose own ANCESTOR chain carries a real,
+   viewport-bound height at EVERY window width (chat.html's .quick-chat-page, re_triage_stage.html's
+   .interactive-chat-pane -- both themes.css, both unconditional calc(100vh - ...) now), as opposed
+   to session.html's own Agent-mode .session-chat-column, which only gets a bounded height at all
+   >=1100px wide (below that the log/chat columns stack in normal document flow instead, by design,
+   so the PAGE scrolls rather than this panel internally -- h-[32rem] is the deliberate, still-
+   needed fixed fallback there). Real, confirmed bug this fixes: h-[32rem] lg:h-full only ever
+   switched to h-full at Tailwind's lg: breakpoint (1024px) -- on Quick Chat/Interactive/RE at any
+   width BELOW 1024px (a real, common desktop-app window size, not just a phone), the panel stayed
+   pinned at a fixed 512px tall regardless of how much real vertical space its now-bounded parent
+   actually had, so on a window shorter than roughly 512px + that page's own header the panel (and
+   its own message input) still ran off the bottom of the viewport -- fixing the PARENT's own height
+   (themes.css) alone was not enough while this child never actually filled it below 1024px wide. #}
+<div id="chat-panel" class="bg-surface border border-default rounded-lg flex flex-col {{ 'h-full' if chat_panel_bounded_height else 'h-[32rem] lg:h-full' }}">
+  {# show_chat_tabs (templates/chat.html only) -- a real, explicit operator ask: the history-icon
+     dialog below is convenient for a project's own compact sidebar chat, but the standalone Quick
+     Chat page has room for actual browser-style tabs, one click to switch instead of open-dialog-
+     then-click. Kept as a SEPARATE strip above the existing header row rather than replacing the
+     title there, so the history dialog (still useful once there are more threads than fit in this
+     strip) and every other header control stay exactly where they already are. #}
+  {% if show_chat_tabs %}
+    {# Rendered once here, never re-sent -- partials/chat_thread_tabs.html's own innerHTML gets
+       wholesale-replaced on every OOB refresh, so a <style> tag placed inside it would need
+       re-adding after every single one of those; this container element survives every swap
+       untouched, so declaring it here means declaring it exactly once. #}
+    <style>
+      /* Full tab-strip parity with the Terminal tab strip (real, explicit operator ask) --
+         static/js/terminal.js's own .terminal-tab/.terminal-tab-dot/.terminal-tab-color-btn/
+         .terminal-tab-close rules (terminal_panel.html), same custom-property-driven whole-tab
+         color technique, same class shapes with a chat-tab-* prefix instead. */
+      .chat-tab.is-dragging { opacity: .35; }
+      .chat-tab.drag-over-left { box-shadow: inset 2px 0 0 var(--accent); }
+      .chat-tab.drag-over-right { box-shadow: inset -2px 0 0 var(--accent); }
+
+      .chat-tab {
+        color: var(--chat-tab-fg, var(--text-secondary));
+        background-color: var(--chat-tab-color-dim, transparent);
+        transition: background-color .12s ease, color .12s ease;
+      }
+      .chat-tab:hover {
+        color: var(--chat-tab-fg, var(--text-primary));
+        background-color: var(--chat-tab-color-dim, rgb(127 127 127 / 0.06));
+      }
+      .chat-tab.chat-tab-active {
+        color: var(--chat-tab-fg, var(--text-primary));
+        background-color: var(--chat-tab-color, var(--surface-elevated));
+      }
+      .chat-tab-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: currentColor; opacity: .45; margin-left: 0.5rem; }
+      .chat-tab:not(.chat-tab-active) .chat-tab-dot { visibility: hidden; }
+      .chat-tab-dot.is-live {
+        background: rgb(var(--status-online)); opacity: 1;
+        animation: chat-tab-pulse 2.2s ease-in-out infinite;
+      }
+      @keyframes chat-tab-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgb(var(--status-online) / .5); }
+        50% { box-shadow: 0 0 0 4px rgb(var(--status-online) / 0); }
+      }
+      @media (prefers-reduced-motion: reduce) { .chat-tab-dot.is-live { animation: none; } }
+
+      .chat-tab-label[contenteditable="true"] { outline: none; max-width: none; border-bottom: 1px dashed var(--accent); }
+
+      .chat-tab-color-btn {
+        display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        width: 16px; height: 16px; border-radius: 4px; color: inherit;
+        opacity: 0; transition: opacity .12s ease, background-color .12s ease;
+      }
+      .chat-tab:hover .chat-tab-color-btn, .chat-tab-active .chat-tab-color-btn { opacity: .8; }
+      .chat-tab-color-btn:hover { opacity: 1; background: rgb(127 127 127 / 0.25); }
+      .chat-tab-color-btn > span { width: 8px; height: 8px; border-radius: 999px; background: var(--chat-tab-color, currentColor); }
+
+      /* Small, self-contained popover chrome for #chat-color-picker below -- the Quick Chat page
+         never includes partials/terminal_panel.html (that popover styling lives scoped there, only
+         rendered on pages with an actual terminal drawer), so this is its own copy under a
+         chat-prefixed name rather than reaching for classes that wouldn't exist on this page at
+         all. Same look/shape as the Terminal's own .terminal-popover family on purpose. */
+      #chat-color-picker {
+        position: fixed; z-index: 60; min-width: 170px; max-width: 260px;
+        background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+        box-shadow: 0 10px 28px rgb(0 0 0 / 0.22); padding: 4px; font-size: 11.5px;
+      }
+      .chat-popover-item {
+        display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px;
+        cursor: pointer; color: var(--text-primary);
+      }
+      .chat-popover-item:hover { background: var(--surface-elevated); }
+      .chat-color-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; gap: 8px; }
+      .chat-color-row > span { font-size: 11px; color: var(--text-secondary); }
+      .chat-popover-divider { height: 1px; background: var(--border); margin: 4px; }
+    </style>
+    {% include "partials/chat_thread_tabs.html" %}
+    {# Populated dynamically by this file's own script (openChatColorPicker), same
+       populate-on-open/empty-otherwise shape as terminal_panel.html's own #terminal-color-picker. #}
+    <div id="chat-color-picker" hidden></div>
+  {% endif %}
+  <div class="px-4 h-12 flex items-center gap-1 border-b border-default shrink-0">
+    <svg class="w-4 h-4 text-accent shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
       <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"></path>
     </svg>
-    <p class="text-sm font-semibold text-primary">Chat</p>
-    <span class="ml-auto text-[10px] text-secondary">ask anything about this session</span>
+    {# id targeted by main.py's _render_chat_header_oob -- real, confirmed bug this fixes: this title
+       used to only ever come from the full page's initial render, so switching/creating/deleting a
+       thread (or a thread's own first message setting its real title) never updated it live. #}
+    <p id="chat-panel-title" class="text-sm font-semibold text-primary mr-auto ml-1 truncate">{{ thread.title }}</p>
+    <button type="button" id="chat-new-btn" title="New chat (/new)" aria-label="New chat"
+            hx-post="/api/session/{{ session.session_id }}/chat/new-thread" hx-target="#chat-stream" hx-swap="morph:innerHTML" data-no-progress-bar
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 5v14M5 12h14" stroke-linecap="round"></path>
+      </svg>
+    </button>
+    <button type="button" id="chat-history-btn" title="Chat history (/resume)" aria-label="Chat history"
+            hx-get="/api/session/{{ session.session_id }}/chat/threads" hx-target="#chat-thread-picker-content" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) document.getElementById('chat-thread-picker').showModal()"
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="12" cy="12" r="9"></circle>
+        <path d="M12 7v5l3.5 2" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+    </button>
+    {# hx-disabled-elt="this" -- without it, a synchronous compact request (agent/chat.py's
+       compact_chat_thread_route awaits the LLM call to completion within the request) gave zero
+       feedback while in flight, so a real operator click a second/third time queued that many
+       separate synchronous compact calls, each landing late and out of order once they finally
+       resolved. The before/after-request icon<->spinner swap (same .asra-spinner language as
+       chat_messages.html's own "thinking…" indicator) gives the immediate "it's working" signal
+       the icon-only button had none of, same pattern settings.html's own Test buttons already use
+       via textContent, adapted here since this button has no text to swap. #}
+    <button type="button" id="chat-compact-btn" title="Compact history (/compact)" aria-label="Compact chat history"
+            hx-post="/api/session/{{ session.session_id }}/chat/compact" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+            hx-disabled-elt="this"
+            hx-on::before-request="this.querySelector('svg').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
+            hx-on::after-request="this.querySelector('svg').classList.remove('hidden'); this.querySelector('.asra-spinner').classList.add('hidden')"
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3.5 7l1.5-3.5h14L20.5 7M4 7h16v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7z" stroke-linecap="round" stroke-linejoin="round"></path>
+        <path d="M9.5 11.5h5" stroke-linecap="round"></path>
+      </svg>
+      <span class="asra-spinner hidden"></span>
+    </button>
+    {# Quick Chat (mode="standalone") ONLY -- a real project (agent/interactive/reverse_engineering)
+       already picked which Subagents it can see once, up front, in its own New Project form
+       (partials/new_project_form.html's subagent_project_checklist()); showing this same picker
+       again in that project's own chat sidebar would just be a second, redundant control over the
+       exact same already-made choice. Quick Chat has no New Project form of its own at all -- this
+       is the ONLY place it can ever be set, which is exactly why it needs to live here, live,
+       inside the chat itself, rather than in Settings (which subagents exist/are enabled changes
+       day to day, so an operator needs this one click away, not buried in a settings tab). Also
+       requires delegation to actually be reachable at all for standalone (chat_settings.json's
+       subagents_enabled toggle, Settings -> Chat -- see agent/chat.py's _chat_tool_specs) and at
+       least one globally-enabled profile to pick from. #}
+    {% if session.mode == "standalone" and get_enabled_subagent_profiles() and chat_subagents_delegation_enabled() %}
+    <button type="button" id="chat-subagents-btn" title="Subagents for this chat" aria-label="Subagents for this chat"
+            hx-get="/api/session/{{ session.session_id }}/subagents-panel" hx-target="#chat-subagents-picker-content" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) document.getElementById('chat-subagents-picker').showModal()"
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="4" y="8" width="16" height="11" rx="2"></rect>
+        <path d="M9 8V6a3 3 0 0 1 6 0v2" stroke-linecap="round"></path>
+        <circle cx="9.5" cy="13.5" r="1" fill="currentColor" stroke="none"></circle>
+        <circle cx="14.5" cy="13.5" r="1" fill="currentColor" stroke="none"></circle>
+      </svg>
+    </button>
+    {% endif %}
+    {# hide_chat_collapse (set by templates/chat.html for the standalone Quick Chat page) -- there's
+       nothing beside this panel on its own dedicated page for collapsing it to reveal, so this
+       control (and its edge reopen-handle below) would just slide the whole page off past the
+       viewport edge with nothing behind it. Omitted from the DOM entirely rather than hidden, so
+       the collapse/reopen JS below can just skip its own wiring when these are absent (getElementById
+       returning null) instead of needing a second, separate flag threaded through it. #}
+    {% if not hide_chat_collapse %}
+    <button type="button" id="chat-collapse-toggle" title="Collapse chat" aria-label="Collapse chat"
+            class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary">
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M14 5l7 7-7 7M21 12H3" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+    </button>
+    {% endif %}
   </div>
 
-  {# Sessions created before 4.9 have no "chat" field at all — default to empty rather than a
-     Jinja UndefinedError, same defensive-default spirit as the setdefault() calls in agent/core.py. #}
-  {% set chat_messages = session.get("chat", {}).get("messages", []) %}
-  <div id="chat-messages" class="flex-1 overflow-y-auto asra-scroll p-4 space-y-3">
-    {% for msg in chat_messages %}
-      <div class="text-sm {{ 'text-right' if msg.role == 'user' else 'text-left' }}">
-        <span class="inline-block px-3 py-2 rounded-lg max-w-[90%] break-words text-left {{ 'bg-accent/10 text-primary' if msg.role == 'user' else 'bg-elevated text-primary' }}">{{ msg.content }}</span>
-      </div>
-    {% else %}
-      <div class="h-full flex flex-col items-center justify-center text-center px-4">
-        <p class="text-sm font-medium text-primary">Ask about this session</p>
-        <p class="text-[11px] text-secondary mt-1">Findings, progress, or a hint like "skip the CORS finding" or "focus on redirects" &mdash;
-          available any time, even while the scan is still running.</p>
-      </div>
-    {% endfor %}
+  {# flex-1 flex flex-col min-h-0 -- WITHOUT this, #chat-stream is a plain block div, so
+     #chat-messages' own flex-1 (chat_messages.html) is inert (flex-1 only means anything under a
+     flex parent). Real, confirmed bug this fixes: #chat-messages then just grows to fit its
+     content instead of being height-constrained, so overflow-y-auto never actually kicks in --
+     long conversations visually overflow #chat-panel's own h-[32rem]/h-full bound, pushing the
+     form (and the collapse animation's own real geometry) around with it, which is exactly the
+     "input field jumps between top and bottom" bug report this addresses. min-h-0 overrides the
+     flex-item default of min-height:auto (a flex item otherwise refuses to shrink below its own
+     content size, which would silently defeat the height constraint above even with flex-1 set)
+     -- same "remove the implicit min-size floor" fix themes.css's own .session-log-column
+     min-width:0 rule already applies for the identical gotcha on the horizontal axis. #}
+  <div id="chat-stream" class="flex-1 flex flex-col min-h-0"
+       hx-ext="sse, morph" sse-connect="/api/session/{{ session.session_id }}/chat/stream" sse-swap="message" hx-swap="morph:innerHTML">
+    {% include "partials/chat_messages.html" %}
   </div>
 
-  <form hx-post="/api/session/{{ session.session_id }}/chat" hx-target="#chat-panel" hx-swap="outerHTML"
-        hx-disabled-elt="this" hx-on::after-swap="document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight"
-        class="border-t border-default p-3 flex gap-2 shrink-0">
-    <input type="text" name="message" placeholder="Ask or instruct&hellip;" required autocomplete="off"
-           class="flex-1 min-w-0 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:ring-accent/20 focus:border-accent">
-    <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm shrink-0">Send</button>
+  <form id="chat-form" hx-post="/api/session/{{ session.session_id }}/chat" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+        hx-disabled-elt="this" hx-on::before-request="var el = this.querySelector('#chat-input'); el.value = ''; el.classList.remove('chat-input-token-active'); el.style.height = 'auto';"
+        class="border-t border-default p-3 space-y-2 shrink-0">
+    <div class="flex gap-2">
+      <label class="w-1/2 min-w-0">
+        <span class="sr-only">Provider</span>
+        {# hx-on::before-request clears #chat-model to a neutral placeholder the instant the
+           provider changes -- without this, the model <select> keeps showing the PREVIOUS
+           provider's model list (a real, confirmed operator complaint: picking a new provider
+           still showed the old provider's model, e.g. "Mistral" next to "big-pickle") for however
+           long the /api/subagents/model-options round trip takes, which reads as broken even
+           though the correct list does land moments later. #}
+        <select name="provider" id="chat-provider"
+                hx-get="/api/subagents/model-options" hx-target="#chat-model" hx-trigger="change"
+                hx-on::before-request="document.getElementById('chat-model').innerHTML = '&lt;option value=&quot;&quot;&gt;Loading models…&lt;/option&gt;'"
+                class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {{ provider_options(thread.provider) }}
+        </select>
+      </label>
+      <label class="w-1/2 min-w-0">
+        <span class="sr-only">Model</span>
+        <select name="model" id="chat-model"
+                class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {{ model_options(thread.provider, thread.model, chat_model_choices) }}
+        </select>
+      </label>
+    </div>
+    <div class="flex gap-2">
+      <div class="relative flex-1 min-w-0">
+        {# A <textarea>, not a single-line <input> -- real, confirmed operator complaint: a
+           single-line field with a lot of typed text scrolls horizontally, and switching away to
+           another browser tab and back loses the visible caret position entirely, forcing a manual
+           jump back to the end just to keep typing. rows="1" + the auto-grow script below (input
+           listener) keeps it exactly one line tall for a short message and grows it (up to
+           INPUT_MAX_HEIGHT_PX, then it scrolls internally) for a longer one, same behavior as every
+           other chat UI's own message box. resize-none -- the auto-grow already owns the height;
+           a manual drag-resize handle would fight it. #}
+        <textarea id="chat-input" name="message" placeholder="Message" required autocomplete="off" rows="1"
+               class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:ring-accent/20 focus:border-accent resize-none leading-normal"></textarea>
+        {# CLI-style slash-command dropdown -- hidden by default, populated/shown by the script
+           below while the input holds a leading "/" and nothing else. Anchored to THIS wrapper
+           (not the whole form row) so it opens directly above the input, not the Send button. #}
+        <div id="chat-slash-menu" class="hidden absolute bottom-full left-0 mb-1 w-full rounded-lg border border-default bg-surface shadow-lg overflow-hidden z-10"></div>
+      </div>
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm shrink-0">Send</button>
+    </div>
+    <p class="text-[10px] text-secondary">Only providers with a key configured in Settings are listed. Leave blank to use the main agent's own provider.</p>
   </form>
 </div>
+
+{# Lives OUTSIDE #chat-panel on purpose -- #chat-panel itself slides fully off past the viewport
+   edge when collapsed (see the .chat-collapsed transform in themes.css), so anything meant to stay
+   clickable while collapsed can't live inside it. Hidden by default; the script below shows it
+   exactly when the panel is collapsed. Omitted entirely when hide_chat_collapse is set (see the
+   collapse button's own comment above) -- there's no collapsed state to reopen from on that page. #}
+{% if not hide_chat_collapse %}
+<button type="button" id="chat-reopen-handle" title="Open chat" aria-label="Open chat"
+        class="hidden fixed right-0 top-1/2 -translate-y-1/2 z-20 bg-accent hover:bg-accent-hover text-white rounded-l-lg px-1.5 py-3 shadow-lg">
+  <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M10 5l-7 7 7 7" stroke-linecap="round" stroke-linejoin="round"></path>
+  </svg>
+</button>
+{% endif %}
+
+{# /resume's own picker -- a sibling of #chat-panel, never inside #chat-stream's own SSE/morph
+   subtree, so it's never at risk of a live push interfering with it while open (same reasoning
+   #new-project-modal in base.html sits outside every morphed subtree). Content is fetched fresh
+   on every open (chat-history-btn's own hx-get) rather than kept in sync live -- a picker that's
+   only ever open for a few seconds doesn't need its own SSE connection. #}
+<dialog id="chat-thread-picker" class="bg-surface text-primary border border-default rounded-lg p-4 w-full max-w-sm backdrop:bg-black/50">
+  <div id="chat-thread-picker-content"></div>
+</dialog>
+
+{# #chat-subagents-btn's own dialog -- same "sibling of #chat-panel, fetched fresh on every open"
+   shape as #chat-thread-picker just above. #}
+<dialog id="chat-subagents-picker" class="bg-surface text-primary border border-default rounded-lg p-4 w-full max-w-sm backdrop:bg-black/50">
+  <div id="chat-subagents-picker-content"></div>
+</dialog>
+
+<script>
+  (function () {
+    var chatStream = document.getElementById("chat-stream");
+    var form = document.getElementById("chat-form");
+
+    // #chat-stream itself is never destroyed/recreated (only its children morph — see the comment
+    // above), so this listener, set up once at panel load, keeps working across every later live
+    // push AND every message/new-thread/switch-thread/compact request — all of them go through the
+    // identical morph:innerHTML swap on this same element.
+    // Real, confirmed operator complaint this fixes: syncChatState used to force #chat-messages
+    // to the very bottom on EVERY single DOM mutation, unconditionally -- during a real, active
+    // tool-heavy turn (100+ tool calls in a row is a real, observed case), a new tool_call
+    // segment landing via SSE is exactly that kind of mutation, so scrolling up to click a
+    // <details> card and actually read its output kept getting yanked straight back to the
+    // bottom the instant the next segment arrived, mid-read. Same "only auto-follow when the
+    // operator was already at the bottom" discipline session.html's own #session-log-list
+    // already applies to the scan log (see that file's own htmx:beforeSwap/afterSwap wasAtBottom
+    // comment) -- tracked continuously via a "scroll" listener here instead (a MutationObserver
+    // callback only ever sees the DOM AFTER it already changed, too late to know where the
+    // operator was scrolled to beforehand).
+    var chatWasAtBottom = true;
+    (function () {
+      var messages = document.getElementById("chat-messages");
+      if (!messages) return;
+      messages.addEventListener("scroll", function () {
+        chatWasAtBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40;
+      });
+    })();
+
+    function syncChatState() {
+      var messages = document.getElementById("chat-messages");
+      var pending = !!(messages && messages.querySelector(".asra-spinner"));
+      // Only the provider/model pickers lock while a turn is in flight -- a thread's provider/
+      // model is one field (agent/chat.py's _new_thread), so switching it mid-turn doesn't mean
+      // anything. The message input and Send button deliberately stay enabled here: this is the
+      // Claude Code CLI-style message queue -- typing and sending while still "thinking…" queues
+      // the message (agent/chat.py's thread["queued_messages"]) instead of blocking on it, which
+      // is exactly what used to happen when this function disabled the whole form.
+      var providerSelect = document.getElementById("chat-provider");
+      var modelSelect = document.getElementById("chat-model");
+      if (providerSelect) providerSelect.disabled = pending;
+      if (modelSelect) modelSelect.disabled = pending;
+      if (messages && chatWasAtBottom) { messages.scrollTop = messages.scrollHeight; }
+    }
+
+    // Same fix as session.html's own #session-log-list <summary> click handler: expanding a
+    // tool-call card's own <details> triggers the browser's native focus/scroll-into-view
+    // handling for the newly-revealed body, which fights with #chat-messages' own scroll
+    // position -- confirmed live, clicking a card mid-list jumped the whole panel's scroll
+    // unpredictably. Delegated on #chat-stream (stable across every SSE/morph swap, unlike
+    // #chat-messages which gets replaced) so it keeps working after every re-render.
+    chatStream.addEventListener("click", function (event) {
+      var summary = event.target.closest("summary");
+      if (!summary) return;
+      var messages = document.getElementById("chat-messages");
+      if (!messages) return;
+      var scrollTop = messages.scrollTop;
+      requestAnimationFrame(function () {
+        messages.scrollTop = scrollTop;
+      });
+    });
+
+    chatStream.addEventListener("htmx:afterSwap", syncChatState);
+    // Real, confirmed bug htmx:afterSwap alone misses: htmx's own SSE extension (base.html) swaps
+    // a live push's content straight in WITHOUT ever dispatching htmx:afterSwap on the target --
+    // confirmed live by instrumenting a real page (only htmx:sseMessage/htmx:load fired, never
+    // afterSwap/beforeSwap). A real, common sequence hits this every time: send a message, navigate
+    // away before the reply lands (a genuine separate page in this app -- no hx-boost anywhere), come
+    // back later -- the still-in-flight background turn finishes and its result arrives ONLY via
+    // this live SSE push (this document made no request of its own to hang an afterSwap off of), so
+    // syncChatState never re-runs and the form stays disabled forever even though the thread is no
+    // longer actually pending. A MutationObserver sidesteps the whole "which htmx event actually
+    // fired" question entirely -- it fires for ANY child change of #chat-stream regardless of what
+    // caused it (SSE push, a real request's own morph swap, anything future), so it can't miss a
+    // path the way listening for one specific named event can.
+    //
+    // attributes/characterData (not just childList) -- real, confirmed operator complaint: chat
+    // buttons stuck disabled until a manual F5, "from time to time". Idiomorph (base.html) doesn't
+    // always remove+recreate a changed node -- when the old and new version of an element are
+    // similar enough (same tag, same position), it patches that SAME node's attributes/text in
+    // place instead (this exact behavior is why session.html's own beforeAttributeUpdated hook has
+    // to exist, see that file's comment). The trailing "thinking…" bubble and a plain final-text
+    // reply bubble are both `<div class="text-sm text-left">...` at the same position in
+    // #chat-messages -- structurally similar enough that idiomorph can choose to morph the old
+    // node's own children/classes in place rather than remove/add a whole new node, which a
+    // childList-only observer never sees at all, leaving syncChatState() thinking a turn is still
+    // pending forever even after it's genuinely done.
+    new MutationObserver(syncChatState).observe(chatStream, { childList: true, subtree: true, attributes: true, characterData: true });
+    syncChatState();
+    // Real, confirmed bug this fixes: opening a session/chat page showed the message log scrolled
+    // to the very TOP of the whole history instead of the latest message at the bottom. The
+    // synchronous syncChatState() call just above runs at the moment this <script> executes --
+    // before the vendored Tailwind runtime (base.html) has necessarily finished generating/
+    // injecting the utility CSS for the classes #chat-messages and its ancestors were just parsed
+    // with (h-[32rem]/flex-1/overflow-y-auto/...), the same async-relative-to-DOM-content timing
+    // this file's own #chat-stream comment above already documents for SSE morph swaps. Computing
+    // scrollHeight/clientHeight against not-yet-fully-laid-out ancestors can under-measure the real
+    // scrollable height, so the "scroll to bottom" it performs lands short of where the FINAL,
+    // fully-styled layout's true bottom actually is. A double requestAnimationFrame (same pattern
+    // static/js/session_state.js's own restoreScrollPositions uses for this identical class of
+    // "wait for the real post-stylesheet layout" gotcha) re-snaps to the bottom once a real paint
+    // has actually happened, without touching chatWasAtBottom's own scroll-tracking listener above.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        if (!chatWasAtBottom) return;
+        var messages = document.getElementById("chat-messages");
+        if (messages) messages.scrollTop = messages.scrollHeight;
+      });
+    });
+
+    // Collapse/expand (right-edge slide) -- transform only, never touches .session-layout's own
+    // grid-template-columns (that grid's column tracks are deliberately fixed, see themes.css's
+    // own comment on it), so the log column's width is completely unaffected either way. Persisted
+    // in localStorage, same convention base.html's own theme toggle already uses.
+    var COLLAPSE_STORAGE_KEY = "asra-chat-collapsed";
+    var panel = document.getElementById("chat-panel");
+    var collapseBtn = document.getElementById("chat-collapse-toggle");
+    var reopenBtn = document.getElementById("chat-reopen-handle");
+    // Real default (a no-op), not left undefined -- asraDiscussInChat/asraUseSuggestedStep below
+    // both call setChatCollapsed(false) unconditionally before doing anything else of their own;
+    // on the standalone Quick Chat page (collapseBtn/reopenBtn both absent, see the guard below)
+    // there's nothing to collapse, but neither of those two entry points should ever throw just
+    // because this page happens to have no collapse control to reopen.
+    var setChatCollapsed = function () {};
+
+    // Both elements are omitted from the DOM entirely on the standalone Quick Chat page
+    // (templates/chat.html's hide_chat_collapse) -- nothing to wire up there at all, so this whole
+    // block is skipped rather than throwing on a null getElementById.
+    if (collapseBtn && reopenBtn) {
+      setChatCollapsed = function (collapsed) {
+        // Interactive mode owns its own collapse behavior: instead of sliding the chat off the right
+        // edge (the 2-column agent layout's affordance), collapsing reveals the Findings split beside
+        // it (session.html defines this hook). When present, delegate entirely and skip the slide-off
+        // + right-edge reopen handle -- interactive has its own "Back to chat" control (reopenBtn
+        // stays hidden the whole time in this mode, see the guard below -- never shown, never
+        // touched here).
+        if (window.asraInteractiveCollapse) { window.asraInteractiveCollapse(collapsed); return; }
+        panel.classList.toggle("chat-collapsed", collapsed);
+        // reopenBtn's own [hidden] is no longer touched here -- real operator ask: it must stay
+        // visible in BOTH states now, not just while collapsed, so it works as a genuine toggle
+        // (click to close from either the header arrow above OR this edge tab, click to reopen the
+        // same way) instead of a one-way "reopen" handle. See the guard below for where it actually
+        // gets un-hidden (once, at load, agent mode only).
+        reopenBtn.title = collapsed ? "Open chat" : "Collapse chat";
+        reopenBtn.setAttribute("aria-label", reopenBtn.title);
+        localStorage.setItem(COLLAPSE_STORAGE_KEY, collapsed ? "1" : "0");
+      };
+
+      collapseBtn.addEventListener("click", function () { setChatCollapsed(true); });
+      // Toggles off whatever the CURRENT state actually is -- not a one-way "always reopen" anymore,
+      // now that this button is always visible (real operator ask: some people want to click the
+      // arrow inside the panel to close it, others the edge tab -- both need to keep working, in
+      // both directions, not just the arrow). Only ever reachable in agent mode in practice --
+      // interactive mode never un-hides this element (guard below), so this listener is otherwise
+      // dead code there, same as it always was.
+      reopenBtn.addEventListener("click", function () { setChatCollapsed(!panel.classList.contains("chat-collapsed")); });
+      // Restore the persisted collapse state, and un-hide the edge tab, only in the 2-column agent
+      // layout -- interactive mode always starts with the chat open (its collapse reveals the
+      // Findings split, which shouldn't spring open on load just because the chat was collapsed in
+      // some earlier agent session) and keeps its own separate "Back to chat" edge tab instead of
+      // this one, so reopenBtn deliberately stays [hidden] there, unchanged from before.
+      if (!window.asraInteractiveCollapse) {
+        reopenBtn.classList.remove("hidden");
+        setChatCollapsed(localStorage.getItem(COLLAPSE_STORAGE_KEY) === "1");
+      }
+    }
+
+    // Slash commands (/new, /resume, /compact [instructions]) -- intercepted client-side so the
+    // exact same actions the header buttons trigger are also reachable by typing, same as Umbra
+    // Agent's own command set. Falls through to a normal chat send for anything else (including a
+    // message that merely CONTAINS a slash later in the text, not as its own first word).
+    var newBtn = document.getElementById("chat-new-btn");
+    var historyBtn = document.getElementById("chat-history-btn");
+    var input = document.getElementById("chat-input");
+
+    // Auto-grow the textarea with its own content -- resets to "auto" first so shrinking (deleting
+    // text, or the after-request clear) actually shrinks it back down instead of only ever growing.
+    // Capped at INPUT_MAX_HEIGHT_PX (~8 lines) so one very long paste can't push the Send button and
+    // provider/model pickers off-panel -- it scrolls internally past that instead.
+    var INPUT_MAX_HEIGHT_PX = 160;
+    function autoResizeInput() {
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, INPUT_MAX_HEIGHT_PX) + "px";
+    }
+
+    // Global (not scoped to this IIFE) on purpose -- session_fragment.html's own "Discuss in chat"
+    // button on each finding/hypothesis/recon-target card lives in a completely separate template
+    // include with no access to this closure's own locals, so it needs a real window-level entry
+    // point to reach into the chat panel at all. ref is the exact F#/H#/R# id CHAT_PROMPT/
+    // INTERACTIVE_CHAT_PROMPT/RE_CHAT_PROMPT (agent/prompts.py) already know how to read
+    // ANYWHERE in a message, not just a leading run -- agent/chat.py's _session_snapshot stamps
+    // the identical id onto the matching finding/hypothesis/recon_target entry, so the two sides
+    // can never drift out of sync with each other. Inserts "[ref] " at the input's own current
+    // cursor position (replacing any active selection) rather than always at the very front --
+    // real, confirmed operator complaint: the old front-only insert made every click produce a
+    // wall of tags before the operator's own sentence ("[F2] [R1] check this target"), destroying
+    // the actual context of WHICH part of the sentence each tag was about. Typing "Check finding "
+    // then clicking a card's button, then typing " against target " and clicking another now
+    // produces "Check finding [F2] against target [R1]" -- the tag lands exactly where the
+    // operator's own cursor was, same as any normal text insertion. selectionStart/End on a
+    // <textarea> survive a blur (clicking a card's button elsewhere never focuses the input), so
+    // the last real cursor position is still there when this runs; a field never focused yet
+    // reports 0/0, which correctly inserts at the very start, same as the old default behavior.
+    window.asraDiscussInChat = function (ref) {
+      setChatCollapsed(false);
+      closeSlashMenu();
+      var tag = "[" + ref + "] ";
+      var start = input.selectionStart == null ? input.value.length : input.selectionStart;
+      var end = input.selectionEnd == null ? input.value.length : input.selectionEnd;
+      input.value = input.value.slice(0, start) + tag + input.value.slice(end);
+      autoResizeInput();
+      updateInputTokenHighlight();
+      input.focus();
+      var caret = start + tag.length;
+      input.setSelectionRange(caret, caret);
+    };
+
+    // Global for the same reason as asraDiscussInChat just above -- a suggested_actions segment's
+    // buttons (chat_messages.html, agent/chat.py's suggest_next_steps) live in a separate template
+    // include with no access to this closure. Unlike asraDiscussInChat, this REPLACES the whole
+    // input rather than just swapping a leading tag: a suggested step is a full next message on its
+    // own, not a reference tag meant to prefix whatever the operator was already typing.
+    //
+    // Sends immediately (requestSubmit(), not just filling the field) -- a real, confirmed operator
+    // complaint: clicking one of the model's own suggested next steps used to only stage it in the
+    // input box, an extra "now press Send yourself on the exact thing you just clicked" step the
+    // button's own label ("do X") already implied was the point of clicking it. Whatever the
+    // operator had been typing before the click is replaced, same as the old fill-only behavior --
+    // clicking a suggested step is a deliberate "send this instead", not a merge. requestSubmit()
+    // (not form.submit()) so hx-on::before-request/hx-disabled-elt on #chat-form still run exactly
+    // as if the operator had typed this and hit Send themselves -- htmx has no separate JS API of
+    // its own for "submit this form", it hooks the native submit event.
+    window.asraUseSuggestedStep = function (text) {
+      setChatCollapsed(false);
+      closeSlashMenu();
+      input.value = text;
+      form.requestSubmit();
+    };
+
+    // CLI-style slash-command autocomplete -- a small dropdown shown while the input holds a
+    // leading "/" and nothing after it but (optionally) part of a command name, filtered as more
+    // is typed, navigable with Up/Down/Enter/Tab/Escape or a plain click. Selecting an item only
+    // COMPLETES the text (with a trailing space, so /compact's own optional instructions can still
+    // be typed after it) -- it never submits by itself, so the submit-time interception below
+    // still owns actually running whichever command ends up typed, exactly like a real terminal's
+    // own Tab-to-complete/Enter-to-run split.
+    var SLASH_COMMANDS = [
+      {cmd: "/new", desc: "Start a new chat"},
+      {cmd: "/resume", desc: "Browse chat history"},
+      {cmd: "/compact", desc: "Summarize older history"},
+    ];
+    var slashMenu = document.getElementById("chat-slash-menu");
+    var slashMatches = [];
+    var slashActiveIndex = -1;
+
+    function closeSlashMenu() {
+      slashMenu.classList.add("hidden");
+      slashMenu.innerHTML = "";
+      slashMatches = [];
+      slashActiveIndex = -1;
+    }
+
+    function renderSlashMenu() {
+      slashMenu.innerHTML = slashMatches.map(function (item, i) {
+        // role="button" -- not just semantics: debug_events.js's own delegated click tracker
+        // only listens for "button, summary, a, [role='button'],
+        // ..." -- a plain unstyled <div> would silently fall outside that coverage entirely.
+        return '<div class="slash-item flex items-baseline gap-2 px-3 py-2 text-[12px] cursor-pointer hover:bg-elevated' +
+          (i === slashActiveIndex ? ' bg-elevated' : '') + '" data-index="' + i + '" role="button">' +
+          '<span class="font-mono font-semibold text-accent">' + item.cmd + '</span>' +
+          '<span class="text-secondary text-[11px]">' + item.desc + '</span></div>';
+      }).join("");
+      slashMenu.classList.toggle("hidden", slashMatches.length === 0);
+    }
+
+    function selectSlashCommand(index) {
+      var item = slashMatches[index];
+      if (!item) return;
+      input.value = item.cmd + " ";
+      autoResizeInput();
+      updateInputTokenHighlight();
+      closeSlashMenu();
+      input.focus();
+    }
+
+    // Live-typing counterpart to _CHAT_REF_TAG_RE/_CHAT_SLASH_CMD_RE's own highlighting of
+    // ALREADY-SENT messages (main.py's _render_chat_markdown) -- an operator typing "[F17] ..." or
+    // "/compact ..." got zero visual confirmation the leading token was actually recognized until
+    // AFTER hitting Send, same complaint that applied to the sent-message rendering. A plain
+    // <textarea> can't style part of its own text, so this recolors the WHOLE field (text-accent +
+    // semibold via the .chat-input-token-active class, themes.css) whenever the CURRENT value
+    // starts with a real recognized token -- a full slash command word (not a partial one still
+    // being typed, which the autocomplete dropdown below already covers on its own) or a complete
+    // [F#]/[H#]/[R#] tag exactly like the one asraDiscussInChat inserts.
+    var INPUT_TOKEN_RE = /^(\/(?:new|resume|compact)\b|\[[FHR]\d+\])/;
+    function updateInputTokenHighlight() {
+      input.classList.toggle("chat-input-token-active", INPUT_TOKEN_RE.test(input.value));
+    }
+
+    input.addEventListener("input", function () {
+      autoResizeInput();
+      updateInputTokenHighlight();
+      var match = /^\/(\w*)$/.exec(input.value);
+      if (!match) {
+        closeSlashMenu();
+        return;
+      }
+      var typed = match[1].toLowerCase();
+      slashMatches = SLASH_COMMANDS.filter(function (c) { return c.cmd.slice(1).indexOf(typed) === 0; });
+      slashActiveIndex = slashMatches.length ? 0 : -1;
+      renderSlashMenu();
+    });
+    updateInputTokenHighlight(); // asraDiscussInChat can populate the field before this fires once
+
+    input.addEventListener("keydown", function (event) {
+      if (!slashMenu.classList.contains("hidden")) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          slashActiveIndex = (slashActiveIndex + 1) % slashMatches.length;
+          renderSlashMenu();
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          slashActiveIndex = (slashActiveIndex - 1 + slashMatches.length) % slashMatches.length;
+          renderSlashMenu();
+        } else if (event.key === "Enter" || event.key === "Tab") {
+          if (slashActiveIndex >= 0) {
+            event.preventDefault();
+            selectSlashCommand(slashActiveIndex);
+          }
+        } else if (event.key === "Escape") {
+          closeSlashMenu();
+        }
+        return;
+      }
+      // Now that the field is a <textarea>, Enter's own default is a newline, not "send" (the old
+      // single-line <input> got this for free from the browser). Restoring "Enter sends, Shift+Enter
+      // inserts a real newline" -- the same convention every chat UI (Slack/Discord/ChatGPT) uses --
+      // needs an explicit handler here; nothing else in this file submits the form on a bare Enter.
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
+    // A mousedown (not click) preventDefault keeps the input from ever blurring in the first
+    // place when a menu item is picked -- the blur listener below is only the fallback for
+    // dismissing the menu on a click truly outside both the input and the menu.
+    slashMenu.addEventListener("mousedown", function (event) {
+      var item = event.target.closest(".slash-item");
+      if (!item) return;
+      event.preventDefault();
+      selectSlashCommand(parseInt(item.dataset.index, 10));
+    });
+    input.addEventListener("blur", function () { setTimeout(closeSlashMenu, 150); });
+
+    form.addEventListener("submit", function (event) {
+      closeSlashMenu();
+      var text = (input.value || "").trim();
+      var firstWord = text.split(/\s+/, 1)[0].toLowerCase();
+
+      if (firstWord === "/new") {
+        event.preventDefault();
+        input.value = "";
+        autoResizeInput();
+        newBtn.click();
+      } else if (firstWord === "/resume") {
+        event.preventDefault();
+        input.value = "";
+        autoResizeInput();
+        historyBtn.click();
+      } else if (firstWord === "/compact") {
+        event.preventDefault();
+        var instructions = text.slice(firstWord.length).trim();
+        input.value = "";
+        autoResizeInput();
+        // Bypasses compactBtn's own hx-post (htmx.ajax lets an instructions string ride along as
+        // a form value), so it needs the same manual busy-state treatment that button's own
+        // hx-disabled-elt/before-after-request handlers give a real click on it -- otherwise
+        // typing "/compact" twice in a row queues two overlapping synchronous compact calls the
+        // same way an un-disabled button click did (see compactBtn's own comment above).
+        var compactBtn = document.getElementById("chat-compact-btn");
+        compactBtn.disabled = true;
+        compactBtn.querySelector("svg").classList.add("hidden");
+        compactBtn.querySelector(".asra-spinner").classList.remove("hidden");
+        htmx.ajax("POST", "/api/session/{{ session.session_id }}/chat/compact", {
+          target: "#chat-stream", swap: "morph:innerHTML", values: {instructions: instructions},
+        }).finally(function () {
+          compactBtn.disabled = false;
+          compactBtn.querySelector("svg").classList.remove("hidden");
+          compactBtn.querySelector(".asra-spinner").classList.add("hidden");
+        });
+      }
+    });
+
+    {% if show_chat_tabs %}
+    // ---- Quick Chat tab strip: drag-and-drop reordering -----------------------------------
+    // Real, explicit operator ask: same drag-over-half/insertBefore interaction as the Terminal
+    // tab strip (static/js/terminal.js's own wireDragAndDrop). Delegated on #chat-thread-tabs
+    // itself (never replaced, only its children -- see that partial's own comment) rather than
+    // on individual tab buttons, so this is wired ONCE here and keeps working after every later
+    // OOB refresh (switch/new/delete/send, main.py's _render_chat_header_oob) without needing to
+    // re-bind anything.
+    //
+    // The strip's default order is server-driven (newest-first by updated_at) and would otherwise
+    // silently snap back to that on the very next OOB refresh -- sending a message re-sorts by
+    // updated_at, which would undo a drag the instant the operator used the chat again. A saved
+    // order (thread ids, this browser's own localStorage -- same per-browser convention
+    // terminal.js's own tab order already uses, no backend schema needed) is reapplied to the DOM
+    // after every swap via a MutationObserver on the same stable container.
+    (function () {
+      var tabsContainer = document.getElementById("chat-thread-tabs");
+      if (!tabsContainer) return;
+      var TAB_ORDER_KEY = "asra-quick-chat-tab-order";
+      var dragThreadId = null;
+
+      function loadTabOrder() {
+        try { return JSON.parse(localStorage.getItem(TAB_ORDER_KEY) || "[]"); } catch (e) { return []; }
+      }
+
+      function currentTabIds() {
+        return Array.prototype.map.call(tabsContainer.querySelectorAll(".chat-tab"), function (el) {
+          return el.dataset.threadId;
+        });
+      }
+
+      function saveTabOrder() {
+        try { localStorage.setItem(TAB_ORDER_KEY, JSON.stringify(currentTabIds())); } catch (e) {}
+      }
+
+      // Idempotent by design (checks before it mutates) -- this is what stops the MutationObserver
+      // below from re-triggering itself forever: its own reorder is a real DOM mutation, but the
+      // observer's queued callback runs it again, and that second call sees the order already
+      // matches its target and returns without touching the DOM, ending the chain right there.
+      function applySavedOrder() {
+        var byId = {};
+        var current = currentTabIds();
+        current.forEach(function (id, i) { byId[id] = tabsContainer.children[i]; });
+        var saved = loadTabOrder();
+        // Known ids keep the saved sequence (silently dropping any id that no longer exists, a
+        // deleted thread); an id never seen before -- a just-created tab, from either "+" button --
+        // is appended LAST, after every known tab, in its current relative order. Real, confirmed
+        // operator complaint this fixes: a brand-new tab used to jump to the FRONT of the strip
+        // instead of landing next to the "+" that created it (every ordinary tab strip in the
+        // world -- a browser, an IDE, Terminal's own tabs right here -- opens a new tab adjacent to
+        // where it was opened FROM, never at the far end away from the control that made it).
+        var target = saved.filter(function (id) { return byId[id]; })
+          .concat(current.filter(function (id) { return saved.indexOf(id) === -1; }));
+        var alreadyInOrder = target.length === current.length && target.every(function (id, i) { return id === current[i]; });
+        if (!alreadyInOrder) {
+          // Real, confirmed bug this trailingEls dance fixes: chat_thread_tabs.html's own inline
+          // "+" button lives as a plain sibling AFTER every .chat-tab in this same container (not
+          // matched by currentTabIds()'s ".chat-tab" selector, so it's never part of `target`
+          // itself) -- appendChild-ing each tab one at a time each moves that tab to the container's
+          // current end, and the "+" button was originally sitting AT that end, so the very FIRST
+          // tab appended already leapfrogs past it; by the time every tab has been reordered this
+          // way, the button that never moved on its own has been pushed all the way to the FRONT
+          // instead of staying last. Re-appending it (and anything else non-tab) after the tabs
+          // settle keeps it where it visually belongs regardless of how many tabs get reordered.
+          var trailingEls = Array.prototype.filter.call(tabsContainer.children, function (el) {
+            return !el.classList.contains("chat-tab");
+          });
+          target.forEach(function (id) { tabsContainer.appendChild(byId[id]); });
+          trailingEls.forEach(function (el) { tabsContainer.appendChild(el); });
+        }
+        // Persisted every time (not only on manual drag), so a brand-new tab's "goes last" position
+        // above is remembered from its very first render onward -- without this, it would still
+        // count as "unseen" on every later OOB refresh (a message send, a switch elsewhere and
+        // back), and if the server's own relative order for not-yet-saved ids ever isn't stable
+        // across renders, that would let it visibly drift to a different spot each time instead of
+        // staying put after that first, correct placement.
+        saveTabOrder();
+      }
+
+      tabsContainer.addEventListener("dragstart", function (event) {
+        var tabEl = event.target.closest(".chat-tab");
+        if (!tabEl) return;
+        dragThreadId = tabEl.dataset.threadId;
+        tabEl.classList.add("is-dragging");
+        event.dataTransfer.effectAllowed = "move";
+        try { event.dataTransfer.setData("text/plain", dragThreadId); } catch (e) {}
+      });
+      tabsContainer.addEventListener("dragend", function () {
+        dragThreadId = null;
+        Array.prototype.forEach.call(tabsContainer.querySelectorAll(".chat-tab"), function (el) {
+          el.classList.remove("is-dragging", "drag-over-left", "drag-over-right");
+        });
+      });
+      tabsContainer.addEventListener("dragover", function (event) {
+        var tabEl = event.target.closest(".chat-tab");
+        if (!tabEl || !dragThreadId || tabEl.dataset.threadId === dragThreadId) return;
+        event.preventDefault();
+        var rect = tabEl.getBoundingClientRect();
+        var isLeftHalf = (event.clientX - rect.left) < rect.width / 2;
+        tabEl.classList.toggle("drag-over-left", isLeftHalf);
+        tabEl.classList.toggle("drag-over-right", !isLeftHalf);
+      });
+      tabsContainer.addEventListener("dragleave", function (event) {
+        var tabEl = event.target.closest(".chat-tab");
+        if (tabEl) tabEl.classList.remove("drag-over-left", "drag-over-right");
+      });
+      tabsContainer.addEventListener("drop", function (event) {
+        var tabEl = event.target.closest(".chat-tab");
+        var draggedId = dragThreadId;
+        dragThreadId = null;
+        if (!tabEl || !draggedId || tabEl.dataset.threadId === draggedId) return;
+        event.preventDefault();
+        tabEl.classList.remove("drag-over-left", "drag-over-right");
+        var draggedEl = tabsContainer.querySelector('[data-thread-id="' + draggedId + '"]');
+        if (!draggedEl) return;
+        var rect = tabEl.getBoundingClientRect();
+        var isLeftHalf = (event.clientX - rect.left) < rect.width / 2;
+        tabsContainer.insertBefore(draggedEl, isLeftHalf ? tabEl : tabEl.nextSibling);
+        saveTabOrder();
+        if (window.asraDebugEvent) window.asraDebugEvent("chat", "reordered tab " + draggedId);
+      });
+
+      applySavedOrder();
+      new MutationObserver(applySavedOrder).observe(tabsContainer, { childList: true });
+    })();
+
+    // ---- Quick Chat tab strip: color / rename / live-dot parity with the Terminal tab strip ----
+    // Real, explicit operator ask. Delegated on #chat-thread-tabs itself, same "wired once here,
+    // survives every later OOB/SSE swap" reasoning as the drag-and-drop block just above.
+    (function () {
+      var tabsContainer = document.getElementById("chat-thread-tabs");
+      var colorPicker = document.getElementById("chat-color-picker");
+      if (!tabsContainer || !colorPicker) return;
+
+      // ---- color: same perceived-brightness contrast + custom-property technique as
+      // static/js/terminal.js's own setTabColor/_readableTextColor/_hexToRgbTriplet -- small
+      // enough to duplicate here rather than pulling a shared module in for one page.
+      function readableTextColor(hex) {
+        var m = /^#([0-9a-f]{6})$/i.exec(hex);
+        if (!m) return "#f5f5f5";
+        var n = parseInt(m[1], 16);
+        var r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+        return (r * 299 + g * 587 + b * 114) / 1000 > 140 ? "#14161a" : "#f5f5f5";
+      }
+      function hexToRgbTriplet(hex) {
+        var m = /^#([0-9a-f]{6})$/i.exec(hex);
+        if (!m) return "128, 128, 128";
+        var n = parseInt(m[1], 16);
+        return ((n >> 16) & 255) + ", " + ((n >> 8) & 255) + ", " + (n & 255);
+      }
+      function applyTabColor(tabEl, colorValue) {
+        var style = tabEl.style;
+        if (colorValue) {
+          style.setProperty("--chat-tab-color", colorValue);
+          style.setProperty("--chat-tab-color-dim", "rgba(" + hexToRgbTriplet(colorValue) + ", 0.35)");
+          style.setProperty("--chat-tab-fg", readableTextColor(colorValue));
+        } else {
+          style.removeProperty("--chat-tab-color");
+          style.removeProperty("--chat-tab-color-dim");
+          style.removeProperty("--chat-tab-fg");
+        }
+      }
+      // Applies every tab's own server-persisted data-color -- run once on load AND after every
+      // OOB/SSE swap replaces #chat-thread-tabs' children, since a plain re-render has no idea
+      // about the CSS custom-property state a previous JS call set; only the data attribute
+      // (server-rendered fresh every time) survives a swap.
+      function applyAllTabColors() {
+        Array.prototype.forEach.call(tabsContainer.querySelectorAll(".chat-tab"), function (tabEl) {
+          applyTabColor(tabEl, tabEl.dataset.color || null);
+        });
+      }
+      applyAllTabColors();
+      new MutationObserver(applyAllTabColors).observe(tabsContainer, { childList: true });
+
+      function persistColor(threadId, colorValue) {
+        fetch("/api/session/{{ session.session_id }}/chat/thread-color", {
+          method: "POST", body: new URLSearchParams({ thread_id: threadId, color: colorValue || "" }),
+        });
+      }
+
+      function hideColorPicker() {
+        colorPicker.hidden = true;
+        if (colorPicker._asraOutsideHandler) {
+          document.removeEventListener("click", colorPicker._asraOutsideHandler);
+          colorPicker._asraOutsideHandler = null;
+        }
+      }
+
+      function openColorPicker(anchorEl, threadId, tabEl) {
+        colorPicker.innerHTML = "";
+        var row = document.createElement("div");
+        row.className = "chat-color-row";
+        var label = document.createElement("span");
+        label.textContent = "Color";
+        row.appendChild(label);
+        var colorLabel = document.createElement("label");
+        colorLabel.className = "icon-picker-colorbtn";
+        colorLabel.title = "Chat tab color — pick any";
+        colorLabel.addEventListener("click", function (event) { event.stopPropagation(); });
+        var colorInput = document.createElement("input");
+        colorInput.type = "color";
+        colorInput.value = tabEl.dataset.color || "#808080";
+        colorInput.addEventListener("input", function () { // live preview while dragging the native picker
+          tabEl.dataset.color = colorInput.value;
+          applyTabColor(tabEl, colorInput.value);
+        });
+        colorInput.addEventListener("change", function () { // fires once, when the native dialog actually closes
+          tabEl.dataset.color = colorInput.value;
+          applyTabColor(tabEl, colorInput.value);
+          persistColor(threadId, colorInput.value);
+          hideColorPicker();
+        });
+        colorLabel.appendChild(colorInput);
+        row.appendChild(colorLabel);
+        colorPicker.appendChild(row);
+
+        var divider = document.createElement("div");
+        divider.className = "chat-popover-divider";
+        colorPicker.appendChild(divider);
+
+        var resetItem = document.createElement("div");
+        resetItem.className = "chat-popover-item";
+        resetItem.textContent = "Default color";
+        resetItem.addEventListener("click", function () {
+          tabEl.dataset.color = "";
+          applyTabColor(tabEl, null);
+          persistColor(threadId, null);
+          hideColorPicker();
+        });
+        colorPicker.appendChild(resetItem);
+
+        // Simple below-left placement clamped to the viewport -- a lighter version of
+        // static/js/terminal.js's own showPopover (that one also dodges the fixed sidebar column
+        // and flips above when there's no room below, real concerns for the Terminal drawer's own
+        // narrow, sometimes-cramped placement; the Quick Chat page is a full-width page, not a
+        // narrow drawer, so this simpler version is enough here).
+        var rect = anchorEl.getBoundingClientRect();
+        colorPicker.hidden = false;
+        colorPicker.style.visibility = "hidden";
+        colorPicker.style.left = "0px";
+        colorPicker.style.top = "0px";
+        var width = colorPicker.offsetWidth;
+        colorPicker.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)) + "px";
+        colorPicker.style.top = (rect.bottom + 4) + "px";
+        colorPicker.style.visibility = "";
+
+        if (colorPicker._asraOutsideHandler) document.removeEventListener("click", colorPicker._asraOutsideHandler);
+        var onOutsideClick = function (event) {
+          if (!colorPicker.contains(event.target) && event.target !== anchorEl) hideColorPicker();
+        };
+        colorPicker._asraOutsideHandler = onOutsideClick;
+        setTimeout(function () { document.addEventListener("click", onOutsideClick); }, 0);
+      }
+
+      // ---- rename: same dblclick-to-contenteditable-commit shape as static/js/terminal.js's own
+      // wireRename, delegated instead of wired per-node so it survives every swap.
+      function commitRename(labelEl) {
+        labelEl.contentEditable = "false";
+        var threadId = labelEl.dataset.threadId;
+        var text = labelEl.textContent.replace(/\s+/g, " ").trim();
+        var committed = text || labelEl.dataset.lastCommitted || "New chat";
+        labelEl.textContent = committed;
+        labelEl.dataset.lastCommitted = committed;
+        if (!text) return; // nothing actually changed -- don't round-trip an empty rename
+        var tabEl = labelEl.closest(".chat-tab");
+        if (tabEl && tabEl.classList.contains("chat-tab-active")) {
+          var titleEl = document.getElementById("chat-panel-title");
+          if (titleEl) titleEl.textContent = committed;
+        }
+        fetch("/api/session/{{ session.session_id }}/chat/rename-thread", {
+          method: "POST", body: new URLSearchParams({ thread_id: threadId, title: committed }),
+        });
+      }
+
+      tabsContainer.addEventListener("dblclick", function (event) {
+        var labelEl = event.target.closest(".chat-tab-label");
+        if (!labelEl) return;
+        event.stopPropagation();
+        event.preventDefault();
+        labelEl.dataset.lastCommitted = labelEl.textContent;
+        labelEl.contentEditable = "true";
+        labelEl.focus();
+        var range = document.createRange();
+        range.selectNodeContents(labelEl);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      });
+      // blur/focus don't bubble -- a capturing-phase listener on the stable container is the
+      // standard way to delegate them anyway (capture fires top-down, before the non-bubbling
+      // event would otherwise be lost at its own target).
+      tabsContainer.addEventListener("blur", function (event) {
+        var labelEl = event.target.closest && event.target.closest(".chat-tab-label");
+        if (labelEl && labelEl.isContentEditable) commitRename(labelEl);
+      }, true);
+      tabsContainer.addEventListener("keydown", function (event) {
+        var labelEl = event.target.closest && event.target.closest(".chat-tab-label");
+        if (!labelEl || !labelEl.isContentEditable) return;
+        if (event.key === "Enter") { event.preventDefault(); labelEl.blur(); }
+        else if (event.key === "Escape") { labelEl.textContent = labelEl.dataset.lastCommitted || labelEl.textContent; labelEl.blur(); }
+      });
+
+      // Instant (optimistic) active-tab highlight -- applied the moment the operator clicks, not
+      // after the switch-thread round trip's OOB refresh comes back. Real, confirmed operator
+      // complaint this fixes: the tab strip used to wait on a full network round trip before the
+      // clicked tab even LOOKED selected, even though which tab is highlighted needs no data from
+      // the server at all -- static/js/terminal.js's own setActive() already does this highlight
+      // purely client-side (its tabs stay mounted, so there's nothing to fetch); this mirrors that
+      // for the one piece of chat-tab state that truly doesn't depend on the network response:
+      // the highlight. #chat-stream's own content still morphs in only once the response lands
+      // (that part IS real, server-held data, unlike terminal.js's always-mounted panes) -- this
+      // does not, and must not, try to fake THAT part.  Only toggles classes; never touches
+      // textContent/innerHTML, so it can't disturb the dblclick-to-rename detection below.
+      function markTabActiveOptimistically(clickedTabEl) {
+        var prevActive = tabsContainer.querySelector(".chat-tab.chat-tab-active");
+        if (prevActive && prevActive !== clickedTabEl) {
+          prevActive.classList.remove("chat-tab-active");
+          var prevLabel = prevActive.querySelector(".chat-tab-label");
+          if (prevLabel) { prevLabel.classList.remove("text-primary"); prevLabel.classList.add("text-secondary", "hover:text-primary"); }
+          var prevClose = prevActive.querySelector("form[hx-post*='delete-thread'] button");
+          if (prevClose) { prevClose.classList.remove("opacity-80"); prevClose.classList.add("opacity-0", "group-hover:opacity-80"); }
+        }
+        clickedTabEl.classList.add("chat-tab-active");
+        var label = clickedTabEl.querySelector(".chat-tab-label");
+        if (label) { label.classList.remove("text-secondary", "hover:text-primary"); label.classList.add("text-primary"); }
+        var closeBtn = clickedTabEl.querySelector("form[hx-post*='delete-thread'] button");
+        if (closeBtn) { closeBtn.classList.remove("opacity-0", "group-hover:opacity-80"); closeBtn.classList.add("opacity-80"); }
+        var titleEl = document.getElementById("chat-panel-title");
+        if (titleEl) {
+          var newLabel = clickedTabEl.querySelector(".chat-tab-label");
+          if (newLabel) titleEl.textContent = newLabel.textContent;
+        }
+      }
+
+      // The label is a plain span, not a real <button> -- switching threads on a single click is
+      // therefore this handler's own job now (.chat-tab-switch-form's hidden form, submitted via
+      // .requestSubmit() so htmx's normal submit interception still applies), same delegated shape
+      // every other tab-strip interaction here already uses.
+      //
+      // The actual form submit (which fetches #chat-stream's real content) stays DEFERRED, not
+      // fired synchronously on the first click -- switching threads is a real network round trip
+      // whose response replaces this whole strip's DOM (an OOB refresh of #chat-thread-tabs,
+      // main.py's _render_chat_header_oob). Confirmed live: firing it synchronously broke
+      // dblclick-to-rename outright -- the swap could land IN BETWEEN the two clicks of a double-
+      // click, and the browser's own dblclick synthesis never fired against the resulting churn. A
+      // short cancel-window (the dblclick handler below clears this same timer) is the standard fix
+      // for "single-click does X, double-click does Y" on the same element. The highlight above is
+      // exempt from all of this -- it's a synchronous classList toggle, not a DOM replacement, so it
+      // can't interfere with dblclick synthesis the way the deferred network swap could.
+      var pendingSwitchTimer = null;
+      tabsContainer.addEventListener("click", function (event) {
+        var colorBtn = event.target.closest(".chat-tab-color-btn");
+        if (colorBtn) {
+          event.preventDefault();
+          event.stopPropagation();
+          openColorPicker(colorBtn, colorBtn.dataset.threadId, colorBtn.closest(".chat-tab"));
+          return;
+        }
+        var labelEl = event.target.closest(".chat-tab-label");
+        if (!labelEl) return;
+        if (labelEl.isContentEditable) return; // mid-rename -- let the click just place the caret
+        if (event.detail > 1) {
+          if (pendingSwitchTimer) { clearTimeout(pendingSwitchTimer); pendingSwitchTimer = null; }
+          return; // second click of what's about to become a dblclick -- that owns this instead
+        }
+        var tabEl = labelEl.closest(".chat-tab");
+        if (tabEl.classList.contains("chat-tab-active")) return; // already showing this thread -- no-op
+        var form = tabEl.querySelector(".chat-tab-switch-form");
+        if (!form) return;
+        markTabActiveOptimistically(tabEl);
+        pendingSwitchTimer = setTimeout(function () { pendingSwitchTimer = null; form.requestSubmit(); }, 250);
+      });
+
+      // Middle-click closes a tab -- same convention as static/js/terminal.js's own tab strip
+      // (real, explicit operator ask for parity there) and as a normal browser tab. Reuses the
+      // delete-thread <form> already sitting in every tab (its own hx-confirm, wired through
+      // confirm_dialog.js's shared htmx:confirm hook, same "don't ask again" checkbox as the visible
+      // X button) rather than building a second confirmation path -- a plain .click() on that
+      // button's own submit triggers the exact same flow the X button already does.
+      tabsContainer.addEventListener("mousedown", function (event) {
+        if (event.button === 1 && event.target.closest(".chat-tab")) event.preventDefault(); // suppress the OS's own autoscroll icon
+      });
+      tabsContainer.addEventListener("auxclick", function (event) {
+        if (event.button !== 1) return;
+        var tabEl = event.target.closest(".chat-tab");
+        if (!tabEl) return;
+        event.preventDefault();
+        var closeBtn = tabEl.querySelector("form[hx-post*='delete-thread'] button");
+        if (closeBtn) closeBtn.click();
+      });
+    })();
+    {% endif %}
+  })();
+</script>

@@ -1,0 +1,24 @@
+{% from "macros/ui.html" import copy_button %}
+{# Result of the "Open target folder" button (session.html's Target Profile header, RE mode only,
+   main.py's open_target_folder route) -- one row per session["target"] entry. "opened" means it
+   was actually launched just now (native Linux/macOS); "windows_path" means nothing was launched
+   (WSL2 -- see projects.paths.resolve_open_target's own docstring for why) and the operator gets
+   the real Windows-shaped path to open with their own desktop shell or copy into Explorer. #}
+<div class="space-y-1.5 mt-2">
+  {% for r in results %}
+    {% if r.kind == "opened" %}
+      <p class="text-[11px] text-severity-low flex items-center gap-1.5">
+        <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Opened {{ r.folder }}
+      </p>
+    {% elif r.kind == "windows_path" %}
+      <div class="flex items-center gap-1.5 bg-elevated border border-default rounded px-2 py-1">
+        <code class="text-[10.5px] text-primary flex-1 truncate" title="{{ r.path }}">{{ r.path }}</code>
+        {{ copy_button(r.path) }}
+      </div>
+      <p class="text-[10px] text-secondary/70">Opening this directly isn't safe from inside WSL2 — paste the path into File Explorer's address bar instead.</p>
+    {% else %}
+      <p class="text-[11px] text-severity-high">{{ r.message }}</p>
+    {% endif %}
+  {% endfor %}
+</div>

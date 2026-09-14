@@ -1,0 +1,60 @@
+{# Intruder's own live results table -- SELF-swapping (hx-get on this same root element, targeting
+   itself via outerHTML) rather than Site Map's morph:innerHTML: this element's own hx-trigger
+   value must be able to CHANGE between polls (drops "every 2s" the instant `running` goes false,
+   so polling actually stops once the attack finishes instead of continuing forever) -- morph only
+   ever rewrites CHILDREN, never the container's own attributes, so it can't do that. Sort-column
+   links and the "Anomalies only" checkbox both target this same id, replacing it with a freshly
+   rendered version whose OWN hx-get/hx-trigger carry the new sort/filter forward -- the next
+   automatic poll (if still running) keeps that choice without the operator having to reselect it
+   every 2 seconds. #}
+{% set trigger = "load, every 2s" if running else "load" %}
+<div id="toolkit-intruder-results"
+     hx-get="{{ toolkit_base_url }}/intruder/results/{{ run_id }}?expected={{ expected }}&sort={{ sort }}&anomalies_only={{ anomalies_only | lower }}"
+     hx-trigger="{{ trigger }}" hx-swap="outerHTML">
+  <div class="flex items-center justify-between mb-2">
+    <p class="text-[11px] text-secondary">
+      {{ received }}/{{ expected }} attempt(s){% if running %} &mdash; running&hellip;{% else %} &mdash; done{% endif %}
+    </p>
+    <label class="flex items-center gap-1 text-[11px] text-secondary cursor-pointer">
+      <input type="checkbox" {% if anomalies_only %}checked{% endif %}
+             hx-get="{{ toolkit_base_url }}/intruder/results/{{ run_id }}?expected={{ expected }}&sort={{ sort }}&anomalies_only={{ (not anomalies_only) | lower }}"
+             hx-target="#toolkit-intruder-results" hx-swap="outerHTML">
+      Anomalies only
+    </label>
+  </div>
+
+  {% if rows %}
+    <div class="border border-default rounded-lg overflow-auto max-h-96 asra-scroll">
+      <table class="w-full text-[11px] font-mono border-collapse">
+        <thead>
+          <tr class="text-secondary text-left">
+            <th class="px-2 py-1 font-semibold uppercase tracking-wider">Payload</th>
+            {% for key, label in [("status", "Status"), ("length", "Length"), ("duration", "Time")] %}
+              <th class="px-2 py-1 font-semibold uppercase tracking-wider">
+                <a hx-get="{{ toolkit_base_url }}/intruder/results/{{ run_id }}?expected={{ expected }}&sort={{ key }}&anomalies_only={{ anomalies_only | lower }}"
+                   hx-target="#toolkit-intruder-results" hx-swap="outerHTML"
+                   class="cursor-pointer hover:text-primary {{ 'text-accent' if sort == key else '' }}">{{ label }}</a>
+              </th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr class="border-t border-default {{ 'bg-severity-high/10' if row.is_anomaly else '' }}">
+              <td class="px-2 py-1 text-primary truncate max-w-xs">{{ row.intruder_payload_values | join(" | ") if row.intruder_payload_values else "—" }}</td>
+              <td class="px-2 py-1 font-mono
+                         {{ 'text-severity-low' if row.response_status and row.response_status < 300
+                            else 'text-severity-medium' if row.response_status and row.response_status < 400
+                            else 'text-severity-high' if row.response_status and row.response_status >= 400
+                            else 'text-secondary' }}">{{ row.response_status or '—' }}</td>
+              <td class="px-2 py-1 text-secondary">{{ row.response_content_length if row.response_content_length is not none else '—' }} B</td>
+              <td class="px-2 py-1 text-secondary">{{ row.duration_ms if row.duration_ms is not none else '—' }} ms</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="text-sm text-secondary italic py-4">{% if running %}Waiting for the first result&hellip;{% else %}No results.{% endif %}</p>
+  {% endif %}
+</div>

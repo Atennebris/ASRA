@@ -1,0 +1,236 @@
+{# Tools tab content -- moved here from the old standalone /tools page (real, explicit operator
+   ask to fold it into Settings instead of its own sidebar entry). Rendered as Settings' own "tools"
+   tab panel (settings.html); the route/context that used to feed the standalone page now feeds this
+   same partial via GET /settings (main.py's get_settings merges in _grouped_tools_context +
+   nuclei_packs alongside every other tab's own context). #}
+<p class="text-[11px] text-secondary mb-4">
+  Every tool ASRA's registry knows about, and whether it's actually installed on this machine
+  right now — the same live check the agent itself makes before running one. Grouped by what
+  it's actually for (this is what the Subagents tab's own colored dots draw from too), then by
+  how it gets installed: <span class="text-primary font-medium">Native</span> ships with ASRA's
+  own Python code, no separate step; <span class="text-primary font-medium">External</span> is a
+  real binary <code class="font-mono">setup_tools.sh</code> has to provision, so it's the one that
+  can genuinely be missing on a given machine.
+</p>
+
+{# Arsenal readiness + one-click install (agent/tools/arsenal.py, agent/tools/arsenal_install.py).
+   Two buttons whose output lands inline in #arsenal-output below -- nothing pops over, per the
+   agreed design. "Install" first shows its own warning/confirm step, and only runs after it. #}
+<div class="bg-elevated border border-default rounded-lg p-4 mb-6">
+  <div class="flex flex-wrap items-center gap-2">
+    <button type="button" hx-get="/api/tools/arsenal/check" hx-target="#arsenal-output" hx-swap="innerHTML"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent/10 text-accent border border-accent/30 hover:bg-accent/20 h-8 px-4 text-[12px]">
+      Check arsenal
+    </button>
+    <button type="button" hx-get="/api/tools/arsenal/install/confirm" hx-target="#arsenal-output" hx-swap="innerHTML"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-4 text-[12px]">
+      Install
+    </button>
+    <span class="text-[11px] text-secondary">Check whether the external arsenal is installed, and add what's missing in one click.</span>
+  </div>
+  <div id="arsenal-output" class="empty:hidden mt-3"></div>
+</div>
+
+{# Real, confirmed bug this fixes: #arsenal-install-view (partials/arsenal_install.html) polls
+   itself every 2s with hx-swap="outerHTML" while the install runs -- that destroys and recreates
+   the whole element (log <pre> included) on every poll, which resets its scrollTop to 0. To
+   anyone watching, every new output line yanked the view back to the TOP of the log instead of
+   following the tail. #arsenal-output itself is never swapped (only its child is), so it's a
+   stable place to hang htmx:beforeSwap/afterSwap listeners across every one of those swaps --
+   same "auto-follow only if already at the bottom" pattern session.html's own log stream uses. #}
+<script>
+  (function () {
+    var arsenalOutput = document.getElementById("arsenal-output");
+    if (!arsenalOutput) return;
+    // Not scoped by event.target id on purpose -- for an outerHTML swap, htmx dispatches
+    // afterSwap on whichever element still exists once the original (now-removed) target is
+    // gone, which isn't reliably #arsenal-install-view itself. Looking the log element up by id
+    // fresh in each handler sidesteps that entirely: before a swap it's still the old node,
+    // after a swap it's the new one (or null, for the Check/Install buttons' own swaps, which
+    // don't touch this log at all -- harmless no-op either way).
+    var wasAtBottom = true;
+    arsenalOutput.addEventListener("htmx:beforeSwap", function () {
+      var log = document.getElementById("arsenal-install-log");
+      wasAtBottom = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 20;
+    });
+    arsenalOutput.addEventListener("htmx:afterSwap", function () {
+      if (!wasAtBottom) return;
+      var log = document.getElementById("arsenal-install-log");
+      if (log) log.scrollTop = log.scrollHeight;
+    });
+  })();
+</script>
+
+{# Optional nuclei template packs (agent/tools/nuclei_template_packs.py) -- nothing enabled by
+   default; nuclei already keeps its own official template set up to date on every run on its
+   own, this is only extra third-party packs an operator opts into. #}
+<div class="bg-elevated border border-default rounded-lg p-4 mb-6">
+  <p class="text-[13px] font-semibold text-primary mb-1">Nuclei template packs</p>
+  <p class="text-[11px] text-secondary mb-3 max-w-[46rem]">
+    Optional, extra template sources beyond nuclei's own official set (which nuclei keeps current
+    on every run by itself — no action needed for that). Each pack is fetched straight from its
+    own GitHub repo via nuclei's built-in <code class="font-mono">-t github/&lt;repo&gt;</code>
+    mechanism, never copied into this repo, so it stays under its own license and its own upstream
+    updates. Requires nuclei to already be installed (Arsenal, above).
+  </p>
+  {% include "partials/nuclei_packs_list.html" %}
+</div>
+
+{% if not sections %}
+  {{ empty_state("No tools registered", "Something is wrong with this install — the tool registry should never be empty.") }}
+{% else %}
+  {# Plain client-side filtering (no htmx round-trip, no framework) -- the whole registry is
+     ~100 rows, cheap enough to filter in the browser instantly on every click. Grouped sections
+     stay exactly as they render server-side; a filter just toggles [data-tool-row] visibility
+     and then hides any tier-block/domain-section left with nothing visible in it, so narrowing
+     down (e.g. "just what's missing") never leaves an empty "Native" label floating over
+     nothing.
+
+     Each group is a real segmented control (a bordered "track" holding its own options as one
+     cohesive widget, the active one filled solid with the accent color) -- not plain text links,
+     which a real operator confirmed live read as inert, unclickable labels. The bordered track
+     itself is the affordance: it looks like a control before you ever hover it, the same way
+     toggle_switch/button (macros/ui.html) already commit to a real visual widget rather than
+     styled text anywhere else clickable in this app. #}
+  <div class="flex flex-wrap items-end gap-x-6 gap-y-3 mb-5" role="group" aria-label="Filter tools">
+    <div data-filter-group-wrap="domain">
+      <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Domain</span>
+      <div class="asra-segmented" role="radiogroup" aria-label="Filter by domain">
+        <button type="button" class="asra-segment active" role="radio" aria-checked="true" data-filter-group="domain" data-filter-value="all">All</button>
+        {% for section in sections %}
+          <button type="button" class="asra-segment" role="radio" aria-checked="false" data-filter-group="domain" data-filter-value="{{ section.key }}">{{ section.label }}</button>
+        {% endfor %}
+      </div>
+    </div>
+    <div data-filter-group-wrap="tier">
+      <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Type</span>
+      <div class="asra-segmented" role="radiogroup" aria-label="Filter by install type">
+        <button type="button" class="asra-segment active" role="radio" aria-checked="true" data-filter-group="tier" data-filter-value="all">All</button>
+        <button type="button" class="asra-segment" role="radio" aria-checked="false" data-filter-group="tier" data-filter-value="native">Native</button>
+        <button type="button" class="asra-segment" role="radio" aria-checked="false" data-filter-group="tier" data-filter-value="external">External</button>
+      </div>
+    </div>
+    <div data-filter-group-wrap="status">
+      <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Status</span>
+      <div class="asra-segmented" role="radiogroup" aria-label="Filter by status">
+        <button type="button" class="asra-segment active" role="radio" aria-checked="true" data-filter-group="status" data-filter-value="all">All</button>
+        <button type="button" class="asra-segment" role="radio" aria-checked="false" data-filter-group="status" data-filter-value="installed">Installed</button>
+        <button type="button" class="asra-segment" role="radio" aria-checked="false" data-filter-group="status" data-filter-value="missing">Missing</button>
+      </div>
+    </div>
+    <span id="tools-filter-empty" class="hidden text-[11px] text-secondary italic pb-1.5">No tool matches this combination.</span>
+  </div>
+
+  {% macro tool_table(tools) %}
+    <table class="w-full text-[12px]">
+      <thead>
+        <tr class="text-left text-secondary border-b border-default">
+          <th class="py-1.5 pr-3 font-medium">Name</th>
+          <th class="py-1.5 pr-3 font-medium">Category</th>
+          <th class="py-1.5 pr-3 font-medium">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tool in tools %}
+          <tr class="border-b border-default/50 last:border-b-0" data-tool-row data-status="{{ 'installed' if tool.installed else 'missing' }}">
+            <td class="py-1.5 pr-3 text-primary font-mono whitespace-nowrap">{{ tool.name }}</td>
+            <td class="py-1.5 pr-3 text-secondary whitespace-nowrap">{{ tool.categories | join(", ") }}</td>
+            <td class="py-1.5 pr-3 whitespace-nowrap">
+              {% if tool.installed %}
+                {# Only the DOT switches to text-status-online (a real, established green --
+                   base.html's own Tailwind config, static/css/themes.css's --status-online):
+                   confirmed live the operator wants the lamp itself green but the "Installed"
+                   WORD kept exactly as it already was (text-severity-low, this app's own
+                   deliberate blue) -- a mismatched-color status pairing on purpose here, not an
+                   oversight; don't "fix" this back into a matched pair without being told to. #}
+                <span class="inline-flex items-center gap-1.5 text-severity-low"><span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span>Installed</span>
+              {% else %}
+                <span class="inline-flex items-center gap-1.5 text-severity-high"><span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span>{{ "Not installed" if tool.checks_dependency else "Not found on PATH" }}</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endmacro %}
+
+  <div class="space-y-5" id="tools-sections">
+    {% for section in sections %}
+      {% if section.native or section.external %}
+        <div class="bg-surface border border-default rounded-lg p-4" data-domain-section data-domain="{{ section.key }}">
+          <div class="flex items-baseline gap-2 mb-1">
+            <h2 class="text-[13px] font-semibold text-primary">{{ section.label }}</h2>
+            <span class="text-[10.5px] text-secondary">{{ (section.native | length) + (section.external | length) }} tools</span>
+          </div>
+          <p class="text-[10.5px] text-secondary mb-3 leading-relaxed max-w-[52rem]">{{ section.description }}</p>
+          {% if section.native %}
+            <div class="mb-3" data-tier-block data-tier="native">
+              <span class="block text-[10.5px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Native — ships with ASRA</span>
+              <div class="overflow-x-auto">{{ tool_table(section.native) }}</div>
+            </div>
+          {% endif %}
+          {% if section.external %}
+            <div data-tier-block data-tier="external">
+              <span class="block text-[10.5px] font-semibold uppercase tracking-wider text-secondary mb-1.5">External — provisioned by setup_tools.sh</span>
+              <div class="overflow-x-auto">{{ tool_table(section.external) }}</div>
+            </div>
+          {% endif %}
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+
+  {# data-domain/data-tier live on the tool ROW itself too (not just its ancestor blocks) so the
+     filter script never has to walk back up the DOM to know a row's own domain/tier -- set via
+     a tiny inline script pass over already-rendered rows instead of threading two more Jinja
+     params through tool_table, since the ancestor blocks already carry the real values. #}
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      document.querySelectorAll("[data-domain-section]").forEach(function (section) {
+        var domain = section.getAttribute("data-domain");
+        section.querySelectorAll("[data-tier-block]").forEach(function (block) {
+          var tier = block.getAttribute("data-tier");
+          block.querySelectorAll("[data-tool-row]").forEach(function (row) {
+            row.setAttribute("data-domain", domain);
+            row.setAttribute("data-tier", tier);
+          });
+        });
+      });
+
+      var filters = { domain: "all", tier: "all", status: "all" };
+
+      function applyFilters() {
+        var anyVisibleTotal = false;
+        document.querySelectorAll("[data-tool-row]").forEach(function (row) {
+          var matches = (filters.domain === "all" || row.getAttribute("data-domain") === filters.domain)
+            && (filters.tier === "all" || row.getAttribute("data-tier") === filters.tier)
+            && (filters.status === "all" || row.getAttribute("data-status") === filters.status);
+          row.classList.toggle("hidden", !matches);
+          if (matches) anyVisibleTotal = true;
+        });
+        document.querySelectorAll("[data-tier-block]").forEach(function (block) {
+          var anyVisible = block.querySelectorAll("[data-tool-row]:not(.hidden)").length > 0;
+          block.classList.toggle("hidden", !anyVisible);
+        });
+        document.querySelectorAll("[data-domain-section]").forEach(function (section) {
+          var anyVisible = section.querySelectorAll("[data-tool-row]:not(.hidden)").length > 0;
+          section.classList.toggle("hidden", !anyVisible);
+        });
+        document.getElementById("tools-filter-empty").classList.toggle("hidden", anyVisibleTotal);
+      }
+
+      document.querySelectorAll("[data-filter-group]").forEach(function (chip) {
+        chip.addEventListener("click", function () {
+          var group = chip.getAttribute("data-filter-group");
+          filters[group] = chip.getAttribute("data-filter-value");
+          document.querySelectorAll('[data-filter-group="' + group + '"]').forEach(function (c) {
+            c.classList.toggle("active", c === chip);
+            c.setAttribute("aria-checked", c === chip ? "true" : "false");
+          });
+          applyFilters();
+          if (window.asraDebugEvent) window.asraDebugEvent("tools-filter", group + "=" + filters[group]);
+        });
+      });
+    });
+  </script>
+{% endif %}

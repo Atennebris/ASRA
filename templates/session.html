@@ -1,37 +1,422 @@
 {% extends "base.html" %}
+{% from "macros/ui.html" import tab_bar %}
+{% from "macros/nav.html" import nav_icon %}
 {% block title %}ASRA &mdash; {{ session.name or session.session_id }}{% endblock %}
-{% block main_class %}max-w-none{% endblock %}
 {% block content %}
-  <div class="flex items-center justify-between py-3.5 border-b border-default mb-4">
+  {# The slide-out terminal drawer below embeds partials/terminal_panel.html, same as the standalone
+     Terminal page (templates/terminal.html) -- needs this same xterm.css. Was in {% block head %}
+     until base.html's #sidebar/listing-page hx-boost could reach this page directly (a <link
+     rel="stylesheet"> works identically in <body> or <head>, unlike a <style> tag's placement
+     mattering) -- boosting only ever swaps #main-content, never <head>, so anything a boosted-in
+     page needs has to live in block content instead, same fix as settings.html's own
+     view-transition <style>. #}
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+{% if session.mode in ("interactive", "reverse_engineering") %}
+  {# Interactive AND Reverse Engineering modes share this same workspace shape: the chat panel plus
+     a "Logs" bar, no plan/findings tabs, no scan SSE. chat_panel.html carries its OWN /chat/stream
+     SSE + all its own scripts, so it's fully self-contained here. The wrapper gives it a real
+     bounded height for its lg:h-full to resolve against (themes.css's .interactive-workspace).
+     RE mode's one real difference: agent/core.py's run_re_triage already ran a bounded baseline
+     pass before this page is ever reached (via the Start button, main.py's start_session route),
+     so session["findings"]/session["logs"] may already be non-empty on first load here, unlike
+     Interactive mode which always starts from zero. #}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div data-mascot-track class="relative flex items-start justify-between py-3.5 border-b border-default mb-4">
+    <div class="min-w-0">
+      <h1 class="text-[13px] font-semibold text-primary truncate">{{ session.name or session.session_id }}</h1>
+      <p class="text-[11px] text-secondary truncate">{{ "Reverse Engineering mode" if session.mode == "reverse_engineering" else "Interactive mode" }} &middot; {{ session.session_id }}
+        {% set project_folder = get_session_folder(session.session_id) %}
+        {% if project_folder %}
+          <a href="/terminal?cwd={{ project_folder | urlencode }}" title="Open a real terminal here"
+             class="ml-1 text-secondary hover:text-accent underline decoration-dotted">&middot; Open terminal here</a>
+        {% endif %}
+      </p>
+    </div>
+    {# static/js/mascot.js's own mount point -- context="chat" since this branch never renders
+       session_fragment.html (no #session-content/data-status to react to), only #chat-messages.
+       A real inline flex item (themes.css's .asra-mascot), not an overlay -- the row grows to fit
+       it like any other content, on purpose (see that CSS comment for the complaint this fixes). #}
+    <span data-mascot-mount data-mascot-context="chat" class="shrink-0"></span>
+    {% include "macros/header_light.html" %}
+  </div>
+  {% if session.mode == "reverse_engineering" %}
+    {# The one real difference from Interactive mode: a Start trigger for agent/core.py's
+       run_re_triage, scheduled via the same POST /api/session/{id}/start route Agent-mode's own
+       Start button uses (main.py's start_session already branches on session.mode to run_re_triage
+       instead of run_session). Real incident this fixes: this workspace was copied wholesale from
+       Interactive mode without this block, so a freshly-created RE project had no way at all to
+       reach run_re_triage -- session.status stayed "created" forever and the operator could only
+       ever drive the chat manually, silently losing the whole "short automatic baseline pass"
+       half of this mode's design. Plain (non-htmx) form submit -- the redirect start_session
+       already returns lands back on this exact page, which is enough to reflect the new status.
+       The block itself lives in its own partial so htmx can re-poll it live while a pass runs --
+       see re_control_bar.html for why a static version left a stale Stop button hanging. #}
+    {% include "partials/re_control_bar.html" %}
+  {% endif %}
+  {# Defined BEFORE the chat panel include below, so chat_panel.html's own setChatCollapsed sees
+     this hook the moment it loads and delegates to it (its collapse arrow reveals the Findings split
+     instead of sliding the chat off-screen). Looks the workspace up lazily, so defining it above the
+     element it touches is fine. #}
+  <script>
+    // Scoped by session_id, unlike chat_panel.html's own COLLAPSE_STORAGE_KEY (a single global
+    // "asra-chat-collapsed" key shared across every Agent-mode session, deliberately never
+    // restored here — see that file's own comment for why a global key can't be reused for this
+    // mode: it would leak one session's collapsed state into an unrelated one on first load).
+    // A per-session key sidesteps that exact concern while still fixing the real complaint: this
+    // session's OWN state (findings split open, or chat) surviving an actual page reload of the
+    // SAME project, not carrying over between different projects.
+    var INTERACTIVE_FINDINGS_OPEN_KEY = "asra-findings-open-{{ session.session_id }}";
+    window.asraInteractiveCollapse = function (collapsed) {
+      var ws = document.getElementById("interactive-workspace");
+      if (!ws) return;
+      ws.classList.toggle("findings-open", collapsed);
+      localStorage.setItem(INTERACTIVE_FINDINGS_OPEN_KEY, collapsed ? "1" : "0");
+      if (collapsed) {
+        htmx.ajax("GET", "/api/session/{{ session.session_id }}/interactive-findings",
+                  {target: "#interactive-findings-content", swap: "innerHTML"});
+        {% if session.mode == "reverse_engineering" %}
+        htmx.ajax("GET", "/api/session/{{ session.session_id }}/target-profile",
+                  {target: "#target-profile-content", swap: "innerHTML"});
+        {% endif %}
+      }
+      if (window.asraDebugEvent) window.asraDebugEvent("interactive-findings", collapsed ? "opened" : "closed");
+    };
+    // #interactive-workspace itself is defined further down in this same page -- deferred to
+    // DOMContentLoaded so the lookup inside asraInteractiveCollapse doesn't run before that
+    // element actually exists (this script block runs at parse time, well before it).
+    document.addEventListener("DOMContentLoaded", function () {
+      var wasCollapsed = localStorage.getItem(INTERACTIVE_FINDINGS_OPEN_KEY) === "1";
+      {% if session.mode == "reverse_engineering" and session.status in ("pending", "processing") %}
+        // A live baseline-triage run auto-reveals the info tabs (Graph pre-selected by the
+        // "checked" attribute rendered server-side below) instead of leaving the operator looking
+        // at the chat pane's own now-content-free "triage is running" placeholder -- real,
+        // confirmed operator ask: whatever view auto-shows while a scan is live should be the
+        // interesting one (the graph), not an empty placeholder one click away from it.
+        wasCollapsed = true;
+      {% endif %}
+      if (wasCollapsed) window.asraInteractiveCollapse(true);
+    });
+  </script>
+
+  {# Chat is the stage by default; collapsing it (chat_panel's arrow, or the info tabs below while
+     RE mode) swaps in the Findings split. For RE mode this split is a real 3-way tab bar (Graph /
+     Triage / Findings) instead of a fixed 2-column grid -- Chat itself is deliberately NOT one of
+     these tabs (real, confirmed operator correction: chat already has its own reveal/collapse
+     button, a redundant "Chat" tab inside the split only confused which pane a graph was even
+     supposed to belong to). Interactive mode keeps the original fixed Findings+Reserved 2-column
+     layout unchanged, since it has no graph/timeline data to show tabs for. #}
+  <div class="interactive-workspace" id="interactive-workspace">
+    <div class="interactive-stage">
+      <div class="interactive-chat-pane">
+        {% include "partials/re_triage_stage.html" %}
+      </div>
+      <div class="interactive-findings-split{{ ' re-info-tabs' if session.mode == 'reverse_engineering' else '' }}">
+        {% if session.mode == "reverse_engineering" %}
+          {% set is_live = session.status in ("pending", "processing") %}
+          <input type="radio" id="re-info-graph" name="re-info-tab" class="sr-only" {{ "checked" if is_live else "" }}>
+          <input type="radio" id="re-info-triage" name="re-info-tab" class="sr-only">
+          <input type="radio" id="re-info-findings" name="re-info-tab" class="sr-only" {{ "checked" if not is_live else "" }}>
+          <input type="radio" id="re-info-summary" name="re-info-tab" class="sr-only">
+          {# Anti-FOUC tab restore, same technique/reason as macros/ui.html's tab_bar() own inline
+             script (that file's own long comment) -- must run synchronously here, immediately after
+             the radios just above, not deferred to DOMContentLoaded, so the operator's last-viewed
+             tab (Summary, say) is already checked before the browser paints anything, instead of
+             visibly flashing the server's live/not-live default first. Only overrides the
+             server-rendered default when an actual saved choice exists -- a fresh session with
+             nothing saved yet still gets the live/not-live default computed above.
+             static/js/session_tab_memory.js is the save half (listens for this radio group's own
+             "change" event); this is only ever the restore half. #}
+          <script>
+            (function () {
+              try {
+                var saved = localStorage.getItem("asra-re-info-tab-" + {{ session.session_id | tojson }});
+                if (!saved) return;
+                var radio = document.getElementById("re-info-" + saved);
+                if (radio && radio.name === "re-info-tab") radio.checked = true;
+              } catch (e) {}
+            })();
+          </script>
+          <div class="asra-segmented re-info-tabbar mb-3 shrink-0">
+            <label for="re-info-graph" role="button" class="asra-segment">Graph</label>
+            <label for="re-info-triage" role="button" class="asra-segment">Logs</label>
+            <label for="re-info-findings" role="button" class="asra-segment">Findings</label>
+            <label for="re-info-summary" role="button" class="asra-segment">Summary</label>
+          </div>
+          {% include "partials/re_triage_tab.html" %}
+          <section class="interactive-pane re-info-panel-findings">
+            <header class="interactive-pane-head">
+              <span class="text-[13px] font-semibold text-primary">Findings</span>
+            </header>
+            {# hx-trigger="load, every 3s" -- "load" populates this on first paint (the div has no
+               server-rendered content of its own), "every 3s" keeps it live afterward instead of
+               only ever refreshing on the next chat-collapse toggle (window.asraInteractiveCollapse
+               above). Real, confirmed gap this closes: a finding recorded by a still-running RE
+               triage/re-verify pass, or by the chat itself, never appeared here until the operator
+               happened to collapse/expand the chat panel again -- this tab looked frozen even while
+               real work was actively landing behind it. morph (not a plain innerHTML swap) so an
+               already-open finding <dialog> (interactive_findings.html's own per-finding dialogs,
+               rendered inside this same fragment) survives a poll tick instead of being torn down
+               and silently closed under the operator. #}
+            <div id="interactive-findings-content" class="interactive-pane-body asra-scroll" hx-ext="morph"
+                 hx-get="/api/session/{{ session.session_id }}/interactive-findings" hx-trigger="load, every 3s" hx-swap="morph:innerHTML"></div>
+            {# Target Profile -- durable facts about THIS target (language, compiler, obfuscator,
+               platform, version, ...) the agent established via record_target_profile
+               (agent/core.py), fed to every later chat turn too (agent/chat.py's
+               _session_snapshot). Real gap this closes: an RE session repeatedly re-discovered
+               the same tech-stack facts across turns/subagent delegations with nothing durable
+               holding them in view. Stacked under Findings in this same tab rather than its own
+               separate tab -- both are "what do we know" facts, not separate workflows. #}
+            <header class="interactive-pane-head border-t border-default">
+              <span class="text-[13px] font-semibold text-primary">Target Profile</span>
+              {# Opens (or, under WSL2, surfaces a copyable path for) the local file/folder the RE
+                 target was staged into -- a git clone or archive extraction lands in this
+                 project's own re_target/ folder, a plain local path is referenced in place. See
+                 main.py's open_target_folder route + projects.paths.resolve_open_target. #}
+              <button type="button" id="open-target-folder-btn"
+                      hx-post="/api/session/{{ session.session_id }}/open-target-folder"
+                      hx-target="#open-target-folder-result" hx-swap="innerHTML"
+                      hx-on::before-request="this.textContent='Opening…'"
+                      hx-on::after-request="this.textContent='Open target folder'"
+                      class="inline-flex items-center gap-1.5 rounded border border-default bg-elevated hover:bg-overlay hover:border-accent px-2 py-1 text-[11px] text-secondary hover:text-primary transition-colors shrink-0">
+                <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7a2 2 0 012-2h4l2 2h6a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Open target folder
+              </button>
+            </header>
+            <div id="target-profile-content" class="interactive-pane-body asra-scroll"></div>
+            <div id="open-target-folder-result" class="px-3 pb-2 shrink-0"></div>
+          </section>
+          {# Summary -- the RE-mode analog of the Agent pipeline's own Summary tab (session_fragment.
+             html), the one view meant to be read LAST once Graph/Logs/Findings are done. Rendered
+             directly here for a correct, flash-free first paint (this page's own `session` context
+             is already enough for that), then kept live by the same polling GET this content also
+             has its own route for (main.py's re_summary_tab) -- real, confirmed gap this closes:
+             this tab used to never update again after the initial page load, no matter how long a
+             triage/re-verify pass kept running in the background; only F5 ever refreshed it. morph
+             (not a plain innerHTML swap) for the same reason Graph/Logs/Findings all use it here --
+             nothing stateful lives in this tab today, but a plain swap would silently re-decide that
+             for any future addition instead of it being a deliberate choice. #}
+          <section class="interactive-pane re-info-panel-summary">
+            <header class="interactive-pane-head">
+              <span class="text-[13px] font-semibold text-primary">Summary</span>
+            </header>
+            <div class="interactive-pane-body asra-scroll" hx-ext="morph"
+                 hx-get="/api/session/{{ session.session_id }}/re-summary-tab" hx-trigger="every 3s" hx-swap="morph:innerHTML">
+              {% include "partials/re_summary_tab.html" %}
+            </div>
+          </section>
+        {% else %}
+          <section class="interactive-pane interactive-findings-pane">
+            <header class="interactive-pane-head">
+              <span class="text-[13px] font-semibold text-primary">Findings</span>
+            </header>
+            {# hx-trigger="load, every 3s" -- "load" populates this on first paint (the div has no
+               server-rendered content of its own), "every 3s" keeps it live afterward instead of
+               only ever refreshing on the next chat-collapse toggle (window.asraInteractiveCollapse
+               above). Real, confirmed gap this closes: a finding recorded by a still-running RE
+               triage/re-verify pass, or by the chat itself, never appeared here until the operator
+               happened to collapse/expand the chat panel again -- this tab looked frozen even while
+               real work was actively landing behind it. morph (not a plain innerHTML swap) so an
+               already-open finding <dialog> (interactive_findings.html's own per-finding dialogs,
+               rendered inside this same fragment) survives a poll tick instead of being torn down
+               and silently closed under the operator. #}
+            <div id="interactive-findings-content" class="interactive-pane-body asra-scroll" hx-ext="morph"
+                 hx-get="/api/session/{{ session.session_id }}/interactive-findings" hx-trigger="load, every 3s" hx-swap="morph:innerHTML"></div>
+          </section>
+          <section class="interactive-pane interactive-reserved-pane">
+            <div class="text-center px-6">
+              <svg class="w-6 h-6 mx-auto text-secondary/60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></svg>
+              <p class="text-[12px] font-medium text-secondary mt-2">Reserved</p>
+              <p class="text-[10.5px] text-secondary/70 mt-1">More lands here soon.</p>
+            </div>
+          </section>
+        {% endif %}
+      </div>
+
+      {# Reopen handle -- the same right-edge tab the 2-column agent layout uses to bring a collapsed
+         chat back (chat_panel.html's #chat-reopen-handle), replicated here as a direct child of the
+         workspace (NOT inside .interactive-chat-pane, which is display:none while findings show, so
+         a handle in there would be hidden too). Shown only when findings are open (themes.css).
+
+         ALWAYS clickable now -- it used to be server-rendered `disabled` while a live RE-triage pass
+         was pending/processing, re-enabled only by a live 3s poll (re_triage_stage.html) the instant
+         triage actually finished. Real, confirmed operator incident this simplification fixes: that
+         poll is the ONLY thing that ever clears the disabled attribute -- if it's ever missed for any
+         reason (this exact button sitting through a LATER processing state too, e.g. a Re-verify
+         pass kicked off from the Findings tab while chat was already open and then collapsed; a
+         dropped poll tick; more than one tab/window open on the same session, each with its own,
+         independently stale view of this flag) there is no other path that ever re-enables it --
+         reported live as "collapsed chat mid-scan, then no working way back to it at all, only a
+         full page reload (the sidebar's own active-session link) fixed it." Removing the disabled
+         state removes the entire class of "this flag drifted out of sync with reality" bugs instead
+         of chasing the specific trigger: clicking this while triage is GENUINELY still running is
+         completely safe regardless -- .interactive-chat-pane still holds re_triage_stage.html's own
+         "Baseline triage is running" spinner at that point (chat_panel.html, and the write-race its
+         own comment warns about, don't exist in the DOM at all yet), so revealing it just shows that
+         same live-updating status instead of Findings/Graph, never a broken or empty pane. #}
+      <button type="button" id="interactive-reopen-handle"
+              class="interactive-reopen-handle fixed right-0 top-1/2 -translate-y-1/2 z-20 bg-accent hover:bg-accent-hover text-white rounded-l-lg px-1.5 py-3 shadow-lg"
+              title="Back to chat" aria-label="Back to chat"
+              onclick="window.asraInteractiveCollapse(false)">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 5l-7 7 7 7" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      </button>
+    </div>
+    {% if session.mode != "reverse_engineering" %}
+      {# RE mode's own Triage tab already IS this same activity log, always visible, no popup
+         needed -- real, confirmed operator complaint this closes: having both a "Triage" tab AND
+         this floating "Logs" button open the exact same data was pointless duplication. Interactive
+         mode has no such tab, so it keeps this as its only way to see the trace. #}
+      <div class="interactive-log-bar shrink-0">
+        <button type="button" id="interactive-log-btn"
+                hx-get="/api/session/{{ session.session_id }}/interactive-log"
+                hx-target="#interactive-log-content" hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('interactive-log-modal').showModal()"
+                class="inline-flex items-center gap-2 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M4 6h16M4 12h10M4 18h7" stroke-linecap="round"/>
+          </svg>
+          Logs
+        </button>
+      </div>
+    {% endif %}
+  </div>
+
+  {# The activity-log modal -- a sibling of the workspace, never inside any morphed subtree. Content
+     is fetched fresh on each open by the button above (hx-get -> #interactive-log-content). #}
+  <dialog id="interactive-log-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-3xl max-h-[85vh] flex flex-col overflow-hidden backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
+      <span class="text-[13px] font-semibold">Activity log</span>
+      <button type="button" onclick="document.getElementById('interactive-log-modal').close()"
+              class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <div id="interactive-log-content" class="p-4 overflow-y-auto asra-scroll min-h-0"></div>
+  </dialog>
+{% else %}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div data-mascot-track class="relative flex items-start justify-between py-3.5 border-b border-default mb-4">
     <div class="min-w-0">
       <h1 class="text-[13px] font-semibold text-primary truncate">{{ session.name or session.session_id }}</h1>
       {% if session.name %}<p class="text-[11px] text-secondary truncate">{{ session.session_id }}</p>{% endif %}
     </div>
-    {# Always connects, regardless of status at page load — a session that looks finished can
-       still come back to life later (the Deep dive button can flip a completed session back to
-       processing). Skipping the connection for an already-terminal session used to avoid the
-       reconnect-flap bug, but it meant an already-open tab had no way to ever see a Deep dive
-       run's progress without a manual reload. main.py's stream_session never voluntarily closes
-       the connection either (see that file), which is the actual fix for the flapping — this
-       doesn't need to also skip connecting in the first place. #}
-    <span id="sse-indicator" class="text-[11px] px-2 py-1 rounded border border-default text-secondary shrink-0">connecting&hellip;</span>
+    {# sse-indicator + the mascot mount are grouped in their own flex column so this outer row
+       stays a clean 2-way justify-between split (title-block | this group) regardless of whether
+       a mascot is mounted -- three direct children here would make justify-between space all
+       three apart instead of pushing this group as a whole to the right edge. #}
+    <div class="flex flex-col items-end gap-2 shrink-0">
+      {# Always connects, regardless of status at page load — a session that looks finished can
+         still come back to life later (the Deep dive button can flip a completed session back to
+         processing). Skipping the connection for an already-terminal session used to avoid the
+         reconnect-flap bug, but it meant an already-open tab had no way to ever see a Deep dive
+         run's progress without a manual reload. main.py's stream_session never voluntarily closes
+         the connection either (see that file), which is the actual fix for the flapping — this
+         doesn't need to also skip connecting in the first place. #}
+      <span id="sse-indicator" class="text-[11px] px-2 py-1 rounded border border-default text-secondary shrink-0">connecting&hellip;</span>
+      {# static/js/mascot.js's own mount point -- context="session" reads #session-content's
+         data-status/data-findings-count (session_fragment.html), refreshed on every SSE morph.
+         A real inline flex item (themes.css's .asra-mascot), not an overlay -- this column grows
+         to fit it like any other content, on purpose (see that CSS comment for the complaint this
+         fixes: an earlier absolute-positioned version read as a detached floating popup). #}
+      <span data-mascot-mount data-mascot-context="session"></span>
+    </div>
+    {% include "macros/header_light.html" %}
   </div>
 
-  {# Main session content (left) + chat panel (right, 4.9) — a fixed 2-column split, not
-     resizable (the resizable-panel pattern from the Piligrim reference was explicitly declined
-     for ASRA in 4.8/4.9's planning, there's no multi-panel workspace concept here to justify it).
-     Chat is sticky + full viewport height — it stays pinned and visible while the log on the
-     left scrolls past it, not a small box you lose track of. .session-layout/.session-log-column/
-     .session-chat-column are a real container query (themes.css), not a Tailwind viewport
-     breakpoint — see the comment there for why that distinction matters here specifically. #}
+  {# Main session content (left) + chat panel (right) — a fixed 2-column split, not resizable
+     (there's no multi-panel workspace concept here to justify it). Chat is sticky + full viewport
+     height — it stays pinned and visible while the log on the left scrolls past it, not a small
+     box you lose track of. .session-layout/.session-log-column/.session-chat-column are a CSS
+     grid with fixed column tracks (themes.css), not Tailwind's own w-full/flex classes — see the
+     comment there for why that distinction matters here specifically. #}
   <div class="session-layout">
-    <div id="session-stream" class="session-log-column w-full"
-         hx-ext="sse, morph" sse-connect="/api/session/{{ session.session_id }}/stream" sse-swap="message" hx-swap="morph">
-      {% include "partials/session_fragment.html" %}
+    {# The class that used to sit directly on #session-stream (the min-width:0 CSS hook,
+       .session-layout's own direct-child selector, themes.css) now lives on THIS wrapper instead
+       — #session-stream itself is unchanged below, still the sole SSE/morph target with its own
+       id. This wrapper is what makes room for the tab bar as a real sibling of #session-stream,
+       deliberately OUTSIDE the morphed subtree (see the tab-bar comment just below) while still
+       counting as .session-layout's one "log column" grid child. #}
+    <div class="session-log-column w-full">
+      {# Session tabs (4.9.x): radio-driven, CSS-only (static/css/themes.css's ".session-tabs"
+         rules), never JavaScript — this is deliberate, not a missed opportunity to "just toggle a
+         class". Idiomorph (base.html) already has one real, load-bearing scar from this exact
+         class of bug: a global beforeAttributeUpdated hook exists solely to stop morph from
+         silently stripping <details open> on every SSE tick, because morph resets ANY
+         client-only attribute/class that isn't also present in the server-rendered markup it's
+         diffing against. A JS-toggled "hidden"/"data-active" class on a tab panel living INSIDE
+         #session-content (the morphed subtree) would suffer the identical fate — the active tab
+         snapping back to whatever the server's next render defaults to, on every single live
+         update during an active scan. Keeping the actual "which tab is selected" state inside
+         .session-tabs — a real sibling of #session-stream, never touched by the morph at all since
+         morph only ever rewrites #session-stream's own children — sidesteps the whole problem:
+         nothing here is ever reset, because morph never sees it. tab_bar() below renders the
+         radios themselves nested INSIDE .session-tabs (interleaved with their own <label>, purely
+         so `input:checked + label` can style the active one) — themes.css's panel-visibility rules
+         therefore key off `.session-tabs:has(#tab-X:checked)`, not the individual radio ids
+         directly, specifically because a plain sibling combinator on the radio id alone would need
+         it to be a DIRECT sibling of #session-stream, which it isn't (it's one level deeper, inside
+         .session-tabs) — :has() reaches through that nesting; a real bug from an earlier version of
+         this that shipped with the sibling-combinator version is documented in themes.css itself. #}
+      {{ tab_bar(session) }}
+      {# hx-swap="morph:innerHTML" (not the bare "morph" default, which morphs the target's own
+         outerHTML) is load-bearing here, not a style choice — the server's SSE fragment
+         (session_fragment.html) always has its own root id ("session-content"), different from
+         this wrapper's ("session-stream"). With a bare outerHTML-style morph, idiomorph rewrites
+         *this* element's own attributes to match that different-id incoming root on the very first
+         live update — which strips id="session-stream" and even this element's own
+         hx-ext/sse-connect/sse-swap attributes, permanently corrupting the very connection the
+         swap arrived on. morph:innerHTML instead only ever touches this element's children, so
+         its own attributes — the SSE wiring — are untouched no matter how many live updates land. #}
+      <div id="session-stream"
+           hx-ext="sse, morph" sse-connect="/api/session/{{ session.session_id }}/stream" sse-swap="message" hx-swap="morph:innerHTML">
+        {% include "partials/session_fragment.html" %}
+      </div>
+      {# Deliberately a sibling of #session-stream, not inside it -- see toolkit_panel.html's own
+         module comment for why the whole native toolkit lives outside the SSE morph subtree. #}
+      {% include "partials/toolkit_panel.html" %}
+      {# Map tab's Attack Surface graph needs cytoscape.js -- loaded here, a real sibling of
+         #session-stream, same "outside the morphed subtree" placement xterm.js's own script tags
+         already use (terminal_panel.html) and for the identical reason: a <script> tag sitting
+         INSIDE #session-stream would be part of what idiomorph diffs on every live SSE tick, a
+         real, documented class of bug elsewhere in this app (the beforeAttributeUpdated hook
+         above exists because of exactly this). attack_surface_graph.js itself reads the Map tab's
+         own #attack-surface-data JSON blob (which DOES live inside the morphed subtree, and is
+         SUPPOSED to update on every tick) via a MutationObserver, not a page-load-once read --
+         see that script's own comment. #}
+      <script src="/static/vendor/cytoscape.min.js"></script>
+      <script src="/static/js/attack_surface_graph.js?v=34"></script>
+      {# Map tab's Geopolitical Map sub-tab -- same "load outside the morphed subtree, read the
+         in-subtree JSON blob via a MutationObserver instead of a page-load-once read" posture as
+         cytoscape/attack_surface_graph.js right above. jsvectormap (MIT license, map data derived
+         from Natural Earth, public domain) is a small, dependency-free world-map library purpose-
+         built for exactly this: clickable/hoverable countries plus lat/lon markers, with real
+         per-country path data keyed by ISO-3166-1 alpha-2 code (world.js's own "US"/"DE"/etc. path
+         entries) -- no d3/topojson runtime, matching this app's own hand-rolled-SVG convention
+         (diagram_builder.js) more closely than a heavier geo-rendering pipeline would. #}
+      <link rel="stylesheet" href="/static/vendor/jsvectormap.min.css">
+      <script src="/static/vendor/jsvectormap.min.js"></script>
+      {# ?v=1 -- unlike jsvectormap.min.js/css right above (untouched, third-party code, no reason
+         to ever cache-bust it), THIS file's own territory names get hand-edited directly (and the
+         operator intends to keep updating labels here by hand as things change) -- StaticFiles
+         serves it with no Cache-Control header, so a browser that already loaded it keeps silently
+         serving the pre-edit copy forever otherwise. Bump this number on every future manual name
+         edit here, same versioned-static-asset discipline every other script/link tag in this file
+         already follows (see attack_surface_graph.js/geo_map.js's own ?v= tags right around this
+         one). #}
+      <script src="/static/vendor/jsvectormap-world.js?v=1"></script>
+      <script src="/static/js/geo_map.js?v=3"></script>
     </div>
 
     <div class="session-chat-column w-full">
       {% include "partials/chat_panel.html" %}
+      {% include "partials/session_collapsed_panel.html" %}
     </div>
   </div>
 
@@ -73,6 +458,41 @@
         document.title = baseTitle;
       });
 
+      // Real, confirmed operator report this fixes: stepping away (desktop app minimized to tray,
+      // or just a backgrounded browser tab) for a while during a live scan, then coming back to
+      // find clicks do nothing at all for a long stretch before the UI "catches up". Chromium/
+      // WebView2's own Page Lifecycle freezes a hidden/occluded window's JS timers AND the SSE
+      // connection's message-processing task -- up to one full-fragment morph per second (this
+      // stream's own poll rate, main.py's _SSE_POLL_INTERVAL_SECONDS) backs up server-side the
+      // whole time nothing's processing it, then delivers in one burst the instant the window
+      // unfreezes, and the main thread churns through every queued morph back-to-back before it
+      // can respond to a click again -- proportional to how long the tab/window sat hidden. A full
+      // reload is the simplest reliable fix: it drops the stale EventSource and its entire backlog
+      // outright and gets exactly one fresh render, and nearly everything worth keeping (active
+      // tab, scroll position, findings filters) already survives a reload on its own via
+      // session_state.js/session_tab_memory.js's own localStorage persistence -- the only real
+      // loss is an unsent chat draft, an acceptable trade for not sitting frozen for a long stretch.
+      // Only reloads after a genuinely meaningful hidden stretch (not a quick alt-tab) AND only
+      // while the session is actually live right now (re-checked fresh off #session-content's own
+      // data-status at the moment visibility returns, not cached from page load) -- a completed
+      // session's own SSE connection has nothing left to fall behind on, so reloading one just to
+      // "fix" a freeze that can't happen there would be a pure, needless disruption.
+      var HIDDEN_RELOAD_THRESHOLD_MS = 15000;
+      var hiddenSinceMs = null;
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "hidden") {
+          hiddenSinceMs = Date.now();
+          return;
+        }
+        if (hiddenSinceMs === null) return;
+        var hiddenForMs = Date.now() - hiddenSinceMs;
+        hiddenSinceMs = null;
+        if (hiddenForMs < HIDDEN_RELOAD_THRESHOLD_MS) return;
+        var content = document.getElementById("session-content");
+        var status = content ? content.getAttribute("data-status") : null;
+        if (["processing", "awaiting_approval", "pending"].indexOf(status) !== -1) location.reload();
+      });
+
       // With hx-swap="morph" (Idiomorph, see base.html), a swap only touches nodes that actually
       // changed — an unrelated new log line no longer destroys/recreates the whole list, so a
       // manually-opened <details> card and the list's own scroll position both survive on their
@@ -109,24 +529,120 @@
         });
       });
 
-      // textContent (not innerText) deliberately — a collapsed <details> still has its body in
-      // the DOM, just not painted, and innerText respects that rendered/hidden state while
-      // textContent doesn't, so this is the only way to grab every entry's full text regardless
-      // of which cards are expanded on screen right now.
-      window.asraCopyLogs = function () {
-        var log = document.getElementById("session-log-list");
-        var btn = document.getElementById("copy-logs-btn");
-        if (!log) return;
-        var lines = Array.prototype.map.call(log.querySelectorAll("details"), function (entry) {
-          return entry.textContent.replace(/\s+/g, " ").trim();
-        });
-        navigator.clipboard.writeText(lines.join("\n\n")).then(function () {
-          if (!btn) return;
-          var original = btn.textContent;
-          btn.textContent = "Copied!";
-          setTimeout(function () { btn.textContent = original; }, 1500);
-        });
-      };
+      // asraCopyCard/asraCopyLogs moved to static/js/copy_card.js (loaded unconditionally in
+      // base.html) -- they used to live only in this Interactive/RE-only branch, which meant
+      // window.asraCopyCard was never defined at all for an Agent-mode session (session_fragment.html,
+      // rendered from a completely separate template branch further down this same file, never got
+      // it either). Every copy button anywhere in Agent mode silently did nothing on click. See copy_card.js's own
+      // top comment for the full detail.
     })();
   </script>
+{% endif %}
+
+{# Desktop-only: fire a native OS notification when this session reaches a terminal state. Rides on
+   the same SSE stream (#session-content[data-status], morphed on every message) as the single source
+   of truth — no second channel. No-op in a browser (window.__TAURI__ absent), so the web path is
+   unaffected. #}
+<script>
+  (function () {
+    var t = window.__TAURI__;
+    if (!(t && t.core && t.core.invoke)) return;
+    var TERMINAL = { completed: 1, interrupted: 1, failed: 1 };
+    var LIVE = { pending: 1, processing: 1, created: 1, paused: 1 };
+    function status() {
+      var el = document.getElementById("session-content");
+      return el ? el.getAttribute("data-status") : null;
+    }
+    var prev = status();
+    var notified = false;
+    document.body.addEventListener("htmx:afterSettle", function () {
+      var s = status();
+      if (!s) return;
+      if (LIVE[s]) notified = false;
+      if (!notified && prev && LIVE[prev] && TERMINAL[s]) {
+        notified = true;
+        var name = document.title ? document.title.replace(/^ASRA\s*[—-]\s*/, "") : "session";
+        t.core.invoke("notify_session_done", {
+          title: "ASRA — session " + s,
+          body: name + " finished.",
+        }).catch(function () {});
+      }
+      prev = s;
+    });
+  })();
+</script>
+
+{# Slide-out terminal drawer -- a real system shell (agent/tools/terminal_manager.py, same backend
+   the standalone /terminal page uses) reachable from any session mode (Agent/Interactive/RE alike)
+   without leaving this page, via #session-terminal-toggle below (a right-edge tab styled like
+   chat_panel.html's own #chat-reopen-handle, but always visible instead of only while chat is
+   collapsed). Lives here, after every mode's own {% if %}/{% else %}, so it's one shared element
+   regardless of which workspace shape rendered above it -- not duplicated per branch.
+
+   static/js/terminal.js restores/ensures this project's own tab right away on every page load,
+   independent of whether this drawer PANEL is actually open -- only the panel's own visibility
+   defaults closed (this file's own script below), never the tab data underneath it.
+
+   initial_cwd defaults the FIRST tab (whenever one doesn't already exist) to this project's own
+   folder -- same root the existing "Open terminal here" link already opens, just without the
+   extra navigation away from the session. #}
+{% set terminal_project_folder = get_session_folder(session.session_id) %}
+{% set initial_cwd = terminal_project_folder or "" %}
+{% set initial_skip_close_confirm = terminal_skip_close_confirm() %}
+{% set terminal_cwd_mode = "reuse" %}
+{% set terminal_storage_scope = "session-" + session.session_id %}
+{% set terminal_show_collapse_button = true %}
+
+{# Styled like chat_panel.html's own #chat-reopen-handle (bg-accent/text-white, same rounded-l-lg
+   edge tab) -- not the muted bg-elevated/text-secondary this started with, which sat almost
+   invisible against the dark theme's own near-identical surface color right behind it.
+
+   top: calc(50% + 3rem) -- deliberately NOT stacked on the drawer's own header (top-16 used to
+   put it right on top of the terminal-workspace's own tab strip / +/chevron controls, real,
+   confirmed operator report: those buttons stopped reacting to clicks at all, because this
+   higher-z-index button was sitting directly over them intercepting every click). Positioned a
+   fixed offset below chat_panel.html's own #chat-reopen-handle (which sits at the exact viewport
+   center, top-1/2) instead -- the two edge tabs stack without overlapping either the terminal's
+   own header or each other. #}
+<button type="button" id="session-terminal-toggle" title="Terminal" aria-label="Toggle terminal" aria-expanded="false"
+        style="top: calc(50% + 3rem);"
+        class="fixed right-0 -translate-y-1/2 z-50 flex items-center justify-center bg-accent hover:bg-accent-hover text-white rounded-l-lg px-1.5 py-3 shadow-lg transition-colors">
+  {{ nav_icon("terminal") }}
+</button>
+
+<div id="session-terminal-drawer" class="session-terminal-drawer">
+  {% include "partials/terminal_panel.html" %}
+</div>
+
+<script>
+  (function () {
+    var drawer = document.getElementById("session-terminal-drawer");
+    var toggleBtn = document.getElementById("session-terminal-toggle");
+    var collapseBtn = document.getElementById("terminal-drawer-collapse-toggle");
+    if (!drawer || !toggleBtn) return;
+
+    function setOpen(open) {
+      // Purely visual -- the tab data underneath (static/js/terminal.js's own restoreTabs()) is
+      // already restored/ensured on page load regardless of whether this panel is open, real
+      // operator ask: the project's own terminal must always be there and ready the moment this
+      // opens, not something that only gets created on first open.
+      drawer.classList.toggle("is-open", open);
+      toggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (window.asraDebugEvent) window.asraDebugEvent("terminal", "drawer " + (open ? "opened" : "closed"));
+    }
+
+    // Real operator ask: the drawer must always start collapsed -- never reopen itself just
+    // because it happened to be left open before the last navigation/reload. Deliberately NOT
+    // persisted to localStorage at all (unlike chat's own COLLAPSE_STORAGE_KEY, which chat_panel.html
+    // intentionally DOES restore) -- every fresh page load starts closed, full stop.
+    toggleBtn.addEventListener("click", function () { setOpen(!drawer.classList.contains("is-open")); });
+    // The inline arrow inside the terminal's own header (partials/terminal_panel.html,
+    // terminal_show_collapse_button) -- a second, equally real way to close it, alongside the edge
+    // tab above: real operator ask, some people reach for the arrow, others for the edge tab.
+    if (collapseBtn) collapseBtn.addEventListener("click", function () { setOpen(false); });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && drawer.classList.contains("is-open")) setOpen(false);
+    });
+  })();
+</script>
 {% endblock %}

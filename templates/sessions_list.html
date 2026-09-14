@@ -1,52 +1,47 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import button, status_badge, page_header, empty_state %}
+{% from "macros/nav.html" import nav_icon %}
 {% block title %}ASRA &mdash; Projects{% endblock %}
 {% block content %}
-  {{ page_header("Projects") }}
+  {# Same asraOpenDialog('new-project-modal') the sidebar's own "New project" nav item already
+     uses (base.html) -- a second, on-page entry point so starting a project doesn't always
+     require going back to the sidebar first, without duplicating the dialog itself. #}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div class="relative flex items-center justify-between py-3.5 border-b border-default mb-4">
+    <h1 class="text-[13px] font-semibold text-primary">Projects</h1>
+    <button type="button" onclick="asraOpenDialog('new-project-modal')"
+            class="inline-flex items-center justify-center gap-1.5 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-8 px-3 text-[13px] shrink-0">
+      {{ nav_icon("plus") }}
+      New project
+    </button>
+    {% include "macros/header_light.html" %}
+  </div>
 
-  {% if sessions %}
-    {% set completed_count = sessions | selectattr("status", "equalto", "completed") | list | length %}
-    {% set in_progress_count = sessions | selectattr("status", "in", ["pending", "processing", "awaiting_approval"]) | list | length %}
-    {% set total_findings = sessions | sum(attribute="findings_count") %}
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-      {% for label, value in [("Total sessions", sessions | length), ("Completed", completed_count), ("In progress", in_progress_count), ("Total findings", total_findings)] %}
-        <div class="bg-surface border border-default rounded-lg p-4">
-          <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">{{ label }}</p>
-          <p class="text-2xl font-semibold tabular-nums text-primary">{{ value }}</p>
-        </div>
-      {% endfor %}
-    </div>
-
-    <ul class="space-y-2">
-      {% for s in sessions %}
-        <li class="bg-surface border border-default rounded-lg p-3 flex items-center gap-3">
-          <div class="w-8 h-8 rounded bg-elevated flex items-center justify-center shrink-0">
-            <svg class="w-4 h-4 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M12 2 3 6v6c0 5 4 9 9 10 5-1 9-5 9-10V6z" stroke-linejoin="round"></path>
-            </svg>
-          </div>
-          <a href="/session/{{ s.session_id }}" class="flex-1 min-w-0 group">
-            <p class="text-sm font-medium text-primary group-hover:text-accent truncate">{{ s.name }}</p>
-            <p class="text-[11px] text-secondary truncate" title="{{ s.target }}">{{ s.target }} &middot; {{ s.findings_count }} finding(s) &middot; {{ s.created_at }}</p>
-            {% if s.folder %}
-              <p class="text-[11px] text-secondary/70 truncate" title="{{ s.folder }}">&#128193; {{ s.folder }}</p>
-            {% endif %}
-          </a>
-          {{ status_badge(s.status) }}
-          {% if s.status == "interrupted" %}
-            <form method="post" action="/api/session/{{ s.session_id }}/resume">
-              {{ button("Resume from " ~ s.resumable_from, variant="secondary", size="sm", type="submit") }}
-            </form>
-          {% endif %}
-          <form method="post" action="/api/session/{{ s.session_id }}/delete"
-                onsubmit="return confirm('Delete this project? This cannot be undone.');">
-            {{ button("Delete", variant="danger", size="sm", type="submit") }}
-          </form>
-        </li>
-      {% endfor %}
-    </ul>
-  {% else %}
-    {{ empty_state("No sessions yet.", "Start a scan to see it here.") }}
-    <p class="text-center mt-2"><a href="/" class="text-accent hover:text-accent-hover text-sm underline">Start a scan</a></p>
-  {% endif %}
+  {# Polls itself every 5s (same interval as the sidebar's active-session widget, base.html) and
+     morph-swaps the result — a session's status/finding-count changing while this page is open
+     used to need a manual reload or a navigate-away-and-back to notice at all. hx-ext="morph" is
+     declared here (not globally) matching how session.html's own #session-stream already scopes
+     it locally rather than adding it to <body> for every page.
+     morph:innerHTML, not the bare "morph" default: sessions_list_fragment.html's own root is one
+     or more siblings with no id matching this container's — an outerHTML-style morph would
+     rewrite this element's own attributes (id, and critically hx-get/hx-trigger="every 5s"
+     themselves) to match the incoming fragment on the very first poll, permanently killing the
+     polling trigger after just one cycle. Same real bug, same fix, as session.html's SSE
+     container and index.html's recent-projects-fragment. #}
+  {# data-privacy-key/data-privacy-collapsed live on THIS element deliberately -- morph:innerHTML
+     only ever replaces this div's children, never the div itself, so a collapse flag set here is
+     the one thing the 5s poll below can never quietly reset back open. See macros/ui.html's
+     privacy_restore_script comment for the full reasoning. #}
+  {# NOT hx-boosted, deliberately -- see index.html's own recent-projects-fragment comment for the
+     full incident (a real session page can be ~10MB; htmx's client-side hx-select silently
+     mis-extracts content at that size instead of erroring). Opening a project stays a plain full
+     navigation. #}
+  <div id="sessions-list-fragment" data-privacy-key="projects-list" data-privacy-collapsed="false"
+       hx-ext="morph" hx-get="/api/sessions/fragment" hx-trigger="every 5s" hx-swap="morph:innerHTML">
+    {% include "partials/sessions_list_fragment.html" %}
+  </div>
 {% endblock %}

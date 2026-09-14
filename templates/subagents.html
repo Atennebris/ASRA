@@ -1,0 +1,388 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header, section_label, button, empty_state, toggle_switch %}
+{% from "macros/ui.html" import provider_options, model_options with context %}
+{% from "macros/subagent_icons.html" import subagent_icon, subagent_icon_picker %}
+{% block title %}ASRA &mdash; Subagents{% endblock %}
+
+{# One tool per row: a small on/off switch (the same toggle_switch used for the enable/disable
+   column and everywhere else in the app — never a raw native checkbox, which rendered inconsistently
+   and read as a cramped, hard-to-hit target) plus the tool's full monospace name.
+
+   report_subagent_result stays IN the list, in its natural place, rendered as a checked-but-disabled
+   (greyed, non-clickable) switch so the operator sees the complete arsenal at a glance — it's always
+   there. It just can't be toggled: agent/core.py's _delegate_to_subagent_impl always appends it
+   regardless of what's stored (it's how the subagent reports its result back), and a disabled input
+   never posts, so it can't accidentally end up in the submitted allowed_tools either.
+
+   The whole tool list is rendered in full with NO inner scrollbar of its own — a fixed-height inner
+   scroll box was the "half-cropped rectangle" that cut tool rows mid-height and left a dead gap below
+   it. The single scroll that matters (the page on the New-subagent section, the dialog body in Edit)
+   owns scrolling instead, so nothing is ever clipped. grid_classes is passed in so each context picks
+   the column count its width actually fits without truncating a name. #}
+{# Domain dot colors/labels -- shared vocabulary with templates/tools.html's own grouped sections
+   (main.py's _tool_domain computes the SAME bucket for both, so a tool's color here always matches
+   which section it lands in there). Picked for real separation, not just "4 different chart-N
+   tokens" -- confirmed live the FIRST attempt (chart-7 lavender / chart-1 blue / chart-4 amber /
+   chart-3 teal, all at 6px) was barely distinguishable: chart-7 (144 133 233) sits close enough to
+   both this app's own accent blue AND the "purple" theme's own accent (#a78bfa) that RE and Web
+   read as nearly the same dot in practice. Reselected 4 chart-N indices that are maximally spread
+   around the hue wheel instead (blue ~210°, magenta ~330°, amber ~40°, green ~150°), and sized up
+   from w-1.5 (6px) to w-2.5 (10px) with a thin dark ring for contrast against every surface color
+   this app's 5 themes use -- a color choice alone doesn't fix an indicator that's just too small
+   to read at a glance. #}
+{% set domain_colors = {"re": "rgb(var(--chart-5))", "web": "rgb(var(--chart-1))", "toolkit": "rgb(var(--chart-4))", "browser": "rgb(var(--chart-3))"} %}
+{% set domain_labels = {"re": "Reverse Engineering", "web": "Web / API pentest", "toolkit": "Toolkit (manual HTTP proxy/repeater/decoder/comparer primitives — used for web APIs, including a mobile app's own backend)", "browser": "Browser / page automation"} %}
+
+{% macro domain_legend() %}
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-1 px-1 mb-1.5">
+    {% for key, label in domain_labels.items() %}
+      <span class="inline-flex items-center gap-1.5 text-[10.5px] text-secondary">
+        <span class="asra-domain-dot shrink-0" style="background-color: {{ domain_colors[key] }}"></span>{{ label }}
+      </span>
+    {% endfor %}
+  </div>
+{% endmacro %}
+
+{# Bulk on/off controls -- confirmed live the operator wants this for a 90+ tool checklist:
+   flipping each switch by hand is real, tedious, repetitive work. "All"/"None" affect every
+   tool; each domain group gets its own "All"/"None" pair scoped to just that color. Delegated
+   click handling (base.html's own script block below, not one listener per button) so this
+   works identically for however many copies of this macro end up on the page at once (the
+   full-page New-subagent section, plus one per profile's own Edit dialog) without needing any
+   id-scoping scheme -- each button's own closest(".asra-tool-checklist") ancestor is what it
+   actually acts on, the exact same "scope by DOM position, not a generated id" fix
+   icon_picker's own id_prefix comment already documents needing for this same macro-repeated-
+   on-one-page situation. report_subagent_result (always_on, disabled) is skipped by construction
+   -- a disabled checkbox's own .checked can still be set programmatically, but it isn't a real
+   form value change the operator asked for, so the bulk handler explicitly leaves it alone. #}
+{% macro bulk_toggle_row() %}
+  <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 mb-2 text-[11px]">
+    <span class="inline-flex rounded-md border border-default overflow-hidden">
+      <button type="button" class="asra-bulk-btn" data-bulk-action="all">Select all</button>
+      <button type="button" class="asra-bulk-btn border-l border-default" data-bulk-action="none">Deselect all</button>
+    </span>
+    {% for key, label in domain_labels.items() %}
+      <span class="inline-flex items-center gap-1.5">
+        <span class="asra-domain-dot shrink-0" style="background-color: {{ domain_colors[key] }}"></span>
+        <span class="inline-flex rounded-md border border-default overflow-hidden">
+          <button type="button" class="asra-bulk-btn" data-bulk-action="all" data-bulk-domain="{{ key }}">All</button>
+          <button type="button" class="asra-bulk-btn border-l border-default" data-bulk-action="none" data-bulk-domain="{{ key }}">None</button>
+        </span>
+        <span class="text-secondary">{{ label.split(" (")[0] }}</span>
+      </span>
+    {% endfor %}
+  </div>
+{% endmacro %}
+
+{% macro tool_checklist(field_prefix, checked_tools, grid_classes="grid-cols-2 lg:grid-cols-3") %}
+  {{ domain_legend() }}
+  {{ bulk_toggle_row() }}
+  <div class="asra-tool-checklist border border-default rounded-lg overflow-hidden bg-elevated/30">
+    <div class="p-1.5">
+      <div class="grid {{ grid_classes }} gap-x-3 gap-y-0.5">
+        {% for tool_name in available_tools %}
+          {% set always_on = tool_name == "report_subagent_result" %}
+          {% set description = tool_descriptions.get(tool_name, "") %}
+          {% set domain = tool_domains.get(tool_name) %}
+          {# data-tool-description (static/js/tool_tooltip.js) drives a body-level floating tooltip
+             rather than a native title= — a native tooltip needs a multi-second hover and truncates
+             long descriptions. The label wraps the switch input so the whole row is one click target. #}
+          <label class="group flex items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors {{ 'cursor-default' if always_on else 'cursor-pointer hover:bg-overlay' }}"
+                 {% if description %}data-tool-description="{{ description }}"{% endif %}
+                 {% if always_on %}title="Always included — it's how the subagent reports its result back. It can't be turned off."{% endif %}
+                 {% if domain %}data-tool-domain="{{ domain }}"{% endif %}>
+            {{ toggle_switch(field_prefix, value=tool_name, checked=(always_on or tool_name in checked_tools), disabled=always_on) }}
+            {% if domain %}
+              <span class="asra-domain-dot shrink-0" style="background-color: {{ domain_colors[domain] }}" title="{{ domain_labels[domain] }}"></span>
+            {% endif %}
+            <span class="min-w-0 truncate font-mono text-[12px] {{ 'text-secondary' if always_on else 'text-primary' }}">{{ tool_name }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+{% endmacro %}
+
+{# The actual form fields, shared verbatim by both the full-page New-subagent section and the Edit
+   dialog — the only thing that differs between the two is the wrapper (subagent_form below), never
+   the fields themselves. #}
+{% macro subagent_fields(profile, id_suffix, tool_grid) %}
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Name</span>
+    <input type="text" name="name" value="{{ profile.name if profile else '' }}" placeholder="e.g. OSINT recon bot" required
+           class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+  </label>
+
+  {{ subagent_icon_picker(profile.icon if profile else "", profile.icon_color if profile else "", id_prefix="sub-" ~ id_suffix ~ "-") }}
+
+  <label class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">
+      Instructions <span class="normal-case font-normal">(how this subagent should behave)</span>
+    </span>
+    <textarea name="instructions" rows="3" placeholder="e.g. Focus only on passive subdomain/OSINT discovery — never touch anything authenticated."
+              class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 resize-y">{{ profile.instructions if profile else '' }}</textarea>
+  </label>
+
+  <div class="block">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Allowed tools</span>
+    {{ tool_checklist("allowed_tools", profile.allowed_tools if profile else [], tool_grid) }}
+    <span class="block text-[11px] text-secondary mt-1.5">Only tools actually installed on this machine are listed. Leave every switch off to give this subagent no tools at all.</span>
+  </div>
+
+  <label class="block max-w-sm">
+    <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Provider &amp; model</span>
+    <select name="provider" id="subagent-provider-{{ id_suffix }}"
+            hx-get="/api/subagents/model-options" hx-target="#subagent-model-{{ id_suffix }}" hx-trigger="change"
+            class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 mb-2">
+      {{ provider_options(profile.provider if profile else None) }}
+    </select>
+    <select name="model" id="subagent-model-{{ id_suffix }}"
+            class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      {{ model_options(profile.provider if profile else None, profile.model if profile else None, subagent_model_choices.get(profile.id, []) if profile else []) }}
+    </select>
+    <span class="block text-[11px] text-secondary mt-1.5">Only providers with a key configured in Settings are listed. Pick a provider to see its real models — no typing.</span>
+    {# Same real, minimal-completion Test as Settings' own AI Provider & Model picker
+       (main.py's test-llm start/status/cancel, agent/tools/llm_test_job.py) -- lets the operator
+       confirm THIS subagent's own provider/model choice actually works before saving, instead of
+       finding out mid-run. hx-include="closest form" picks up the picker's own provider/model
+       selects (plus every tool toggle/name field on this form, harmlessly ignored by the route's
+       own Form(...) params) -- same pattern the main picker's Test button already uses. target_id
+       is unique per id_suffix (this macro renders twice per page: the New-subagent form and every
+       open Edit dialog), so multiple copies of this button never fight over the same DOM id or
+       Cancel target (see partials/llm_test_status.html's own docstring for why that matters once
+       more than one Test button exists on a page at once). #}
+    <div class="flex items-center gap-2 mt-2">
+      <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form"
+              hx-vals='{"target_id": "subagent-test-status-{{ id_suffix }}"}'
+              hx-target="#subagent-test-status-{{ id_suffix }}" hx-swap="outerHTML" hx-disabled-elt="this"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px] shrink-0">Test</button>
+      <span id="subagent-test-status-{{ id_suffix }}" class="text-[11px] text-secondary break-words"></span>
+    </div>
+  </label>
+{% endmacro %}
+
+{# layout="page": the New-subagent section — plain stacked fields, Save at the end, the whole page
+   scrolls. layout="modal": the Edit dialog — the field area is the single scroll region and the Save
+   bar is pinned to the dialog's bottom edge (a real footer, not something you have to scroll to
+   reach), so the dialog reads as one complete window with a fixed header, a clean scroll, and a
+   fixed action bar. Both share subagent_fields verbatim. #}
+{% macro subagent_form(action_url, profile, id_suffix, tool_grid="grid-cols-1 sm:grid-cols-2", layout="page") %}
+  {% if layout == "modal" %}
+    <form method="post" action="{{ action_url }}" class="flex flex-col min-h-0 flex-1">
+      {# overscroll-contain keeps a flick past the end of the tool list from chaining out to scroll
+         the page behind the dialog. #}
+      <div class="flex-1 min-h-0 overflow-y-auto overscroll-contain asra-scroll px-5 py-4 space-y-4">
+        {{ subagent_fields(profile, id_suffix, tool_grid) }}
+      </div>
+      <div class="shrink-0 flex items-center justify-end gap-2 px-5 py-3 border-t border-default bg-surface">
+        {{ button("Save", variant="primary", type="submit") }}
+      </div>
+    </form>
+  {% else %}
+    <form method="post" action="{{ action_url }}" class="space-y-4">
+      {{ subagent_fields(profile, id_suffix, tool_grid) }}
+      <div class="flex items-center justify-end gap-2 pt-1">
+        {{ button("Save", variant="primary", type="submit") }}
+      </div>
+    </form>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
+    <h1 class="text-[13px] font-semibold text-primary">Subagents</h1>
+    <div class="flex items-center gap-2 flex-wrap shrink-0">
+      <a href="/api/subagents/export"
+         class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export
+      </a>
+      <button type="button" onclick="document.getElementById('subagent-import').showModal()"
+              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Import
+      </button>
+    </div>
+    {% include "macros/header_light.html" %}
+  </div>
+
+  {% if error %}
+    <p class="mb-4 px-3 py-2 rounded-lg border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ error }}</p>
+  {% endif %}
+
+  {% if message %}
+    <p class="mb-4 px-3 py-2 rounded-lg border border-accent/40 bg-accent/10 text-primary text-[12px] break-words">{{ message }}</p>
+  {% endif %}
+
+  <section class="bg-surface border border-default rounded-xl p-5 mb-6">
+    {{ section_label("What subagents do") }}
+    <p class="text-[12px] leading-relaxed text-secondary mb-5 max-w-3xl">
+      A subagent is a pre-configured worker with its own name, allowed tools, instructions, and
+      (optionally) its own LLM provider. While a scan is running, the main agent can hand off a
+      bounded, self-contained sub-task to an enabled subagent and keep working on something more
+      important itself — the subagent reports its own result back automatically once it's done.
+      Only enabled subagents are ever visible to the main agent; disabled ones sit here configured
+      but unused.
+    </p>
+
+    {% if subagent_profiles %}
+      <div class="overflow-x-auto -mx-1 px-1">
+        <table class="w-full text-[12px]">
+          <thead>
+            <tr class="text-left text-secondary border-b border-default">
+              <th class="py-2 px-3 font-medium uppercase tracking-wider text-[10px]">Name</th>
+              <th class="py-2 px-3 font-medium uppercase tracking-wider text-[10px] text-center">Enabled</th>
+              <th class="py-2 px-3 font-medium uppercase tracking-wider text-[10px] text-right">Tools</th>
+              <th class="py-2 px-3 font-medium uppercase tracking-wider text-[10px]">Provider</th>
+              <th class="py-2 px-3 font-medium uppercase tracking-wider text-[10px]"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for profile in subagent_profiles %}
+              {% set dialog_id = "subagent-edit-" ~ profile.id %}
+              <tr class="border-b border-default/50 last:border-b-0 hover:bg-elevated/40 transition-colors">
+                <td class="py-2.5 px-3 text-primary whitespace-nowrap">
+                  <div class="flex items-center gap-2.5">
+                    {# Per-profile avatar (agent/tools/subagent_icons.py), not the old fixed
+                       icon_avatar("bot", ...) every profile used to share -- confirmed live the
+                       operator wants each subagent visually distinguishable at a glance. Falls
+                       back to "robot"/no explicit color for a profile saved before this existed
+                       (icon/icon_color simply absent from its own stored JSON) -- resolves to a
+                       real, randomly-chosen icon+color the next time that profile is saved either
+                       way (main.py's create_subagent_route/update_subagent_route). #}
+                    <div class="w-7 h-7 rounded-lg bg-elevated border border-default flex items-center justify-center shrink-0">
+                      {{ subagent_icon(profile.icon or "robot", size_class="w-4 h-4", color=profile.icon_color or none) }}
+                    </div>
+                    <span class="font-medium">{{ profile.name }}</span>
+                  </div>
+                </td>
+                <td class="py-2.5 px-3 whitespace-nowrap">
+                  {# Toggling submits this tiny form immediately (onchange, no separate Save) --
+                     main.py's toggle_subagent_route flips the profile's stored state server-side
+                     itself, so the switch here only ever needs to REFLECT profile.enabled. #}
+                  <form method="post" action="/api/subagents/{{ profile.id }}/toggle" class="flex items-center justify-center">
+                    <label class="inline-flex items-center cursor-pointer">
+                      {{ toggle_switch("subagent_enabled_" ~ profile.id, checked=profile.enabled, onchange="this.form.requestSubmit()") }}
+                    </label>
+                  </form>
+                </td>
+                <td class="py-2.5 px-3 text-secondary whitespace-nowrap text-right tabular-nums">{{ profile.allowed_tools | length }}</td>
+                <td class="py-2.5 px-3 text-secondary whitespace-nowrap">{{ all_provider_display_names.get(profile.provider, profile.provider) if profile.provider else "(same as main agent)" }}</td>
+                <td class="py-2.5 px-3 whitespace-nowrap">
+                  <div class="flex items-center justify-end gap-1.5">
+                    <button type="button" onclick="asraOpenDialog('{{ dialog_id }}')"
+                            class="inline-flex items-center justify-center rounded-md font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay hover:border-accent/40 h-7 px-2.5 text-[11px]">Edit</button>
+                    <form method="post" action="/api/subagents/{{ profile.id }}/delete"
+                          onsubmit="return asraConfirmSubmit(event, {title: 'Delete subagent?', message: 'This removes &quot;{{ profile.name }}&quot; and its configuration. This cannot be undone.', confirmLabel: 'Delete'});">
+                      <button type="submit" class="inline-flex items-center justify-center rounded-md h-7 px-2.5 text-[11px] text-secondary hover:text-severity-high hover:bg-severity-high/10 transition-colors">Delete</button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      {{ empty_state("No subagents yet", "Create one below to let the main agent delegate simple sub-tasks while it works on something else.") }}
+    {% endif %}
+  </section>
+
+  {# Every Edit dialog, hoisted here as siblings of the table above -- NOT inline inside each
+     <tr>/<tbody> the way this used to be rendered. Real, confirmed bug this fixes: a <dialog> (and
+     everything inside it, including its own <form>) is not valid content inside <tbody> per the
+     HTML5 table content model, so the browser silently "foster parents" it out of the table at
+     parse time -- and, worse, the resulting DOM ends up with this dialog's own <form> tag dropped
+     entirely rather than just relocated (Chrome's single "open form" parser rule: encountering a
+     second <form> start tag while one from EARLIER in the table-context parse is still considered
+     open is a parse error, and the second tag is ignored outright rather than creating an
+     element). The dialog itself still rendered and opened fine (asraOpenDialog/showModal don't
+     care where in the DOM an id lives), which is why this went unnoticed until a control inside it
+     needed real DOM form-ancestry to work: the Provider & Model Test button's
+     hx-include="closest form" resolved to null (thrown as "Cannot read properties of null" from
+     htmx, request never even sent) because there was, in the ACTUAL parsed DOM, no <form> ancestor
+     at all -- confirmed live via the browser's own accessibility tree, not guessed. Same
+     "every dialog this page opens is rendered in its own pass, hoisted outside the thing that can
+     hide/mis-parent it" discipline settings.html's own provider_dialog macro already documents,
+     just for a table instead of a display:none tab panel. #}
+  {% for profile in subagent_profiles %}
+    {% set dialog_id = "subagent-edit-" ~ profile.id %}
+    {# Fixed header, one scrolling field area, fixed Save footer (subagent_form's modal
+       layout). max-w-4xl gives three full tool columns room without truncating a name.
+       The flex column lives on an INNER wrapper, never on <dialog> itself: a display
+       utility (flex) on the dialog element overrides the UA `dialog:not([open]){display:none}`
+       rule, which leaves every dialog painted on the page even while closed (they stacked
+       over the table, bleeding their controls through). The dialog keeps its default
+       display so open/closed still works; the wrapper owns the layout. #}
+    <dialog id="{{ dialog_id }}" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-4xl overflow-hidden backdrop:bg-black/60 backdrop:backdrop-blur-sm">
+      <div class="flex flex-col max-h-[85vh]">
+        <div class="flex items-center justify-between px-5 h-12 border-b border-default shrink-0">
+          <span class="text-[13px] font-semibold truncate pr-3">Edit {{ profile.name }}</span>
+          <button type="button" onclick="document.getElementById('{{ dialog_id }}').close()"
+                  class="shrink-0 inline-flex items-center justify-center w-7 h-7 rounded-md text-secondary hover:text-primary hover:bg-elevated transition-colors text-lg leading-none">&times;</button>
+        </div>
+        {{ subagent_form("/api/subagents/" ~ profile.id, profile, profile.id, tool_grid="grid-cols-2 lg:grid-cols-3", layout="modal") }}
+      </div>
+    </dialog>
+  {% endfor %}
+
+  <section class="bg-surface border border-default rounded-xl p-5 mb-6">
+    {{ section_label("New subagent") }}
+    <div class="mt-1">
+      {{ subagent_form("/api/subagents", None, "new", tool_grid="grid-cols-2 md:grid-cols-3 xl:grid-cols-4") }}
+    </div>
+  </section>
+
+  {# Import dialog -- paste an exported subagent-profile JSON to merge it in (dedup by id,
+     always lands disabled -- agent/tools/subagent_store.py's import_profiles docstring). #}
+  <dialog id="subagent-import" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">Import subagent profiles JSON</span>
+      <button type="button" onclick="document.getElementById('subagent-import').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <form method="post" action="/api/subagents/import" class="p-4 space-y-3">
+      <p class="text-[11px] text-secondary">Paste a previously exported <code class="text-[10px]">asra_subagents.json</code>. Existing profiles (matched by id) are left alone; new ones are merged in disabled, ready to review and turn on.</p>
+      <textarea name="data" rows="8" placeholder='{ "profiles": [ ... ] }' autocomplete="off"
+                class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      <div class="flex justify-end">
+        <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Merge in</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Delegated (one listener for the whole page, not one per button) -- however many copies of
+     bulk_toggle_row()/tool_checklist() end up rendered at once (the New-subagent section, plus one
+     per profile's own Edit dialog) all work identically with zero id-scoping needed: each click
+     acts only on switches inside the SAME .asra-tool-checklist the clicked button's own bulk-toggle
+     row sits directly above (closest(".mb-2, .mb-3")-style DOM-position scoping would be fragile,
+     so the row and checklist are instead paired by simple adjacent-sibling order in the DOM, which
+     bulk_toggle_row()/tool_checklist() are always rendered as, one right after the other). #}
+  <script>
+    document.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-bulk-action]");
+      if (!btn) return;
+      // bulk_toggle_row() and tool_checklist()'s own outer div are always rendered back to back
+      // (nothing else in between) -- walking forward one sibling from the row itself finds the
+      // right checklist without any id-scoping scheme, correct however many copies of both macros
+      // end up on the page at once (New-subagent section, plus one per profile's own Edit dialog).
+      var row = btn.closest("div.flex.flex-wrap");
+      var target = row ? row.nextElementSibling : null;
+      if (!target || !target.classList.contains("asra-tool-checklist")) return;
+      var domain = btn.getAttribute("data-bulk-domain");
+      var turnOn = btn.getAttribute("data-bulk-action") === "all";
+      target.querySelectorAll("input[type=checkbox]").forEach(function (cb) {
+        if (cb.disabled) return; // report_subagent_result -- always on, never part of a bulk action
+        var label = cb.closest("label");
+        if (domain && (!label || label.getAttribute("data-tool-domain") !== domain)) return;
+        cb.checked = turnOn;
+      });
+      if (window.asraDebugEvent) window.asraDebugEvent("subagent-bulk-toggle", (domain || "all") + "=" + turnOn);
+    });
+  </script>
+{% endblock %}

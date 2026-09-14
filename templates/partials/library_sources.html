@@ -1,0 +1,39 @@
+{% from "macros/ui.html" import provider_options, model_options with context %}
+{# Library source list (main.py's _render_library_sources) -- the hx-target for upload/analyze/
+   delete/stop. Always swapped as outerHTML, never innerHTML.
+
+   No self-poll lives on THIS element anymore -- see partials/library_card.html's own docstring
+   for why (a real, confirmed flicker bug this replaces: polling the whole list re-swapped every
+   card, including ones that weren't analyzing, on every 2-second tick). Each card polls only
+   itself now, while its own status=="analyzing".
+
+   hx-sync="#library-sources:replace" on every action that swaps this same element (delete/
+   analyze/stop buttons in library_card.html, both upload forms in playbook.html) -- a real,
+   confirmed bug this fixes: those requests used to race an in-flight one from a moment earlier
+   with no coordination, so whichever response arrived LAST won even when it was the STALER one
+   (e.g. a delete succeeding, then an unrelated in-flight request's stale response landing after
+   it and silently reverting the deletion). :replace aborts whichever request was already in
+   flight the instant a newer one starts, so only the latest response is ever applied. #}
+<div id="library-sources" class="p-3 space-y-2.5">
+  {% if message %}
+    <div class="rounded-md border border-severity-medium/40 bg-severity-medium/10 px-3 py-2 text-[11px] text-primary">{{ message }}</div>
+  {% endif %}
+  {% if sources %}
+    {# "Analyses running" -- a real, confirmed operator question ("сколько анализов сразу можно
+       сделать? сколько захочу?"): there IS a real per-process cap now (library_store.py's own
+       _MAX_CONCURRENT_ANALYSES), shown here as living proof of it, not just a number buried in
+       .env the operator would have to go find. Infinity symbol when the operator has configured
+       it as 0/unlimited, never the literal number 0 (which would read as "no analyses allowed
+       at all", the opposite of what 0 actually means here). #}
+    <p class="text-[10px] text-secondary/70">Analyses running: {{ running_analyses }} / {{ max_concurrent_label }}</p>
+  {% endif %}
+  {% if not sources %}
+    <div class="text-center py-10 px-4">
+      <svg class="w-7 h-7 text-secondary mx-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M12 3v10m0 0l-3-3m3 3l3-3M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <p class="text-[11.5px] text-secondary mt-2.5">No sources uploaded yet. Add a PDF, epub, or text file above.</p>
+    </div>
+  {% endif %}
+  {% for s in sources %}
+    {% include "partials/library_card.html" %}
+  {% endfor %}
+</div>

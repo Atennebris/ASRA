@@ -1,0 +1,42 @@
+{# {{name}} variables for the manual Repeater/Intruder/Racer forms (agent/tools/toolkit_variables.py)
+   -- define a reusable value once (a session token, an API key), reference it as {{name}} in the
+   URL/headers/body of any of those three forms instead of copy-pasting it into every send by hand.
+   Manual-UI-only convenience -- the agent-facing tools never see or apply this (that module's own
+   docstring explains why). #}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-variables-container">
+  <p class="text-[11px] text-secondary mb-3">
+    Define a value once, reference it as <code class="font-mono">{{ '{{name}}' }}</code> in the URL/headers/body
+    of Repeater, Intruder, or Racer. Resolved right before sending -- the form itself keeps showing
+    your <code class="font-mono">{{ '{{name}}' }}</code> template, not the resolved value.
+  </p>
+
+  {% if variables %}
+    <div class="divide-y divide-default border border-default rounded-lg overflow-hidden mb-3">
+      {% for name, value in variables.items() %}
+        <div class="flex items-center gap-2 px-3 py-2 bg-surface">
+          <span class="text-[11px] font-mono font-semibold text-accent shrink-0">{{ '{{' ~ name ~ '}}' }}</span>
+          <span class="text-[11px] font-mono text-secondary truncate flex-1 min-w-0">{{ value }}</span>
+          <button type="button" title="Delete" aria-label="Delete {{ name }}"
+                  hx-post="{{ toolkit_base_url }}/variables/{{ name }}/delete"
+                  hx-target="#toolkit-variables-container" hx-swap="outerHTML"
+                  class="shrink-0 text-secondary hover:text-severity-high">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </button>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="text-sm text-secondary italic py-2 mb-3">No variables defined yet.</p>
+  {% endif %}
+
+  <form hx-post="{{ toolkit_base_url }}/variables/set" hx-target="#toolkit-variables-container" hx-swap="outerHTML" hx-disabled-elt="this" class="flex gap-2">
+    <input type="text" name="name" placeholder="name" required
+           class="w-32 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    <input type="text" name="value" placeholder="value"
+           class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    {{ button("Save", type="submit", size="sm") }}
+  </form>
+</div>

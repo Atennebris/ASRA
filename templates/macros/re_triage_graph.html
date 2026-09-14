@@ -1,0 +1,100 @@
+{# Reverse Engineering baseline-triage node graph -- a radar/scope motif (concentric orbit rings,
+   a crosshair target reticle, capsule-shaped tool tags) instead of the earlier plain
+   circle-and-line wireframe. One tag per DISTINCT tool called so far, radiating around the center
+   "TARGET" reticle; the most-recently-used tool's tag gets a pulsing accent glow. Data comes from
+   main.py's _re_triage_graph_context, used both by the small live-polling placeholder
+   (partials/re_triage_stage.html, while triage is still running) and the persistent, larger Graph
+   tab (partials/re_triage_tab.html, any status) -- one shared macro so there's exactly one copy of
+   this markup to keep in sync, not two.
+
+   Every coordinate a node carries (x/y, edge_x1/y1/x2/y2, pill_w, label_text, order, has_error) is
+   computed once in _re_triage_graph_context, not re-derived here -- real, confirmed bug this
+   fixes: this macro used to compute its own pill_w from a SEPARATE truncate() call than the one
+   main.py's edge-geometry math would have needed, so the two could silently disagree the moment
+   either one changed. One source of truth now; this file just places what it's handed.
+
+   size_class: the SVG's own Tailwind size classes -- small (~350px, live placeholder) vs large
+   (~550px+, the dedicated Graph tab) both read the identical 0-400 viewBox coordinate space
+   correctly, since SVG scales the whole drawing (including text) proportionally with its
+   rendered size -- no separate "large" layout math needed.
+   live: only true for the still-running placeholder -- gates the rotating radar-sweep animation
+   (an ambient "this is actively scanning" cue) so a PERSISTED, finished graph in the Graph tab
+   never animates something that already happened. #}
+{% macro re_triage_graph(graph_nodes, graph_center, size_class="w-full max-w-[22rem] h-auto", live=false) %}
+  <svg id="re-graph-svg" viewBox="0 0 400 400" class="{{ size_class }} re-graph-svg" aria-hidden="true">
+    <defs>
+      <radialGradient id="re-graph-target-glow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.35" />
+        <stop offset="100%" stop-color="var(--accent)" stop-opacity="0" />
+      </radialGradient>
+    </defs>
+
+    {# Orbit rings -- the signature element. Three concentric dashed circles reading as a
+       radar/scope sweep, the one visual through-line tying "this is a live scan of a target"
+       together at both the small and large size. #}
+    <circle cx="{{ graph_center }}" cy="{{ graph_center }}" r="70" class="re-graph-orbit-ring" />
+    <circle cx="{{ graph_center }}" cy="{{ graph_center }}" r="118" class="re-graph-orbit-ring" />
+    <circle cx="{{ graph_center }}" cy="{{ graph_center }}" r="166" class="re-graph-orbit-ring" />
+    {% if live %}
+      {# id="re-graph-sweep" so a morph swap (re_triage_tab.html's poll) matches this <g> to its own
+         PREVIOUS render instead of tearing it down and recreating it -- the real fix for the sweep
+         needle visibly "teleporting" back to its start angle every ~3s: its 4s rotation never
+         survived long enough to complete once outerHTML-swap was destroying and rebuilding the
+         whole <svg> (this node included) on every poll, restarting the CSS animation from frame 0
+         each time. Kept alive across renders now, it just keeps sweeping. #}
+      <g id="re-graph-sweep" class="re-graph-sweep-group">
+        <line x1="{{ graph_center }}" y1="{{ graph_center }}" x2="{{ graph_center }}" y2="{{ graph_center - 166 }}" class="re-graph-sweep-line" />
+      </g>
+    {% endif %}
+
+    <circle cx="{{ graph_center }}" cy="{{ graph_center }}" r="60" fill="url(#re-graph-target-glow)" />
+
+    {# Edges run from the TARGET reticle's own boundary (r=34) to each pill's own rectangular
+       boundary -- both endpoints computed in main.py (_re_graph_rect_boundary_point), not the
+       node centers -- so the line visibly starts and ends exactly where an element's own edge is,
+       never disappearing underneath either shape. pathLength="100" normalizes the line's length to
+       an abstract 0-100 range regardless of its real on-screen length, so the newest edge's
+       "draw itself in" keyframe (.re-graph-edge-latest, themes.css) is one fixed animation
+       independent of how far that particular node happens to sit from center. #}
+    {% for node in graph_nodes %}
+      <line id="re-graph-edge-{{ loop.index }}" pathLength="100"
+            x1="{{ node.edge_x1 }}" y1="{{ node.edge_y1 }}" x2="{{ node.edge_x2 }}" y2="{{ node.edge_y2 }}"
+            class="re-graph-edge{{ ' re-graph-edge-latest' if node.is_latest else '' }}" />
+    {% endfor %}
+
+    {# Target reticle -- a crosshair instead of a plain filled circle, reading as "the thing being
+       aimed at/analyzed" rather than just another node like the tool tags around it. #}
+    <circle cx="{{ graph_center }}" cy="{{ graph_center }}" r="34" class="re-graph-target-node" />
+    <line x1="{{ graph_center - 46 }}" y1="{{ graph_center }}" x2="{{ graph_center - 20 }}" y2="{{ graph_center }}" class="re-graph-target-tick" />
+    <line x1="{{ graph_center + 20 }}" y1="{{ graph_center }}" x2="{{ graph_center + 46 }}" y2="{{ graph_center }}" class="re-graph-target-tick" />
+    <line x1="{{ graph_center }}" y1="{{ graph_center - 46 }}" x2="{{ graph_center }}" y2="{{ graph_center - 20 }}" class="re-graph-target-tick" />
+    <line x1="{{ graph_center }}" y1="{{ graph_center + 20 }}" x2="{{ graph_center }}" y2="{{ graph_center + 46 }}" class="re-graph-target-tick" />
+    <text x="{{ graph_center }}" y="{{ graph_center }}" class="re-graph-target-label">TARGET</text>
+
+    {# Tool tags -- a capsule (rounded rect) carrying name + count as one monospace line, sized to
+       its own text instead of a fixed circle awkwardly truncating long tool names above a
+       separately-floating count. A small numbered badge on the pill's own top-left corner is the
+       first-use/discovery order (node.order) -- ring position already encodes this via angle, but
+       not legibly; a small red dot on the top-right corner marks a tool that failed at least once
+       (node.has_error), the same "something here needs a second look" signal the Triage timeline's
+       own red-bordered cards already use, now visible from the graph too instead of only after
+       opening the timeline. id="re-graph-node-N" (N = first-use order, stable across polls since
+       tool_order only ever grows) is what lets a morph swap leave an unrelated node's ping/pulse
+       alone when a DIFFERENT tool becomes the latest one. #}
+    {% for node in graph_nodes %}
+      <g id="re-graph-node-{{ loop.index }}" class="re-graph-tool-group">
+        {% if node.is_latest %}
+          <circle cx="{{ node.x }}" cy="{{ node.y }}" r="4" class="re-graph-tool-ping" />
+        {% endif %}
+        <rect x="{{ node.x - node.pill_w / 2 }}" y="{{ node.y - 13 }}" width="{{ node.pill_w }}" height="26" rx="13"
+              class="re-graph-tool-node{{ ' re-graph-tool-node-latest' if node.is_latest else '' }}" />
+        <text x="{{ node.x }}" y="{{ node.y + 1 }}" class="re-graph-tool-label{{ ' re-graph-tool-label-latest' if node.is_latest else '' }}">{{ node.label_text }}</text>
+        <circle cx="{{ node.x - node.pill_w / 2 + 9 }}" cy="{{ node.y - 13 }}" r="7" class="re-graph-order-badge" />
+        <text x="{{ node.x - node.pill_w / 2 + 9 }}" y="{{ node.y - 12 }}" class="re-graph-order-label">{{ node.order }}</text>
+        {% if node.has_error %}
+          <circle cx="{{ node.x + node.pill_w / 2 - 9 }}" cy="{{ node.y - 13 }}" r="4" class="re-graph-error-dot" title="At least one call failed" />
+        {% endif %}
+      </g>
+    {% endfor %}
+  </svg>
+{% endmacro %}

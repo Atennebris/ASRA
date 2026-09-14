@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "IPC for the start screen (local asset origin) AND the live backend UI this window navigates to once started (http://127.0.0.1/localhost, any port -- PORT is operator-configurable in .env). Real, confirmed incident this fixes: without the \"remote\" block below, a capability only ever applies to the window's ORIGINAL local asset content -- once main.rs's own window.navigate() moves this same window to the live http:// backend (every ordinary use of the app past the start screen), Tauri's own ACL treated that as unauthorized remote content and silently rejected every command call from it (\"Command <name> not allowed by ACL\", surfaced nowhere but the JS invoke() promise's own rejection) -- including open_external_url (Codex/Copilot OAuth \"Connect\", a Library source's own link, \"Get a key\" links) and notify_session_done, both called only from THIS post-navigation UI, never the start screen.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:default",
+    "allow-get-start-config",
+    "allow-launch-backend",
+    "allow-force-restart-agent",
+    "allow-save-env",
+    "allow-open-in-browser",
+    "allow-open-external-url",
+    "allow-notify-session-done"
+  ]
+}

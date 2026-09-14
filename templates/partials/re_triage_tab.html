@@ -1,0 +1,43 @@
+{# Graph + Triage tab SHELL (session.html's RE-mode info tabs) -- a thin polling wrapper around the
+   real content (partials/re_triage_tab_content.html). Split into shell + content specifically so
+   the live poll below can use hx-swap="morph:innerHTML" correctly: that swap style morphs THIS
+   element's children against the response body, so the response has to be the content alone, never
+   a second copy of this same shell -- see the content partial's own top comment for the mechanics,
+   the exact same "outer polling id must differ from what the response re-renders" shape
+   session.html's #session-stream / session_fragment.html's #session-content pair already uses for
+   Agent mode's SSE stream.
+
+   hx-ext="morph" + hx-swap="morph:innerHTML" (not the old plain hx-swap="outerHTML") -- two real,
+   confirmed operator complaints this closes, both the SAME root cause session.html's own
+   #session-stream / base.html's Idiomorph guard already exists to fix for Agent mode, just never
+   applied here: (1) a manually-EXPANDED Triage timeline <details> card re-closed itself the instant
+   the NEXT tool call's poll landed, because outerHTML swap tears down and recreates the entire
+   subtree from scratch every 3s, discarding the live-DOM-only `open` state on every single card
+   regardless of whether that card's own content changed. (2) the radar sweep needle (.re-graph-
+   sweep-group, themes.css) visibly "teleported" back to its start angle every ~3s instead of
+   sweeping continuously -- its 4s CSS animation was restarting from frame 0 every time, because
+   outerHTML swap destroys the live <svg> node (and therefore the running animation) and replaces it
+   with a brand new one, well before the animation ever completes one full rotation. morph:innerHTML
+   only patches attributes/text on nodes idiomorph can match to their previous render (interactive_
+   log.html's stable id="interactive-log-N" on each card, the graph macro's own stable ids) -- an
+   unrelated new log line no longer touches either the open cards or the live SVG node at all, so
+   both keep running exactly as the operator left them. Fetched by main.py's
+   GET /api/session/{id}/re-triage-tab (renders re_triage_tab_content.html directly, not this
+   shell), both for this poll and, unwrapped, for the initial page render just below.
+
+   Polls unconditionally, not gated on session.status in ("pending", "processing") at render time
+   like an earlier version of this shell -- real, confirmed gap that caused: the poll attributes
+   live on THIS shell div, which a morph:innerHTML swap never touches (only its children are
+   morphed), so that gate was only ever evaluated once, at whatever status the page happened to be
+   loaded at. A page loaded (or left open) while a triage/re-verify pass was NOT yet running never
+   started polling at all, so a pass that started moments or minutes later had no live hook left to
+   notice it -- unlike re_triage_stage.html's own similar-looking gate, whose polled response swaps
+   its OWN outerHTML (including its own hx-trigger), so that one IS correctly re-evaluated fresh on
+   every tick. Same "just keep polling, it's cheap" convention already used unconditionally
+   elsewhere in this app (index.html/sessions_list.html's own "every 5s" tiles, no status gate at
+   all) rather than a stop-on-terminal mechanism that would need its own way to resume once a later
+   pass starts. #}
+<div id="re-triage-tab" class="contents"
+     hx-ext="morph" hx-get="/api/session/{{ session.session_id }}/re-triage-tab" hx-trigger="every 3s" hx-swap="morph:innerHTML">
+  {% include "partials/re_triage_tab_content.html" %}
+</div>

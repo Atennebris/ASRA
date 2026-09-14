@@ -1,0 +1,33 @@
+{# Live View: real-time, INTERACTIVE preview of the agent's own Playwright browser (CDP Page.
+   startScreencast, agent/tools/browser_manager.py) -- off by default (streaming frames nobody's
+   watching isn't free), toggled via a round-trip through
+   main.py's get_toolkit_screencast_panel rather than a client-side-only show/hide: the "on"
+   state's own sse-connect element must only EXIST in the DOM while actually visible, so toggling
+   back to "off" genuinely closes the connection (and, server-side, stops the real screencast)
+   instead of just hiding an element that's still silently streaming underneath. Clicking/
+   scrolling/typing on the frame itself is forwarded into the real page (static/js/
+   live_view_input.js, main.py's toolkit_live_view_input route) -- lets the operator manually
+   click through a live bot-challenge the agent's own call may still be blocked waiting on. #}
+{% if visible %}
+  <div id="toolkit-live-view" class="mb-3 bg-elevated border border-default rounded-lg p-2">
+    <div class="flex items-center justify-between mb-1.5">
+      <span class="text-[11px] font-semibold uppercase tracking-wider text-secondary">Live view <span class="normal-case font-normal text-secondary/70">&mdash; click the frame to interact</span></span>
+      <button type="button" hx-get="/api/session/{{ session_id }}/toolkit/screencast-panel?visible=false"
+              hx-target="#toolkit-live-view" hx-swap="outerHTML"
+              class="text-[11px] text-secondary hover:text-primary">Hide</button>
+    </div>
+    {# hx-ext declared locally, its own island -- same reasoning as toolkit_panel.html's own
+       polling container: this never shares #session-stream's connection (see main.py's
+       toolkit_screencast_stream docstring for why it couldn't even if it wanted to). #}
+    <div id="toolkit-live-frame-container" hx-ext="sse"
+         sse-connect="/api/session/{{ session_id }}/toolkit/screencast/stream" sse-swap="message" hx-swap="innerHTML">
+      <p class="text-sm text-secondary italic">Waiting for the agent&rsquo;s browser&hellip;</p>
+    </div>
+  </div>
+{% else %}
+  <div id="toolkit-live-view" class="mb-3">
+    <button type="button" hx-get="/api/session/{{ session_id }}/toolkit/screencast-panel?visible=true"
+            hx-target="#toolkit-live-view" hx-swap="outerHTML"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">Show live view</button>
+  </div>
+{% endif %}

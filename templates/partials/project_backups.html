@@ -1,0 +1,49 @@
+{# Manual + auto backup snapshots of this project's own folder (agent/tools/project_backup.py) --
+   session.json, debug.log, findings, screenshots. Real engagement data with no protection before
+   this against a crash mid-write or a bad run overwriting something. list_project_backups is a
+   Jinja global (main.py), same "pure lookup, no request state" reasoning as get_session_folder just
+   above it -- session_fragment.html gets re-rendered from many different routes that would each
+   otherwise need to remember to thread a "backups" context key through by hand. #}
+{% set backups = list_project_backups(session.session_id) %}
+<details id="project-backups" class="mt-2 text-[11px]">
+  <summary class="cursor-pointer text-secondary hover:text-primary select-none">Backups ({{ backups | length }})</summary>
+  <div class="mt-2 space-y-2 max-w-[32rem]">
+    {# Real, confirmed operator confusion this note fixes: seeing several backup-*.tar.gz archives
+       pile up looked like a bug ("shouldn't there be just one?") and raised the question of whether
+       resuming a paused/interrupted scan requires restoring one of them. Neither is true -- rotation
+       to the newest {{ project_backup_max_count }} is the whole design (agent/tools/project_backup.py's
+       PROJECT_BACKUP_MAX_COUNT), and a resume just reopens the live session.json, no restore needed. #}
+    <p class="text-secondary italic">Auto-backup keeps the newest {{ project_backup_max_count }} snapshots (older ones
+      are deleted automatically) -- this is disaster recovery, not how you resume: continuing a paused
+      or interrupted scan already picks up from the live session.json on its own, with nothing to
+      restore. Only use Restore here to roll this project's files back to an earlier point in time.</p>
+    <form hx-post="/api/session/{{ session.session_id }}/backup" hx-target="#project-backups" hx-swap="outerHTML" hx-disabled-elt="this">
+      <button type="submit"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-7 px-3 text-[11px]">
+        Backup now
+      </button>
+    </form>
+    {% if backups %}
+      <div class="space-y-1">
+        {% for backup in backups %}
+          <div class="flex items-center justify-between gap-2 border border-default rounded px-2 py-1">
+            <span class="font-mono text-secondary truncate" title="{{ backup.name }}">{{ backup.name }}</span>
+            <span class="text-secondary shrink-0">{{ "%.1f"|format(backup.size_bytes / 1048576) }} MB</span>
+            <div class="flex items-center gap-2 shrink-0">
+              <form hx-post="/api/session/{{ session.session_id }}/backup/{{ backup.name }}/restore" hx-target="#project-backups" hx-swap="outerHTML" hx-disabled-elt="this"
+                    hx-confirm="Restore this backup ({{ backup.name }})? This overwrites the current project files (session.json, findings, logs) with the snapshot's contents. Anything changed since the backup was taken will be lost.">
+                <button type="submit" class="text-accent hover:underline">Restore</button>
+              </form>
+              <form hx-post="/api/session/{{ session.session_id }}/backup/{{ backup.name }}/delete" hx-target="#project-backups" hx-swap="outerHTML" hx-disabled-elt="this"
+                    hx-confirm="Delete this backup ({{ backup.name }})? This can't be undone.">
+                <button type="submit" class="text-severity-high hover:underline">Delete</button>
+              </form>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-secondary italic">No backups yet.</p>
+    {% endif %}
+  </div>
+</details>

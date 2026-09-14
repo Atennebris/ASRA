@@ -11,7 +11,10 @@ import os
 import time
 from pathlib import Path
 
-CACHE_DIR = Path("data/cache")
+from projects.paths import resolve_global_app_dir
+
+# Global app data (Documents/ASRA/data, see projects/paths.py), not a repo-relative data/ folder.
+CACHE_DIR = resolve_global_app_dir() / "data" / "cache"
 
 _DEFAULT_TTL_SECONDS = 3600
 

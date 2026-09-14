@@ -1,0 +1,55 @@
+{# Comparer: pick two captured traffic entries (Site Map or Repeater -- same underlying list, see
+   main.py's get_toolkit_comparer_panel), diff their request or response side by side. Root div's
+   own id is the stable hx-target/hx-swap="outerHTML" anchor for the form's own submit, same
+   self-contained container convention as toolkit_repeater.html/toolkit_decoder.html. #}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-comparer-container">
+  <form hx-post="{{ toolkit_base_url }}/comparer/run" hx-target="#toolkit-comparer-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="grid grid-cols-2 gap-2">
+      <select name="entry_id_a" class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">— select A —</option>
+        {% for e in entries %}
+          <option value="{{ e.id }}" {% if e.id == entry_id_a %}selected{% endif %}>{{ e.method }} {{ e.url }} ({{ e.response_status or '—' }})</option>
+        {% endfor %}
+      </select>
+      <select name="entry_id_b" class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">— select B —</option>
+        {% for e in entries %}
+          <option value="{{ e.id }}" {% if e.id == entry_id_b %}selected{% endif %}>{{ e.method }} {{ e.url }} ({{ e.response_status or '—' }})</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="flex items-center gap-3">
+      <div class="flex items-center gap-3 text-[11px] text-secondary">
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="part" value="request" {% if part == "request" %}checked{% endif %}> Request
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="part" value="response" {% if part == "response" %}checked{% endif %}> Response
+        </label>
+      </div>
+      {{ button("Compare", type="submit", size="sm") }}
+    </div>
+  </form>
+
+  {% if error %}
+    <div class="bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">
+      {{ error }}
+    </div>
+  {% elif rows is not none %}
+    <div class="border border-default rounded-lg overflow-auto max-h-96 asra-scroll">
+      <table class="w-full text-[11px] font-mono border-collapse">
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td class="align-top px-2 py-0.5 w-1/2 whitespace-pre-wrap break-words {{ 'bg-severity-high/10' if row.tag in ('delete', 'replace') else '' }}">{% if row.left_spans %}{% for span in row.left_spans %}{% if span.changed %}<mark class="bg-severity-high/30 text-severity-high">{{ span.text }}</mark>{% else %}{{ span.text }}{% endif %}{% endfor %}{% elif row.left_text is not none %}{{ row.left_text }}{% endif %}</td>
+            <td class="align-top px-2 py-0.5 w-1/2 whitespace-pre-wrap break-words border-l border-default {{ 'bg-severity-low/10' if row.tag in ('insert', 'replace') else '' }}">{% if row.right_spans %}{% for span in row.right_spans %}{% if span.changed %}<mark class="bg-severity-low/30 text-severity-low">{{ span.text }}</mark>{% else %}{{ span.text }}{% endif %}{% endfor %}{% elif row.right_text is not none %}{{ row.right_text }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="text-sm text-secondary italic py-4">Select two entries above and click Compare.</p>
+  {% endif %}
+</div>

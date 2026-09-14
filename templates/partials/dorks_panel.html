@@ -1,0 +1,106 @@
+{# Dork Engine's own form + quick-button grid + result area -- one htmx swap target
+   (main.py's post_dorks_build returns this SAME partial, hx-swap="outerHTML" on #dorks-panel), so
+   every submitted field (target/engine/custom_dork) is simply echoed back into its own input's
+   value= on re-render rather than needing a separate "preserve what I typed" mechanism. Every
+   quick-button is a real <button type="submit" name="category" value="{{ c.id }}"> inside the
+   ONE #dorks-form -- clicking it submits target/engine/custom_dork alongside that button's own
+   category, no hx-include/hx-vals bookkeeping needed to keep two things in sync. Categories come
+   from agent/tools/dork_engine.py's list_dork_categories() (main.py's _dorks_panel_context) --
+   never hand-copied here, so a new catalog entry appears on this page automatically. #}
+{% from "macros/ui.html" import copy_button, section_label, card %}
+
+<div id="dorks-panel">
+  {# The input row/result stay at a readable max-w-3xl (a wide target/engine/custom-dork row reads
+     worse, not better); the button grid below is deliberately OUTSIDE that cap so it uses whatever
+     width the page actually has (dorks_standalone.html's own max-w-none) to wrap more of the ~50
+     category buttons per row instead of stacking them into a tall, narrow column. #}
+  <form id="dorks-form" hx-post="/api/dorks/build" hx-target="#dorks-panel" hx-swap="outerHTML" class="space-y-5">
+    <div class="max-w-3xl space-y-5">
+    <div class="grid grid-cols-1 sm:grid-cols-[2fr_1fr] gap-3">
+      <label class="block">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Target</span>
+        <input type="text" name="target" value="{{ target }}"
+               placeholder="example.com, https://app.example.com, 10.0.0.5, or *.example.com"
+               class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <label class="block">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Engine</span>
+        <select name="engine" class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {% for eng in engines %}
+            <option value="{{ eng }}" {% if eng == engine %}selected{% endif %}>{{ eng }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <div class="flex items-end gap-2">
+      <label class="block flex-1">
+        <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Custom dork (optional)</span>
+        <input type="text" name="custom_dork" value="{{ custom_dork }}"
+               placeholder='ext:sql intext:&quot;password&quot; — combined as site:{target} ... when Target is also set'
+               class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <button type="submit" name="category" value=""
+              class="shrink-0 px-4 py-2 rounded bg-accent text-white text-sm font-medium hover:bg-accent/90 transition-colors">
+        Run
+      </button>
+    </div>
+
+    {# Result sits right here, above the quick-button grid -- with 50 category buttons below,
+       a result appended at the very bottom (this block's old position) was invisible without
+       scrolling past all of them on every single click. Real, confirmed operator complaint this
+       fixes. #}
+    {% if result %}
+      <div>
+        {% if result.status == "error" %}
+          <div class="bg-severity-high/10 border border-severity-high/30 rounded-lg p-4 text-sm text-severity-high">
+            {{ result.error }}
+          </div>
+
+        {% elif result.status == "lead" %}
+          {% call card() %}
+            <div class="flex items-start justify-between gap-3 mb-2">
+              <div>
+                <span class="text-[11px] uppercase tracking-wider text-secondary">
+                  {{ result.kind | replace("_", " ") }}{% if result.engine %} — {{ result.engine }}{% endif %}
+                </span>
+                {% if result.label %}<h4 class="text-sm font-medium text-primary mt-0.5">{{ result.label }}</h4>{% endif %}
+              </div>
+              {{ copy_button(result.url) }}
+            </div>
+            {% if result.query %}
+              <code class="block text-[12px] text-secondary bg-elevated rounded px-2 py-1.5 mb-2 break-all">{{ result.query }}</code>
+            {% endif %}
+            <a href="{{ result.url }}" target="_blank" rel="noopener noreferrer" class="text-[12px] text-accent hover:underline break-all">{{ result.url }}</a>
+            <p class="text-[11px] text-secondary mt-2">{{ result.note }}</p>
+          {% endcall %}
+
+        {% elif result.status == "ok" %}
+          {% call card() %}
+            <span class="text-[11px] uppercase tracking-wider text-severity-low block mb-2">
+              {{ (result.dork_category or "lookup") | replace("_", " ") }} — ok
+            </span>
+            <pre class="text-[12px] text-primary bg-elevated rounded px-3 py-2 overflow-x-auto asra-scroll whitespace-pre-wrap break-all">{{ result | tojson }}</pre>
+          {% endcall %}
+        {% endif %}
+      </div>
+    {% endif %}
+    </div>
+
+    <div class="space-y-5">
+    {% for kind, categories in categories_by_kind.items() %}
+      <div>
+        {{ section_label(kind_labels[kind]) }}
+        <div class="flex flex-wrap gap-1.5">
+          {% for c in categories %}
+            <button type="submit" name="category" value="{{ c.id }}" title="{{ c.description }}"
+                    class="px-2.5 py-1 rounded border border-default text-[11px] text-secondary hover:bg-elevated hover:text-primary hover:border-accent/40 transition-colors">
+              {{ c.label }}
+            </button>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+    </div>
+  </form>
+</div>

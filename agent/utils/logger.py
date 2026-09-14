@@ -11,13 +11,31 @@ LOG_CATEGORIES: set[str] = {
     "API",
     "CHAT",
     "PROJECTS",
+    "UI",  # browser-side activity — buttons, dialogs, htmx requests; see main.py's /api/debug/client-event
+    "SUBAGENT",  # delegate_to_subagent lifecycle + a delegated subagent's own LLM turns/tool calls — split out from AGENT so it renders in its own console color
+    "PLAYBOOK",  # cross-session technique capture/lookup/distillation — agent/tools/playbook_store.py + agent/core.py's playbook hooks
+    "TOOLKIT",  # native Proxy/Repeater/Decoder/Comparer traffic capture — agent/tools/toolkit_store.py
+    "UPDATE",  # git-based update checks/apply + startup check — agent/updater.py
+    "TERMINAL",  # standalone PTY terminal tab lifecycle (create/attach/detach/exit) —
+    # agent/tools/terminal_manager.py + main.py's /terminal, /api/terminal/*, /ws/terminal/*.
+    # Lifecycle events only, deliberately never raw keystrokes/output (see that module's own
+    # docstring) — a real operator shell can carry a typed password, which debug.log is not the
+    # place for.
+    "DESKTOP",  # the Tauri desktop shell's own Rust-side diagnostics (desktop/src-tauri/src/main.rs) —
+    # never emitted through this Python logger itself, but declared here so debug.py's
+    # CATEGORY_COLORS (the shared source of truth main.rs and scripts/debug_console.ps1 both read)
+    # has a real, matching entry for the "[asra.DESKTOP]" lines that file writes directly
+    "LIBRARY",  # knowledge-library source upload/normalization/LLM-extraction pipeline —
+    # agent/tools/library_store.py
 }
 
 _configured: set[str] = set()
 
 
 def get_logger(category: str) -> logging.Logger:
-    """Returns a logger wired to data/debug.log + colorized console when DEBUG=true, silent otherwise."""
+    """Returns a logger wired to colorized console output + the global debug log (and, when a
+    session is active, that session's own project-folder debug log too — see agent/utils/debug.py)
+    when DEBUG=true; silent otherwise."""
     if category not in LOG_CATEGORIES:
         raise ValueError(f"Unknown log category: {category!r}. Add it to LOG_CATEGORIES first.")
 

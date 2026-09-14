@@ -1,0 +1,24 @@
+{# The standalone Dork Engine page -- reachable straight from the sidebar (base.html's own nav
+   entry), same "no project/session needed" shape as /toolkit (toolkit_standalone.html): dorking a
+   target is ad-hoc manual work, never tied to one specific engagement's own project folder.
+   partials/dorks_panel.html is the single source of both this page's own form/button-grid/result
+   area AND every htmx re-render after a quick-button click (main.py's post_dorks_build) -- the
+   SAME catalog (agent/tools/dork_engine.py) also backs the dork_search tool the autonomous agent,
+   subagents, and chat all call natively, so this page is a manual front end onto that one catalog,
+   never a second hand-copied list of dorks. #}
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header %}
+{% block title %}ASRA &mdash; Dork Engine{% endblock %}
+
+{% block content %}
+  {{ page_header("Dork Engine") }}
+  <p class="text-[11px] text-secondary mb-4 max-w-2xl">
+    Search-engine dorks and third-party OSINT lookups for one target, from one curated catalog —
+    the same one the autonomous agent, Subagents, and Chat all reach through the dork_search tool.
+    A search-engine dork is never run automatically here (most engines CAPTCHA-gate automated
+    traffic) — clicking one builds the query and opens it in your own browser. A "Live OSINT
+    lookups" button actually runs (ASRA's own crt.sh/Wayback/WHOIS/DNS/... tools) and shows the
+    real result inline.
+  </p>
+  {% include "partials/dorks_panel.html" %}
+{% endblock %}

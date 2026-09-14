@@ -1,0 +1,57 @@
+{# Decorative header light -- Settings -> Customization -> Header light (settings.html). Applied live by
+   static/js/header_light.js from localStorage; styled by static/css/themes.css's .header-light /
+   .header-light-fixture rules. Included as a direct child of the page's own title bar -- that bar
+   carries `position:relative` (either baked into macros/ui.html's page_header() macro on Settings/Chat
+   settings/Tools/Toolkit/Dorks/Terminal, or added directly to a page's own bar div elsewhere --
+   Dashboard/Fleet/Playbook/Subagents/Projects/index.html's hero/session.html's own title bar)
+   specifically so this can anchor its `inset:0` boxes against the WHOLE bar, not just the <h1> text.
+   Real, confirmed bug an earlier version of this had: anchoring the light to a small box
+   shrink-wrapped around just the <h1> put the lamp fixture directly ON TOP of the title text instead
+   of hanging clear of it near the bar's right edge -- the bar itself needs to be the anchor so the
+   fixture has real room away from the text (and, where a bar also carries action buttons or a mascot
+   mount, away from those too -- see the "Lamp position" slider below for the rare case the two still
+   get close).
+
+   The default "bulb" style is a real pendant lamp hanging over the page title, mounted at the bar's
+   RIGHT edge (--hl-x in themes.css) with a long cord (header_lamp_svg below) that pokes up well above
+   the bar itself, reading as if it drops in from outside/above the title bar rather than sitting flush
+   on it: a metal shade + a glowing bulb, and -- the whole point -- a wash of light (.hl-pool) that
+   floods the ENTIRE bar like a lamp lighting a shelf. The pool's box is the bar itself (themes.css sets
+   inset:0), so the light brightens the title and the whole surface yet physically cannot bleed past the
+   bar's borders onto the content below.
+
+   The other two styles: "garland" is a festoon string of small bulbs (header_garland_bulbs below)
+   strung along the bar's bottom edge; "comet" is a single bright point that continuously sweeps
+   across the bar trailing a glow, instead of sitting still as a static dot.
+
+   TWO sibling elements, not one -- real, confirmed bug this split fixes: the glow (.hl-pool) needs
+   z-index:-1 so it sits behind the title text instead of washing it out (see themes.css's own
+   .header-light comment), but that same negative z-index sinks its ENTIRE subtree below every
+   ancestor's own box for HIT-TESTING too, not just visually below the text -- confirmed live via
+   elementsFromPoint(): with the click target living in that subtree, even its own exact center point
+   resolved to the ancestor title bar <div>, never to the icon, everywhere except the sliver poking
+   entirely above the bar's own box. That's why clicking the lamp read as "sometimes reacts, mostly
+   doesn't" rather than a small-hit-target problem. `.header-light` below now holds ONLY the glow;
+   `.header-light-fixture` holds the actual clickable parts (bulb icon / comet dot / garland string)
+   in normal (non-negative) stacking, so real clicks reach them. header_light.js applies every
+   --hl-*/data-* value to BOTH via document.querySelectorAll("[data-header-light]") -- both elements
+   carry that attribute -- so they always stay in sync with no extra JS needed for the split.
+   settings.html's own style-preview cards are unaffected: those are a separate, static, non-
+   interactive swatch that still keeps everything in one `.header-light` element (see its own markup
+   and themes.css's `[data-header-light-preview]` rules).
+
+   The glow stays pointer-events:none so the title stays selectable; the fixture stays
+   pointer-events:none at the container level too so it never swallows clicks meant for real buttons/
+   mascot mounts sharing the same bar -- only the fixture (or the comet/garland of the other two
+   styles) opts back in as the click target. Clicking it is the pull-chain switch -- a mouse-only
+   cosmetic toggle of data-lit, same spirit as the session mascot (aria-hidden, no tab stop). All
+   three styles' markup is always present; CSS shows only the one matching data-style. #}
+{% from "macros/ui.html" import header_lamp_svg, header_garland_bulbs %}
+<span class="header-light" data-header-light data-style="bulb" data-color-mode="auto" data-lit="true" aria-hidden="true">
+  <span class="hl-pool" aria-hidden="true"></span>
+</span>
+<span class="header-light-fixture" data-header-light data-style="bulb" data-color-mode="auto" data-lit="true" aria-hidden="true" tabindex="-1" title="Header light">
+  <span class="hl-lamp-btn" aria-hidden="true">{{ header_lamp_svg("hl-shade-grad") }}</span>
+  <span class="hl-comet"></span>
+  <span class="hl-garland" aria-hidden="true">{{ header_garland_bulbs() }}</span>
+</span>

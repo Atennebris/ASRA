@@ -1,0 +1,5 @@
+{# main.py's toggle_pinned_ref route -- just the one chat_ref span the operator clicked, re-rendered
+   with its new pinned state, so its own hx-target="closest span"/hx-swap="outerHTML" can replace
+   itself in place without needing the whole card it lives on to re-render. #}
+{% from "macros/ui.html" import chat_ref %}
+{{ chat_ref(ref, pinned=pinned, session_id=session_id) }}

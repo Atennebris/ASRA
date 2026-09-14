@@ -1,0 +1,47 @@
+{# The actual Graph + Triage CONTENT -- split out of re_triage_tab.html (that file is now just the
+   thin polling shell around this) for the same structural reason session.html's own #session-stream
+   wrapper is a separate element from session_fragment.html's #session-content root: hx-swap="morph:
+   innerHTML" morphs the POLLING element's CHILDREN against whatever the response body is, so that
+   response body must be this content alone, never re-wrapped in a copy of the polling element's own
+   id/hx-* attributes -- returning the outer shell from here too would morph a second, nested
+   #re-triage-tab INSIDE the real one on every single poll instead of updating its actual content.
+   Fetched by main.py's GET /api/session/{id}/re-triage-tab for every poll; re_triage_tab.html
+   includes this same file directly for the initial page render, so both paths render identically. #}
+{% from "macros/re_triage_graph.html" import re_triage_graph %}
+<section id="re-info-panel-graph" class="interactive-pane re-info-panel-graph">
+  <div class="flex flex-col items-center justify-center flex-1 min-h-0 px-4 py-4">
+    {% if graph_nodes %}
+      {{ re_triage_graph(graph_nodes, graph_center, size_class="w-full max-w-[30rem] h-auto", live=(session.status in ("pending", "processing"))) }}
+      {# Sweep-sequence strip -- honest about what it can and can't say: lit segments are stages
+         the log genuinely shows tool activity for (_RE_GRAPH_STAGES, main.py); the one dashed
+         "awaiting" segment names the next UNTOUCHED stage, never a guess at which specific tool
+         runs next -- there's no signal in this data that could support that stronger claim. #}
+      <ol class="re-graph-stage-strip" aria-label="Triage stage sequence">
+        {% for stage in graph_stages %}
+          <li class="re-graph-stage-chip{{ ' re-graph-stage-chip-active' if stage.active else '' }}{{ ' re-graph-stage-chip-next' if stage.is_next else '' }}">
+            <span class="re-graph-stage-dot" aria-hidden="true"></span>
+            <span>{{ stage.label }}</span>
+            {% if stage.active %}<span class="re-graph-stage-count">×{{ stage.count }}</span>{% elif stage.is_next %}<span class="re-graph-stage-count">awaiting</span>{% endif %}
+          </li>
+        {% endfor %}
+      </ol>
+      {% if graph_last_activity_at %}
+        <p class="text-[11px] text-secondary mt-2 text-center">
+          Last activity <span data-live-duration data-started-at="{{ graph_last_activity_at }}">{{ graph_last_activity_at | duration_between(none) }}</span> ago
+        </p>
+      {% endif %}
+    {% else %}
+      <p class="text-[11px] text-secondary text-center py-8">No tool activity recorded yet.</p>
+    {% endif %}
+    <p class="text-[11px] text-secondary mt-2 text-center truncate w-full">{{ graph_target_label }}</p>
+  </div>
+</section>
+<section id="re-info-panel-triage" class="interactive-pane re-info-panel-triage">
+  {# data-scroll-persist reuses static/js/session_state.js's existing scroll-position-persistence
+     mechanism (originally built for the Logs modal/session tabs) -- real, confirmed operator
+     complaint this closes: every 3s poll swap reset this list's scroll straight back to the top,
+     mid-read. No new JS needed -- this attribute alone is what that file already watches for. #}
+  <div id="re-triage-timeline-scroll" class="interactive-pane-body asra-scroll" data-scroll-persist="re-triage-timeline-{{ session.session_id }}">
+    {% include "partials/interactive_log.html" %}
+  </div>
+</section>

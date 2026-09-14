@@ -1,0 +1,337 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import provider_options, model_options with context %}
+{% block title %}ASRA &mdash; Playbook{% endblock %}
+{% block content %}
+  {# The Playbook manager: the cross-session technique store (agent/tools/playbook_store.py) made
+     visible and editable. It's global operator knowledge -- not tied to any one project -- that
+     surfaces as a lead the next time a similarly fingerprinted target shows up. #}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
+    <div class="min-w-0">
+      <h1 class="text-[15px] font-semibold text-primary">Playbook</h1>
+      <p class="text-[11px] text-secondary mt-0.5 max-w-2xl">Cross-session exploitation techniques &amp; confirmed dead-ends — the accumulating edge that gets surfaced as a lead on similarly fingerprinted targets. Survives project deletion.</p>
+      <p class="text-[11px] text-secondary/70 mt-1.5 max-w-2xl leading-relaxed">
+        Entries build up on their own — every confirmed exploit the agent lands, plus anything the chat saves with <code class="text-[10px]">record_technique</code>. You have <strong class="text-secondary">{{ total }}</strong> already.
+        <strong class="text-secondary">Seed pack</strong> is a one-click, optional starter set of {{ 5 }} well-known <em>public</em> WAF/CDN-bypass patterns (built into ASRA, not fetched from anywhere) to prime an empty playbook — nothing you need to click if you already have your own. <strong class="text-secondary">Export</strong>/<strong class="text-secondary">Import</strong> back up or move the whole store as JSON.
+      </p>
+      {# Semantic (meaning-based) search coverage. Embeddings come from whatever LLM provider is
+         active; if none supports them, this stays 0 and search silently uses keyword matching. #}
+      <p class="text-[11px] mt-1.5">
+        {% if total and embedded >= total %}
+          <span class="inline-flex items-center gap-1 text-severity-low"><svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>Semantic search active — all {{ total }} techniques embedded.</span>
+        {% elif embedded %}
+          <span class="text-secondary/70">Semantic search: <strong class="text-secondary">{{ embedded }}/{{ total }}</strong> embedded — <button type="button" hx-post="/api/playbook/reembed" hx-target="#playbook-list" hx-swap="innerHTML" hx-on::before-request="this.textContent='embedding…'" class="text-accent hover:underline">embed the rest</button> to cover meaning-based search everywhere.</span>
+        {% elif total %}
+          <span class="text-secondary/70">Semantic search: none embedded yet — <button type="button" hx-post="/api/playbook/reembed" hx-target="#playbook-list" hx-swap="innerHTML" hx-on::before-request="this.textContent='embedding…'" class="text-accent hover:underline">turn it on</button> (uses your active LLM provider's embeddings; falls back to keyword search if it has none).</span>
+        {% endif %}
+      </p>
+      {% if total %}
+        <p class="text-[11px] text-secondary/70 mt-1">
+          Threat-intel: <button type="button" hx-post="/api/playbook/refresh-intel" hx-target="#playbook-list" hx-swap="innerHTML" hx-on::before-request="this.textContent='pulling KEV/EPSS…'" class="text-accent hover:underline">pull live KEV/EPSS</button> for techniques that name CVEs, so the agent prioritizes what's actively exploited in the wild.
+        </p>
+      {% endif %}
+    </div>
+    <div class="flex items-center gap-2 flex-wrap shrink-0">
+      {# Opens the Library drawer (partials/library_sources.html) -- upload a source, analyze it
+         with an already-configured LLM provider, extracted techniques land below as unreviewed. #}
+      <button type="button" onclick="window.asraToggleLibraryPanel(true)"
+              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v10m0 0l-3-3m3 3l3-3M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Library
+      </button>
+      <button type="button" onclick="document.getElementById('playbook-add').showModal()"
+              class="inline-flex items-center gap-1.5 rounded-md bg-accent hover:bg-accent-hover text-white px-3 py-1.5 text-[12px] font-medium transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+        Add technique
+      </button>
+      <a href="/api/playbook/export"
+         class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export
+      </a>
+      <button type="button" onclick="document.getElementById('playbook-import').showModal()"
+              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Import
+      </button>
+      {% if total %}
+        {# Real, direct operator ask: rename off "Remove duplicates" and stop irreversibly
+           auto-merging on click -- the old button only ever offered a static hx-confirm warning
+           text, never an actual look at which entries would be folded together, before an
+           unrecoverable merge ran. "Check duplicates" opens a real preview (playbook-duplicates
+           dialog below) listing every group found, with a "Keep this one" choice PER group --
+           the operator picks which copy survives, not "whichever dedupe_all_techniques itself
+           would have picked" -- and merges happen one deliberate group at a time from inside it.
+           agent/tools/playbook_store.py's own dedupe_all_techniques (blind auto-merge-keep-newest)
+           still exists underneath and is what a group's own history summary is built from, just
+           never invoked directly from this button anymore. #}
+        <button type="button" hx-get="/api/playbook/duplicates" hx-target="#playbook-duplicates-content" hx-swap="innerHTML"
+                hx-on::after-request="document.getElementById('playbook-duplicates').showModal()"
+                class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 8h13v13H8z"/></svg>
+          Check duplicates
+        </button>
+      {% endif %}
+      {% if seeded %}
+        <span class="inline-flex items-center gap-1.5 rounded-md border border-severity-low/40 bg-severity-low/10 px-3 py-1.5 text-[12px] text-severity-low" title="The built-in starter pack is already in your playbook — nothing to do.">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Seed pack imported
+        </span>
+      {% else %}
+        <button type="button" hx-post="/api/playbook/seed" hx-target="#playbook-list" hx-swap="innerHTML"
+                hx-confirm="Add the built-in starter pack — 5 well-known, public WAF/CDN-bypass technique templates — to your playbook? They're generic leads to prime an empty playbook, and this is optional."
+                class="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 hover:bg-accent/20 px-3 py-1.5 text-[12px] text-accent transition-colors">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l2.2 5 5.3.4-4 3.5 1.2 5.2L12 16l-4.7 2.6 1.2-5.2-4-3.5 5.3-.4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Seed pack
+        </button>
+      {% endif %}
+    </div>
+    {% include "macros/header_light.html" %}
+  </div>
+
+  {# One form so every control (search text + the three dropdowns) submits together on either
+     trigger -- htmx reads all of a triggering form's named fields, not just the one that fired. #}
+  <form id="playbook-filter-form" class="mb-4 space-y-2" hx-get="/api/playbook" hx-target="#playbook-list" hx-swap="innerHTML"
+        hx-trigger="input changed delay:250ms from:[name='q'], search from:[name='q'], change from:select">
+    {# Set by the Library panel's own "Review in Playbook" link (library_card.html) before it
+       dispatches a change on the confidence select below -- scopes the list to exactly that one
+       source's own extractions instead of every unreviewed technique from every source at once
+       (a real, confirmed operator complaint: "не все вместе в кашу"). Never a visible dropdown of
+       its own; templates/partials/playbook_list.html's own banner + "Show all" is the only way an
+       operator sees or clears it. #}
+    <input type="hidden" name="source_id" id="playbook-filter-source-id" value="">
+    <div class="relative">
+      <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4" stroke-linecap="round"/></svg>
+      <input type="search" name="q" placeholder="Search techniques, tech, WAF, vuln class…" autocomplete="off"
+             class="w-full bg-elevated border border-default rounded-lg pl-9 pr-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    </div>
+    {# Structured filters/sort -- narrow by outcome or rank tier, or reorder by something other than
+       recency (rank, times confirmed, success rate, stale-first). Combine freely with the text search
+       above; every option left on its default is a no-op. #}
+    <div class="flex flex-wrap items-center gap-2">
+      <select name="outcome" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">All outcomes</option>
+        <option value="worked">Works</option>
+        <option value="failed">Dead-end</option>
+      </select>
+      <select name="rank" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">All ranks</option>
+        {% for r in rank_order | reverse %}
+          <option value="{{ r }}">{{ r | capitalize }}</option>
+        {% endfor %}
+      </select>
+      {# Library-extracted entries not yet confirmed (agent/tools/library_store.py) -- their own
+         filter, separate from outcome/rank since "unreviewed" is a trust state, not a result. #}
+      <select name="confidence" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">All (reviewed + unreviewed)</option>
+        <option value="unreviewed">Unreviewed only</option>
+      </select>
+      <select name="sort" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="recent">Sort: Recently confirmed</option>
+        <option value="rank">Sort: Highest rank</option>
+        <option value="confirmed">Sort: Most confirmed</option>
+        <option value="success">Sort: Best success rate</option>
+        <option value="stale">Sort: Stale first</option>
+      </select>
+    </div>
+  </form>
+
+  <div id="playbook-list">
+    {{ list_html | safe }}
+  </div>
+
+  {# Add-technique dialog -- hand-add a single technique the operator already knows. #}
+  <dialog id="playbook-add" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
+      <span class="text-[13px] font-semibold">Add a technique</span>
+      <button type="button" onclick="document.getElementById('playbook-add').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <form hx-post="/api/playbook/add" hx-target="#playbook-list" hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('playbook-add').close(); this.reset();"
+          class="p-4 space-y-3 overflow-y-auto asra-scroll min-h-0">
+      <p class="text-[11px] text-secondary">Add one technique you already know. Key it to the stack it applies to so it resurfaces on similar targets later. It ranks and surfaces exactly like an agent-captured one.</p>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Technique <span class="text-severity-high">*</span></span>
+        <textarea name="technique" rows="2" required placeholder="e.g. Bypass the WAF by double-URL-encoding the payload"
+                  class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      </label>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Payload / command</span>
+        <input type="text" name="payload_or_command" placeholder="e.g. %2527%2520OR%25201%3D1" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">CVEs <span class="text-secondary/60 normal-case">— for live KEV/EPSS threat-intel</span></span>
+        <input type="text" name="cves" placeholder="CVE-2021-41773, CVE-2023-..." class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <div class="flex gap-2">
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Tech keywords</span>
+          <input type="text" name="tech_keywords" placeholder="nginx, php, wordpress" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">WAF vendors</span>
+          <input type="text" name="waf_vendors" placeholder="cloudflare, akamai" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+      </div>
+      <div class="flex gap-2">
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Vuln class</span>
+          <input type="text" name="vuln_class" placeholder="sqli / xss / ssrf / …" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Outcome</span>
+          <select name="outcome" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <option value="worked">Works — a lead to try</option>
+            <option value="failed">Dead-end — skip it next time</option>
+          </select>
+        </label>
+      </div>
+      <div class="flex justify-end pt-1">
+        <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Add to playbook</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Import dialog -- paste an exported playbook JSON to merge it in (dedup by id). #}
+  <dialog id="playbook-import" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">Import playbook JSON</span>
+      <button type="button" onclick="document.getElementById('playbook-import').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <form hx-post="/api/playbook/import" hx-target="#playbook-list" hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('playbook-import').close(); this.reset();" class="p-4 space-y-3">
+      <p class="text-[11px] text-secondary">Paste a previously exported <code class="text-[10px]">asra_playbook.json</code>. Existing entries (matched by id) are left alone; new ones are merged in.</p>
+      <textarea name="data" rows="8" placeholder='{ "..." : [ ... ] }' autocomplete="off"
+                class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      <div class="flex justify-end">
+        <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Merge in</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Read-only preview behind the "Check duplicates" button above -- content is fetched fresh
+     into #playbook-duplicates-content every time the button opens this (never rendered with the
+     rest of the page), so it's never stale relative to whatever the operator just did. #}
+  <dialog id="playbook-duplicates" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
+      <span class="text-[13px] font-semibold">Duplicate techniques</span>
+      <button type="button" onclick="document.getElementById('playbook-duplicates').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <div id="playbook-duplicates-content" class="p-4 overflow-y-auto asra-scroll"></div>
+    <div class="flex justify-end px-4 py-3 border-t border-default shrink-0">
+      {# Refreshes the real list behind the dialog with whatever got merged, then closes -- the
+         dialog's own content only ever mutates itself (its own hx-target), never #playbook-list
+         directly, so without this the main list would keep showing pre-merge state until some
+         unrelated action happened to re-render it. #}
+      <button type="button" hx-get="/api/playbook" hx-target="#playbook-list" hx-swap="innerHTML"
+              hx-on::after-request="document.getElementById('playbook-duplicates').close()"
+              class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Done</button>
+    </div>
+  </dialog>
+
+  {# Library drawer -- upload a raw source, analyze it with an already-configured LLM provider
+     (same picker chat_panel.html already uses), extracted techniques land in the list above as
+     source_type="extracted"/confidence="unreviewed". Same fixed-drawer shape as base.html's own
+     #sidebar (-translate-x-full <-> translate-x-0, transition-transform), mirrored to the right. #}
+  <div id="library-panel-backdrop" onclick="window.asraToggleLibraryPanel(false)" class="hidden fixed inset-0 bg-black/50 z-40"></div>
+  <aside id="library-panel" class="w-full sm:w-[26rem] bg-surface border-l border-default flex flex-col fixed inset-y-0 right-0 z-50 translate-x-full transition-transform duration-200">
+    <div class="px-4 h-12 flex items-center gap-2 border-b border-default shrink-0">
+      <svg class="w-4 h-4 text-accent shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3v10m0 0l-3-3m3 3l3-3M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <p class="text-sm font-semibold text-primary mr-auto">Library</p>
+      <button type="button" onclick="window.asraToggleLibraryPanel(false)" class="shrink-0 p-1 rounded text-secondary hover:bg-elevated hover:text-primary" aria-label="Close">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 6l12 12M18 6L6 18" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <div class="p-3 border-b border-default shrink-0">
+      <p class="text-[11px] text-secondary leading-relaxed mb-2">Upload a source (PDF/epub/md/txt) or paste a link, then analyze it with your own configured LLM provider — extracted techniques land in the playbook as <strong class="text-secondary">unreviewed</strong>, separate from field-proven ones, until confirmed.</p>
+      {# hx-sync -- see partials/library_sources.html's own comment on its self-poll trigger for
+         the real race this coordinates against (an in-flight poll response landing after this
+         one and silently reverting what it just did). #}
+      <form hx-post="/api/library/upload" hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace" hx-encoding="multipart/form-data"
+            hx-on::after-request="this.reset();" class="space-y-2">
+        <input type="file" name="file" accept=".pdf,.epub,.md,.txt" required
+               class="w-full text-[11px] text-secondary file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:bg-elevated file:text-secondary file:text-[11px] hover:file:bg-overlay">
+        <div class="flex gap-2">
+          <input type="text" name="title" placeholder="Title (optional)" class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <input type="text" name="author" placeholder="Author (optional)" class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </div>
+        <button type="submit" class="w-full inline-flex items-center justify-center gap-1.5 rounded-md bg-accent hover:bg-accent-hover text-white px-3 py-1.5 text-[12px] font-medium transition-colors">Upload</button>
+      </form>
+
+      <div class="flex items-center gap-2 my-2.5">
+        <div class="h-px flex-1 bg-default"></div>
+        <span class="text-[10px] text-secondary/70 uppercase tracking-wide">or</span>
+        <div class="h-px flex-1 bg-default"></div>
+      </div>
+
+      {# Fetches server-side (agent/tools/library_store.py's add_source_from_url) -- a plain
+         article/writeup link, or a direct .pdf/.epub URL; anything else is read as a web page. #}
+      <form hx-post="/api/library/upload-url" hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace"
+            hx-on::after-request="this.reset();" class="space-y-2">
+        <input type="url" name="url" placeholder="Paste a URL (article, writeup, PDF…)" required
+               class="w-full bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <div class="flex gap-2">
+          <input type="text" name="title" placeholder="Title (optional)" class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <input type="text" name="author" placeholder="Author (optional)" class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </div>
+        {# Real, direct operator ask: rename off "Fetch URL" -- that name described only the FIRST
+           of the two mechanisms this button actually uses (see the caption right below it), plain
+           httpx fetch, and read as narrower than what it really does. "Add from URL" matches
+           "Upload"'s own action-first naming above and doesn't imply which fetch path was used. #}
+        <button type="submit" class="w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">Add from URL</button>
+        <p class="text-[10px] text-secondary/70 leading-relaxed">Tries a plain fetch first; if that's blocked or comes back empty (JS-rendered page), ASRA automatically retries through its own real browser automation — the source card shows "via browser" when that happened.</p>
+      </form>
+    </div>
+
+    {# ONE shared provider/model picker for the whole panel -- chosen up front, before anything is
+       even uploaded, not gated behind having a source yet. Every source card's own "Analyze"
+       button and chunk-estimate span pull their provider/model from THESE two selects via
+       hx-include (a CSS selector, not restricted to a containing <form> -- htmx's own extended
+       hx-include syntax), so there's no separate per-card picker to keep back in sync anymore. #}
+    <div class="p-3 border-b border-default shrink-0">
+      <p class="text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Analyze with</p>
+      <div class="flex gap-1.5">
+        {# Pre-filled from library_store.py's own saved last_provider/last_model (main.py's
+           get_playbook) -- a real, confirmed operator complaint: this used to always reset to
+           blank ("same as main agent") on every page load, forcing a favorite provider/model to
+           be re-picked every single time instead of being remembered. #}
+        <select name="provider" id="library-provider-shared"
+                hx-get="/api/library/model-options" hx-target="#library-model-shared" hx-trigger="change"
+                hx-on::before-request="document.getElementById('library-model-shared').innerHTML = '&lt;option value=&quot;&quot;&gt;Loading models…&lt;/option&gt;'"
+                class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {{ provider_options(library_last_provider) }}
+        </select>
+        <select name="model" id="library-model-shared"
+                class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          {{ model_options(library_last_provider, library_last_model, library_last_model_choices) }}
+        </select>
+      </div>
+      <p class="text-[10px] text-secondary mt-1">Applies to every source's "Analyze" below. Only providers actually configured in Settings are listed.</p>
+    </div>
+
+    <div class="flex-1 overflow-y-auto asra-scroll">
+      {{ library_sources_html | safe }}
+    </div>
+  </aside>
+
+  <script>
+    // Same toggle shape as base.html's own window.asraToggleSidebar -- a fixed drawer flipped
+    // between off-screen and on-screen via one Tailwind transform class, plus a click-outside
+    // backdrop. Scoped to this page (the Library drawer only exists on /playbook), unlike the
+    // sidebar toggle which lives in base.html because every page has a sidebar.
+    window.asraToggleLibraryPanel = function (open) {
+      var panel = document.getElementById("library-panel");
+      var backdrop = document.getElementById("library-panel-backdrop");
+      if (!panel) return;
+      panel.classList.toggle("translate-x-full", !open);
+      panel.classList.toggle("translate-x-0", open);
+      if (backdrop) backdrop.classList.toggle("hidden", !open);
+    };
+  </script>
+{% endblock %}

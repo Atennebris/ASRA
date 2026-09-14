@@ -1,0 +1,13 @@
+[package]
+name = "asra-pty-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Native Windows ConPTY bridge for ASRA's standalone Terminal tab -- lets a Windows console app (cmd.exe/powershell.exe), launched from ASRA's WSL2-side backend via WSL interop, run against a REAL Win32 pseudo-console instead of a translated Linux pty. See agent/tools/terminal_manager.py's own module docstring for why this exists (PSReadLine/tab-completion don't work when a Windows console app is attached directly to a Linux pty over interop -- this bridge is what actually fixes that, not a workaround)."
+publish = false
+
+[[bin]]
+name = "asra-pty-bridge"
+path = "src/main.rs"
+
+[dependencies]
+portable-pty = "0.9"

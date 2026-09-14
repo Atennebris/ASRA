@@ -1,0 +1,259 @@
+{# Chat message log + "thinking" indicator -- the SSE morph target inside chat_panel.html's own
+   #chat-stream wrapper (main.py's chat_stream route re-renders exactly this template, and only
+   this template, on every ACTIVE thread change). Root id ("chat-messages") is deliberately
+   different from the wrapper's own id ("chat-stream") -- same "morph:innerHTML only ever touches
+   this element's children, never the wrapper's own SSE-carrying attributes" fix
+   session_fragment.html/#session-stream already established (see session.html's own comment for
+   the real morph-corruption incident that fix closes).
+
+   A message is an ordered list of "segments" (agent/chat.py) -- text, tool_call, and/or
+   suggested_actions entries in the order they actually happened, not a flat text blob with tool use
+   thrown away once the turn ends. render_chat_markdown (main.py, markdown + bleach.clean) renders a
+   text segment -- safe to trust as real HTML specifically because bleach's allowlist sanitizes it;
+   content can still echo back session-derived facts through the LLM's reply (a finding title, a
+   reflected payload string from the target), so raw model output is never trusted as literal HTML,
+   only what survives that allowlist. A tool_call segment's own `output` is plain escaped text
+   (Jinja's default), never markdown-rendered -- it's raw tool JSON/confirmation text, not prose
+   meant to be formatted. A suggested_actions segment (agent/chat.py's suggest_next_steps bookkeeping
+   tool, Interactive/Reverse-Engineering modes only) renders as its own visually distinct card of
+   buttons -- each click sends that exact step immediately (window.asraUseSuggestedStep,
+   chat_panel.html), no separate manual Send needed. #}
+{% from "macros/project_icons.html" import project_icon %}
+{% from "macros/nav.html" import nav_icon %}
+{% set chat_messages = thread.get("messages", []) %}
+{# The agent's identity mark, reused for every asra-side row and the "thinking" bubble -- this
+   project's own icon/color (picked at project creation, sessions/store.py) rather than a fixed
+   generic glyph, so the chat rail matches the same identity shown everywhere else the project is
+   listed (sessions_list_fragment.html, recent_projects_fragment.html). Defined once as a macro so
+   the avatar can never drift between a real reply and the pending indicator. #}
+{% macro agent_avatar() %}
+  <div class="shrink-0 w-7 h-7 mt-0.5 rounded-lg bg-accent/10 border border-default flex items-center justify-center text-accent" aria-hidden="true">
+    {# Quick Chat has no real project identity to show (no icon/color was ever deliberately picked
+       for it -- session.icon is whatever create_session's own random default happened to land on),
+       so it gets the same chat-bubble glyph the sidebar's own "Chat" nav entry uses instead of a
+       random, meaningless project icon. #}
+    {% if session.get("mode") == "standalone" %}
+      {{ nav_icon("chat") }}
+    {% else %}
+      {{ project_icon(session.icon or "shield", size_class="w-3.5 h-3.5", color=session.icon_color or "var(--accent)") }}
+    {% endif %}
+  </div>
+{% endmacro %}
+{# data-message-count/data-last-role/data-thread-id: read by static/js/sound_events.js's own
+   MutationObserver (chat_reply sound) -- a real new assistant reply is "count went up AND the last
+   message is role=assistant AND the thread id didn't just change" (switching threads/compacting
+   also changes count with no new reply having actually arrived). #}
+<div id="chat-messages" class="flex-1 min-h-0 overflow-y-auto asra-scroll p-4 space-y-4"
+     data-message-count="{{ chat_messages | length }}"
+     data-last-role="{{ chat_messages[-1].role if chat_messages else '' }}"
+     data-thread-id="{{ thread.get('id', '') }}">
+  {% if flash %}
+    <div class="text-[11px] text-center text-secondary italic">{{ flash }}</div>
+  {% endif %}
+  {% for msg in chat_messages %}
+    {% if msg.role == "system" %}
+      {# A persisted compaction note (_run_compaction, agent/chat.py) -- a durable, centered marker
+         on the scrollback (hairline rules either side) so it reads as a break in the conversation,
+         not a message from either side. Covers the automatic budget-triggered path too, which has
+         no transient flash to hang off of. #}
+      <div class="flex items-center gap-2 text-[11px] text-secondary italic px-2">
+        <span class="flex-1 border-t border-default"></span>
+        <span class="shrink-0">{% for seg in msg.get("segments", []) %}{% if seg.type == "text" %}{{ seg.content }}{% endif %}{% endfor %}</span>
+        <span class="flex-1 border-t border-default"></span>
+      </div>
+    {% elif msg.role == "reward" %}
+      {# Gamified "+N" storage marker (agent/chat.py's deliver_storage_reward_to_chat) -- a real,
+         durable chat event fired whenever something worth remembering lands in storage (a captured
+         playbook technique, a recorded finding), in BOTH agent and interactive mode. UI-only:
+         run_chat_turn_background/_segments_to_text never replay it to the model. The +N pops on
+         insert (themes.css @keyframes reward-pop). #}
+      {% set r = msg.reward %}
+      {# id="chat-reward-{{ loop.index }}": every reward card in a run is structurally near-identical
+         (same "flex justify-center" > ".reward-card" shape, differing only in inner text), and with
+         no id Idiomorph's positional match has nothing but that shape to go on -- once several stack
+         up, a fresh SSE morph on each new finding mismatches them, re-triggering the reward-pop entry
+         animation on already-settled cards instead of only the new one (the real, confirmed "chat
+         breaks/jitters once many findings pile up" report). loop.index is this message's fixed
+         position in the thread's append-only message list, stable across every re-render. #}
+      <div class="flex justify-center" id="chat-reward-{{ loop.index }}">
+        {# data-reward-kind: read by static/js/mascot.js's watchChatContext so the mascot can react
+           specifically to a finding landing (react("found")) instead of the generic react("reply")
+           every other new chat message gets -- see that file's own comment for why "chat" context
+           had no way to tell the two apart before this. #}
+        <div class="reward-card" data-reward-kind="{{ r.kind }}">
+          <span class="reward-glyph" aria-hidden="true">
+            {% if r.kind == "finding" %}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 21V4h13l-2 4 2 4H6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            {% else %}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l2.2 5 5.3.4-4 3.5 1.2 5.2L12 16l-4.7 2.6 1.2-5.2-4-3.5 5.3-.4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            {% endif %}
+          </span>
+          <div class="min-w-0 flex-1">
+            <div class="reward-label">{{ r.label }}</div>
+            {% if r.detail %}<div class="reward-detail">{{ r.detail }}</div>{% endif %}
+          </div>
+          <div class="reward-meta">
+            <span class="reward-delta">+{{ r.delta }}</span>
+            <span class="reward-total">{{ r.total }} {{ r.total_label }}</span>
+          </div>
+        </div>
+      </div>
+    {% else %}
+    {% set is_user = msg.role == "user" %}
+    {# Robust chat row: a flex parent (justify-start/end) does the alignment, NOT text-align on an
+       inline-flex block -- the old inline-flex + max-w-[92%] pair had no min-w-0 on its column, so
+       a child bubble's min-content floor (the longest unbroken token) defeated the max-width cap and
+       pushed the bubble past the panel edge, where #chat-messages' overflow-x:hidden clipped it out
+       of sight (the "messages land crooked / half off-screen" report). min-w-0 on the column removes
+       that floor so break-words/overflow-wrap can actually wrap the token instead. #}
+    <div class="flex gap-2.5 {{ 'justify-end' if is_user else 'justify-start' }}">
+      {% if not is_user %}{{ agent_avatar() }}{% endif %}
+      <div class="flex flex-col gap-1.5 min-w-0 max-w-[82%] items-{{ 'end' if is_user else 'start' }}">
+        {% for seg in msg.get("segments", []) %}
+          {% set merges_into_next_suggestions = (not seg.error) and (not seg.suspected_fake_tool_call) and loop.nextitem and loop.nextitem.type == "suggested_actions" and loop.nextitem.actions %}
+          {% if seg.type == "text" and seg.content and not merges_into_next_suggestions %}
+            {# error=True (agent/chat.py's run_chat_turn_background except-branch) -- a turn-level
+               failure notice, never a real answer; tinted like a failed tool_call below so it reads
+               as distinctly "this turn broke" rather than blending in with a normal reply. The tail
+               corner (rounded-br/bl-md) points the bubble at its own side, the usual chat cue. #}
+            {% if seg.suspected_fake_tool_call %}
+              {# _looks_like_narrated_fake_tool_call (agent/chat.py) -- the model's own tool_calls
+                 came back genuinely empty this turn, yet the text narrates something like
+                 "[used some_tool(...) -> ok]" as if it had actually run and gotten output. Flagged,
+                 not silently trusted -- anything the text claims happened after that point (a
+                 command's supposed output, "confirmed" facts) may be the model's own fabrication,
+                 not a real result. #}
+              <p class="flex items-center gap-1.5 text-[10.5px] text-severity-medium/90 px-1" title="This model's response described running a tool and getting output, but no real tool call was made this turn -- treat any claimed results in it as unverified.">
+                <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.29 3.86l-8.18 14.18A1.5 1.5 0 0 0 3.5 20h17a1.5 1.5 0 0 0 1.39-1.96l-8.18-14.18a1.5 1.5 0 0 0-2.62 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                No real tool call was made — this may just describe one, not have run it
+              </p>
+            {% endif %}
+            <div class="max-w-full px-3.5 py-2 text-sm text-left break-words chat-markdown shadow-sm border {% if seg.error %}bg-severity-high/10 text-primary border-severity-high/40 rounded-2xl{% elif is_user %}bg-accent/15 text-primary border-default rounded-2xl rounded-br-md{% else %}bg-elevated text-primary border-default rounded-2xl rounded-bl-md{% endif %}">{{ seg.content | render_chat_markdown }}</div>
+          {% elif seg.type == "tool_call" %}
+            <details class="w-full rounded-xl border text-[11px] overflow-hidden {{ 'border-severity-high/40' if seg.error else 'border-default' }} bg-elevated">
+              <summary class="flex items-center gap-2 px-3 py-2 cursor-pointer list-none hover:bg-overlay transition-colors">
+                {% if not seg.done %}
+                  <span class="asra-spinner shrink-0"></span>
+                {% elif seg.error %}
+                  <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-high" title="Failed"></span>
+                {% else %}
+                  <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-low" title="Done"></span>
+                {% endif %}
+                <span class="font-mono font-semibold text-secondary shrink-0">{{ seg.name }}</span>
+                {% if seg.arg_summary %}<span class="font-mono text-secondary/70 truncate flex-1 min-w-0">{{ seg.arg_summary }}</span>{% endif %}
+              </summary>
+              <div class="border-t border-default px-3 py-2">
+                <pre class="whitespace-pre-wrap break-words text-[10px] font-mono text-secondary max-h-40 overflow-y-auto asra-scroll">{{ seg.output or "(running…)" }}</pre>
+              </div>
+            </details>
+          {% elif seg.type == "suggested_actions" and seg.actions %}
+            {# Clickable next-step menu (suggest_next_steps, agent/chat.py) -- replaces the model
+               writing "(1)...(2)...(3)..." into its own reply text, see this file's own header
+               comment. A real, confirmed operator complaint this box styling fixes: the buttons used
+               to be plain pills in the SAME bg-elevated shade every assistant text bubble and
+               tool_call card above already uses, so nothing set them apart as a distinct, clickable
+               menu rather than more inert chat content -- an operator has to be able to tell "these
+               are choices" at a glance, not discover it by hovering. The wrapping card (accent-tinted
+               background + border, distinct from bg-elevated) plus a small label give it its own
+               visual identity; each pill's own border/shadow (not just a hover state) reads as
+               "raised, clickable" even before the cursor gets there. Clicking sends immediately
+               (asraUseSuggestedStep, chat_panel.html) -- see this file's header comment for why. #}
+            {% set lead_in = loop.previtem if (loop.previtem and loop.previtem.type == "text" and loop.previtem.content and not loop.previtem.error and not loop.previtem.suspected_fake_tool_call) else None %}
+            <div class="w-full rounded-xl border border-accent/25 bg-accent/5 p-2.5 space-y-2">
+              {% if lead_in %}
+                {# The model's own lead-in sentence before offering these buttons (e.g. "click one of
+                   the options below") -- merged into this same card, muted (text-secondary, not the
+                   full-emphasis text-primary a real reply bubble uses), instead of floating above it
+                   as its own separate bubble: it's framing for the choices below, not a reply in its
+                   own right, a real, confirmed operator complaint this closes. #}
+                <p class="text-[12px] text-secondary leading-snug break-words chat-markdown">{{ lead_in.content | render_chat_markdown }}</p>
+              {% endif %}
+              <p class="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-accent/80">
+                <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Suggested next steps
+              </p>
+              <div class="flex flex-wrap gap-1.5">
+                {% for action in seg.actions %}
+                  <button type="button" onclick='asraUseSuggestedStep({{ action | tojson }})'
+                          class="px-3 py-1.5 text-[11px] font-medium rounded-full border border-accent/40 bg-surface text-primary shadow-sm hover:border-accent hover:bg-accent/15 hover:text-accent transition-colors">
+                    {{ action }}
+                  </button>
+                {% endfor %}
+              </div>
+            </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  {% else %}
+    <div class="h-full flex flex-col items-center justify-center text-center px-6">
+      {{ agent_avatar() }}
+      {% if session.get("mode") == "standalone" %}
+        {# The top-level, project-less Quick Chat -- "this session" framing below is meaningless
+           here (there IS no scan/findings behind it), so it gets its own empty-state copy instead
+           of inheriting the project-chat one. #}
+        <p class="text-sm font-medium text-primary mt-3">Ask anything</p>
+        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">A security question,
+          how something works, or a quick lookup &mdash; not tied to any project.</p>
+      {% else %}
+        <p class="text-sm font-medium text-primary mt-3">Ask about this session</p>
+        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">Findings, progress, or a hint like &ldquo;skip the CORS finding&rdquo; or &ldquo;focus on redirects&rdquo; &mdash;
+          available any time, even while the scan is still running.</p>
+      {% endif %}
+    </div>
+  {% endfor %}
+  {# Not-yet-dispatched follow-ups typed while the turn above was still running (Claude Code
+     CLI-style message queue, agent/chat.py's thread["queued_messages"]) -- the operator never has
+     to wait for "thinking…" to clear before typing the next thing; each is sent automatically, in
+     order, once the current (and any earlier-queued) turn finishes. Dashed border + "Queued" label
+     deliberately distinguish this from a real sent bubble (solid border, chat-markdown rendered
+     below) -- this is still just raw typed text, not yet processed. #}
+  {% for q in thread.get("queued_messages", []) %}
+    <div class="flex gap-2.5 justify-end">
+      <div class="flex flex-col gap-1 min-w-0 max-w-[82%] items-end">
+        <div class="max-w-full px-3.5 py-2 text-sm text-left break-words border border-dashed border-default rounded-2xl rounded-br-md bg-accent/10 text-secondary">{{ q.text }}</div>
+        <div class="flex items-center gap-1.5 text-[10px] text-secondary">
+          <span>Queued</span>
+          <button type="button" title="Cancel queued message" aria-label="Cancel queued message"
+                  hx-post="/api/session/{{ session.session_id }}/chat/queued/cancel" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+                  hx-vals='{"thread_id": "{{ thread.id }}", "message_id": "{{ q.id }}"}'
+                  class="hover:text-severity-high underline">cancel</button>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  {# A tool call already IN FLIGHT (its own row above, `seg.done` false, own asra-spinner) means
+     the model isn't generating text right now -- it's waiting on that tool's real result. Showing
+     a SECOND "thinking…" spinner+bubble underneath it at the same time was a real, confirmed
+     duplicate (two separate spinning indicators claiming two different things are happening when
+     only one real thing is): only the tool's own row should spin while a tool call is running;
+     "thinking…" is for when the model is actually about to/currently writing a text reply, once
+     that tool call itself is done. Stop must stay reachable either way, so this doesn't just hide
+     the whole indicator -- it drops the spinner+label but keeps the button, `agent_avatar()`
+     rendered as usual either way so the row's left-alignment never shifts based on this. #}
+  {% set last_msg = chat_messages[-1] if chat_messages else none %}
+  {% set last_seg = (last_msg.get("segments") or [])[-1] if last_msg and last_msg.get("segments") else none %}
+  {% set tool_in_flight = last_seg is not none and last_seg.type == "tool_call" and not last_seg.done %}
+  {% if thread.get("pending") %}
+    <div class="flex gap-2.5 justify-start">
+      {{ agent_avatar() }}
+      <div class="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-2xl rounded-bl-md bg-elevated border border-default text-secondary shadow-sm">
+        {% if not tool_in_flight %}
+          <span class="asra-spinner"></span>
+          <span class="text-sm">thinking&hellip;</span>
+        {% endif %}
+        {# hx-vals (not a hidden form field -- this button lives outside #chat-form entirely) --
+           the exact thread_id this indicator was rendered for, so a Stop click always targets the
+           turn it was actually clicked on even if the operator has since switched threads (see
+           main.py's own route docstring). #}
+        <button type="button" title="Stop this chat turn" aria-label="Stop"
+                hx-post="/api/session/{{ session.session_id }}/chat/stop" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+                hx-vals='{"thread_id": "{{ thread.id }}"}'
+                class="{{ 'ml-1' if not tool_in_flight else '' }} text-[11px] font-medium text-secondary hover:text-severity-high underline underline-offset-2">Stop</button>
+      </div>
+    </div>
+  {% endif %}
+</div>

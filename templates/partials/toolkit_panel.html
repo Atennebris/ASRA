@@ -1,0 +1,143 @@
+{# Native Toolkit (Proxy/Repeater/Decoder/Comparer/Intruder/Sequencer) -- rendered in TWO contexts:
+   (1) embedded in a real project's session page (session_fragment.html includes this with `session`
+   already in scope, Jinja's default context-sharing on {% include %}), as a DIRECT sibling of
+   #session-stream, outside the SSE morph subtree entirely (same reasoning already established for
+   .session-tabs and #chat-thread-picker: content a live SSE tick doesn't own must never sit where
+   that tick could reset/overwrite it). Visibility is driven by the OUTER tab bar's own #tab-toolkit
+   radio (macros/ui.html's tab_bar, themes.css's `.session-tabs:has(#tab-toolkit:checked) ~
+   #toolkit-panel` rule).
+   (2) the standalone /toolkit page (main.py, templates/toolkit_standalone.html), reachable straight
+   from the sidebar -- genuinely no project/session involved at all (never a hidden/fake session,
+   see agent/tools/toolkit_store.py's own docstring for why). No outer tab bar to gate on there, so
+   this renders under a DIFFERENT wrapper id (#toolkit-panel-standalone, themes.css's own
+   unconditional "always visible" rule) and skips the live-view panel entirely (CDP screencast of
+   the agent's OWN Playwright browser has no meaning without a session to browse for).
+
+   Sub-tab bar below is the SAME CSS-only radio + :has() technique as the outer tab_bar(), just
+   scoped to its own name group ("toolkit-subtab") so it can never collide with the outer
+   "session-tab" radios -- see themes.css for the matching visibility rules. #}
+{% set session_id = session.session_id if session is defined else none %}
+{% set toolkit_base_url = ("/api/session/" ~ session_id ~ "/toolkit") if session_id else "/api/toolkit" %}
+<div id="{{ 'toolkit-panel' if session_id else 'toolkit-panel-standalone' }}">
+  {% if session_id %}
+    {# Deliberately ABOVE the sub-tab bar, not inside any one [data-toolkit-subtab] panel -- stays
+       visible regardless of which sub-tab (Site Map/Repeater/Decoder/Comparer) is currently
+       selected, same "don't force a tab switch to keep watching" reasoning the persistent chat
+       column already gets for free. Session-only -- the standalone page has no agent browser to
+       show a live view of. #}
+    {% include "partials/toolkit_live_view.html" %}
+  {% endif %}
+
+  <div class="toolkit-subtabs flex items-center gap-1 border-b border-default mb-3">
+    <input type="radio" id="toolkit-subtab-sitemap" name="toolkit-subtab" class="sr-only" checked>
+    <label for="toolkit-subtab-sitemap" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Site Map</label>
+    <input type="radio" id="toolkit-subtab-repeater" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-repeater" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Repeater</label>
+    <input type="radio" id="toolkit-subtab-decoder" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-decoder" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Decoder</label>
+    <input type="radio" id="toolkit-subtab-comparer" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-comparer" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Comparer</label>
+    <input type="radio" id="toolkit-subtab-intruder" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-intruder" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Intruder</label>
+    <input type="radio" id="toolkit-subtab-sequencer" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-sequencer" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Sequencer</label>
+    <input type="radio" id="toolkit-subtab-racer" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-racer" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Racer</label>
+    <input type="radio" id="toolkit-subtab-variables" name="toolkit-subtab" class="sr-only">
+    <label for="toolkit-subtab-variables" role="button"
+           class="tab-label shrink-0 cursor-pointer whitespace-nowrap px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary hover:text-primary border-b-2 border-transparent">Variables</label>
+  </div>
+
+  <div data-toolkit-subtab="sitemap">
+    {# HTTPQL-lite filter (agent/tools/toolkit_query.py) -- same engine as the agent-facing
+       list_captured_traffic tool's own `query` parameter, so a filter typed here behaves
+       identically to one the model writes. hx-include="this" on the input drives an immediate
+       refresh while typing; the poller div below ALSO includes this input's current value on
+       every "load"/"every 4s" tick (its own hx-include, by id) so a periodic poll never wipes out
+       an in-progress filter. #}
+    <input type="search" id="toolkit-query-input" name="query"
+           placeholder='Filter, e.g. method.eq:POST AND resp.body.cont:"error"'
+           class="w-full text-[11px] font-mono px-2.5 py-1.5 mb-2 rounded-lg border border-default bg-surface text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:ring-accent"
+           hx-get="{{ toolkit_base_url }}/traffic" hx-trigger="keyup changed delay:400ms, search"
+           hx-target="#toolkit-traffic-list" hx-swap="morph:innerHTML" hx-include="this">
+    {# hx-ext declared locally (not inherited) -- this subtree is its own island outside
+       #session-stream's own hx-ext="sse, morph", same reasoning as that div declaring its own
+       instead of relying on a page-wide ancestor. morph:innerHTML (not a bare swap) so the
+       operator's current scroll position in a long traffic list survives each 4s poll, same
+       "diff, don't replace" benefit #session-log-list already gets from SSE ticks. #}
+    <div id="toolkit-traffic-list" hx-ext="morph" hx-include="#toolkit-query-input"
+         hx-get="{{ toolkit_base_url }}/traffic" hx-trigger="load, every 4s" hx-swap="morph:innerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading captured traffic&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="repeater">
+    {# Lazy-loaded via htmx (same "load" trigger convention as the Site Map traffic list above)
+       rather than rendered inline from session.html's own context -- keeps context-building for
+       the Repeater panel (prefill, history) in exactly one place, main.py's own GET route, instead
+       of duplicating it between the initial page render and every later interaction. #}
+    <div id="toolkit-repeater-container" hx-get="{{ toolkit_base_url }}/repeater" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Repeater&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="decoder">
+    {# Lazy-loaded via htmx, same "load" trigger convention as the Repeater container above --
+       keeps the blank-default context-building in exactly one place, main.py's own GET route. #}
+    <div id="toolkit-decoder-container" hx-get="{{ toolkit_base_url }}/decoder" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Decoder&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="comparer">
+    {# Lazy-loaded via htmx, same "load" trigger convention as Repeater/Decoder above -- keeps the
+       blank-default context-building in exactly one place, main.py's own GET route. #}
+    <div id="toolkit-comparer-container" hx-get="{{ toolkit_base_url }}/comparer" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Comparer&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="intruder">
+    {# Lazy-loaded via htmx, same "load" trigger convention as Repeater/Decoder/Comparer above. #}
+    <div id="toolkit-intruder-container" hx-get="{{ toolkit_base_url }}/intruder" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Intruder&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="sequencer">
+    {# Lazy-loaded via htmx, same "load" trigger convention as every other sub-tab above. #}
+    <div id="toolkit-sequencer-container" hx-get="{{ toolkit_base_url }}/sequencer" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Sequencer&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="racer">
+    {# Lazy-loaded via htmx, same "load" trigger convention as every other sub-tab above. #}
+    <div id="toolkit-racer-container" hx-get="{{ toolkit_base_url }}/racer" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Racer&hellip;</p>
+    </div>
+  </div>
+
+  <div data-toolkit-subtab="variables">
+    {# Lazy-loaded via htmx, same "load" trigger convention as every other sub-tab above. #}
+    <div id="toolkit-variables-container" hx-get="{{ toolkit_base_url }}/variables" hx-trigger="load" hx-swap="outerHTML">
+      <p class="text-sm text-secondary italic py-4">Loading Variables&hellip;</p>
+    </div>
+  </div>
+</div>
+
+{# Shared dialog for a traffic entry's raw request/response -- one dialog, lazily filled per click
+   (partials/toolkit_traffic_list.html's row buttons), not one per entry. Same shape as
+   chat_panel.html's own #chat-thread-picker (fetched fresh on every open, no persistent
+   'close' listener attached/detached per open -- avoiding the exact reuse-race class of bug a
+   prior version of a shared dialog elsewhere in this app already hit once). #}
+<dialog id="toolkit-traffic-detail" class="bg-surface text-primary border border-default rounded-lg p-4 w-full max-w-2xl backdrop:bg-black/50">
+  <div id="toolkit-traffic-detail-content"></div>
+</dialog>

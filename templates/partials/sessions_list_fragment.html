@@ -1,0 +1,98 @@
+{# The dynamic part of the Projects page (sessions_list.html) — split out so it can be re-rendered
+   on its own by both the full-page route (/sessions) and the polling fragment endpoint
+   (/api/sessions/fragment, main.py). Before this existed, this whole page was rendered exactly
+   once at page load and never again: a scan's status/finding-count changing while this page was
+   open needed a manual reload or a navigate-away-and-back to see, same real bug the session detail
+   page already solved for itself with SSE + morph (session.html) — this brings the Projects page
+   and the home page's "Recent projects" list (recent_projects_fragment.html) up to the same bar. #}
+{% from "macros/ui.html" import button, status_badge, empty_state, privacy_toggle_button, privacy_placeholder, privacy_restore_script %}
+{% from "macros/project_icons.html" import project_icon %}
+{% if sessions %}
+  {% set completed_count = sessions | selectattr("status", "equalto", "completed") | list | length %}
+  {% set in_progress_count = sessions | selectattr("status", "in", ["pending", "processing", "awaiting_approval"]) | list | length %}
+  {% set total_findings = sessions | sum(attribute="findings_count") %}
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+    {% for label, value in [("Total sessions", sessions | length), ("Completed", completed_count), ("In progress", in_progress_count), ("Total findings", total_findings)] %}
+      <div class="bg-surface border border-default rounded-lg p-4">
+        <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">{{ label }}</p>
+        <p class="text-2xl font-semibold tabular-nums text-primary">{{ value }}</p>
+      </div>
+    {% endfor %}
+  </div>
+
+  {# Two genuinely separate confirmations (static/js/confirm_dialog.js's asraConfirmTwoStep)
+     before this ever submits — deleting every project at once is too destructive for even the
+     usual single confirm every other delete action in this app uses. #}
+  <div class="flex items-center justify-between mb-3">
+    {{ privacy_toggle_button("projects-list") }}
+    <form id="delete-all-sessions-form" method="post" action="/api/sessions/delete-all" class="hidden"></form>
+    <button type="button"
+            onclick="asraConfirmTwoStep(
+              {title: 'Delete all projects?', message: 'This permanently deletes all {{ sessions | length }} project(s) and everything recorded in them — findings, logs, evidence. This cannot be undone.', confirmLabel: 'Continue'},
+              {title: 'Are you absolutely sure?', message: 'All {{ sessions | length }} project(s) will be deleted right now. There is no way to undo this.', confirmLabel: 'Yes, delete everything'}
+            ).then(function (ok) { if (ok) document.getElementById('delete-all-sessions-form').submit(); });"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-high/10 text-severity-high border border-severity-high/20 hover:bg-severity-high/20 h-7 px-2 text-[11px]">Delete all projects</button>
+  </div>
+
+  {# Placed here, right after the toggle button rendered above (not at the top of the {% if %}
+     block) so the button already exists in the DOM for this script's label/aria sync -- the
+     anti-flash guarantee itself doesn't depend on this exact position (the ancestor's
+     data-privacy-collapsed attribute -- #sessions-list-fragment in sessions_list.html -- is what
+     static/css/themes.css keys off, and nothing in this document has painted yet regardless of
+     where in this synchronous parse it gets set). Same anti-flash technique as macros/ui.html's
+     own tab_bar() restore script. #}
+  {{ privacy_restore_script("projects-list") }}
+
+  <ul data-privacy-content class="space-y-2">
+    {% for s in sessions %}
+      {# A stable id (not just position) is what lets Idiomorph (base.html) match "this row
+         already exists" across a poll cycle instead of destroying/recreating every <li> just
+         because one row's status changed — same reasoning as session_fragment.html's finding/log
+         card ids. Without it, a 5-second poll on a list this size reads as constant flicker. #}
+      <li id="session-row-{{ s.session_id }}" class="bg-surface border border-default rounded-lg p-3 flex items-center gap-3">
+        <div class="w-8 h-8 rounded bg-elevated flex items-center justify-center shrink-0">
+          {{ project_icon(s.icon or "shield", size_class="w-4 h-4", color=s.icon_color or "var(--text-secondary)") }}
+        </div>
+        <a href="/session/{{ s.session_id }}" class="flex-1 min-w-0 group">
+          <p class="text-sm font-medium text-primary group-hover:text-accent truncate">{{ s.name }}</p>
+          <p class="text-[11px] text-secondary truncate" title="{{ s.target }}">{{ s.target }} &middot; {{ s.findings_count }} finding(s) &middot; {{ s.created_at }}</p>
+          {% if s.folder %}
+            <p class="text-[11px] text-secondary/70 truncate" title="{{ s.folder }}">&#128193; {{ s.folder }}</p>
+          {% endif %}
+          {% if s.rescanned_from_name %}
+            <p class="text-[11px] text-secondary/70 truncate">&#8635; Rescan of &ldquo;{{ s.rescanned_from_name }}&rdquo;</p>
+          {% endif %}
+        </a>
+        {{ status_badge(s.status, s.phase) }}
+        {% if s.status in ("interrupted", "failed") %}
+          <form method="post" action="/api/session/{{ s.session_id }}/resume">
+            {{ button("Resume from " ~ (s.resumable_from or "recon"), variant="secondary", size="sm", type="submit") }}
+          </form>
+        {% endif %}
+        {# The confirm message names THIS row's own project explicitly (not a generic "this
+           project") -- real incident this fixes: this list polls/morph-swaps every 5s
+           (hx-trigger="every 5s" above) and sessions commonly re-sort as their own status/
+           updated_at changes underneath an operator's mouse; a row can physically move to a
+           different position between the operator visually targeting it and actually clicking,
+           landing the click on a DIFFERENT project's Delete button entirely. A generic confirm
+           message gives no way to notice the mismatch before it's too late -- naming the actual
+           target here is the one thing standing between a stale click and a real, unrecoverable
+           delete_session()/shutil.rmtree of the wrong project.
+           name/target ride in data-* attributes, read back and assembled into the confirm message
+           in plain JS (static/js/confirm_dialog.js's asraConfirmDeleteProject) -- NOT interpolated
+           directly into the onsubmit="..." JS-source string here, which a project name containing
+           a genuine apostrophe or quote (a real, plausible bug-bounty program name) would have
+           broken out of, corrupting the handler or silently skipping the confirm entirely. #}
+        <form method="post" action="/api/session/{{ s.session_id }}/delete"
+              data-project-name="{{ s.name }}" data-project-target="{{ s.target }}"
+              onsubmit="return asraConfirmDeleteProject(event);">
+          {{ button("Delete", variant="danger", size="sm", type="submit") }}
+        </form>
+      </li>
+    {% endfor %}
+  </ul>
+  {{ privacy_placeholder("projects-list", sessions | length, "project") }}
+{% else %}
+  {{ empty_state("No sessions yet.", "Start a scan to see it here.") }}
+  <p class="text-center mt-2"><a href="/" class="text-accent hover:text-accent-hover text-sm underline">Start a scan</a></p>
+{% endif %}

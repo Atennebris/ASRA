@@ -1,0 +1,74 @@
+{# Agent-mode collapsed-chat side panel's LIVE half -- polled every 3s by
+   partials/session_collapsed_panel.html's own wrapper (main.py's session_side_panel route), same
+   idiom as re_summary_tab.html. Pulse (status/time-budget/last log line/severity counts) + the
+   Pinned and Activity tab-pane bodies -- both tab panes are always rendered here, toggled purely
+   by CSS :has() reaching from the STATIC radio buttons in the wrapper (never touched by this
+   poll) into whichever of these two panes matches, the same split session.html's own tab bar and
+   RE mode's info-tabs already use to survive a live re-render without losing the selected tab. #}
+{% from "macros/ui.html" import status_badge, chat_ref %}
+
+<div class="chat-collapsed-pulse">
+  <p class="text-sm">{{ status_badge(session.status, session.logs[-1].phase if session.logs else none) }}</p>
+  {% if session.time_budget_seconds and session.status == "processing" %}
+    {% set tb_deadline_epoch = session | time_budget_deadline_epoch %}
+    {% if tb_deadline_epoch %}
+      <p class="text-[11px] text-secondary mt-1">Time budget:
+        <span data-live-countdown data-deadline-epoch="{{ tb_deadline_epoch }}">{{ session.time_budget_seconds | accumulated_duration }} remaining</span>
+      </p>
+    {% endif %}
+  {% endif %}
+  {% if session.logs %}
+    {% set last_entry = session.logs[-1] %}
+    <p class="text-[11px] text-secondary mt-1 truncate" title="{{ last_entry.command or last_entry.thought or last_entry.status }}">
+      Last: <code class="text-secondary">{{ (last_entry.command.split("(")[0] if last_entry.command else last_entry.thought) or last_entry.status }}</code>
+    </p>
+  {% endif %}
+  {% if session.findings %}
+    {% set pulse_sev_order = ["Critical", "High", "Medium", "Low", "Info"] %}
+    {% set pulse_sev_colors = {"Critical": "text-severity-critical", "High": "text-severity-high", "Medium": "text-severity-medium", "Low": "text-severity-low", "Info": "text-severity-info"} %}
+    <p class="text-[11px] mt-1.5 flex items-center gap-2.5 flex-wrap">
+      {% for sev in pulse_sev_order %}
+        {% set count = session.findings | selectattr("severity", "equalto", sev) | list | length %}
+        {% if count %}<span class="{{ pulse_sev_colors[sev] }}">{{ count }} {{ sev }}</span>{% endif %}
+      {% endfor %}
+    </p>
+  {% endif %}
+</div>
+
+<div class="chat-collapsed-tabpane side-tab-pane-pinned asra-scroll">
+  {% set pinned_items = session | resolve_pinned_refs %}
+  {% if pinned_items %}
+    <ul class="space-y-1.5">
+      {% for item in pinned_items %}
+        <li class="bg-elevated border border-default rounded p-2 text-[11px]">
+          <div class="flex items-start justify-between gap-2">
+            <span class="text-primary break-words min-w-0">{{ item.title }}</span>
+            {{ chat_ref(item.ref, pinned=true, session_id=session.session_id) }}
+          </div>
+          {% if item.meta %}<p class="text-secondary/70 mt-0.5">{{ item.meta }}</p>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="text-[11px] text-secondary/70 italic">Nothing pinned yet — click the star on any finding, hypothesis, or recon host to keep it visible here.</p>
+  {% endif %}
+</div>
+
+<div class="chat-collapsed-tabpane side-tab-pane-activity asra-scroll">
+  {% set recent_calls = session.logs | selectattr("command") | list | reverse | list %}
+  {% if recent_calls %}
+    <ul class="space-y-1 font-mono">
+      {% for entry in recent_calls[:10] %}
+        <li class="flex items-center gap-1.5 text-[11px]">
+          <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-severity-low' if entry.status == 'success' else 'bg-severity-high' }}"></span>
+          <span class="text-secondary truncate flex-1 min-w-0">{{ entry.command.split("(")[0] }}</span>
+          {% if entry.duration_ms is not none %}
+            <span class="text-secondary/70 shrink-0">{{ "%.1fs"|format(entry.duration_ms / 1000) if entry.duration_ms >= 1000 else (entry.duration_ms ~ "ms") }}</span>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="text-[11px] text-secondary/70 italic">No tool calls yet.</p>
+  {% endif %}
+</div>

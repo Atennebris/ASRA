@@ -1,0 +1,248 @@
+{# RE mode's Summary tab (session.html's re-info-tabbar) -- the RE-mode analog of the Agent
+   pipeline's own Summary tab (partials/session_fragment.html's data-tab="summary"): the one view
+   meant to be read LAST, after Graph/Logs/Findings, by an operator deciding what's actually worth
+   reporting. Reuses the exact same process-efficiency gauge (session-generic, agent/core.py's
+   compute_efficiency_score doesn't know or care what mode produced the tool-call trace) and the
+   same severity/verification breakdown chart language as the Agent Summary tab -- but drops
+   "Bounty scope match" and the "Qualifying findings" spotlight entirely, since those are bug-bounty
+   program concepts (qualifies_for_bounty, scope_rules) that don't exist in RE mode at all. In their
+   place: Target Profile (durable target facts, partials/target_profile.html) and a Hypotheses
+   summary, since "what do we actually know about this target" is the RE-mode equivalent of a
+   bug-bounty program's own qualifying-scope framing. #}
+<div class="space-y-4">
+  {% set eff = session | efficiency_score %}
+  {% if eff.has_data %}
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Process efficiency</span>
+        <span class="text-[11px] text-secondary">{{ eff.total_tool_calls }} tool call{{ "s" if eff.total_tool_calls != 1 else "" }} this session</span>
+      </div>
+      <div class="flex flex-col sm:flex-row items-center gap-4">
+        {% set needle = eff.score | efficiency_needle_point %}
+        <div class="relative w-52 shrink-0" style="aspect-ratio: 200 / 120;">
+          <svg viewBox="0 0 200 120" class="w-full h-full" aria-hidden="true">
+            <defs>
+              <linearGradient id="re-efficiency-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="rgb(var(--severity-critical))"></stop>
+                <stop offset="50%" stop-color="rgb(var(--severity-medium))"></stop>
+                <stop offset="100%" stop-color="rgb(var(--status-online))"></stop>
+              </linearGradient>
+            </defs>
+            <path d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="url(#re-efficiency-gradient)" stroke-width="14" stroke-linecap="round"></path>
+            <line x1="100" y1="100" x2="{{ '%.2f' | format(needle.x) }}" y2="{{ '%.2f' | format(needle.y) }}"
+                  stroke-width="3" stroke-linecap="round" class="text-primary" style="stroke: currentColor;"></line>
+            <circle cx="100" cy="100" r="6" class="text-primary" style="fill: currentColor;"></circle>
+            <text x="20" y="114" class="text-secondary" style="fill: currentColor; font-size: 9px;">-100</text>
+            <text x="100" y="14" text-anchor="middle" class="text-secondary" style="fill: currentColor; font-size: 9px;">0</text>
+            <text x="180" y="114" text-anchor="end" class="text-secondary" style="fill: currentColor; font-size: 9px;">+100</text>
+          </svg>
+          <div class="absolute inset-x-0 bottom-0 flex flex-col items-center pointer-events-none">
+            <span class="text-2xl font-bold tabular-nums leading-none {{ 'text-severity-critical' if eff.score < -20 else 'text-status-online' if eff.score > 20 else 'text-severity-medium' }}">{{ eff.score }}%</span>
+          </div>
+        </div>
+        <div class="flex-1 w-full space-y-1 text-[11px] text-secondary">
+          <p>Weighs failed/retried/duplicate tool calls and forced-stop stalls against the total —
+            never how many findings turned up.</p>
+          <p class="tabular-nums">Failed/error: {{ (eff.failure_rate * 100) | round(1) }}% &middot;
+            Needed a retry: {{ (eff.retry_rate * 100) | round(1) }}% &middot;
+            Exact repeats: {{ (eff.duplicate_rate * 100) | round(1) }}%{% if eff.stall_count %} &middot;
+            <span class="text-severity-high font-semibold" title="A phase was force-ended mid-work because the same tool call repeated too many times in a row. Check the Logs tab around that point — a long-running background job can finish AFTER the forced stop, so its result may still be sitting unrecorded in that job's own entry rather than lost outright.">Forced stops: {{ eff.stall_count }}</span>{% endif %}</p>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  {# Which LLM(s) actually handled this session, and how every provider ever used across every
+     project on disk stacks up -- see partials/session_fragment.html's own copy of these two blocks
+     (Agent mode's Summary tab) for the full reasoning; identical data source
+     (agent/core.py's compute_llm_usage_summary / compute_provider_leaderboard), just re-styled with
+     this file's own plain-span section headers since section_label() (macros/ui.html) isn't
+     imported into this partial. #}
+  {% set usage = session | llm_usage_summary %}
+  {% if usage %}
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">LLM used this session</span>
+      <div class="space-y-1.5 mt-1.5">
+        {% for entry in usage %}
+          <div class="flex items-center justify-between gap-2 text-[11px]">
+            <span class="text-primary font-medium truncate">{{ entry.display_name }}
+              <span class="text-secondary font-normal font-mono">{{ entry.model }}</span>{% if not loop.first %}
+              <span class="text-secondary font-normal">(reserve fallback)</span>{% endif %}</span>
+            <span class="text-secondary tabular-nums shrink-0">{{ entry.calls }} call{{ "s" if entry.calls != 1 else "" }}{% if entry.avg_latency_seconds is not none %} &middot; {{ entry.avg_latency_seconds | round(1) }}s avg{% endif %}{% if entry.estimated_cost_usd is not none %} &middot; ~${{ "%.4f" | format(entry.estimated_cost_usd) }}{{ "+" if entry.cost_is_partial else "" }}{% endif %}</span>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
+
+  {% set leaderboard = provider_leaderboard() %}
+  {% if leaderboard | length > 1 or (leaderboard and usage) %}
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Provider leaderboard</span>
+        <span class="text-[11px] text-secondary">Across every project on disk</span>
+      </div>
+      <div class="overflow-x-auto asra-scroll">
+        <table class="w-full text-[11px] tabular-nums">
+          <thead>
+            <tr class="text-secondary text-left border-b border-default">
+              <th class="font-medium py-1 pr-3">Provider</th>
+              <th class="font-medium py-1 pr-3">Sessions</th>
+              <th class="font-medium py-1 pr-3">Cleanliness</th>
+              <th class="font-medium py-1 pr-3">Avg latency</th>
+              <th class="font-medium py-1 pr-3">Avg cost/session</th>
+              <th class="font-medium py-1">Findings/100 calls</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in leaderboard %}
+              <tr class="border-b border-default last:border-0 {{ 'bg-accent/10' if usage and row.provider_id == usage[0].provider_id }}">
+                <td class="py-1 pr-3 text-primary font-medium">{{ row.display_name }}{% if usage and row.provider_id == usage[0].provider_id %} <span class="text-accent font-normal">(this session)</span>{% endif %}{% if loop.first and row.avg_cleanliness_score is not none %} <span class="text-status-online font-normal">— most efficient</span>{% endif %}</td>
+                <td class="py-1 pr-3 text-secondary">{{ row.sessions_count }}</td>
+                <td class="py-1 pr-3 {{ 'text-severity-critical' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score < -20 else 'text-status-online' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score > 20 else 'text-severity-medium' }}">{{ (row.avg_cleanliness_score ~ "%") if row.avg_cleanliness_score is not none else "—" }}</td>
+                <td class="py-1 pr-3 text-secondary">{{ (row.avg_latency_seconds | round(1) ~ "s") if row.avg_latency_seconds is not none else "—" }}</td>
+                <td class="py-1 pr-3 text-secondary">{{ ("$" ~ "%.4f" | format(row.avg_cost_per_session_usd)) if row.avg_cost_per_session_usd is not none else "—" }}</td>
+                <td class="py-1 text-secondary">{{ row.findings_per_100_calls | round(1) if row.findings_per_100_calls is not none else "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="text-[11px] text-secondary mt-2">Cleanliness is this project's own process-efficiency
+        score averaged across every session that provider handled; Findings/100 calls is a separate
+        yield metric, not folded into it.</p>
+    </div>
+  {% endif %}
+
+  {% set severity_order = ["Critical", "High", "Medium", "Low", "Info"] %}
+  {% set total_findings = session.findings | length %}
+  {% set severity_counts = {} %}
+  {% for sev in severity_order %}
+    {% set _ = severity_counts.update({sev: session.findings | selectattr("severity", "equalto", sev) | list | length}) %}
+  {% endfor %}
+  {% set max_severity_count = severity_counts.values() | max %}
+
+  <div class="bg-surface border border-default rounded-lg p-3">
+    <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Findings</span>
+    <p class="text-[11.5px] text-secondary mt-1 mb-3">
+      {{ total_findings }} finding{{ "s" if total_findings != 1 else "" }} recorded against
+      <strong class="text-primary break-words">{{ session.target }}</strong>.
+      {% if severity_counts["Critical"] or severity_counts["High"] %}
+        {{ severity_counts["Critical"] + severity_counts["High"] }} of those are Critical/High severity.
+      {% endif %}
+    </p>
+    {% if total_findings %}
+      <div class="flex flex-col sm:flex-row items-center gap-4">
+        <div class="relative w-24 h-24 shrink-0">
+          <svg viewBox="0 0 36 36" class="w-24 h-24 -rotate-90" aria-hidden="true">
+            <circle cx="18" cy="18" r="15.9155" fill="none" stroke="rgb(var(--border))" stroke-width="4"></circle>
+            {% set cum = namespace(value=0) %}
+            {% for sev in severity_order %}
+              {% set count = severity_counts[sev] %}
+              {% set pct = (count / total_findings * 100) if total_findings else 0 %}
+              {% if count > 0 %}
+                <circle cx="18" cy="18" r="15.9155" fill="none" stroke-linecap="butt"
+                        stroke="rgb(var(--severity-{{ sev | lower }}, var(--severity-unknown)))" stroke-width="4"
+                        stroke-dasharray="{{ '%.3f' | format(pct) }} {{ '%.3f' | format(100 - pct) }}"
+                        stroke-dashoffset="{{ '%.3f' | format(-1 * cum.value) }}">
+                  <title>{{ sev }}: {{ count }} finding{{ "s" if count != 1 else "" }} ({{ pct | round(1) }}%)</title>
+                </circle>
+              {% endif %}
+              {% set cum.value = cum.value + pct %}
+            {% endfor %}
+          </svg>
+          <div class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <span class="text-base font-semibold text-primary tabular-nums leading-none">{{ total_findings }}</span>
+            <span class="text-[8.5px] text-secondary uppercase tracking-wider">total</span>
+          </div>
+        </div>
+        <div class="flex-1 w-full space-y-2">
+          {% for sev in severity_order %}
+            {% set count = severity_counts[sev] %}
+            {% set pct = (count / total_findings * 100) if total_findings else 0 %}
+            <div class="flex items-center gap-2" title="{{ count }} {{ sev }} finding{{ 's' if count != 1 else '' }} — {{ pct | round(1) }}% of all findings.">
+              <span class="w-16 shrink-0 text-[11px] text-secondary">{{ sev }}</span>
+              <div class="flex-1 h-4 bg-elevated rounded-full overflow-hidden">
+                {% if count > 0 %}<div class="h-full rounded-full bg-severity-{{ sev | lower }}" style="width: {{ (count / max_severity_count * 100) if max_severity_count else 0 }}%"></div>{% endif %}
+              </div>
+              <span class="w-6 shrink-0 text-[11px] text-primary text-right tabular-nums">{{ count }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="mt-3 pt-3 border-t border-default">
+        <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Verification status</span>
+        <div class="space-y-1.5 mt-1.5">
+          {% for status, tone, label in [("verified", "low", "Verified"), ("inferred", "medium", "Inferred"), ("needs_verification", "unknown", "Unverified")] %}
+            {% set count = session.findings | selectattr("verification", "equalto", status) | list | length %}
+            <div class="flex items-center gap-2" title="{{ count }} finding{{ 's' if count != 1 else '' }} marked &quot;{{ status }}&quot;.">
+              <span class="w-20 shrink-0 text-[11px] text-secondary truncate">{{ label }}</span>
+              <div class="flex-1 h-3.5 bg-elevated rounded-full overflow-hidden">
+                {% if count > 0 %}<div class="h-full rounded-full bg-severity-{{ tone }}" style="width: {{ (count / total_findings * 100) if total_findings else 0 }}%"></div>{% endif %}
+              </div>
+              <span class="w-6 shrink-0 text-[11px] text-primary text-right tabular-nums">{{ count }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% else %}
+      <p class="text-[11px] text-secondary/70">Nothing recorded yet — this fills in as the pass confirms real issues.</p>
+    {% endif %}
+  </div>
+
+  {% set hyp_order = [("unconfirmed", "medium", "Open"), ("confirmed", "low", "Confirmed"), ("ruled_out", "unknown", "Ruled out")] %}
+  {% set total_hyp = session.hypotheses | length %}
+  {% if total_hyp %}
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Hypotheses</span>
+      <div class="space-y-1.5 mt-1.5">
+        {% for status, tone, label in hyp_order %}
+          {% set count = session.hypotheses | selectattr("status", "equalto", status) | list | length %}
+          <div class="flex items-center gap-2" title="{{ count }} hypothes{{ 'is' if count == 1 else 'es' }} marked &quot;{{ status }}&quot;.">
+            <span class="w-20 shrink-0 text-[11px] text-secondary truncate">{{ label }}</span>
+            <div class="flex-1 h-3.5 bg-elevated rounded-full overflow-hidden">
+              {% if count > 0 %}<div class="h-full rounded-full bg-severity-{{ tone }}" style="width: {{ (count / total_hyp * 100) if total_hyp else 0 }}%"></div>{% endif %}
+            </div>
+            <span class="w-6 shrink-0 text-[11px] text-primary text-right tabular-nums">{{ count }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
+
+  <div class="bg-surface border border-default rounded-lg p-3">
+    <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Target Profile</span>
+    <div class="mt-2">
+      {% set facts = session.target_profile %}
+      {% include "partials/target_profile.html" %}
+    </div>
+  </div>
+
+  {% if session.status == "completed" and session.findings %}
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Export</span>
+      <form method="get" action="/api/session/{{ session.session_id }}/export" class="mt-2 flex items-center gap-2 flex-wrap">
+        <label class="text-[11px] text-secondary" for="re-export-format-{{ session.session_id }}">Format</label>
+        <select id="re-export-format-{{ session.session_id }}"
+                onchange="document.getElementById('re-export-word-variant-{{ session.session_id }}').hidden = (this.value !== 'word'); document.getElementById('re-export-format-value-{{ session.session_id }}').value = (this.value === 'word' ? document.getElementById('re-export-word-variant-{{ session.session_id }}').value : this.value);"
+                class="bg-elevated border border-default rounded px-2 py-1.5 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <option value="html">HTML</option>
+          <option value="txt">Plain text (.txt)</option>
+          <option value="md">Markdown (.md)</option>
+          <option value="pdf">PDF</option>
+          <option value="word">Word</option>
+          <option value="zip">All formats together (.zip)</option>
+        </select>
+        <select id="re-export-word-variant-{{ session.session_id }}" hidden
+                onchange="document.getElementById('re-export-format-value-{{ session.session_id }}').value = this.value;"
+                class="bg-elevated border border-default rounded px-2 py-1.5 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <option value="docx">Word 2007+ (.docx)</option>
+          <option value="doc">Word 97-2003 (.doc)</option>
+        </select>
+        <input type="hidden" name="format" id="re-export-format-value-{{ session.session_id }}" value="html">
+        <button type="submit"
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm">Export</button>
+      </form>
+    </div>
+  {% endif %}
+</div>

@@ -1,0 +1,28 @@
+{# Recon tab's tech/WAF icons (Wappalyzer-style "what does this run" glance). main.py's
+   tech_icon_meta filter classifies a label into one of three shapes:
+   - a real vendor logo, vendored as a static file under static/icons/tech/<key>.svg -- Simple
+     Icons (https://simpleicons.org, CC0 1.0), downloaded once and colored with each brand's own
+     official hex, same "no CDN calls at runtime" rule Tailwind/htmx already follow (see
+     base.html's own vendoring comment) -- for a product this project actually curated an icon for.
+   - a shield glyph, hand-drawn in this project's own existing icon style (see
+     templates/macros/project_icons.html/subagent_icons.html), for a known WAF/CDN vendor
+     (agent/core.py's own _WHATWEB_WAF_CDN_PLUGIN_NAMES allowlist) with no vendored logo above.
+   - a generic chip glyph, same hand-drawn style, for anything else -- so an unrecognized token
+     still reads as SOMETHING instead of a blank gap, never a dead-end lookup.
+#}
+{% macro tech_icon(display_text, size_class="w-4 h-4") %}
+  {% set icon = display_text | tech_icon_meta %}
+  {% if icon.kind == "logo" %}
+    <img src="/static/icons/tech/{{ icon.key }}.svg?v=1" alt="" title="{{ display_text }}" class="{{ size_class }} shrink-0 object-contain" loading="lazy">
+  {% elif icon.kind == "waf" %}
+    <svg class="{{ size_class }} shrink-0 text-severity-high" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <title>{{ display_text }}</title>
+      <path d="M12 2 3 6v6c0 5 4 9 9 10 5-1 9-5 9-10V6z"/><path d="M9 12l2 2 4-4"/>
+    </svg>
+  {% else %}
+    <svg class="{{ size_class }} shrink-0 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <title>{{ display_text }}</title>
+      <rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l1.8 1.8M17.2 17.2 19 19M19 5l-1.8 1.8M6.8 17.2 5 19"/>
+    </svg>
+  {% endif %}
+{% endmacro %}

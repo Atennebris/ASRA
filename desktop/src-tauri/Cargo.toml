@@ -1,0 +1,20 @@
+[package]
+name = "asra-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "ASRA desktop shell — native window over the local FastAPI web UI"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+getrandom = "0.2"
+tauri-plugin-notification = "2"
+# Local-time-with-UTC-offset timestamps for this shell's own debug.log lines (see
+# append_desktop_log_line in main.rs) -- matches agent/utils/debug.py's own format exactly, so the
+# same tailing console/window reads both without a second parser.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

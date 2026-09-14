@@ -1,0 +1,37 @@
+{# Decoder: encode/decode a pasted string through a common webapp scheme. Root div's own id is the
+   stable hx-target/hx-swap="outerHTML" anchor for the form's own submit, same self-contained,
+   self-replacing container convention as partials/toolkit_repeater.html's #toolkit-repeater-container. #}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-decoder-container">
+  <form hx-post="{{ toolkit_base_url }}/decoder/run" hx-target="#toolkit-decoder-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="flex flex-wrap items-center gap-3">
+      <select name="scheme" class="bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        {% for s in schemes %}
+          <option value="{{ s }}" {% if s == scheme %}selected{% endif %}>{{ s | upper }}</option>
+        {% endfor %}
+      </select>
+      <div class="flex items-center gap-3 text-[11px] text-secondary">
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="mode" value="encode" {% if mode == "encode" %}checked{% endif %}> Encode
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="radio" name="mode" value="decode" {% if mode == "decode" %}checked{% endif %}> Decode
+        </label>
+      </div>
+      {{ button("Run", type="submit", size="sm") }}
+    </div>
+    <textarea name="input_text" rows="6" placeholder="Input"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ input_text | default('') }}</textarea>
+  </form>
+
+  {% if error %}
+    <div class="bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">
+      {{ error }}
+    </div>
+  {% elif result is not none %}
+    <div>
+      <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Output</p>
+      <pre class="text-[11px] font-mono whitespace-pre-wrap break-words bg-elevated border border-default rounded p-2 max-h-64 overflow-y-auto asra-scroll">{{ result }}</pre>
+    </div>
+  {% endif %}
+</div>

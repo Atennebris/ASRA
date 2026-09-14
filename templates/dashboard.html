@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import section_label, empty_state, privacy_toggle_button, privacy_placeholder, privacy_restore_script %}
+{% block title %}ASRA &mdash; Dashboard{% endblock %}
+{% block content %}
+  {# Cross-session cost/efficiency dashboard -- pure aggregation of what every session already
+     records (llm_usage/phase_efficiency/stall_events, sessions/store.py's _build_summary), never a
+     fresh load_session() per project. Two views on the same underlying data: by program/target
+     (agent/core.py's compute_portfolio_summary -- "which programs are worth continued LLM spend")
+     and by LLM provider (compute_provider_leaderboard, already shown per-session on each project's
+     own Summary tab -- repeated here as a portfolio-wide view, not duplicated logic). #}
+  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
+     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
+     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
+     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
+     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
+     confirmed visual bug that fix caused. #}
+  <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
+    <div class="min-w-0">
+      <h1 class="text-[15px] font-semibold text-primary">Dashboard</h1>
+      <p class="text-[11px] text-secondary mt-0.5 max-w-2xl">Cost and process-efficiency across every project on disk — which programs and providers are actually worth continued LLM spend, without opening each project individually.</p>
+    </div>
+    {% include "macros/header_light.html" %}
+  </div>
+
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <p class="text-[11px] text-secondary">Total sessions</p>
+      <p class="text-xl font-semibold text-primary mt-0.5">{{ portfolio.total_sessions }}</p>
+    </div>
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <p class="text-[11px] text-secondary">Total findings</p>
+      <p class="text-xl font-semibold text-primary mt-0.5">{{ portfolio.total_findings }}</p>
+    </div>
+    <div class="bg-surface border border-default rounded-lg p-3">
+      <p class="text-[11px] text-secondary">Estimated LLM spend</p>
+      <p class="text-xl font-semibold text-primary mt-0.5">{{ ("$" ~ "%.2f" | format(portfolio.total_estimated_cost_usd)) if portfolio.total_estimated_cost_usd is not none else "—" }}</p>
+    </div>
+  </div>
+
+  <div class="bg-surface border border-default rounded-lg p-3 mb-4" data-privacy-key="dashboard-programs" data-privacy-collapsed="false">
+    <div class="flex items-center justify-between gap-2 mb-2">
+      {{ section_label("By program") }}
+      {% if portfolio.programs %}{{ privacy_toggle_button("dashboard-programs") }}{% endif %}
+    </div>
+    {# Placed after the toggle button (not at the top of this wrapper) so the button already
+       exists in the DOM when this runs and its label/aria can be synced too -- the anti-flash
+       guarantee itself doesn't depend on this position (the ancestor's data-privacy-collapsed
+       attribute, set here, is what static/css/themes.css keys off, and nothing below has painted
+       yet regardless of exactly where in this synchronous parse it gets set). #}
+    {{ privacy_restore_script("dashboard-programs") }}
+    {% if portfolio.programs %}
+      <div data-privacy-content class="overflow-x-auto asra-scroll">
+        <table class="w-full text-[11px] tabular-nums">
+          <thead>
+            <tr class="text-secondary text-left border-b border-default">
+              <th class="font-medium py-1 pr-3">Target</th>
+              <th class="font-medium py-1 pr-3">Sessions</th>
+              <th class="font-medium py-1 pr-3">Findings</th>
+              <th class="font-medium py-1 pr-3">Cleanliness</th>
+              <th class="font-medium py-1">Estimated spend</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in portfolio.programs %}
+              <tr class="border-b border-default last:border-0">
+                <td class="py-1 pr-3 text-primary font-medium break-all"><a href="/program?target={{ row.target | urlencode }}" class="hover:text-accent hover:underline">{{ row.target }}</a></td>
+                <td class="py-1 pr-3 text-secondary">{{ row.sessions_count }}</td>
+                <td class="py-1 pr-3 text-secondary">{{ row.findings_count }}</td>
+                <td class="py-1 pr-3 {{ 'text-severity-critical' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score < -20 else 'text-status-online' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score > 20 else 'text-severity-medium' }}">{{ (row.avg_cleanliness_score ~ "%") if row.avg_cleanliness_score is not none else "—" }}</td>
+                <td class="py-1 text-secondary">{{ ("$" ~ "%.4f" | format(row.cost_usd)) if row.cost_usd is not none else "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {{ privacy_placeholder("dashboard-programs", portfolio.programs | length, "target") }}
+    {% else %}
+      {{ empty_state("No sessions yet.", "Start a project to see it show up here.") }}
+    {% endif %}
+  </div>
+
+  <div class="bg-surface border border-default rounded-lg p-3 mb-4">
+    {{ section_label("By LLM provider") }}
+    {% if leaderboard %}
+      <div class="overflow-x-auto asra-scroll">
+        <table class="w-full text-[11px] tabular-nums">
+          <thead>
+            <tr class="text-secondary text-left border-b border-default">
+              <th class="font-medium py-1 pr-3">Provider</th>
+              <th class="font-medium py-1 pr-3">Sessions</th>
+              <th class="font-medium py-1 pr-3">Cleanliness</th>
+              <th class="font-medium py-1 pr-3">Avg latency</th>
+              <th class="font-medium py-1 pr-3">Avg cost/session</th>
+              <th class="font-medium py-1">Findings/100 calls</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in leaderboard %}
+              <tr class="border-b border-default last:border-0 {{ 'bg-accent/10' if loop.first }}">
+                <td class="py-1 pr-3 text-primary font-medium">{{ row.display_name }}{% if loop.first and row.avg_cleanliness_score is not none %} <span class="text-status-online font-normal">— most efficient</span>{% endif %}</td>
+                <td class="py-1 pr-3 text-secondary">{{ row.sessions_count }}</td>
+                <td class="py-1 pr-3 {{ 'text-severity-critical' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score < -20 else 'text-status-online' if row.avg_cleanliness_score is not none and row.avg_cleanliness_score > 20 else 'text-severity-medium' }}">{{ (row.avg_cleanliness_score ~ "%") if row.avg_cleanliness_score is not none else "—" }}</td>
+                <td class="py-1 pr-3 text-secondary">{{ (row.avg_latency_seconds | round(1) ~ "s") if row.avg_latency_seconds is not none else "—" }}</td>
+                <td class="py-1 pr-3 text-secondary">{{ ("$" ~ "%.4f" | format(row.avg_cost_per_session_usd)) if row.avg_cost_per_session_usd is not none else "—" }}</td>
+                <td class="py-1 text-secondary">{{ row.findings_per_100_calls | round(1) if row.findings_per_100_calls is not none else "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="text-[11px] text-secondary mt-2">Cleanliness is process-efficiency (failed/retried/duplicate calls, never how much was found) averaged across every session that provider handled — same definition used by this same table on each project's own Summary tab.</p>
+    {% else %}
+      {{ empty_state("No provider usage recorded yet.", "Shows up once at least one session has made a real LLM call.") }}
+    {% endif %}
+  </div>
+{% endblock %}

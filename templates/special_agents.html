@@ -1,0 +1,25 @@
+{# Special Agents -- a real, empty placeholder tab for a feature that isn't built yet (real operator
+   request: a visible "this is coming" marker in the sidebar, not a hidden/disabled stub). No route
+   logic of its own beyond rendering this template (main.py's get_special_agents) -- nothing to wire
+   up until the actual feature exists. Uses the shared page_header() macro like every other simple
+   title-only page (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), so it gets the same
+   decorative header light, not a bespoke look. #}
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header %}
+{% block title %}ASRA &mdash; Special Agents{% endblock %}
+
+{% block content %}
+  {{ page_header("Special Agents") }}
+  {# Deliberately not empty_state() (macros/ui.html) -- that macro reads as "nothing here yet, but
+     the feature works, go create one" (an empty project list, an empty playbook). This is a
+     different message: the feature itself doesn't exist yet. Same dashed-border/centered shape so
+     it doesn't invent a third visual language for "nothing here", just its own wording. #}
+  <div class="flex flex-col items-center justify-center py-20 text-center border border-dashed border-default rounded-lg">
+    <svg class="w-8 h-8 text-secondary/40 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" stroke-linecap="round" stroke-linejoin="round"></path>
+      <path d="M19 15.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+    <p class="text-lg font-semibold text-primary tracking-wide">COMING SOON</p>
+    <p class="text-[11px] text-secondary mt-1.5 max-w-sm">This feature is still in development. Special Agents will show up here once they're ready.</p>
+  </div>
+{% endblock %}

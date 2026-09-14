@@ -1,0 +1,70 @@
+{# Result of the Tools page "Check arsenal" button -- rendered into #arsenal-output.
+   Purely a live read (agent/tools/arsenal.py's summarize_arsenal over the same tool_is_installed
+   check the agent itself uses); starts/changes nothing. Flag verdict on top, per-mode degradation
+   below, full per-tool detail behind a <details> the operator opens on demand. #}
+{% set verdict = summary.verdict %}
+{% if verdict == "full" %}
+  {% set tone = "text-status-online" %}{% set dot = "bg-status-online" %}
+  {% set headline = "Arsenal is fully installed." %}
+{% elif verdict == "partial" %}
+  {% set tone = "text-severity-medium" %}{% set dot = "bg-severity-medium" %}
+  {% set headline = "Arsenal is partially installed — some external tools are missing." %}
+{% else %}
+  {% set tone = "text-severity-high" %}{% set dot = "bg-severity-high" %}
+  {% set headline = "The tool auto-installer doesn't appear to have run — the agent is limited to native-only mode." %}
+{% endif %}
+
+<div class="bg-surface border border-default rounded-lg p-4">
+  <div class="flex items-start gap-2 mb-3">
+    <span class="w-2 h-2 rounded-full {{ dot }} shrink-0 mt-1.5"></span>
+    <div>
+      <p class="text-[13px] font-semibold {{ tone }}">{{ headline }}</p>
+      <p class="text-[11px] text-secondary mt-0.5">
+        External tools (installed by <code class="font-mono">setup_tools.sh</code>):
+        <span class="text-primary font-medium">{{ summary.external_installed }}/{{ summary.external_total }}</span>
+        ({{ summary.percent }}%). Native tools (ship with ASRA, always present):
+        {{ summary.native_installed }}/{{ summary.native_total }}.
+      </p>
+      {% if verdict != "full" %}
+        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[46rem]">
+          Without the external arsenal the needed scanners / interpreters / compilers are
+          unavailable — the agent loses specific tools (not &ldquo;power&rdquo; in general):
+          native detectors always work, the heavy arsenal does not. Click
+          <span class="text-primary font-medium">Install</span> to add what&rsquo;s missing.
+        </p>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if summary.modes %}
+    <div class="space-y-2 mb-3">
+      {% for mode in summary.modes %}
+        <div class="flex items-center gap-3">
+          <span class="text-[11px] text-secondary w-40 shrink-0">{{ mode.label }}</span>
+          <div class="flex-1 h-1.5 rounded-full bg-elevated overflow-hidden">
+            <div class="h-full rounded-full {{ 'bg-status-online' if mode.percent == 100 else ('bg-severity-medium' if mode.available else 'bg-severity-high') }}"
+                 style="width: {{ mode.percent if mode.percent > 0 else 4 }}%"></div>
+          </div>
+          <span class="text-[11px] w-24 text-right shrink-0 {{ 'text-severity-high' if not mode.available else 'text-secondary' }}">
+            {% if mode.available %}{{ mode.installed }}/{{ mode.total }} ({{ mode.percent }}%){% else %}missing (0/{{ mode.total }}){% endif %}
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <details class="text-[11px]">
+    <summary class="cursor-pointer text-secondary hover:text-primary select-none">Per-tool detail</summary>
+    <div class="mt-2 grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1">
+      {% for name in summary.present %}
+        <span class="inline-flex items-center gap-1.5 text-secondary"><span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span><span class="font-mono text-primary">{{ name }}</span></span>
+      {% endfor %}
+      {% for name in summary.missing %}
+        <span class="inline-flex items-center gap-1.5 text-secondary"><span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span><span class="font-mono">{{ name }}</span></span>
+      {% endfor %}
+    </div>
+    {% if not summary.present and not summary.missing %}
+      <p class="mt-2 text-secondary italic">No external tools registered.</p>
+    {% endif %}
+  </details>
+</div>

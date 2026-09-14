@@ -1,0 +1,42 @@
+{# Repeater: manually edit and resend a captured (or freehand) HTTP request. Root div's own id is
+   the stable hx-target/hx-swap="outerHTML" anchor for every interaction below (form submit, a
+   history row's own reload) -- same "one self-contained, self-replacing container" convention
+   already used elsewhere in this app (session_fragment.html's #session-content). #}
+{% from "macros/toolkit.html" import body_block, method_field %}
+{% from "macros/ui.html" import button %}
+<div id="toolkit-repeater-container">
+  <form hx-post="{{ toolkit_base_url }}/repeater/send" hx-target="#toolkit-repeater-container" hx-swap="outerHTML" hx-disabled-elt="this" class="space-y-2 mb-3">
+    <div class="flex gap-2">
+      {{ method_field("repeater-method-list", method) }}
+      <input type="text" name="url" value="{{ url | default('') }}" placeholder="https://example.com/path"
+             class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      {{ button("Send", type="submit", size="sm") }}
+    </div>
+    <textarea name="headers_text" rows="6" placeholder="Header-Name: value&#10;one per line"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ headers_text | default('') }}</textarea>
+    <textarea name="body" rows="6" placeholder="Request body (leave empty for none)"
+              class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 asra-scroll">{{ body | default('') }}</textarea>
+    {% if binary_request_body_note %}
+      <p class="text-[11px] text-secondary italic">{{ binary_request_body_note }}</p>
+    {% endif %}
+  </form>
+
+  {% if send_error %}
+    <div class="mb-3 bg-severity-high/10 border border-severity-high/40 rounded p-2 text-[11px] text-severity-high">
+      Send failed: {{ send_error }}
+    </div>
+  {% elif result_entry %}
+    <div class="mb-3">
+      <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Response
+        <span class="font-mono
+                     {{ 'text-severity-low' if result_entry.response_status and result_entry.response_status < 300
+                        else 'text-severity-medium' if result_entry.response_status and result_entry.response_status < 400
+                        else 'text-severity-high' if result_entry.response_status and result_entry.response_status >= 400
+                        else 'text-secondary' }}">{{ result_entry.response_status or '—' }}</span>
+      </p>
+      {{ body_block(result_entry.response_headers, response_detail) }}
+    </div>
+  {% endif %}
+
+  {% include "partials/toolkit_repeater_history.html" %}
+</div>

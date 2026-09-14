@@ -1,0 +1,62 @@
+{# The Reverse Engineering mode chat pane's own content -- either a live "triage running" placeholder
+   or the real chat panel, depending on session.status. Its own partial (not inlined directly in
+   session.html) specifically so the SAME markup can be both the initial page render AND the target
+   of htmx's own polling re-fetch below, without duplicating the branch logic in two places.
+
+   Real, confirmed operator complaint this fixes: the placeholder used to be static -- a plain
+   "Refresh" link, no live update at all -- so the operator had to notice on their own that the
+   baseline triage pass had finished and manually reload the page before the chat panel (and its
+   own findings) ever appeared. hx-trigger="every 3s" on the wrapper below polls this exact route
+   while still pending/processing; the moment the response comes back WITHOUT that same polling
+   attribute (this file's own {% else %} branch, chat_panel.html), htmx naturally stops polling --
+   swapping in a fragment with no hx-trigger of its own ends the interval, nothing extra to tear
+   down. Purely a read-refresh (GET, no session mutation) -- doesn't reopen the exact chat-vs-triage
+   write race this placeholder exists to avoid in the first place (see the {% if %} branch's own
+   comment below for that reasoning). #}
+{% if session.mode == "reverse_engineering" and session.status in ("pending", "processing") %}
+  {# Chat is deliberately NOT rendered while the baseline triage pass is live -- both
+     agent/core.py's run_re_triage and agent/chat.py's run_chat_turn_background would hold
+     their own independent, possibly-stale in-memory session snapshot at the same time,
+     each doing its own load/mutate/save cycle with no mutex between them (confirmed: no
+     lock exists anywhere for chat-vs-main-loop writes, only a narrower operator-instruction
+     queue for a live run_session — see agent/core.py's _pop_deep_dive_instruction docstring
+     for the precedent this follows). Real, confirmed incident this design avoids repeating:
+     a delegated Subagent's own stale snapshot already wiped two real findings once this
+     session, purely from this same class of race —
+     triage's own ctx.session is held for its ENTIRE run, the same shape, so letting chat
+     write concurrently would reopen the identical risk on every single triage run instead
+     of the one-off subagent case already fixed. The pass itself is short and bounded by
+     design (RE_TRIAGE_PROMPT), so this costs little real waiting. #}
+  <div id="re-triage-stage" class="flex flex-col items-center justify-center h-full text-center px-6"
+       hx-get="/api/session/{{ session.session_id }}/re-triage-stage" hx-trigger="every 3s" hx-swap="outerHTML">
+    {# No graph here on purpose -- it used to render inline (a real, confirmed operator complaint:
+       showing a graph in what was labeled the "Chat" tab read as a mistake, and it duplicated the
+       exact same visual the dedicated Graph tab already owns, see re_triage_graph.html's own
+       comment). This placeholder is just presence/status; session.html auto-reveals the Graph tab
+       for the operator the moment a run starts, so they land on the interesting view directly
+       instead of this one. #}
+    <span class="asra-spinner mb-3"></span>
+    <p class="text-[13px] font-medium text-primary mt-1">Baseline triage is running</p>
+    <p class="text-[11px] text-secondary mt-1.5 max-w-[22rem] leading-relaxed">
+      See the Graph tab for live progress, or Logs for the tool-by-tool timeline. Chat opens up
+      here the moment it finishes, so its own tool calls never race the triage pass's writes to
+      this same project.
+    </p>
+  </div>
+{% else %}
+  {# Single root wrapper (display:contents -- invisible to layout, chat_panel.html's own sizing is
+     unaffected) so this stays nested INSIDE the one element this hx-swap="outerHTML" response
+     actually swaps in, exactly like the {% if %} branch above -- not a sibling after {% include %},
+     which would leave its survival dependent on how htmx handles a response with more than one
+     top-level node. session.html's own reopen-handle button no longer needs anything from this
+     branch -- it's unconditionally clickable now regardless of which of these two branches is
+     currently in the DOM (see that button's own comment for why). #}
+  <div class="contents">
+    {# .interactive-chat-pane (session.html)'s own height:100% ultimately resolves against
+       .interactive-workspace's real, unconditional viewport-bound height (themes.css) at every
+       window width -- same "#chat-panel can always fill it" signal chat.html's own Quick Chat
+       include sets, see chat_panel.html's own comment on #chat-panel for the bug this fixes. #}
+    {% set chat_panel_bounded_height = true %}
+    {% include "partials/chat_panel.html" %}
+  </div>
+{% endif %}

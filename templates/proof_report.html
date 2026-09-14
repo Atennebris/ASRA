@@ -18,23 +18,52 @@
       --sev-medium-bg: #fef3c7; --sev-medium-text: #92400e;
       --sev-low-bg: #dbeafe; --sev-low-text: #1d4ed8;
       --sev-unknown-bg: #f1f5f9; --sev-unknown-text: #475569;
+      --qualifying-border: #b91c1c; --qualifying-bg: #fef2f2;
+      --nonqualifying-border: #94a3b8; --nonqualifying-bg: #f1f5f9; --nonqualifying-text: #475569;
+      --unclear-border: #ca8a04; --unclear-bg: #fefce8; --unclear-text: #854d0e;
+      --fp-border: #94a3b8; --fp-bg: #f8fafc; --fp-text: #64748b;
+      --fix-border: #16a34a; --fix-bg: #f0fdf4; --fix-text: #15803d;
     }
     @media (prefers-color-scheme: dark) {
       :root:not([data-theme="light"]) {
         --bg: #0d1117; --text: #e6edf3; --heading: #f0f6fc; --meta: #8b949e;
         --border: #30363d; --pre-bg: #161b22;
+        --qualifying-border: #f87171; --qualifying-bg: #2a1516;
+        --nonqualifying-border: #6b7280; --nonqualifying-bg: #1c2128; --nonqualifying-text: #9ca3af;
+        --unclear-border: #eab308; --unclear-bg: #2a2410; --unclear-text: #fde68a;
+        --fp-border: #6b7280; --fp-bg: #161b22; --fp-text: #8b949e;
+        --fix-border: #4ade80; --fix-bg: #142e1c; --fix-text: #86efac;
       }
     }
     :root[data-theme="dark"] {
       --bg: #0d1117; --text: #e6edf3; --heading: #f0f6fc; --meta: #8b949e;
       --border: #30363d; --pre-bg: #161b22;
+      --qualifying-border: #f87171; --qualifying-bg: #2a1516;
+      --nonqualifying-border: #6b7280; --nonqualifying-bg: #1c2128; --nonqualifying-text: #9ca3af;
+      --unclear-border: #eab308; --unclear-bg: #2a2410; --unclear-text: #fde68a;
+      --fp-border: #6b7280; --fp-bg: #161b22; --fp-text: #8b949e;
+      --fix-border: #4ade80; --fix-bg: #142e1c; --fix-text: #86efac;
     }
+    /* overflow-x: hidden here mirrors the live app's own html/body backstop (static/css/
+       themes.css) — this is a standalone document with no server-side truncation on
+       finding.title/description, so a long unbroken token needs the same last-resort
+       containment a live-app page already gets. */
+    html, body { overflow-x: hidden; }
     body { font-family: ui-monospace, Consolas, "SF Mono", monospace; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: var(--text); background: var(--bg); line-height: 1.5; transition: background-color 0.15s, color 0.15s; }
     h1 { font-size: 1.5rem; }
     h1, h2, h3 { color: var(--heading); }
     section { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
-    p, li { word-break: break-word; overflow-wrap: break-word; }
+    /* h1-h4 included, not just p/li: finding.title (h3) is model-generated text with no length
+       cap anywhere in the schema (agent/tools/native.py's record_finding) — the same real risk
+       p/li were already protected against. */
+    h1, h2, h3, h4, p, li { word-break: break-word; overflow-wrap: break-word; }
     pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); word-break: break-word; overflow-wrap: break-word; }
+    th { color: var(--meta); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    .table-scroll { overflow-x: auto; }
+    .cve-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+    .cve-chip { display: inline-block; font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); color: var(--meta); }
     .meta { color: var(--meta); font-size: 0.9rem; }
     .severity { display: inline-block; font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 4px; margin-left: 0.5rem; }
     .severity-critical { background: var(--sev-critical-bg); color: var(--sev-critical-text); }
@@ -42,7 +71,35 @@
     .severity-medium { background: var(--sev-medium-bg); color: var(--sev-medium-text); }
     .severity-low { background: var(--sev-low-bg); color: var(--sev-low-text); }
     .severity-unknown { background: var(--sev-unknown-bg); color: var(--sev-unknown-text); }
+    /* Info shares unknown's neutral gray -- same "not actually dangerous" reasoning as the live
+       UI's severity-info Tailwind alias (templates/base.html), not a separate hand-picked hue. */
+    .severity-info { background: var(--sev-unknown-bg); color: var(--sev-unknown-text); }
+    /* A finding already ruled out below (false-positive-note) must not still shout its original
+       Critical/High color right in the heading -- same "one consistent verdict, not two disagreeing
+       ones" fix as the live UI's own badge(muted=...) (templates/macros/ui.html). */
+    .severity-ruled-out { background: transparent; color: var(--meta); border: 1px dashed var(--border); text-decoration: line-through; }
     .theme-toggle { position: fixed; top: 1rem; right: 1rem; font: inherit; font-size: 0.8rem; padding: 0.35rem 0.7rem; border-radius: 6px; border: 1px solid var(--border); background: var(--pre-bg); color: var(--text); cursor: pointer; }
+    .qualifying-spotlight { border: 2px solid var(--qualifying-border); background: var(--qualifying-bg); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    .qualifying-spotlight h2 { margin-top: 0; }
+    /* One shared shape, three distinct colorings — a "qualifying" tag must not read the same as
+       "non_qualifying"/"unclear" at a glance, that was the actual gap here (all three used to
+       share this one class with no color distinction at all). */
+    .bounty-tag { display: inline-block; font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 4px; margin-left: 0.5rem; border: 1px solid; }
+    .bounty-tag-qualifying { border-color: var(--qualifying-border); color: var(--qualifying-border); font-weight: 600; }
+    .bounty-tag-non_qualifying { border-color: var(--nonqualifying-border); background: var(--nonqualifying-bg); color: var(--nonqualifying-text); }
+    .bounty-tag-unclear { border-color: var(--unclear-border); background: var(--unclear-bg); color: var(--unclear-text); }
+    .false-positive-note { font-size: 0.85rem; color: var(--fp-text); border-left: 2px solid var(--fp-border); padding-left: 0.6rem; margin: 0.5rem 0; }
+    .not-exploitable-note { font-size: 0.85rem; color: var(--unclear-text); background: var(--unclear-bg); border: 1px solid var(--unclear-border); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.5rem 0; }
+    .not-attempted-note { font-size: 0.85rem; color: var(--fp-text); background: var(--fp-bg); border: 1px dashed var(--fp-border); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.5rem 0; }
+    .exploited-note { font-size: 0.9rem; font-weight: 700; color: var(--sev-critical-text); background: var(--sev-critical-bg); border: 2px solid var(--sev-critical-text); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.5rem 0; }
+    .exploited-note code { display: block; margin: 0.3rem 0; font-weight: 700; }
+    .remediation-note { font-size: 0.85rem; color: var(--fix-text); background: var(--fix-bg); border: 1px solid var(--fix-border); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.5rem 0; }
+    /* Mirrors session_fragment.html's own refuted/confirmed/inconclusive skeptical_verification
+       blocks -- the live UI already shows this blind second-opinion verdict, an exported report
+       that goes to an external reader (a real bug bounty submission) must not silently drop it. */
+    .skeptical-refuted { font-size: 0.85rem; font-weight: 700; color: var(--sev-critical-text); background: var(--sev-critical-bg); border: 2px solid var(--sev-critical-text); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.5rem 0; }
+    .skeptical-confirmed { display: inline-block; font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--fix-border); color: var(--fix-text); background: var(--fix-bg); margin: 0.5rem 0; }
+    .skeptical-inconclusive { font-size: 0.85rem; font-style: italic; color: var(--meta); margin: 0.5rem 0; }
     @media print { body { margin: 0; } section { break-inside: avoid; } .theme-toggle { display: none; } }
   </style>
 </head>
@@ -58,14 +115,218 @@
   <p class="meta"><strong>Session:</strong> {{ session.session_id }}</p>
   <p class="meta"><strong>Generated:</strong> {{ generated_at }}</p>
 
+  {# Matches session_fragment.html's own "Qualifying findings" spotlight — a finding the model
+     matched against this project's own Qualifying vulnerabilities scope rules AND actively
+     verified, not a guess. Nothing renders here for a project that never set scope rules.
+     A "refuted" skeptical_verification already downgrades finding.verification back to
+     needs_verification (agent/core.py's _run_skeptical_verification) so it's excluded by the
+     verification=="verified" filter alone -- but "inconclusive" deliberately leaves verification
+     untouched (the original claim was never disproven, just not independently confirmed either),
+     so it needs its own explicit exclusion here or an unconfirmed finding reads as spotlight-ready
+     "verified & ready to report" in the one document meant to leave this app for a real submission. #}
+  {% set qualifying_hits = session.findings | selectattr("qualifies_for_bounty", "equalto", "qualifying") | selectattr("verification", "equalto", "verified") | rejectattr("skeptical_verification", "equalto", "inconclusive") | list %}
+  {% if qualifying_hits %}
+    <div class="qualifying-spotlight">
+      <h2>&#127919; Qualifying findings — verified &amp; ready to report ({{ qualifying_hits | length }})</h2>
+      <p class="meta">Matched against this project's own Qualifying vulnerabilities scope rules and actively verified.</p>
+      <ul>
+        {% for finding in qualifying_hits %}
+          <li><strong>{{ finding.title }}</strong> ({{ finding.severity }})</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {# Real, tool-proven escalations (agent/core.py's _run_chain / record_chain_result) that turned a
+     finding which wouldn't get paid alone into something with demonstrated impact -- "no_chain_
+     found" attempts are deliberately excluded, this section is proof, not a log of every pass.
+     Newest first, matching session_fragment.html's own Chain tab ordering. #}
+  {% set confirmed_chains = session.get("chain_attempts", []) | selectattr("outcome", "equalto", "chain_confirmed") | list | reverse | list %}
+  {% if confirmed_chains %}
+    <h2>&#9873; Attack chains — demonstrated impact ({{ confirmed_chains | length }})</h2>
+    <p class="meta">Real, tool-proven escalations connecting the findings below into concrete, reproducible access/impact — not narrated speculation.</p>
+    {% for chain in confirmed_chains %}
+      <section>
+        <h3>{{ chain.finding_titles | join(" → ") }}{% if chain.hop and chain.hop > 1 %}<span class="severity severity-unknown">Hop {{ chain.hop }}</span>{% endif %}</h3>
+        {% if chain.impact_scenario %}
+          <p class="exploited-note"><strong>Impact:</strong> {{ chain.impact_scenario }}</p>
+        {% endif %}
+        {% if chain.reasoning %}<p>{{ chain.reasoning }}</p>{% endif %}
+        {% if chain.evidence_quotes %}
+          <h4>Evidence quoted</h4>
+          <ul>{% for quote in chain.evidence_quotes %}<li>{{ quote }}</li>{% endfor %}</ul>
+        {% endif %}
+        {% if chain.tool_call_proof %}
+          <h4>Tool-call proof</h4>
+          <pre>{{ chain.tool_call_proof }}</pre>
+        {% endif %}
+      </section>
+    {% endfor %}
+  {% endif %}
+
+  {# Techniques applied this session (agent/tools/playbook_store.py's list_session_techniques) --
+     mirrors session_fragment.html's own Techniques tab: same "what technique, what evidence, when,
+     and what it was for" lens the live view already gives an operator, so an exported report
+     doesn't silently drop it. #}
+  {% set session_techniques = list_session_techniques(session.session_id) %}
+  {% if session_techniques %}
+    <h2>Techniques applied ({{ session_techniques | length }})</h2>
+    {% for entry in session_techniques %}
+      <section>
+        <h3>{{ entry.technique }}<span class="severity {{ 'severity-unknown' if entry.outcome == 'failed' else 'severity-critical' }}">{{ "Dead-end" if entry.outcome == "failed" else "Applied" }}</span></h3>
+        {% set when = entry.last_confirmed_at or entry.last_seen %}
+        {% if when %}<p class="meta"><strong>When:</strong> {{ when | human_dt }}</p>{% endif %}
+        {% if entry.vuln_class %}<p><strong>For:</strong> {{ entry.vuln_class }}</p>{% endif %}
+        {% if entry.payload_or_command %}<h4>Command/payload</h4><pre>{{ entry.payload_or_command }}</pre>{% endif %}
+        {% if entry.evidence_ref %}<h4>Evidence</h4><pre>{{ entry.evidence_ref }}</pre>{% endif %}
+        {% if entry.cves %}<p class="cve-chips">{% for cve in entry.cves %}<span class="cve-chip">{{ cve }}</span>{% endfor %}</p>{% endif %}
+      </section>
+    {% endfor %}
+  {% endif %}
+
+  {# Recon / asset info — the same raw facts the live session page shows (session_fragment.html),
+     missing from this standalone export entirely before: an external reader (hackathon judge/
+     auditor) had no way to see what hosts/ports/services the scan actually covered, only the
+     findings it produced from them. #}
+  {% set recon_targets = session.get("recon_result", {}).get("targets", []) %}
+  {% set recon_cves = session.get("recon_result", {}).get("cves", []) %}
+  {% set dns_map = session.get("recon_result", {}).get("dns_map", {}) %}
+  {% set os_guesses = session.get("recon_result", {}).get("os_guesses", {}) %}
+  {% set technologies_by_host = session.get("recon_result", {}).get("technologies", {}) %}
+  {% set protections_by_host = session.get("recon_result", {}).get("protections", {}) %}
+  {% if recon_targets or recon_cves %}
+    <h2>Recon / Asset Info</h2>
+    {% if recon_targets %}
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Host</th><th>Port</th><th>State</th><th>Service</th><th>Version</th><th>Protection</th><th>Technologies</th></tr>
+          </thead>
+          <tbody>
+            {% for t in recon_targets %}
+              {% set resolved_ips = dns_map.get(t.host) if not (t.host | is_ip) else none %}
+              {# Reverse direction: record_target's "host" is sometimes the literal IP itself
+                 (nmap's own output is IP-based) -- same fix as session_fragment.html's live Asset
+                 Info table, so an exported report doesn't lose every human-readable hostname a
+                 rescan that happened to record IPs directly would otherwise show only bare IPs for,
+                 even though dns_map already has the exact reverse mapping needed. #}
+              {% set known_hostnames = [] %}
+              {% if t.host and (t.host | is_ip) %}
+                {% for hostname, ips in dns_map.items() %}
+                  {% if t.host in ips %}
+                    {% set _ = known_hostnames.append(hostname) %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {# Same tolerant substring lookup as session_fragment.html's live Asset Info table
+                 -- os_guesses/technologies are keyed by whatever exact string nmap/whatweb were
+                 called with, not necessarily record_target's own "host" value verbatim. #}
+              {% set os_guess = os_guesses.get(t.host) %}
+              {% if not os_guess %}
+                {% for known_host, guess in os_guesses.items() %}
+                  {% if not os_guess and t.host and known_host and (t.host in known_host or known_host in t.host) %}
+                    {% set os_guess = guess %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% set technologies = technologies_by_host.get(t.host) %}
+              {% if not technologies %}
+                {% for known_host, techs in technologies_by_host.items() %}
+                  {% if not technologies and t.host and known_host and (t.host in known_host or known_host in t.host) %}
+                    {% set technologies = techs %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {# Own column, not folded into Technologies -- see agent/core.py's
+                 _merge_protection_detection: a WAF/protective system should read as what it is. #}
+              {% set protections = protections_by_host.get(t.host) %}
+              {% if not protections %}
+                {% for known_host, prot in protections_by_host.items() %}
+                  {% if not protections and t.host and known_host and (t.host in known_host or known_host in t.host) %}
+                    {% set protections = prot %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              <tr>
+                <td>{{ t.host }}{% if known_hostnames %} <span class="meta">({{ known_hostnames | join(", ") }})</span>{% endif %}{% if resolved_ips %} <span class="meta">({{ resolved_ips | join(", ") }})</span>{% endif %}{% if os_guess %} <span class="meta">— {{ os_guess }}</span>{% endif %}</td>
+                <td>{{ t.port if t.port is not none else "—" }}</td>
+                <td>{{ "Open" if t.port is not none else "—" }}</td>
+                <td>{{ t.service or "—" }}</td>
+                <td>{{ t.version or "—" }}</td>
+                <td>{{ protections | join(", ") if protections else "—" }}</td>
+                <td>{{ technologies | join(", ") if technologies else "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+    {% if recon_cves %}
+      <div class="cve-chips">
+        {% for cve in recon_cves %}
+          <span class="cve-chip">{{ cve }}</span>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+
   <h2>Findings ({{ session.findings | length }})</h2>
   {% for finding in session.findings %}
-    {% set sev_key = finding.severity | lower if finding.severity in ["Critical", "High", "Medium", "Low"] else "unknown" %}
+    {% set sev_key = finding.severity | lower if finding.severity in ["Critical", "High", "Medium", "Low", "Info"] else "unknown" %}
+    {% set sev_css_class = "severity-ruled-out" if finding.false_positive_reason else "severity-" ~ sev_key %}
     <section>
-      <h3>{{ finding.title }}<span class="severity severity-{{ sev_key }}">{{ finding.severity }}</span></h3>
+      <h3>{{ finding.title }}<span class="severity {{ sev_css_class }}" title="{{ 'Original severity before this finding was ruled out as a false positive' if finding.false_positive_reason else '' }}">{{ finding.severity }}</span>{% if finding.qualifies_for_bounty %}<span class="bounty-tag bounty-tag-{{ finding.qualifies_for_bounty }}">{% if finding.qualifies_for_bounty == "qualifying" %}<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="vertical-align:-1px;margin-right:3px" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>Qualifying{% else %}{{ finding.qualifies_for_bounty }}{% endif %}</span>{% endif %}</h3>
+      {% if finding.original_title %}
+        <p><em>&#8635; Originally reported as &ldquo;{{ finding.original_title }}&rdquo; — corrected since first reported.</em></p>
+      {% endif %}
+      {% if finding.original_severity or finding.original_qualifies_for_bounty %}
+        <p><em>&#8635;
+          {%- if finding.original_severity %} Originally rated {{ finding.original_severity }}, corrected to {{ finding.severity }}{% if finding.original_qualifies_for_bounty %};{% endif %}{% endif -%}
+          {%- if finding.original_qualifies_for_bounty %} originally marked {{ finding.original_qualifies_for_bounty }}, corrected to {{ finding.qualifies_for_bounty or "unset" }}{% endif -%}
+          — once further verification confirmed the real impact.</em></p>
+      {% endif %}
       <p>{{ finding.description }}</p>
       <p><strong>Verification:</strong> {{ finding.verification }}</p>
+      {% if finding.cvss_vector %}<p><strong>CVSS:</strong> <code>{{ finding.cvss_vector }}</code></p>{% endif %}
+      {# agent/core.py's _run_skeptical_verification -- a blind, independent second opinion run
+         once at the very end of the scan on every "verified" finding. Shown here for the exact
+         same reason session_fragment.html shows it: a "refuted"/"inconclusive" verdict means this
+         finding's own claim wasn't independently reproducible, something a real submission
+         reader needs to see, not something this export should silently drop. #}
+      {% if finding.skeptical_verification == "refuted" %}
+        <p class="skeptical-refuted">&#9888; <strong>Could not be independently reproduced:</strong> {{ finding.skeptical_verification_note }}</p>
+      {% elif finding.skeptical_verification == "confirmed" %}
+        <p class="skeptical-confirmed">&#10003; Independently reproduced</p>
+      {% elif finding.skeptical_verification == "inconclusive" %}
+        <p class="skeptical-inconclusive">&#8635; Skeptical verification could not confirm or refute this independently: {{ finding.skeptical_verification_note }}</p>
+      {% endif %}
       <p><strong>Exploited:</strong> {{ finding.exploited }}</p>
+      {% if finding.exploited and (finding.extracted_artifact or finding.artifact_usage_hint) %}
+        {# Verdict first, technical detail after — see session_fragment.html's identical note. #}
+        <p class="exploited-note"><strong>Exploited — access confirmed.</strong>
+          {% if finding.extracted_artifact %}<code>{{ finding.extracted_artifact }}</code>{% endif %}
+          {% if finding.artifact_usage_hint %}{{ finding.artifact_usage_hint }}{% endif %}
+        </p>
+      {% elif not finding.exploited and finding.advisory_note and finding.exploit_outcome and finding.exploit_outcome != "exploit_attempted" %}
+        {# No real exploit tool ever ran against this finding — distinct from a genuine negative
+           test below, since "not exploitable" overclaims certainty a skip (no suitable tool,
+           needs manual verification, an operator/scope decision) never actually established. #}
+        <p class="not-attempted-note"><strong>Not attempted:</strong> {{ finding.advisory_note }}</p>
+      {% elif not finding.exploited and finding.advisory_note %}
+        <p class="not-exploitable-note"><strong>Not exploitable:</strong> {{ finding.advisory_note }}</p>
+      {% endif %}
+      {% if finding.remediation_advice and not finding.false_positive_reason %}
+        <p class="remediation-note">&#10003; <strong>How to fix:</strong> {{ finding.remediation_advice }}</p>
+      {% endif %}
+      {% if finding.false_positive_reason %}
+        <p class="false-positive-note">⊘ <strong>Likely false positive:</strong> {{ finding.false_positive_reason }}</p>
+      {% elif finding | is_ungrounded_cve_lookup %}
+        <p class="false-positive-note">⊘ <strong>No confirmed target:</strong> matched by product name only — no host in this scan's Recon results was ever confirmed running that product.</p>
+      {% endif %}
+      {% if finding.reproduction_steps %}
+        <h4>Reproduction steps</h4>
+        <pre>{{ finding.reproduction_steps }}</pre>
+      {% endif %}
       {% if finding.poc_command %}
         <h4>PoC command</h4>
         <pre>{{ finding.poc_command }}</pre>
@@ -74,7 +335,7 @@
         <h4>Evidence</h4>
         <pre>{{ finding.evidence }}</pre>
       {% endif %}
-      {% if finding.advisory_note %}<p><em>{{ finding.advisory_note }}</em></p>{% endif %}
+      {% if finding.exploited and finding.advisory_note %}<p><em>{{ finding.advisory_note }}</em></p>{% endif %}
     </section>
   {% endfor %}
 

@@ -1,0 +1,38 @@
+{# Read-only duplicate-group preview, swapped into #playbook-duplicates-content (playbook.html's
+   own dialog) by both the "Check duplicates" button (main.py's playbook_duplicates) and every
+   in-dialog merge action (playbook_duplicates_merge re-renders this same fragment so the operator
+   can keep working through remaining groups without the dialog closing). groups is a list of
+   duplicate-technique-text groups, each a list of entry dicts, newest-first within a group and
+   groups themselves newest-first (agent/tools/playbook_store.py's find_duplicate_groups). #}
+{% if not groups %}
+  <div class="flex flex-col items-center justify-center text-center py-10 px-4">
+    <svg class="w-6 h-6 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <p class="text-[12px] text-primary mt-2">No duplicate techniques found.</p>
+  </div>
+{% else %}
+  <p class="text-[11px] text-secondary mb-3">{{ groups | length }} duplicate group{{ "s" if groups | length != 1 else "" }} found -- pick which copy to keep in each.</p>
+  <div class="space-y-3">
+    {% for group in groups %}
+      <div class="rounded-md border border-default p-2.5">
+        <p class="text-[12px] text-primary font-medium mb-2 break-words">{{ group[0].technique }}</p>
+        <div class="space-y-1.5">
+          {% for entry in group %}
+            <div class="flex items-center justify-between gap-2 text-[10.5px] text-secondary bg-elevated rounded px-2 py-1.5">
+              <span class="min-w-0">
+                seen {{ entry.times_confirmed | default(1) }}&times;
+                {% if entry.last_confirmed_at or entry.last_seen %} &middot; last {{ (entry.last_confirmed_at or entry.last_seen)[:10] }}{% endif %}
+                {% if entry.source_type == "extracted" %} &middot; from {{ entry.source_title or "a source" }}{% endif %}
+              </span>
+              <button type="button" class="shrink-0 text-accent hover:underline font-medium"
+                      hx-post="/api/playbook/duplicates/merge" hx-target="#playbook-duplicates-content" hx-swap="innerHTML"
+                      hx-vals='{"keep_id": "{{ entry.id }}", "other_ids": "{{ group | rejectattr("id", "equalto", entry.id) | map(attribute="id") | join(",") }}"}'
+                      hx-confirm="Keep this copy and merge the other {{ group | length - 1 }} into it? This can't be undone.">
+                Keep this one
+              </button>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}

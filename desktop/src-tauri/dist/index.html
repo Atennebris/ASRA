@@ -1,0 +1,1318 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ASRA</title>
+<!--
+  Start screen shown by the desktop shell before anything runs. Pick a launch mode
+  and options, adjust .env settings (toggles/fields parsed from the file), optionally
+  Save them for next time, then Start. Desktop mode navigates this window to the live
+  UI; web mode shows a URL to open in a browser.
+-->
+<style>
+  :root { color-scheme: dark; --bg:#0a0e14; --panel:#0f141c; --panel2:#131a24;
+          --line:#1f2731; --fg:#c9d1d9; --muted:#8b949e; --accent:#e5484d;
+          --intro-void:#05070c; --intro-core:#fff4ea; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 30px 24px; overflow-y: auto;
+  }
+  .card { width: 100%; max-width: 900px; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 12px; padding: 26px 30px; }
+  /* Bottom-left build/version tag -- cfg.version comes from Cargo.toml's own [package] version
+     (main.rs's get_start_config, env!("CARGO_PKG_VERSION")) so this can never drift from what
+     actually got built; blank until init() resolves rather than guessing a number up front. */
+  .version-tag { position: fixed; left: 14px; bottom: 10px; font-size: 10.5px;
+                 color: var(--muted); opacity: 0.65; letter-spacing: 0.03em;
+                 pointer-events: none; z-index: 1; }
+  h1 { margin: 0 0 2px; font-size: 21px; letter-spacing: 0.06em; }
+  .sub { margin: 0 0 20px; font-size: 12.5px; color: var(--muted); }
+  .label { font-size: 11px; letter-spacing: 0.09em; text-transform: uppercase;
+           color: var(--muted); margin: 20px 0 8px; }
+
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .mode { border: 1px solid var(--line); border-radius: 9px; padding: 13px 16px;
+          cursor: pointer; background: var(--panel2); transition: border-color .15s, background .15s; }
+  .mode:hover { border-color: #33404e; }
+  .mode input { position: absolute; opacity: 0; pointer-events: none; }
+  .mode:has(input:checked) { border-color: var(--accent); background: #171015; }
+  .mode .name { font-size: 14px; font-weight: 600; }
+  .mode .desc { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+
+  .switch { position: relative; width: 38px; height: 21px; flex: none; cursor: pointer; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; background: #2a3541; border-radius: 999px; transition: background .15s; }
+  .switch .knob { position: absolute; top: 2.5px; left: 2.5px; width: 16px; height: 16px; border-radius: 50%;
+                  background: #cbd5e1; transition: transform .15s; }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track + .knob { transform: translateX(17px); }
+
+  .opt { display: flex; align-items: flex-start; gap: 12px; margin-top: 14px; }
+  .opt .body { flex: 1; }
+  .opt .title { font-size: 13px; }
+  .opt .hint { font-size: 11px; color: var(--muted); line-height: 1.55; margin-top: 3px; }
+  .opt .hint code { color: #b9c4d0; }
+
+  select, input[type="text"], input[type="password"] {
+    width: 100%; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 7px; color: var(--fg); padding: 8px 10px; font: inherit; font-size: 12.5px; }
+  .sys { margin-top: 6px; }
+  .sys .note { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.55; }
+
+  details { margin-top: 18px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel2); }
+  summary { cursor: pointer; padding: 12px 15px; font-size: 12.5px; color: var(--muted); user-select: none; }
+  summary:hover { color: var(--fg); }
+  .adv-inner { padding: 6px 15px 15px; border-top: 1px solid var(--line); }
+  .adv-bar { display: flex; gap: 10px; align-items: center; margin: 12px 0 8px; }
+  .adv-bar .search { flex: 1; }
+  .btn-save { border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 7px;
+              padding: 8px 14px; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .btn-save:hover { border-color: #33404e; }
+  .saved { font-size: 11.5px; color: #6fbf73; opacity: 0; transition: opacity .2s; white-space: nowrap; }
+  .saved.show { opacity: 1; }
+  .setting { display: flex; align-items: flex-start; gap: 14px; padding: 11px 0; border-top: 1px solid #172029; }
+  .setting:first-of-type { border-top: 0; }
+  .setting .meta { flex: 1; min-width: 0; }
+  .setting .k { font-size: 12px; color: #d7dde3; word-break: break-all; }
+  .setting .d { font-size: 10.5px; color: var(--muted); line-height: 1.5; margin-top: 2px;
+                display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .setting .ctl { flex: none; width: 240px; display: flex; justify-content: flex-end; align-items: center; }
+  .setting.toggle .ctl { width: 44px; }
+  .settings-list { max-height: 50vh; overflow-y: auto; padding-right: 4px; }
+
+  .start { margin-top: 22px; width: 100%; border: 0; border-radius: 9px; padding: 14px;
+        background: var(--accent); color: #fff; font: inherit; font-size: 14px; font-weight: 600;
+        letter-spacing: 0.04em; cursor: pointer; }
+  .start:disabled { opacity: 0.55; cursor: default; }
+  .error { margin-top: 16px; display: none; font-size: 12.5px; color: #ff9ea1; line-height: 1.6; }
+  .error.show { display: block; }
+  .force-restart-row { margin-top: 10px; }
+  .btn-force-restart { display: block; width: 100%; border: 1px solid var(--line); background: var(--bg);
+        color: var(--muted); border-radius: 9px; padding: 11px 14px; font: inherit; font-size: 12.5px;
+        font-weight: 600; letter-spacing: 0.02em; cursor: pointer; text-align: center; }
+  .btn-force-restart:hover { border-color: #ff9ea1; color: #ff9ea1; }
+  .btn-force-restart:disabled { opacity: 0.5; cursor: default; }
+  .force-restart-status { margin-top: 4px; font-size: 11.5px; color: var(--muted); text-align: center; display: none; }
+  .force-restart-status.show { display: block; }
+  .force-restart-status.ok { color: #6fbf73; }
+  .force-restart-status.err { color: #ff9ea1; }
+  .web { margin-top: 16px; display: none; border: 1px solid var(--line); border-radius: 9px;
+        padding: 14px; background: var(--panel2); }
+  .web.show { display: block; }
+  .web .u { font-size: 14px; color: var(--accent); word-break: break-all; }
+  .web .note { font-size: 11.5px; color: var(--muted); margin: 8px 0 10px; line-height: 1.6; }
+  .web-actions { display: flex; gap: 10px; }
+  .web button { border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+        border-radius: 7px; padding: 8px 14px; font: inherit; font-size: 12px; cursor: pointer; }
+  .web .btn-open { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
+
+  /* Loader overlay */
+  .overlay { position: fixed; inset: 0; z-index: 50; display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 20px;
+    background: rgba(10,14,20,0.9); backdrop-filter: blur(4px); }
+  .overlay.show { display: flex; }
+  .loader-ring { width: 66px; height: 66px; border-radius: 50%;
+    background: conic-gradient(from 0deg, rgba(229,72,77,0) 0 25%, var(--accent) 90%, var(--accent) 100%);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 6px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 6px));
+    animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loader-msg { font-size: 14px; letter-spacing: 0.03em; }
+  .loader-sub { font-size: 11.5px; color: var(--muted); max-width: 26rem; text-align: center;
+                line-height: 1.6; margin-top: -8px; }
+  /* Real, confirmed misses on earlier attempts: a smooth gradient streak on a wavy line read as "a
+     crooked line," a chain of plain square dots read as "cubes," and a THIN, dim, clip-path-swept
+     version of this same spiked-ridge idea read as "an ugly arrow with sticks" -- the clip-path
+     sweep trick was fragile (silently never painted anything visible) and, more fundamentally, too
+     small/low-contrast to read as a creature at all against the dim base color. Fixed both: no more
+     clip-path -- the whole silhouette (spikes + spine + head) is drawn directly in the accent color
+     with a real glow, full-time, at roughly double the previous scale. Spikes are still generated
+     from the spine <path>'s own real geometry at runtime (getPointAtLength/tangent, see the script
+     below), not hand-guessed coordinates, so they sit flush against the curve. Motion is a gentle
+     continuous undulation (the whole shape breathing/swimming in place) plus a slow glow pulse --
+     simple, robust, alive-looking, nothing that depends on SVG clip-path compositing working right. */
+  .loader-dragon { width: 280px; height: 120px; overflow: visible;
+    filter: drop-shadow(0 0 5px var(--accent)) drop-shadow(0 0 12px rgba(229,72,77,0.5));
+    animation: dragonPulse 2.4s ease-in-out infinite; }
+  .loader-dragon .spine { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; opacity: .8; }
+  .loader-dragon .spike { fill: var(--accent); }
+  .loader-dragon .head { fill: var(--accent); }
+  .loader-dragon .eye { fill: var(--bg); }
+  .loader-dragon .swim { animation: dragonSwim 3.6s ease-in-out infinite; transform-origin: 140px 60px; }
+  @keyframes dragonPulse { 0%, 100% { opacity: .75; } 50% { opacity: 1; } }
+  @keyframes dragonSwim {
+    0%   { transform: translateY(0px) rotate(0deg); }
+    50%  { transform: translateY(-3px) rotate(-1.5deg); }
+    100% { transform: translateY(0px) rotate(0deg); }
+  }
+
+  /* ---- Launch intro (Settings -> Customization -> Visual's "Play launch intro" switch,
+     agent/intro_settings.py) -- an alternative to the loader overlay above, never a replacement:
+     #overlay (ring/message/dragon, all untouched above) is exactly what still shows when this is
+     turned off. Both sit hidden (display:none) until start() below picks exactly one.
+
+     Concept: a warp-space background (thin warm streaks drifting outward from a central vanishing
+     point -- moving forward through depth) sets the stage; the handle ATENNEBRIS ("from the
+     darkness") emerges SMOOTHLY from that same deep vanishing point in slow motion and settles at
+     screen centre; the impact PUNCHES A HOLE in a glass pane -- the centre shards fall away while the
+     glass at the edges stays, a cracked pane framing the hole, with the word glowing inside it.
+     ONE coherent colour identity throughout -- the app's own warm red -- deliberately, since an
+     unmotivated cool->warm palette flip and a maxed neon bloom are exactly the tells that read as
+     AI-generated. All glows are blurred solid blobs, never multi-stop radial gradients (those band
+     into visible concentric rings -- the "clip-art sun" tell). No chromatic aberration: a red/cyan
+     split needs a cool channel, which would break the single identity.
+
+     Absolute timeline (all delays from the moment #intro gets .show; chained via animation-delay,
+     not JS timers, so an error-retry -- display:none then flex -- replays cleanly for free):
+       0.00-0.55  an INTACT frosted GLASS PANE resolves over the whole screen (a warm veil + a diagonal
+                  sheen highlight, drawn on #intro-canvas ABOVE the word) -- NO cracks; an unbroken pane
+                  has none. Plus the dim warm ember -- so from the first frame the viewer sees glass
+                  between them and the scene, with the word approaching dimmed BEHIND it.
+       0.39-3.00  FROM THE DEPTH, behind the glass: ATENNEBRIS starts at the central vanishing point
+                  (scale ~0.02, translateZ ~-1500px) and -- along Z only, transform+opacity only
+                  (composited, jerk-free) -- ACCELERATES (ease-in) so it is MOVING FAST at contact.
+       THREE ESCALATING IMPACTS, each a text striking the glass and knocking out MORE of it (each text's
+       90% CONTACT lands exactly on its wave; each later text only starts flying AFTER the previous hit):
+       3.0  IMPACT 1 -- ATENNEBRIS strikes (hard stop + recoil): flash + shake + ember swell; the frost
+            clears, cracks are CREATED by the hit, and the CENTRE shards (wave 1) eject, leaving a hole
+            with the word in it. Rims are the real held-shard edges (fine spiky cells), never a separate
+            outline.
+       5.0  IMPACT 2 -- "presents" strikes: wave 2 ejects, the opening GROWS (its new rim equally ragged).
+       7.0  IMPACT 3 -- "Autonomous Security Research Agent" (stacked just under "presents") strikes: wave
+            3 ejects the BULK, so ~80% of the pane is gone and only a thin, raggedly-torn EDGE FRAME stays.
+       7.0+ the three lines glow in the mostly-open warp-space; once the last shards are gone the engine
+            stops its loop WITHOUT clearing -- the thin held frame + the three texts + the status caret
+            PERSIST as the indefinitely-holdable wait-state over the ever-drifting warp background.
+     Total settled ~7.3s. Both canvases build their geometry from the ACTUAL window size when the intro
+     is shown (and rebuild on resize), so they fit this exact, user-resizable window (min 820x600). No
+     CRT scanline layer: a fine repeating gradient Moires into shifting dot artifacts under non-integer
+     Windows display scaling. */
+  .intro-overlay { position: fixed; inset: 0; z-index: 55; display: none;
+    background: var(--intro-void); overflow: hidden;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  .intro-overlay.show { display: block; }
+
+  /* Vignetted dark ground -- dark but never flat black. Only a single colour->transparent stop plus
+     the base, so there is nothing for a browser to band into rings. The cold backlight is NOT baked
+     in here (that was a multi-stop radial that banded); it is a blurred blob below. */
+  .intro-void { position: absolute; inset: 0; opacity: 0;
+    background:
+      radial-gradient(135% 115% at 50% 42%, transparent 42%, rgba(2,3,6,0.94) 100%),
+      var(--intro-void);
+    animation: introVoidIn 0.55s ease-out forwards; }
+  @keyframes introVoidIn { to { opacity: 1; } }
+
+  /* Warp-space background -- a starfield of thin warm streaks radiating from the central vanishing
+     point and drifting slowly OUTWARD (near = long/bright, far = short/dim), so the whole wait reads
+     as moving forward through depth toward the centre, and the word emerging from that same vanishing
+     point feels of a piece with it. Rendered on its own light, ~30fps canvas (warp engine script
+     below), one warm identity, dim on near-black. Sits BEHIND the ember and the word. */
+  .intro-bg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  /* Backlight -- ONE coherent warm identity (the app's own red), never a cool->warm colour shift
+     (an unmotivated temperature flip is an AI tell) and never a maxed neon bloom (that reads as a
+     Codepen demo). Restraint is the point: a dim, controlled ember behind a dark pane. It is built
+     from blurred SOLID blobs, never multi-stop radial gradients -- a gradient with several abrupt
+     stops bands into visible concentric rings ("clip-art sun"); a single colour->transparent fill
+     under a heavy blur has its falloff computed per-pixel, so it is dead smooth. The only movement
+     is intensity, and it is MOTIVATED: the base ember sits low through the credit, then the impact
+     itself swells it (introHotBurst at 3.0s) before it settles to a slow breathe. Three warm blobs
+     of different size, slightly offset, overlap into a deep-red -> ember -> warm-white-core bloom
+     (white is just the hottest point of the same warm light, not a second temperature) with no
+     banding and no perfect-circle symmetry. */
+  .intro-glow-base { position: absolute; left: 50%; top: 41%; width: 78vw; height: 66vh;
+    transform: translate(-50%, -50%); border-radius: 50%; pointer-events: none; mix-blend-mode: screen;
+    background: radial-gradient(closest-side, rgba(196,64,68,0.32), rgba(196,64,68,0) 100%);
+    filter: blur(54px); opacity: 0;
+    animation: introBaseIn 0.7s ease-out forwards, introBaseSwell 2.2s ease-in 0.9s forwards; }
+  @keyframes introBaseIn { to { opacity: 0.17; } }
+  /* The backlight heats up as the nickname bears down on the pane -- anticipation that fills the
+     approach instead of a dead-black wait, then the impact burst (introHotBurst) takes over. */
+  @keyframes introBaseSwell { from { opacity: 0.17; } to { opacity: 0.38; } }
+
+  .intro-hot { position: absolute; inset: 0; pointer-events: none; mix-blend-mode: screen; opacity: 0;
+    animation: introHotBurst 0.7s ease-out 3.0s forwards,
+               introEmberBreathe 4.6s ease-in-out 3.7s infinite; }
+  @keyframes introHotBurst { 0% { opacity: 0; } 26% { opacity: 0.9; } 100% { opacity: 0.42; } }
+  @keyframes introEmberBreathe { 0%, 100% { opacity: 0.42; } 50% { opacity: 0.54; } }
+  .intro-hot .blob { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%);
+    border-radius: 50%; }
+  .intro-hot .b-red   { width: 64vw; height: 56vh; filter: blur(70px);
+    background: radial-gradient(closest-side, rgba(229,72,77,0.42), rgba(229,72,77,0) 100%); }
+  .intro-hot .b-amber { width: 36vw; height: 30vh; filter: blur(48px); margin-left: 2vw;
+    background: radial-gradient(closest-side, rgba(230,120,84,0.5), rgba(230,120,84,0) 100%); }
+  .intro-hot .b-core  { width: 17vw; height: 14vh; filter: blur(30px); margin-left: -1.2vw;
+    background: radial-gradient(closest-side, rgba(255,240,232,0.82), rgba(255,240,232,0) 100%); }
+
+  /* The glass PANE and its break-up are rendered on a real <canvas> (#intro-canvas) by the shatter
+     engine (script below): a Voronoi-tessellated pane whose CENTRE is punched into a HOLE (those
+     shards eject with physics) while the EDGES stay as a held cracked pane framing the hole -- the
+     word glows in the hole, and that cracked-pane-with-a-hole persists as the wait-state. The canvas
+     sits ABOVE the wordmark so the ejected shards fly in front of the name as they clear. */
+  .intro-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  /* Everything that physically "hits" -- the cracks, the shockwave, the flash, the brackets, the
+     wordmark -- lives in here so the shake below can jolt just this group. .intro-status (the real
+     backend-status copy) sits OUTSIDE it, deliberately, so it never jitters and stays easy to read. */
+  .intro-stage { position: absolute; inset: 0;
+    animation: introShake 0.5s ease-out 3.0s, introShake 0.5s ease-out 5.0s, introShake 0.42s ease-out 7.0s; }
+  @keyframes introShake {
+    0%, 100% { transform: translate(0, 0); }
+    10% { transform: translate(-16px, 10px) rotate(-0.9deg); }
+    26% { transform: translate(14px, -12px) rotate(0.8deg); }
+    44% { transform: translate(-10px, 7px) rotate(-0.5deg); }
+    62% { transform: translate(6px, -4px) rotate(0.3deg); }
+    82% { transform: translate(-3px, 2px); }
+  }
+
+  /* Corner brackets -- a scanner/viewfinder edge for the pane (this is a scanning tool), quiet and
+     warm-neutral (same single identity as the rest); fades in just after impact so it reads as the
+     pane's frame resolving, not a static border. */
+  .intro-corners { position: absolute; inset: 14px; pointer-events: none; opacity: 0;
+    animation: introCornersIn 0.7s ease-out 3.15s forwards; }
+  @keyframes introCornersIn { to { opacity: 1; } }
+  .intro-corners span { position: absolute; width: 30px; height: 30px;
+    border: 1px solid rgba(198,168,164,0.34); }
+  .intro-corners span:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+  .intro-corners span:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; }
+  .intro-corners span:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; }
+  .intro-corners span:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+
+  /* Impact flash -- a blurred solid blob, not a hard multi-stop radial (same anti-banding reason as
+     the backlight). Warm-white, brief. */
+  .intro-flash { position: absolute; left: 50%; top: 42%; width: 74vw; height: 64vh;
+    transform: translate(-50%, -50%); border-radius: 50%; pointer-events: none; mix-blend-mode: screen;
+    background: radial-gradient(closest-side, rgba(255,247,240,0.98), rgba(255,247,240,0) 100%);
+    filter: blur(30px); opacity: 0;
+    animation: introFlash 0.6s ease-out 3.0s forwards; }
+  @keyframes introFlash { 0% { opacity: 0; } 7% { opacity: 1; } 100% { opacity: 0; } }
+  /* Impacts 2 and 3 re-fire the same warm-white flash blob at 5.0s and 7.0s (same box, later timing). */
+  .intro-flash--2 { animation: introFlash 0.55s ease-out 5.0s forwards; }
+  .intro-flash--3 { animation: introFlash 0.6s ease-out 7.0s forwards; }
+
+  /* The wrapper only positions the group; it never fades in on its own. The nickname's fly-in
+     (below) is the ONLY thing that brings the big name into view, so it is never seen pre-planted at
+     centre before it has travelled in from behind the screen. */
+  .intro-wordmark { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%);
+    text-align: center; }
+
+  /* The nickname -- the app's own mono face, heavy and wide, with a RESTRAINED warm bleed, single
+     warm identity. Its glow is a STATIC text-shadow on this rule (constant), and the breathing glow
+     (introMarkGlow, from 3.35s) also only touches text-shadow -- so the fly-in animation itself never
+     touches a paint property. `will-change: transform, opacity` forces a compositor layer, so the
+     approach runs on the COMPOSITOR thread, immune to the two canvas RAF loops (warp + shatter) that
+     share the main thread -- that main-thread contention was exactly what made the word arrive in jerks. */
+  .intro-mark { display: inline-block;
+    font-weight: 800; letter-spacing: 0.13em; font-size: clamp(32px, 7vw, 74px);
+    color: var(--intro-core);
+    text-shadow: 0 2px 5px rgba(0,0,0,0.5), 0 0 6px rgba(229,72,77,0.5), 0 0 20px rgba(229,72,77,0.28);
+    will-change: transform, opacity;
+    animation: introMarkFly 2.9s linear 0.39s both,
+               introMarkGlow 5s ease-in-out 3.35s infinite; }
+
+  /* Emerges FROM BEHIND THE SCREEN, transform+opacity ONLY (both compositor-safe -- no
+     text-shadow/colour/filter here, which would drag the whole animation onto the janky main thread,
+     so the glide is jerk-free). The approach is now ONE continuous ACCELERATING interval (ease-IN):
+     the word is slow/far at first (the slow-mo read) then accelerates hard into the pane, so it is
+     unmistakably MOVING FAST at contact -- perspective foreshortening makes screen-size shoot up near
+     the glass, so the break is clearly caused by a fast-moving object, not a crawl. At 90% (== absolute
+     t=3.0s, which the flash/shake/ember/shatter all fire at) the pane ARRESTS it in a hard STOP -- the
+     ONE intentional sharp instant (the collision). 90->100% is the crisp physical recoil (a moment
+     over-sized from momentum, then a squash, then settle) that sells the hit. No intermediate waypoints
+     in the approach, so there are no "рывки" -- only the impact is crisp. */
+  @keyframes introMarkFly {
+    0%   { opacity: 0.06; transform: perspective(1200px) translateZ(-1500px) scale(0.02);
+           animation-timing-function: cubic-bezier(.5,0,.85,.35); }
+    90%  { opacity: 1;    transform: perspective(1200px) translateZ(0) scale(1.06);
+           animation-timing-function: cubic-bezier(.3,0,.3,1); }
+    93%  { opacity: 1;    transform: perspective(1200px) translateZ(0) scale(0.95); }
+    96%  { opacity: 1;    transform: perspective(1200px) translateZ(0) scale(1.02); }
+    100% { opacity: 1;    transform: perspective(1200px) translateZ(0) scale(1); }
+  }
+
+  /* Post-impact glow (from 3.3s, right after the slam) also carries a faint dark seat shadow so the
+     settled word reads as sitting DOWN INTO the cracked pane's dent, not floating on top of it. */
+  @keyframes introMarkGlow {
+    0%, 100% { text-shadow: 0 2px 5px rgba(0,0,0,0.5), 0 0 6px rgba(229,72,77,0.5), 0 0 20px rgba(229,72,77,0.28); }
+    50%      { text-shadow: 0 2px 5px rgba(0,0,0,0.5), 0 0 9px rgba(229,72,77,0.6), 0 0 26px rgba(229,72,77,0.36); }
+  }
+
+  /* "presents" -- the studio-credit line. Legible for a comfortable beat: bright enough against the
+     dark pane, a size you can actually read, held ~1s before it dissolves down and away. */
+  /* Studio credit -- resolves quietly UNDER the settled nickname just after the slam, so during the
+     approach nothing sits at centre but the dark pane and the incoming, far-off name. */
+  /* "presents" is the SECOND projectile: it flies in behind the glass with the SAME composited pattern
+     as the nickname (transform+opacity only, static glow, will-change) and STRIKES the pane at t=5.0s
+     (== 90% of its SHORTER 1.8s fly, which only STARTS at 3.38s -- after impact 1 -- so it is clearly
+     seen rushing in, then striking, as its own event), driving the second, bigger break. Settles under
+     the name. */
+  .intro-presents { display: block; margin-top: 16px;
+    font-size: clamp(12px, 1.8vw, 15px); letter-spacing: 0.34em; text-transform: uppercase;
+    color: #d8cfca; text-indent: 0.34em; text-shadow: 0 0 10px rgba(229,72,77,0.3);
+    will-change: transform, opacity;
+    animation: introMarkFly 1.8s linear 3.38s both; }
+
+  /* The THIRD projectile: the full product name. Same composited fly, STRIKES at t=7.0s (== 90% of its
+     1.8s fly, which starts at 5.38s -- after impact 2) -- the climax that blows out the bulk of the
+     glass. It settles glowing DIRECTLY UNDER "presents" (a centred stack: name / presents / full name),
+     not at the bottom. The wrapper centres it; the span carries the fly, so the fly transform never
+     fights the centering translate (same split as the wordmark). */
+  .intro-fullname-wrap { position: absolute; left: 50%; top: 54%; transform: translate(-50%, -50%);
+    width: 92%; text-align: center; }
+  .intro-fullname { display: inline-block;
+    font-size: clamp(11px, 1.9vw, 17px); letter-spacing: 0.26em; text-transform: uppercase;
+    color: var(--intro-core); text-indent: 0.26em;
+    text-shadow: 0 2px 5px rgba(0,0,0,0.5), 0 0 8px rgba(229,72,77,0.4), 0 0 22px rgba(229,72,77,0.22);
+    will-change: transform, opacity;
+    animation: introMarkFly 1.8s linear 5.38s both; }
+
+  .intro-status { position: absolute; left: 50%; bottom: 8.5%; width: 90%; max-width: 30rem;
+    transform: translate(-50%, 8px); text-align: center; opacity: 0;
+    animation: introStatusReveal 0.55s ease-out 3.55s forwards; }
+  @keyframes introStatusReveal { to { opacity: 1; transform: translate(-50%, 0); } }
+  .intro-status-msg { font-size: 14px; letter-spacing: 0.04em; color: var(--fg); }
+  .intro-status-sub { font-size: 11.5px; color: var(--muted); line-height: 1.6; margin: 7px auto 0; }
+  /* A blinking scan-cursor after the message so a long silent wait still reads as "working." */
+  .intro-status-msg::after { content: ""; display: inline-block; width: 8px; height: 1em;
+    margin-left: 6px; vertical-align: -0.14em; background: var(--accent);
+    animation: introCursor 1.05s steps(1) infinite; }
+  @keyframes introCursor { 0%, 49% { opacity: 0.85; } 50%, 100% { opacity: 0; } }
+
+  /* No spin/scale/shake/flash under reduced motion -- everything snaps straight to the settled end
+     state (settled nickname on the dark backlit ground, status text) with plain, short fades only.
+     The shatter engine detects reduced motion and paints ONE static fractured frame instead of
+     animating, so no canvas motion runs here. */
+  @media (prefers-reduced-motion: reduce) {
+    .intro-void, .intro-glow-base, .intro-hot, .intro-stage, .intro-corners, .intro-flash,
+    .intro-flash--2, .intro-flash--3, .intro-wordmark, .intro-presents, .intro-mark, .intro-fullname,
+    .intro-status, .intro-status-msg::after {
+      animation: none !important;
+    }
+    .intro-void { opacity: 1; }
+    .intro-glow-base { opacity: 0.17; }
+    .intro-hot { opacity: 0.42; }
+    .intro-corners { opacity: 1; }
+    .intro-flash, .intro-flash--2, .intro-flash--3 { opacity: 0; }
+    .intro-wordmark { opacity: 1; }
+    .intro-presents { opacity: 0.92; transform: none; }
+    .intro-mark { opacity: 1; transform: none; }
+    .intro-fullname { opacity: 1; transform: none; }
+    .intro-status { opacity: 1; transform: translate(-50%, 0); transition: opacity 0.3s ease; }
+    .intro-status-msg::after { opacity: 0.6; }
+  }
+</style>
+
+<div class="version-tag" id="version-tag"></div>
+
+<div class="card">
+  <h1>ASRA</h1>
+  <p class="sub">Autonomous Security Research Agent — launch</p>
+
+  <div class="label">Launch mode</div>
+  <div class="modes">
+    <label class="mode">
+      <input type="radio" name="mode" value="desktop" checked>
+      <div class="name">Desktop</div>
+      <div class="desc">Open the UI right in this window.</div>
+    </label>
+    <label class="mode">
+      <input type="radio" name="mode" value="web">
+      <div class="name">Web</div>
+      <div class="desc">Start the server and open it in a browser via URL.</div>
+    </label>
+  </div>
+
+  <div class="opt">
+    <label class="switch"><input type="checkbox" id="root"><span class="track"></span><span class="knob"></span></label>
+    <div class="body">
+      <div class="title">Run the agent as root</div>
+      <div class="hint">Runs inside WSL as root, skipping <code>sudo</code> for tools like <code>nmap -O</code>.
+        Tip: to use privileged tools without root, set your sudo password beforehand in
+        <b>Advanced settings</b> (<code>SUDO_PASSWORD</code>) or manually in <code>.env</code>.</div>
+    </div>
+  </div>
+
+  <div class="label">System</div>
+  <div class="sys" id="sys"></div>
+
+  <details id="advanced">
+    <summary>Advanced settings — .env (toggles &amp; fields; Save to remember for next time)</summary>
+    <div class="adv-inner">
+      <div class="adv-bar">
+        <input type="text" class="search" id="search" placeholder="Filter settings…">
+        <button class="btn-save" id="save">Save</button>
+        <span class="saved" id="saved">Saved <svg width="10" height="10" viewBox="0 0 16 16" fill="none" style="vertical-align:-1px" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      </div>
+      <div class="settings-list" id="settings"></div>
+    </div>
+  </details>
+
+  <button class="start" id="start">Start</button>
+
+  <div class="error" id="error"></div>
+
+  <!-- Always visible on the start screen (not hidden-until-error) so the operator has a manual
+       recovery path in hand even when a stuck backend fails silently/invisibly (window opens
+       hidden behind another window, no on-screen error). Kills only ASRA's own tracked process +
+       its own WSL process pattern; never touches other WSL distros/terminals or any Windows-side
+       app (see force_restart_agent in main.rs for the actual scope). -->
+  <div class="force-restart-row" id="force-restart-row">
+    <button class="btn-force-restart" id="force-restart">Force restart ASRA (stuck backend?)</button>
+    <div class="force-restart-status" id="force-restart-status"></div>
+  </div>
+
+  <div class="web" id="web">
+    <div class="u" id="web-url"></div>
+    <div class="note">Open it in your browser with the button, or copy the address. ASRA opens the browser only on this explicit click — never on its own.</div>
+    <div class="web-actions">
+      <button id="open" class="btn-open">Open in browser</button>
+      <button id="copy">Copy</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="loader-ring"></div>
+  <div class="loader-msg" id="loader-msg">Starting backend…</div>
+  <div class="loader-sub">Waiting for the server to be ready. A first launch can take a couple of minutes while the environment is built.</div>
+  <svg class="loader-dragon" viewBox="0 0 280 100" width="280" height="100" aria-hidden="true">
+    <g class="swim">
+      <path id="dragonSpine" class="spine" d="M 14,60 C 55,80 95,15 150,32 C 195,46 230,8 262,40" />
+      <g id="dragonSilhouette"></g>
+    </g>
+  </svg>
+</div>
+
+<!-- Launch intro (Settings -> Customization -> Visual's "Play launch intro" switch) -- start()
+     below shows exactly one of #overlay above / #intro here, never both. See the .intro-overlay
+     CSS comment (this file's own <style>) for the full beat-by-beat timeline. -->
+<div class="intro-overlay" id="intro" aria-hidden="true">
+  <div class="intro-void"></div>
+  <canvas class="intro-bg" id="intro-bg" aria-hidden="true"></canvas>
+  <div class="intro-glow-base"></div>
+  <div class="intro-hot"><div class="blob b-red"></div><div class="blob b-amber"></div><div class="blob b-core"></div></div>
+  <div class="intro-stage" id="intro-stage">
+    <div class="intro-corners"><span></span><span></span><span></span><span></span></div>
+    <div class="intro-wordmark">
+      <span class="intro-mark">ATENNEBRIS</span>
+      <span class="intro-presents">presents</span>
+    </div>
+    <div class="intro-fullname-wrap">
+      <span class="intro-fullname">Autonomous Security Research Agent</span>
+    </div>
+  </div>
+  <canvas class="intro-canvas" id="intro-canvas" aria-hidden="true"></canvas>
+  <div class="intro-flash"></div>
+  <div class="intro-flash intro-flash--2"></div>
+  <div class="intro-flash intro-flash--3"></div>
+  <div class="intro-status">
+    <div class="intro-status-msg" id="intro-msg">Starting backend…</div>
+    <div class="intro-status-sub">Waiting for the server to be ready. A first launch can take a couple of minutes while the environment is built.</div>
+  </div>
+</div>
+
+<script>
+  // Builds the dragon's spiked ridge + head from the #dragonSpine path's own real geometry
+  // (getPointAtLength/tangent sampling), not hand-guessed coordinates -- see the .loader-dragon
+  // CSS comment above for why. Runs once; the whole <g class="swim"> then undulates as one rigid
+  // unit (pure CSS, see @keyframes dragonSwim) -- simpler and far more robust than the earlier
+  // clip-path sweep attempt, which silently never painted anything visible.
+  (function () {
+    var svgNS = "http://www.w3.org/2000/svg";
+    var spine = document.getElementById("dragonSpine");
+    var silhouette = document.getElementById("dragonSilhouette");
+    if (!spine || !silhouette || typeof spine.getTotalLength !== "function") return;
+
+    function addPolygon(points, cls, target) {
+      var el = document.createElementNS(svgNS, "polygon");
+      el.setAttribute("points", points);
+      if (cls) el.setAttribute("class", cls);
+      target.appendChild(el);
+    }
+
+    var len = spine.getTotalLength();
+    var SPIKE_COUNT = 15, MIN_H = 5, MAX_H = 17, BASE_W = 6.5;
+    for (var i = 1; i < SPIKE_COUNT; i++) {
+      var t = i / SPIKE_COUNT;
+      var d = t * len;
+      var p = spine.getPointAtLength(d);
+      var ahead = spine.getPointAtLength(Math.min(d + 1.5, len));
+      var dx = ahead.x - p.x, dy = ahead.y - p.y;
+      var mag = Math.sqrt(dx * dx + dy * dy) || 1;
+      var ux = dx / mag, uy = dy / mag;   // unit tangent (along the spine)
+      var nx = -uy, ny = ux;              // unit normal (perpendicular, "up" off the spine)
+      var taper = Math.sin(Math.PI * t);  // 0 at both ends, 1 at mid-body -- tallest spikes in the middle
+      var h = MIN_H + taper * (MAX_H - MIN_H);
+      var half = BASE_W / 2;
+      var bx1 = (p.x + ux * half).toFixed(1), by1 = (p.y + uy * half).toFixed(1);
+      var bx2 = (p.x - ux * half).toFixed(1), by2 = (p.y - uy * half).toFixed(1);
+      var tipx = (p.x + nx * h).toFixed(1), tipy = (p.y + ny * h).toFixed(1);
+      var pts = bx1 + "," + by1 + " " + tipx + "," + tipy + " " + bx2 + "," + by2;
+      addPolygon(pts, "spike", silhouette);
+    }
+
+    // Head: a small wedge continuing straight out from the spine's own leading tangent, plus an eye.
+    var end = spine.getPointAtLength(len);
+    var justBefore = spine.getPointAtLength(Math.max(len - 2, 0));
+    var hx = end.x - justBefore.x, hy = end.y - justBefore.y;
+    var hmag = Math.sqrt(hx * hx + hy * hy) || 1;
+    var hux = hx / hmag, huy = hy / hmag;
+    var hnx = -huy, hny = hux;
+    var HEAD_LEN = 21, HEAD_WIDE = 8.5;
+    var tipX = (end.x + hux * HEAD_LEN).toFixed(1), tipY = (end.y + huy * HEAD_LEN).toFixed(1);
+    var b1x = (end.x + hnx * HEAD_WIDE).toFixed(1), b1y = (end.y + hny * HEAD_WIDE).toFixed(1);
+    var b2x = (end.x - hnx * HEAD_WIDE).toFixed(1), b2y = (end.y - hny * HEAD_WIDE).toFixed(1);
+    var headPts = b1x + "," + b1y + " " + tipX + "," + tipY + " " + b2x + "," + b2y;
+    addPolygon(headPts, "head", silhouette);
+
+    var eye = document.createElementNS(svgNS, "circle");
+    eye.setAttribute("cx", (end.x + hux * 6.5).toFixed(1));
+    eye.setAttribute("cy", (end.y + huy * 6.5).toFixed(1));
+    eye.setAttribute("r", "1.6");
+    eye.setAttribute("class", "eye");
+    silhouette.appendChild(eye);
+  })();
+</script>
+
+<script>
+  // Intro shatter engine (Frontend 2.0): renders the glass pane + its break-up on a real <canvas>
+  // with genuine geometry and physics. Rung 2 of the realism ladder -- Canvas 2D + hand-rolled
+  // physics, no external lib, no WebGL/GPU-driver risk, safe on a pre-backend loading screen. The
+  // pane is tessellated into Voronoi shards (seeded densely at the impact, so the break is finest
+  // where it is hit). From t=0 the canvas draws an INTACT FROSTED PANE over the whole screen -- a warm
+  // veil + a diagonal sheen highlight + faint latent stress cracks -- so the viewer perceives glass
+  // between them and the scene, with the word approaching dimmed BEHIND it (this canvas sits above the
+  // wordmark). The impact then BREAKS that same pane and PUNCHES A HOLE: the frost clears, the latent
+  // cracks brighten into the full fracture, and only the shards inside a central ellipse (sized to hold
+  // the wordmark) are ejected -- they fall (gravity), spin, come toward the viewer, motion-blur and
+  // fade, clearing a hole; every EDGE shard OUTSIDE the ellipse stays put, drawn every frame as a held
+  // cracked pane framing the hole. The heavy tessellation runs at start(), not on the slam, so the
+  // impact never hitches. Once the ejected shards are gone the loop stops WITHOUT clearing, so the
+  // cracked-pane-with-a-hole (the word glowing in it) persists as the indefinitely-holdable wait-state.
+  //
+  // Self-contained: exposes window.introShatter.{start,resize}. start() is called by the launcher
+  // right when #intro is shown (so geometry matches the CURRENT, resizable window); the impact is
+  // scheduled to land at the same t=3.0s every CSS FX is keyed to. Honors prefers-reduced-motion
+  // (one static fractured frame, no motion) and degrades to nothing if 2D canvas is unavailable.
+  (function () {
+    // Three escalating impacts land at these times -- each a text projectile hitting the glass and
+    // knocking out MORE of it: 1) ATENNEBRIS, 2) "presents", 3) the full-name line -- until ~80% of the
+    // pane is gone and only a thin edge frame remains. Impacts are spaced ~2s apart so each "text
+    // strikes -> glass falls" reads as its own distinct event; the CSS text flies are keyed to the SAME
+    // times (each text's 90% CONTACT keyframe lands exactly here) so glass and word strike together, and
+    // each later text only STARTS flying after the previous impact -- never glass breaking from nothing.
+    var T1 = 3.0, T2 = 5.0, T3 = 7.0;
+    var CY_FRAC = 0.42;                 // impact Y == the wordmark's own top:42% anchor
+    var GRAVITY = 1500, DRAG = 1.05;    // px/s^2, and exponential velocity damping per second
+    var CORE = "rgba(255,244,236,";     // warm-white highlight (the one hot point of the warm light)
+    var BODY = "rgba(228,150,132,";     // faint warm glass body
+    var canvas, ctx, dpr, W, H, cx, cy, maxDim, holeRX, holeRY, borderMargin;
+    var shards = [], dust = [], raf = 0, last = 0, t0 = 0, firedWave = 0, running = false, settled = false;
+    var reduce = false;
+    try { reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) {}
+
+    function rnd(a, b) { return a + Math.random() * (b - a); }
+
+    // Sutherland-Hodgman clip of a polygon against the half-plane {p : dot(n, p - m) <= 0}. Used with
+    // n = (seed_j - seed_i), m = midpoint, to keep the region closer to seed i -- i.e. its Voronoi cell.
+    function clipHalfPlane(poly, nx, ny, mx, my) {
+      var out = [], n = poly.length;
+      for (var i = 0; i < n; i++) {
+        var a = poly[i], b = poly[(i + 1) % n];
+        var da = nx * (a[0] - mx) + ny * (a[1] - my);
+        var db = nx * (b[0] - mx) + ny * (b[1] - my);
+        if (da <= 0) out.push(a);
+        if ((da <= 0) !== (db <= 0)) {
+          var t = da / (da - db);
+          out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+        }
+      }
+      return out;
+    }
+
+    // Build the resting tessellation (shards at their home positions, zero velocity). Expensive, so
+    // it runs at start()/resize() -- never on the impact frame.
+    function buildGeometry() {
+      shards = [];
+      // Random per-launch phases for the IRREGULAR edge-frame retention (below) -- so the leftover
+      // border is ragged/uneven, never a straight rectangle.
+      var borderP1 = Math.random() * Math.PI * 2, borderP2 = Math.random() * Math.PI * 2;
+      var pad = maxDim * 0.5;
+      var rect = [[-pad, -pad], [W + pad, -pad], [W + pad, H + pad], [-pad, H + pad]];
+      // IMPACT-FRACTURE seeding: seeds on concentric RINGS x radial SPOKES from the impact, dense near
+      // the centre and geometrically sparser outward, with organic jitter. The Voronoi edges between
+      // them then run radially + concentrically -- the crack web of real impact glass, finest at the
+      // hole and opening up outward -- instead of the old random honeycomb. A couple more spokes per
+      // ring outward keeps far cells from ballooning into giant ugly panels; a few beyond-edge seeds
+      // close the pane cleanly.
+      var seeds = [[cx + rnd(-5, 5), cy + rnd(-5, 5)]];
+      var baseAngle = Math.random() * Math.PI * 2;
+      var ring = 0;
+      for (var r = Math.min(holeRX, holeRY) * 0.5; r < maxDim * 1.05; r *= rnd(1.34, 1.52)) {
+        var spokes = 13 + ring;
+        var ringJitter = rnd(-0.15, 0.15);
+        for (var sI = 0; sI < spokes; sI++) {
+          var a = baseAngle + ringJitter + (sI / spokes) * Math.PI * 2 + rnd(-0.06, 0.06);
+          var rr = r * rnd(0.85, 1.15);
+          seeds.push([cx + Math.cos(a) * rr, cy + Math.sin(a) * rr]);
+        }
+        ring++;
+      }
+      // DENSE, angularly-fine seeds STRADDLING the FIRST HOLE's boundary: at many close angles, one seed
+      // just inside the rim and one just outside, so the cells right at the rim are small, thin and
+      // POINTED -- when the inner pieces are knocked out the union edge of the remaining shards is a
+      // naturally ragged, TOOTHY torn rim (real shard edges, never a separate outline). ONLY at the first
+      // hole: bands at the wave-2/wave-3 + edge boundaries were tried and reverted -- they flooded the
+      // pane with tiny held shards and made the fracture ugly; the clean radial/concentric pattern with a
+      // fine rim at the first hole only is the pretty one the operator approved.
+      var rimSpokes = 48;
+      for (var rs = 0; rs < rimSpokes; rs++) {
+        var ra = baseAngle + (rs / rimSpokes) * Math.PI * 2 + rnd(-0.025, 0.025);
+        var er = ellipseR(ra);
+        seeds.push([cx + Math.cos(ra) * er * rnd(0.78, 0.94), cy + Math.sin(ra) * er * rnd(0.78, 0.94)]);
+        seeds.push([cx + Math.cos(ra) * er * rnd(1.06, 1.24), cy + Math.sin(ra) * er * rnd(1.06, 1.24)]);
+      }
+      for (var u = 0; u < 8; u++) {
+        var ea = Math.random() * Math.PI * 2;
+        seeds.push([cx + Math.cos(ea) * maxDim * rnd(1.12, 1.32), cy + Math.sin(ea) * maxDim * rnd(1.12, 1.32)]);
+      }
+      // VARIETY: real broken glass is a MIX of big and small, sharp and blunt, irregular pieces -- not
+      // uniform ring cells. Inject random seeds with VARIED clustering (sparse spots -> big blunt chunks,
+      // dense/clustered -> small sharp slivers) so sizes and shapes vary naturally across the pane.
+      var varN = Math.round((W * H) / 34000);
+      for (var vv = 0; vv < varN; vv++) {
+        var vr = maxDim * Math.pow(Math.random(), rnd(0.55, 1.5));   // varied distance clustering per point
+        var va = Math.random() * Math.PI * 2;
+        seeds.push([cx + Math.cos(va) * vr, cy + Math.sin(va) * vr]);
+      }
+      for (var cl = 0; cl < 12; cl++) {                                // tight clusters -> small sharp slivers
+        var clx = rnd(0, W), cly = rnd(0, H), cln = 2 + (Math.random() < 0.5 ? 0 : 1);
+        for (var ci = 0; ci < cln; ci++) seeds.push([clx + rnd(-15, 15), cly + rnd(-15, 15)]);
+      }
+
+      for (var s = 0; s < seeds.length; s++) {
+        var poly = rect, si = seeds[s];
+        for (var j = 0; j < seeds.length && poly.length; j++) {
+          if (j === s) continue;
+          var sj = seeds[j];
+          poly = clipHalfPlane(poly, sj[0] - si[0], sj[1] - si[1], (si[0] + sj[0]) / 2, (si[1] + sj[1]) / 2);
+        }
+        if (poly.length < 3) continue;
+        var gx = 0, gy = 0;
+        for (var p = 0; p < poly.length; p++) { gx += poly[p][0]; gy += poly[p][1]; }
+        gx /= poly.length; gy /= poly.length;
+        var verts = poly.map(function (pt) { return [pt[0] - gx, pt[1] - gy]; });
+        var d = Math.hypot(gx - cx, gy - cy);
+        var ex = (gx - cx) / holeRX, ey = (gy - cy) / holeRY;
+        var rn = Math.sqrt(ex * ex + ey * ey);            // elliptical distance from the impact centre
+        var edge = Math.min(gx, W - gx, gy, H - gy);       // distance to the nearest screen edge
+        var ba = Math.atan2(gy - cy, gx - cx);
+        var bn = 0.5 + 0.35 * Math.sin(ba * 2.3 + borderP1) + 0.25 * Math.sin(ba * 5.1 + borderP2);
+        var bf = 0.25 + 1.5 * Math.max(0, bn);             // border thickness varies by angle: some sectors
+        var border = edge < borderMargin * bf;             // thin/near-clear, some thick -> a RAGGED, non-rectangular frame
+        // Wave by how central the piece is: 1 = the innermost hole (holds the word), 2 = the next ring,
+        // 3 = the bulk of the rest. The edge frame is wave 0 and is permanently held.
+        var wave = border ? 0 : (rn <= 1 ? 1 : (rn <= 1.9 ? 2 : 3));
+        shards.push({
+          x: gx, y: gy, verts: verts, d: d, wave: wave, border: border, launched: false,
+          dirx: d ? (gx - cx) / d : rnd(-1, 1), diry: d ? (gy - cy) / d : rnd(-1, 1),
+          vx: 0, vy: 0, angle: 0, spin: 0, scale: 1, sv: 0, alpha: 1, age: 0, glint: rnd(0, Math.PI * 2)
+        });
+      }
+    }
+
+    // Eject one WAVE: hand every not-yet-launched shard of that wave a velocity/spin/depth and mark it
+    // launched (so it stops being drawn as held glass and starts its physics), then burst dust. The
+    // border (wave 0) is never passed here, so the edge frame always stays. Cheap -- geometry pre-built.
+    // Radial speed is highest for shards nearest the impact (they take the most energy).
+    function launchWave(w) {
+      var any = false;
+      for (var i = 0; i < shards.length; i++) {
+        var sh = shards[i];
+        if (sh.border || sh.launched || sh.wave !== w) continue;
+        var speed = 300 + 1000 / (1 + sh.d / 130) + rnd(-50, 90);
+        sh.vx = sh.dirx * speed + rnd(-70, 70);
+        sh.vy = sh.diry * speed + rnd(-70, 70);
+        sh.spin = rnd(-6.5, 6.5);
+        sh.sv = (speed / maxDim) * rnd(0.15, 0.85);   // fast shards also come toward the viewer
+        sh.age = 0; sh.alpha = 1; sh.launched = true;
+        any = true;
+      }
+      if (any) burstDust(w);
+    }
+    function burstDust(w) {
+      var m = Math.min(560, 150 + w * 130);            // bigger bursts on the later, larger impacts
+      for (var k = 0; k < m; k++) {
+        var a = Math.random() * Math.PI * 2, sp = rnd(60, 700) * Math.pow(Math.random(), 0.6);
+        dust.push({
+          x: cx + Math.cos(a) * rnd(0, 20), y: cy + Math.sin(a) * rnd(0, 20),
+          vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - rnd(0, 120),
+          life: rnd(0.5, 1.5), age: 0, size: rnd(0.6, 2.6), warm: Math.random()
+        });
+      }
+    }
+
+    function tracePoly(sh) {
+      ctx.beginPath();
+      ctx.moveTo(sh.verts[0][0], sh.verts[0][1]);
+      for (var i = 1; i < sh.verts.length; i++) ctx.lineTo(sh.verts[i][0], sh.verts[i][1]);
+      ctx.closePath();
+    }
+
+    function drawShard(sh, edgeBoost) {
+      if (sh.alpha <= 0) return;
+      var a = Math.max(0, Math.min(1, sh.alpha));
+      var sp = Math.hypot(sh.vx, sh.vy);
+      if (sp > 480) {   // motion-blur streak, drawn first, behind the crisp shard
+        ctx.save();
+        ctx.translate(sh.x - sh.vx * 0.016, sh.y - sh.vy * 0.016);
+        ctx.rotate(sh.angle); ctx.scale(sh.scale, sh.scale);
+        tracePoly(sh);
+        ctx.fillStyle = CORE + (0.06 * a) + ")"; ctx.fill();
+        ctx.restore();
+      }
+      ctx.save();
+      ctx.translate(sh.x, sh.y);
+      ctx.rotate(sh.angle); ctx.scale(sh.scale, sh.scale);
+      tracePoly(sh);
+      ctx.fillStyle = BODY + (0.10 * a) + ")"; ctx.fill();
+      var face = (0.38 + 0.42 * Math.abs(Math.sin(sh.angle + sh.glint))) * edgeBoost;   // glassy glint
+      ctx.lineWidth = 1.1;
+      ctx.strokeStyle = CORE + (Math.min(1, face) * a) + ")";
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // A HELD (edge) shard rendered as CRACK LINES, not a panel: near-transparent glass fill, and thin
+    // warm edge lines that are brighter/finer near the hole rim and dimmer/sparser outward -- so the
+    // held pane reads as a real impact fracture, never a white honeycomb. `boost` flares it at the hit.
+    function drawHeldShard(sh, boost) {
+      var prox = 1 - Math.min(1, sh.d / (maxDim * 0.6));   // 1 at the impact centre, 0 far out
+      ctx.save();
+      ctx.translate(sh.x, sh.y);
+      tracePoly(sh);
+      ctx.fillStyle = BODY + "0.05)";
+      ctx.fill();
+      ctx.lineJoin = "round";
+      ctx.lineWidth = (0.6 + 0.5 * (1 - prox)) * (0.85 + 0.3 * Math.abs(Math.sin(sh.glint)));
+      ctx.strokeStyle = CORE + Math.min(1, (0.26 + 0.62 * prox) * boost).toFixed(3) + ")";
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function ellipseR(a) {                                  // radius of the base hole ellipse at angle a
+      var c = Math.cos(a) / holeRX, s = Math.sin(a) / holeRY;
+      return 1 / Math.sqrt(c * c + s * s);
+    }
+    // The hole rim is NOT a separate shape. The hole is simply where the central glass PIECES were
+    // knocked out; its ragged, spiky edge is the REAL edges of the remaining (held) shards -- the same
+    // Voronoi crack lines that form the rest of the glass, continuing on to bound the hole. The teeth
+    // are real pointed shards (the fine sliver cells seeded around the rim), never a drawn-on figure
+    // and never a clip to an independent outline.
+    function drawHeldShards(boost) {
+      for (var i = 0; i < shards.length; i++) { if (!shards[i].launched) drawHeldShard(shards[i], boost); }
+    }
+
+    // --- Intact frosted GLASS PANE, present from t=0, so the viewer perceives glass over the whole
+    // screen with the word approaching BEHIND it (not glass spawning at the hit). An UNBROKEN pane has
+    // NO cracks -- it is shown by its SURFACE only: a frosted veil + a diagonal reflection sheen. The
+    // fracture is CREATED by the impact; no crack lines exist before the hit. ---
+    function drawVeil(alpha) {
+      if (alpha <= 0) return;
+      ctx.fillStyle = CORE + alpha.toFixed(3) + ")";      // warm frost softening everything behind the pane
+      ctx.fillRect(0, 0, W, H);
+    }
+    function drawSheen(alpha) {
+      if (alpha <= 0) return;                             // one broad diagonal reflection band -- the key "glass surface" cue
+      var g = ctx.createLinearGradient(0, 0, W, H);
+      g.addColorStop(0, "rgba(255,246,238,0)");
+      g.addColorStop(0.40, "rgba(255,246,238,0)");
+      g.addColorStop(0.52, CORE + (0.15 * alpha).toFixed(3) + ")");
+      g.addColorStop(0.64, "rgba(255,246,238,0)");
+      g.addColorStop(1, "rgba(255,246,238,0)");
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    }
+
+    function frame(now) {
+      if (!running) return;
+      var dt = Math.min(0.05, (now - last) / 1000 || 0); last = now;
+      var t = (now - t0) / 1000;
+      ctx.clearRect(0, 0, W, H);
+
+      // Fire the three escalating waves on the shared clock -- glass falls in step with each text hit.
+      if (t >= T1 && firedWave < 1) { firedWave = 1; launchWave(1); }
+      if (t >= T2 && firedWave < 2) { firedWave = 2; launchWave(2); }
+      if (t >= T3 && firedWave < 3) { firedWave = 3; launchWave(3); }
+
+      if (firedWave === 0) {
+        // The pane is ALREADY THERE but INTACT -- an unbroken pane has NO cracks. Show it by its SURFACE
+        // ONLY: a frosted veil (dims what's behind) + a diagonal reflection sheen (the "glass surface"
+        // cue). The word (below this canvas) is seen dimmed THROUGH the glass. The fracture does not exist
+        // yet -- it is created by the first impact below.
+        var introA = Math.min(1, t / 0.55);
+        drawVeil(0.085 * introA);
+        drawSheen(introA);
+        raf = requestAnimationFrame(frame);
+        return;
+      }
+
+      // IMPACT + after: the SAME pane BREAKS in stages. Time since the most-recent impact drives the
+      // flare; the frost fades once for good after the first hit.
+      var lastT = firedWave >= 3 ? T3 : firedWave >= 2 ? T2 : T1;
+      var since = t - lastT;
+      var edgeBoost = since < 0.15 ? 2.4 : 1;           // the fracture flares white-hot at each hit
+      var forceStop = t > T3 + 3.0;                     // safety: everything is long gone by now
+      var veilFade = Math.max(0, 1 - (t - T1) / 0.5);
+      drawVeil(0.06 * veilFade);
+
+      // Dust from the punched glass -- warm, additive, behind the shards.
+      ctx.globalCompositeOperation = "lighter";
+      for (var d = 0; d < dust.length; d++) {
+        var p = dust[d]; if (p.age >= p.life) continue;
+        p.age += dt; p.vy += 480 * dt;
+        p.vx *= Math.exp(-1.6 * dt); p.vy *= Math.exp(-1.6 * dt);
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        var la = 1 - p.age / p.life; if (la <= 0) continue;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fillStyle = (p.warm > 0.5 ? "rgba(255,238,224," : "rgba(232,120,90,") + (0.5 * la) + ")";
+        ctx.fill();
+      }
+      ctx.globalCompositeOperation = "source-over";
+
+      // The HELD (not-yet-ejected) glass -- future-wave pieces + the permanent edge frame -- drawn with
+      // their REAL edges, so the growing opening is always bounded by the actual remaining shard edges
+      // (never a separate outline). Drawn every frame so the stopped frame keeps the pane on the canvas.
+      drawHeldShards(edgeBoost);
+
+      // A brief sheen flare at the very instant of a hit, then gone with the frost.
+      if (veilFade > 0 || since < 0.18) drawSheen(veilFade + (since < 0.18 ? 0.8 : 0));
+
+      // Ejected shards -- fall (gravity), spin, come toward the viewer, fade, opening the glass wider.
+      var alive = 0;
+      for (var i = 0; i < shards.length; i++) {
+        var sh = shards[i]; if (!sh.launched) continue;
+        if (forceStop) { sh.alpha = 0; }
+        else {
+          sh.vy += GRAVITY * dt;
+          var damp = Math.exp(-DRAG * dt); sh.vx *= damp; sh.vy *= damp;
+          sh.x += sh.vx * dt; sh.y += sh.vy * dt;
+          sh.angle += sh.spin * dt;
+          sh.scale += sh.sv * dt; if (sh.scale > 2.6) sh.scale = 2.6;
+          sh.age += dt; if (sh.age > 0.35) sh.alpha -= dt * 1.2;
+        }
+        drawShard(sh, edgeBoost);
+        if (sh.alpha > 0 && sh.y < H + maxDim && sh.x > -maxDim && sh.x < W + maxDim) alive++;
+      }
+
+      // After the final wave, once its ejected shards are gone, STOP without clearing -- the held edge
+      // frame (the ~20% that stays) is already drawn this frame and persists as the wait-state.
+      if ((firedWave >= 3 && alive === 0) || forceStop) { running = false; settled = true; return; }
+      raf = requestAnimationFrame(frame);
+    }
+
+    function sizeCanvas() {
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      W = window.innerWidth; H = window.innerHeight;
+      cx = W * 0.5; cy = H * CY_FRAC; maxDim = Math.max(W, H);
+      holeRX = W * 0.32; holeRY = H * 0.16;   // central hole ellipse -- sized to hold the wordmark
+      borderMargin = Math.min(W, H) * 0.075;  // thin edge frame kept permanently (~20% of the pane stays)
+      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    // Draw ONLY the held edge pane (the hole left empty) -- the settled wait-state and the reduced-
+    // motion end-state both look like this: a cracked pane with a clean hole where the word sits.
+    function drawHeldPane() {
+      ctx.clearRect(0, 0, W, H);
+      drawHeldShards(1);
+    }
+    // Mark every non-border piece as already gone -- the settled / reduced-motion end-state is the FINAL
+    // one: ~80% knocked out, only the thin edge frame remaining.
+    function finalizeState() {
+      for (var i = 0; i < shards.length; i++) { if (!shards[i].border) shards[i].launched = true; }
+    }
+    function staticFrame() { finalizeState(); drawHeldPane(); settled = true; }
+
+    function start(el) {
+      canvas = el; if (!canvas) return;
+      ctx = canvas.getContext && canvas.getContext("2d"); if (!ctx) return;   // degrade: no shatter
+      sizeCanvas(); buildGeometry();
+      dust = []; firedWave = 0; settled = false;
+      if (reduce) { staticFrame(); return; }
+      t0 = performance.now(); last = t0; running = true;
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
+    }
+
+    function resize() {
+      if (!canvas || !ctx) return;
+      var wasBreaking = firedWave > 0 && running;
+      sizeCanvas(); buildGeometry();
+      if (reduce) { staticFrame(); return; }
+      if (settled) { finalizeState(); drawHeldPane(); return; }   // settled -> repaint the final edge frame
+      if (wasBreaking) {                          // mid-sequence -> re-open every wave that has already hit
+        var t = (performance.now() - t0) / 1000;
+        firedWave = 0;
+        if (t >= T1) { firedWave = 1; launchWave(1); }
+        if (t >= T2) { firedWave = 2; launchWave(2); }
+        if (t >= T3) { firedWave = 3; launchWave(3); }
+      }
+    }
+
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+    });
+
+    window.introShatter = { start: start, resize: resize };
+  })();
+</script>
+
+<script>
+  // Warp-space background engine (Frontend 2.0): a self-contained starfield of thin warm streaks that
+  // radiate from the central vanishing point (the word's own cx/cy) and drift OUTWARD -- near streaks
+  // long and bright, far ones short and dim -- so the whole screen reads as moving forward through
+  // depth toward the centre, and the word emerging from that same point feels of a piece with it.
+  // Rung 2, Canvas 2D, no lib. It runs the WHOLE time (the ambient wait atmosphere), so it is kept
+  // deliberately cheap and capped to ~30fps. Honors reduced motion (a static sparse field, no motion)
+  // and degrades to nothing if 2D canvas is unavailable. Exposes window.introWarp.{start,resize}.
+  (function () {
+    var CY_FRAC = 0.42;
+    var canvas, ctx, dpr, W, H, cx, cy, reachMax;
+    var streaks = [], raf = 0, last = 0, acc = 0, running = false;
+    var reduce = false;
+    try { reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) {}
+    function rnd(a, b) { return a + Math.random() * (b - a); }
+
+    function sizeCanvas() {
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      W = window.innerWidth; H = window.innerHeight;
+      cx = W * 0.5; cy = H * CY_FRAC;
+      reachMax = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy)) * 1.1;   // reach past the far corner
+      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function build() {
+      streaks = [];
+      var n = Math.max(120, Math.min(200, Math.round((W * H) / 12000)));
+      for (var i = 0; i < n; i++) {
+        streaks.push({
+          ang: Math.random() * Math.PI * 2,
+          r: Math.random() * reachMax,     // spread across depth so the field is full on the first frame
+          speed: rnd(60, 240),             // per-streak parallax speed (px/s outward)
+          warm: Math.random()              // mostly warm-white, a whisper of amber
+        });
+      }
+    }
+
+    function drawStreak(s) {
+      var t = s.r / reachMax;              // 0 = far (at the centre), 1 = near (at the edge)
+      if (t <= 0.02) return;               // skip the dead centre so the word is not smothered
+      var len = 8 + t * t * 90;            // near streaks are long
+      var a = 0.05 + t * 0.5;              // near streaks are bright
+      var c = Math.cos(s.ang), sn = Math.sin(s.ang);
+      ctx.beginPath();
+      ctx.moveTo(cx + c * s.r, cy + sn * s.r);
+      ctx.lineTo(cx + c * (s.r + len), cy + sn * (s.r + len));
+      ctx.strokeStyle = (s.warm > 0.7 ? "rgba(255,205,170," : "rgba(255,240,232,") + a.toFixed(3) + ")";
+      ctx.lineWidth = 0.6 + t * 1.2;
+      ctx.stroke();
+    }
+
+    function render() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.globalCompositeOperation = "lighter";
+      for (var i = 0; i < streaks.length; i++) drawStreak(streaks[i]);
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    function frame(now) {
+      if (!running) return;
+      var dt = Math.min(0.05, (now - last) / 1000 || 0); last = now;
+      acc += dt;
+      if (acc >= 1 / 30) {                 // cap the redraw to ~30fps -- cheap over a long backend wait
+        for (var i = 0; i < streaks.length; i++) {
+          var s = streaks[i]; s.r += s.speed * acc;
+          if (s.r > reachMax) {            // drifted off the edge -> respawn near the centre (further depth)
+            s.r = rnd(0, reachMax * 0.06); s.ang = Math.random() * Math.PI * 2; s.speed = rnd(60, 240);
+          }
+        }
+        render(); acc = 0;
+      }
+      raf = requestAnimationFrame(frame);
+    }
+
+    function start(el) {
+      canvas = el; if (!canvas) return;
+      ctx = canvas.getContext && canvas.getContext("2d"); if (!ctx) return;   // degrade: no background
+      sizeCanvas(); build();
+      if (reduce) { render(); return; }    // static sparse field, no motion
+      last = performance.now(); acc = 0; running = true;
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
+    }
+
+    function resize() {
+      if (!canvas || !ctx) return;
+      sizeCanvas(); build();
+      if (reduce) { render(); }
+    }
+
+    // The ambient background is the "still alive" signal for a long wait, so unlike the one-shot
+    // shatter it RESUMES when the tab becomes visible again.
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+      else if (canvas && ctx && !reduce && !running) { last = performance.now(); running = true; raf = requestAnimationFrame(frame); }
+    });
+
+    window.introWarp = { start: start, resize: resize };
+  })();
+</script>
+
+<script>
+  (function () {
+    var invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    var $ = function (id) { return document.getElementById(id); };
+    var cfg = null;
+    var origValues = {};
+
+    function showError(msg) {
+      $("overlay").classList.remove("show");
+      $("intro").classList.remove("show");
+      if (window.introAudio) window.introAudio.stop();
+      var e = $("error"); e.textContent = "Error: " + msg; e.classList.add("show");
+      $("start").disabled = false;
+    }
+
+    function boolFrom(v) {
+      v = String(v || "").trim().toLowerCase();
+      return v === "true" || v === "yes" || v === "on" || v === "1";
+    }
+
+    function renderSystem() {
+      var host = $("sys"); host.innerHTML = "";
+      if (cfg.os === "windows") {
+        var line = document.createElement("div");
+        line.className = "title"; line.style.fontSize = "13px";
+        line.textContent = "Detected: Windows — the agent runs inside WSL2.";
+        host.appendChild(line);
+        if (cfg.distros && cfg.distros.length) {
+          var sel = document.createElement("select");
+          sel.id = "distro"; sel.style.marginTop = "8px";
+          cfg.distros.forEach(function (d) {
+            var o = document.createElement("option");
+            o.value = d.name; o.textContent = d.name + (d.is_default ? "  (default)" : "");
+            if (d.is_default) o.selected = true;
+            sel.appendChild(o);
+          });
+          host.appendChild(sel);
+          if (cfg.distros.length === 1) {
+            var n = document.createElement("div"); n.className = "note";
+            n.textContent = "Only one WSL distro installed — selected automatically.";
+            host.appendChild(n);
+          }
+        } else {
+          var warn = document.createElement("div"); warn.className = "note";
+          warn.textContent = "No WSL distros detected. Install one (see README) before launching.";
+          host.appendChild(warn);
+        }
+      } else {
+        var native = document.createElement("div");
+        native.className = "title"; native.style.fontSize = "13px";
+        native.textContent = "Detected: " + (cfg.os === "macos" ? "macOS" : "Linux") + " — runs natively (no WSL).";
+        host.appendChild(native);
+      }
+    }
+
+    function makeSetting(s) {
+      origValues[s.key] = s.value;
+      var row = document.createElement("div");
+      row.className = "setting" + (s.kind === "toggle" ? " toggle" : "");
+      row.dataset.filter = (s.key + " " + s.description).toLowerCase();
+
+      var meta = document.createElement("div"); meta.className = "meta";
+      var k = document.createElement("div"); k.className = "k"; k.textContent = s.key;
+      meta.appendChild(k);
+      if (s.description) {
+        var d = document.createElement("div"); d.className = "d";
+        d.textContent = s.description; d.title = s.description;
+        meta.appendChild(d);
+      }
+      row.appendChild(meta);
+
+      var ctl = document.createElement("div"); ctl.className = "ctl";
+      if (s.kind === "toggle") {
+        var sw = document.createElement("label"); sw.className = "switch";
+        var cb = document.createElement("input"); cb.type = "checkbox";
+        cb.checked = boolFrom(s.value); cb.dataset.key = s.key; cb.dataset.kind = "toggle";
+        var track = document.createElement("span"); track.className = "track";
+        var knob = document.createElement("span"); knob.className = "knob";
+        sw.appendChild(cb); sw.appendChild(track); sw.appendChild(knob);
+        ctl.appendChild(sw);
+      } else {
+        var inp = document.createElement("input");
+        inp.type = s.kind === "password" ? "password" : "text";
+        inp.value = s.value; inp.dataset.key = s.key; inp.dataset.kind = s.kind;
+        inp.spellcheck = false;
+        inp.placeholder = s.kind === "password" ? "(unset)" : "";
+        ctl.appendChild(inp);
+      }
+      row.appendChild(ctl);
+      return row;
+    }
+
+    function renderSettings() {
+      var host = $("settings"); host.innerHTML = "";
+      (cfg.settings || []).forEach(function (s) { host.appendChild(makeSetting(s)); });
+    }
+
+    function collectChanges() {
+      var updates = {};
+      document.querySelectorAll("#settings [data-key]").forEach(function (el) {
+        var key = el.dataset.key;
+        if (el.dataset.kind === "toggle") {
+          if (el.checked !== boolFrom(origValues[key])) updates[key] = el.checked ? "true" : "false";
+        } else if (el.value !== origValues[key]) {
+          updates[key] = el.value;
+        }
+      });
+      return updates;
+    }
+
+    function commitBaseline(updates) {
+      // After a Save, the written values become the new baseline for change tracking.
+      Object.keys(updates).forEach(function (k) { origValues[k] = updates[k]; });
+    }
+
+    async function init() {
+      if (!invoke) { showError("shell IPC unavailable (__TAURI__ not found)."); return; }
+      try {
+        cfg = await invoke("get_start_config");
+        $("root").checked = !!cfg.run_as_root;
+        if (cfg.version) $("version-tag").textContent = "v" + cfg.version;
+        renderSystem();
+        renderSettings();
+      } catch (e) { showError(String(e)); }
+    }
+
+    async function save() {
+      if (!invoke) return;
+      var updates = collectChanges();
+      updates["ASRA_RUN_AS_ROOT"] = $("root").checked ? "true" : "false";
+      try {
+        await invoke("save_env", { updates: updates });
+        commitBaseline(updates);
+        var s = $("saved"); s.classList.add("show");
+        setTimeout(function () { s.classList.remove("show"); }, 1800);
+      } catch (e) { showError(String(e)); }
+    }
+
+    async function start() {
+      if (!invoke) return;
+      $("error").classList.remove("show");
+      $("web").classList.remove("show");
+      var mode = (document.querySelector('input[name=mode]:checked') || {}).value || "desktop";
+      var distroEl = $("distro");
+      $("start").disabled = true;
+      var msg = mode === "web" ? "Starting the server…" : "Starting backend…";
+      // Settings -> Customization -> Visual's "Play launch intro" switch (agent/intro_settings.py,
+      // read here via cfg.intro_enabled -- get_start_config() already re-reads .env fresh on every
+      // launch). On: the animated intro (#intro; the shatter geometry is built for the CURRENT window
+      // size right when shown, not at page load, in case the operator resized before clicking Start).
+      // Off: the plain loader untouched above -- exactly what always showed here before this existed.
+      if (cfg && cfg.intro_enabled) {
+        $("intro-msg").textContent = msg;
+        $("intro").classList.add("show");
+        if (window.introWarp) window.introWarp.start($("intro-bg"));
+        if (window.introShatter) window.introShatter.start($("intro-canvas"));
+        // Settings -> Customization -> Visual's "Play intro sound" switch (agent/intro_settings.py,
+        // ASRA_INTRO_SOUND_ENABLED, read here via cfg.intro_sound_enabled) -- independent of the
+        // visuals toggle above, so an operator can keep the animation muted without losing it.
+        // Called from right here, inside this click handler, so AudioContext creation is always
+        // inside a real user gesture.
+        if (cfg.intro_sound_enabled && window.introAudio) window.introAudio.start();
+      } else {
+        $("loader-msg").textContent = msg;
+        $("overlay").classList.add("show");
+      }
+      try {
+        var startUpdates = collectChanges();
+        startUpdates["ASRA_RUN_AS_ROOT"] = $("root").checked ? "true" : "false";
+        var res = await invoke("launch_backend", { args: {
+          mode: mode,
+          as_root: $("root").checked,
+          distro: distroEl ? distroEl.value : "",
+          updates: startUpdates
+        }});
+        if (mode === "web") {
+          $("overlay").classList.remove("show");
+          $("intro").classList.remove("show");
+          if (window.introAudio) window.introAudio.stop();
+          $("web-url").textContent = res;
+          $("web").classList.add("show");
+          $("start").disabled = false;
+        }
+        // desktop: the shell navigates this window to the live UI itself.
+      } catch (e) { showError(String(e)); }
+    }
+
+    $("search").addEventListener("input", function () {
+      var q = this.value.trim().toLowerCase();
+      document.querySelectorAll("#settings .setting").forEach(function (row) {
+        row.style.display = (!q || row.dataset.filter.indexOf(q) !== -1) ? "" : "none";
+      });
+    });
+    $("save").addEventListener("click", save);
+    $("start").addEventListener("click", start);
+
+    $("force-restart").addEventListener("click", async function () {
+      if (!invoke) return;
+      var btn = $("force-restart");
+      var status = $("force-restart-status");
+      btn.disabled = true;
+      status.className = "force-restart-status show";
+      status.textContent = "Stopping ASRA's backend and its WSL process (leaves other software untouched)…";
+      try {
+        var distroEl = $("distro");
+        var res = await invoke("force_restart_agent", {
+          distro: distroEl ? distroEl.value : "",
+          asRoot: $("root").checked
+        });
+        status.className = "force-restart-status show ok";
+        status.textContent = res;
+      } catch (e) {
+        status.className = "force-restart-status show err";
+        status.textContent = String(e);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // The desktop window (and a browser tab) is user-resizable at any moment. While #intro is on
+    // screen, resize the canvas and rebuild the shatter geometry for the new size so it always fills
+    // correctly instead of the backing store stretching non-proportionally.
+    var introResizeTimer = null;
+    window.addEventListener("resize", function () {
+      if (!$("intro").classList.contains("show")) return;
+      clearTimeout(introResizeTimer);
+      introResizeTimer = setTimeout(function () {
+        if (!$("intro").classList.contains("show")) return;
+        if (window.introShatter) window.introShatter.resize();
+        if (window.introWarp) window.introWarp.resize();
+      }, 140);
+    });
+    $("open").addEventListener("click", async function () {
+      if (!invoke) return;
+      try { await invoke("open_in_browser", { url: $("web-url").textContent }); }
+      catch (e) { showError(String(e)); }
+    });
+    $("copy").addEventListener("click", async function () {
+      try { await navigator.clipboard.writeText($("web-url").textContent); this.textContent = "Copied"; }
+      catch (e) { this.textContent = "Select and copy manually"; }
+    });
+
+    init();
+  })();
+</script>
