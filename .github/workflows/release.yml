@@ -21,6 +21,13 @@ on:
         description: "Version to build (must match desktop/src-tauri/Cargo.toml's [package] version), e.g. 0.1.0"
         required: true
 
+# The default GITHUB_TOKEN this workflow gets is read-only unless told otherwise -- without this,
+# publish-release's own softprops/action-gh-release step fails with a 403 ("Resource not
+# accessible by integration") the moment it tries to actually create the release, AFTER every
+# build already succeeded. contents: write is the one scope release creation/asset upload needs.
+permissions:
+  contents: write
+
 env:
   # Normalizes both trigger shapes (a real "vX.Y.Z" tag vs. workflow_dispatch's own bare "X.Y.Z"
   # input) down to one bare version string every later step can compare/use identically.
