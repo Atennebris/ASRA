@@ -124,6 +124,25 @@ def remove_provider_from_list(provider_id: str) -> None:
     logger.debug("llm_settings: provider=%s removed", provider_id)
 
 
+def get_free_models_only() -> bool:
+    """Settings -> "Free models only" switch next to the AI Provider & Model picker -- filters
+    every model dropdown in the app (main picker, Reserve providers rows, secondary verification,
+    subagent profiles, chat panel, Library) down to models the provider actually reports as free
+    (agent/providers/models_dev.py's is_model_free, or agent/opencode_local_provider.py's own live
+    pricing for the opencode-local provider). Off by default — same "nothing set -> no behavior
+    change" convention as every other optional flag in this module; the operator opts in, the
+    filter never silently hides a model nobody asked to hide.
+    """
+    return bool(load_llm_settings().get("free_models_only"))
+
+
+def set_free_models_only(enabled: bool) -> None:
+    existing = load_llm_settings()
+    existing["free_models_only"] = enabled
+    _write_llm_settings(existing)
+    logger.debug("llm_settings: free_models_only=%s", enabled)
+
+
 def get_secondary_verification_provider() -> dict | None:
     """Settings -> Secondary verification provider (optional) -- when set, Skeptical Verification
     (agent/core.py's _run_skeptical_verification) independently re-checks each Critical/High
@@ -141,21 +160,26 @@ def get_secondary_verification_provider() -> dict | None:
     model = existing.get("secondary_verification_model")
     if not provider or not model:
         return None
-    return {"provider": provider, "model": model}
+    return {"provider": provider, "model": model, "free_only": bool(existing.get("secondary_verification_free_only"))}
 
 
-def save_secondary_verification_provider(provider: str | None, model: str | None) -> None:
+def save_secondary_verification_provider(provider: str | None, model: str | None, free_only: bool = False) -> None:
     """provider/model both blank clears the setting (feature off) -- same "empty input removes the
-    override" convention as every other optional Settings field in this module."""
+    override" convention as every other optional Settings field in this module. free_only is this
+    picker's own "Free models only" switch state -- persisted here so it survives a reload, same
+    "a toggle remembers its own position" rule every other switch in the app follows (real,
+    confirmed operator complaint: it used to silently reset to off on every page load)."""
     existing = load_llm_settings()
     if provider and model:
         existing["secondary_verification_provider"] = provider
         existing["secondary_verification_model"] = model
+        existing["secondary_verification_free_only"] = bool(free_only)
     else:
         existing.pop("secondary_verification_provider", None)
         existing.pop("secondary_verification_model", None)
+        existing.pop("secondary_verification_free_only", None)
     _write_llm_settings(existing)
-    logger.debug("llm_settings: saved secondary_verification_provider=%s model=%s", provider, model)
+    logger.debug("llm_settings: saved secondary_verification_provider=%s model=%s free_only=%s", provider, model, free_only)
 
 
 def save_fallback_chain_settings(enabled: bool, chain: list[dict]) -> None:

@@ -99,6 +99,44 @@ def test_resolve_command_manual_when_no_sudo_path(monkeypatch):
     assert "setup_tools.sh" in display
 
 
+# --- dependencies: non-tool things setup_tools.sh also provisions (opencode CLI), never counted
+# in verdict/percent/modes above.
+
+
+def test_dependencies_present_regardless_of_tool_inventory(monkeypatch):
+    monkeypatch.setattr(arsenal, "list_tool_availability", _fake_inventory([]))
+    summary = arsenal.summarize_arsenal()
+    names = {dep["name"] for dep in summary["dependencies"]}
+    assert "opencode" in names
+
+
+def test_dependency_installed_reflects_shutil_which(monkeypatch):
+    monkeypatch.setattr(arsenal, "list_tool_availability", _fake_inventory([]))
+    monkeypatch.setattr(arsenal.shutil, "which", lambda name: "/usr/local/bin/opencode" if name == "opencode" else None)
+    dep = next(d for d in arsenal.summarize_arsenal()["dependencies"] if d["name"] == "opencode")
+    assert dep["installed"] is True
+
+
+def test_dependency_not_installed_when_binary_missing(monkeypatch):
+    monkeypatch.setattr(arsenal, "list_tool_availability", _fake_inventory([]))
+    monkeypatch.setattr(arsenal.shutil, "which", lambda name: None)
+    dep = next(d for d in arsenal.summarize_arsenal()["dependencies"] if d["name"] == "opencode")
+    assert dep["installed"] is False
+
+
+def test_dependencies_never_affect_verdict_or_percent(monkeypatch):
+    """A missing dependency (opencode not installed) must not make an otherwise-fully-installed
+    tool arsenal read as degraded -- these are deliberately separate signals, see
+    agent/tools/arsenal.py's own _dependencies docstring."""
+    monkeypatch.setattr(arsenal, "list_tool_availability", _fake_inventory([
+        _entry("nmap", tier=2, installed=True, categories=["scan"]),
+    ]))
+    monkeypatch.setattr(arsenal.shutil, "which", lambda name: None)
+    summary = arsenal.summarize_arsenal()
+    assert summary["verdict"] == "full"
+    assert summary["percent"] == 100
+
+
 def test_status_idle_before_any_install(monkeypatch, tmp_path):
     # Point the log path at an empty temp dir so a real prior run's log can't leak into this test.
     monkeypatch.setattr(arsenal_install, "resolve_global_app_dir", lambda: tmp_path)

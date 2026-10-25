@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -170,6 +171,8 @@ from agent.llm_client import (
     COPILOT_DISPLAY_NAME,
     COPILOT_PROVIDER_ID,
     DEFAULT_PROVIDER,
+    OPENCODE_LOCAL_DISPLAY_NAME,
+    OPENCODE_LOCAL_PROVIDER_ID,
     PROVIDER_REGISTRY,
     all_provider_choices,
     check_api_key,
@@ -191,6 +194,7 @@ from agent.codex_oauth import get_valid_access_token as get_valid_codex_access_t
 from agent.codex_oauth import load_tokens as load_codex_tokens
 from agent.codex_oauth import start_login_flow as start_codex_login_flow
 from agent.codex_provider import CODEX_DEFAULT_MODEL, CODEX_MODELS
+from agent.opencode_local_provider import close_shared_opencode_server
 from agent.copilot_oauth import clear_tokens as clear_copilot_tokens
 from agent.copilot_oauth import get_login_status as get_copilot_login_status
 from agent.copilot_oauth import get_valid_copilot_token
@@ -228,6 +232,7 @@ from agent.tools.tool_api_keys import TOOL_API_KEY_SPECS, clear_tool_api_key, ge
 from agent.settings import (
     add_provider_to_list,
     get_added_providers,
+    get_free_models_only,
     get_secondary_verification_provider,
     is_provider_enabled,
     load_llm_settings,
@@ -235,8 +240,10 @@ from agent.settings import (
     save_fallback_chain_settings,
     save_llm_settings,
     save_secondary_verification_provider,
+    set_free_models_only,
     set_provider_enabled,
 )
+from agent.providers.models_dev import is_model_free
 from agent.tools.allowed_targets import _matches_scope_entries, authorize_exploit_targets
 from agent.tools.builders.validators import classify_target_type, expand_target_alternation, validate_scope_entry
 from agent.tools.native import (
@@ -412,6 +419,10 @@ async def _lifespan(_app: FastAPI):
     # Same backstop, for the standalone Terminal tab's own real PTY child processes -- a graceful
     # shutdown must never leave an orphaned shell running (agent/tools/terminal_manager.py).
     terminal_manager.shutdown_all()
+    # Same backstop, for the opencode-local provider's own shared `opencode serve` subprocess
+    # (agent/opencode_local_provider.py) -- a graceful shutdown must never leave that running
+    # either. No-op if that provider was never actually used this run.
+    close_shared_opencode_server()
 
 
 app = FastAPI(title="ASRA", lifespan=_lifespan)
@@ -493,7 +504,13 @@ _SSE_POLL_INTERVAL_SECONDS = 1.0
 # of mixing flatly into the cloud-provider list.
 templates.env.globals["cloud_provider_ids"] = [pid for pid, cfg in PROVIDER_REGISTRY.items() if not cfg.is_local]
 templates.env.globals["local_provider_ids"] = [pid for pid, cfg in PROVIDER_REGISTRY.items() if cfg.is_local]
-templates.env.globals["provider_display_names"] = {pid: cfg.display_name for pid, cfg in PROVIDER_REGISTRY.items()}
+templates.env.globals["provider_display_names"] = {
+    **{pid: cfg.display_name for pid, cfg in PROVIDER_REGISTRY.items()},
+    # opencode-local isn't a PROVIDER_REGISTRY row (see agent/opencode_local_provider.py) but is
+    # unconditionally offered in the main picker's own "Local" optgroup (_llm_settings_context's
+    # added_local_provider_ids), which looks display names up through this exact global dict.
+    OPENCODE_LOCAL_PROVIDER_ID: OPENCODE_LOCAL_DISPLAY_NAME,
+}
 # The "Open terminal here" quick-launch link (session.html/session_fragment.html) needs a
 # session's own project folder to build /terminal?cwd=... -- registered as a plain Jinja global
 # (not threaded through every session-page context dict) since it's a pure lookup with no request
@@ -560,6 +577,11 @@ templates.env.globals["load_clock_style"] = load_clock_style
 # static/js/sound_events.js's own event watchers (new finding, session done, ...) need to fire from
 # session.html, not only from the Settings screen that edits them.
 templates.env.globals["load_sound_settings"] = load_sound_settings
+# base.html emits window.ASRA_FREE_MODELS_ONLY from this on every page -- the client-side "Free
+# models only" filter (static/js/free_models_filter.js) has to apply to every model <select> on
+# whatever page it's on (chat panel, Library, subagent profiles), not just settings.html, the same
+# reasoning load_sound_settings right above already follows for its own page-wide JS watchers.
+templates.env.globals["get_free_models_only"] = get_free_models_only
 # Project-icon pools -- shared by the New Project picker (macros/project_icons.html's icon_picker)
 # and sessions/store.py's own random default, one source of truth (projects/icons.py).
 templates.env.globals["PROJECT_ICON_NAMES"] = project_icons.ICON_NAMES
@@ -2010,6 +2032,12 @@ def _chat_context(session: dict) -> dict:
         # (/api/subagents/model-options, shared with the subagent picker) ever fires — same
         # reasoning as subagent_model_choices in _subagent_context.
         "chat_model_choices": model_choices,
+        # This picker's own independent "Free models only" switch (chat_panel.html) needs
+        # data-free on its initial render too, same reasoning as subagent_model_free_flags.
+        "chat_model_free_flags": _model_free_flags(provider, model_choices) if provider else {},
+        # This switch's own last-persisted position (chat_settings_store.py's last_free_only) --
+        # same "a toggle remembers its own position" rule every switch in the app follows now.
+        "chat_free_only": load_chat_settings()["last_free_only"],
     }
 
 
@@ -5504,6 +5532,7 @@ def delete_all_sessions_route() -> Response:
 def chat_turn(
     request: Request, session_id: str, background_tasks: BackgroundTasks,
     message: str = Form(""), provider: str | None = Form(None), model: str | None = Form(None),
+    free_only: str | None = Form(None),
 ) -> HTMLResponse:
     """Fast half of a chat turn (agent/chat.py's append_pending_chat_message) — persists the
     operator's own message and pending=True, then hands the actual LLM call off to a
@@ -5532,8 +5561,14 @@ def chat_turn(
     if not message:
         raise HTTPException(status_code=400, detail="Message must not be empty")
 
-    logger.debug("api: chat session_id=%s message_len=%d provider=%r model=%r", session_id, len(message), provider, model)
-    session, started = append_pending_chat_message(session_id, message, provider or None, model or None)
+    # free_only arrives as a definite "true"/"false" string (a hidden input paired with the
+    # checkbox, chat_panel.html) rather than a plain checkbox field, so an unchecked switch still
+    # submits something explicit instead of being silently omitted the way a bare checkbox would
+    # be -- that omission is indistinguishable from "this call site doesn't know about the switch
+    # at all" (None), which append_pending_chat_message treats as "leave it as it was".
+    resolved_free_only = None if free_only is None else free_only == "true"
+    logger.debug("api: chat session_id=%s message_len=%d provider=%r model=%r free_only=%r", session_id, len(message), provider, model, resolved_free_only)
+    session, started = append_pending_chat_message(session_id, message, provider or None, model or None, resolved_free_only)
     if started:
         background_tasks.add_task(run_chat_turn_background, session_id)
     else:
@@ -5938,6 +5973,87 @@ def get_recent_projects_fragment(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request, "partials/recent_projects_fragment.html", {"recent_sessions": _load_all_sessions()[:5]})
 
 
+def _model_free_flags(provider_id: str, model_ids: list[str]) -> dict[str, bool]:
+    """model_id -> is-this-free, for whichever of model_ids this provider actually has a real
+    price signal for -- feeds the "Free models only" filter (agent/settings.py's
+    get_free_models_only/set_free_models_only) via templates/partials/model_options.html's own
+    `data-free` attribute. A model with NO entry here is neither included nor excluded by that
+    filter (unknown stays visible) -- this function only ever returns what it's actually confident
+    about, never guesses.
+
+    opencode-local gets its free flag from its own live server (first-party, real-time --
+    agent/opencode_local_provider.py's list_opencode_local_models), every other provider from the
+    models.dev catalog (agent/providers/models_dev.py's is_model_free, same known-stale-entries
+    caveat its own docstring documents). Codex/Copilot and a provider with no catalog id at all
+    (a custom instance) return {} -- there's no price signal to read for either.
+    """
+    if not model_ids:
+        # Real, confirmed incident this guard fixes: called unconditionally for every provider in
+        # _fallback_chain_context's own provider_model_free_flags comprehension, including every
+        # DEFERRED one (opencode-local, LM Studio/Ollama, Copilot, custom) with an empty model
+        # list -- without this, the opencode-local branch below still spawned a real `opencode
+        # serve` subprocess on every single /settings page load, exactly the "eager probe" cost
+        # the whole eager/deferred split (_requires_live_probe) exists to avoid.
+        return {}
+
+    if provider_id == OPENCODE_LOCAL_PROVIDER_ID:
+        from agent.opencode_local_provider import list_opencode_local_models
+        info = list_opencode_local_models()
+        return {model_id: info[model_id]["free"] for model_id in model_ids if model_id in info}
+
+    config = PROVIDER_REGISTRY.get(provider_id)
+    catalog_id = config.models_dev_id if config else None
+    if not catalog_id:
+        return {}
+    flags = {}
+    for model_id in model_ids:
+        free = is_model_free(catalog_id, model_id)
+        if free is not None:
+            flags[model_id] = free
+    return flags
+
+
+MISTRAL_FREE_FILTER_REASON = "Mistral has no free tier here -- explicitly always disabled"
+
+# Providers whose "Free models only" switch is forced disabled everywhere it appears, regardless
+# of what the per-model free/paid data says -- an explicit operator directive, not a derived rule.
+# Mistral's own live catalog does carry one or two ambiguous "free"/unpriced entries (a preview
+# model, a couple of models models.dev has no cost data for at all), so the data-driven rule below
+# would NOT fully disable it on its own -- confirmed, explained to the operator, and explicitly
+# overridden anyway: Mistral is to read as gray/unavailable everywhere, no exceptions, full stop.
+_FORCE_DISABLED_FREE_FILTER_PROVIDERS = {"mistral": MISTRAL_FREE_FILTER_REASON}
+
+
+def _free_filter_reason(
+    model_ids: list[str], free_flags: dict[str, bool], provider_id: str | None = None
+) -> str | None:
+    """Why the "Free models only" switch is disabled for this model list, or None when it's left
+    enabled. Checked everywhere this switch appears -- the main picker, every Reserve chain row,
+    every subagent row, secondary verification, chat, library -- so the rule never drifts between
+    pickers (static/js/free_models_filter.js's own asraFreeFilterReasonFor mirrors this exactly,
+    including the Mistral override, for the pickers that only ever recompute this client-side).
+
+    Two independent reasons disable it:
+    1. An explicit per-provider override (_FORCE_DISABLED_FREE_FILTER_PROVIDERS) -- checked first,
+       regardless of what the data below says.
+    2. The one data-driven outcome that's actually harmful -- turning the switch on would hide
+       EVERY option, leaving an empty, unusable dropdown (every model confirmed paid, none free or
+       unpriced). Deliberately does NOT disable just because the switch would be a no-op (every
+       model already free -- opencode-local's own free tier today; or no price data at all) -- a
+       no-op is harmless and still honest to leave clickable, real, confirmed operator complaint an
+       earlier version of this got wrong: it also disabled on "all free", which read as "something's
+       broken/restricted" for opencode-local when every one of its models genuinely was selectable.
+    """
+    if provider_id in _FORCE_DISABLED_FREE_FILTER_PROVIDERS:
+        return _FORCE_DISABLED_FREE_FILTER_PROVIDERS[provider_id]
+    if not model_ids:
+        return None
+    paid_count = sum(1 for m in model_ids if free_flags.get(m) is False)
+    if paid_count == len(model_ids):
+        return "none of these models is free here"
+    return None
+
+
 def _llm_settings_context() -> dict:
     saved = load_llm_settings()
     current_provider = saved.get("provider") or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
@@ -5961,12 +6077,19 @@ def _llm_settings_context() -> dict:
         current_model = (
             saved.get("model") if saved.get("provider") == current_provider else None
         ) or COPILOT_DEFAULT_MODEL
+    elif current_provider == OPENCODE_LOCAL_PROVIDER_ID:
+        from agent.opencode_local_provider import OPENCODE_LOCAL_DEFAULT_MODEL
+        current_model = (
+            saved.get("model") if saved.get("provider") == current_provider else None
+        ) or OPENCODE_LOCAL_DEFAULT_MODEL
     else:
         config = PROVIDER_REGISTRY[current_provider]
         current_model = (
             saved.get("model") if saved.get("provider") == current_provider else None
         ) or os.getenv(config.model_env) or config.model_default
 
+    provider_models = get_model_choices(current_provider) or ([current_model] if current_model else [])
+    current_free_flags = _model_free_flags(current_provider, provider_models)
     provider_key_status = {pid: bool(get_provider_api_key(cfg)) for pid, cfg in PROVIDER_REGISTRY.items()}
     provider_base_url_value = {pid: os.getenv(cfg.base_url_env) or "" for pid, cfg in PROVIDER_REGISTRY.items()}
     added = get_added_providers()
@@ -5990,7 +6113,7 @@ def _llm_settings_context() -> dict:
     return {
         "current_provider": current_provider,
         "current_model": current_model,
-        "provider_models": get_model_choices(current_provider) or ([current_model] if current_model else []),
+        "provider_models": provider_models,
         # Per-request, not a startup global like provider_is_local/provider_key_required — an
         # operator can Save/Clear a key or endpoint from this same screen, and .env can change
         # underneath a long-running process, so these have to be read fresh on every render.
@@ -6017,10 +6140,20 @@ def _llm_settings_context() -> dict:
             pid for pid in PROVIDER_REGISTRY
             if not PROVIDER_REGISTRY[pid].is_local and provider_added[pid] and (is_provider_enabled(pid) or pid == current_provider)
         ],
-        "added_local_provider_ids": [
-            pid for pid in PROVIDER_REGISTRY
-            if PROVIDER_REGISTRY[pid].is_local and provider_added[pid] and (is_provider_enabled(pid) or pid == current_provider)
-        ],
+        # opencode-local isn't a PROVIDER_REGISTRY row, but it's gated by the exact same "actually
+        # added, and not disabled" rule as every registry local below it -- real, confirmed operator
+        # complaint this fixes: it used to show up here (and in the "+ Add Provider" flow didn't
+        # even exist to explicitly add it from) unconditionally, which read as "where did this come
+        # from, I never added it" and was genuinely inconsistent with every other provider's own
+        # explicit opt-in. current_provider is exempted the same way every other provider's own
+        # active choice is, so it can never filter itself out of its own dropdown.
+        "added_local_provider_ids": (
+            ([OPENCODE_LOCAL_PROVIDER_ID] if (OPENCODE_LOCAL_PROVIDER_ID in added or current_provider == OPENCODE_LOCAL_PROVIDER_ID) and (is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID) or current_provider == OPENCODE_LOCAL_PROVIDER_ID) else [])
+            + [
+                pid for pid in PROVIDER_REGISTRY
+                if PROVIDER_REGISTRY[pid].is_local and provider_added[pid] and (is_provider_enabled(pid) or pid == current_provider)
+            ]
+        ),
         # Settings -> Providers row toggle (agent/settings.py's set_provider_enabled) -- read fresh
         # per-request like provider_key_status above, not a startup global, since the operator can
         # flip it from this same screen.
@@ -6030,6 +6163,45 @@ def _llm_settings_context() -> dict:
         # truth agent/llm_client.py's all_provider_choices() already is for every other
         # provider-picking dropdown in this app (Reserve providers rows, a subagent's own picker).
         "all_provider_choices": all_provider_choices(),
+        # Settings -> "Free models only" switch, next to the Model picker it filters -- read fresh
+        # per-request like provider_enabled above, since the operator can flip it from this same
+        # screen. The filter itself runs client-side (static/js/free_models_filter.js) off each
+        # <option>'s own data-free attribute (model_free_flags below, via model_options.html) --
+        # this flag only controls whether that filter is ACTIVE, not what data it has to work with.
+        "free_models_only": get_free_models_only(),
+        "model_free_flags": current_free_flags,
+        # Why the switch can't do anything useful right now (no price data / none free / all
+        # free), or None when it genuinely can -- the toggle itself disables and explains instead
+        # of looking broken (same rule this project's own sibling dashboard app already uses, see
+        # _free_filter_reason's own docstring). Computed here only for this INITIAL render, before
+        # any provider switch -- static/js (inline script just below the toggle, settings.html)
+        # recomputes the same thing client-side from #model-select's own live data-free attributes
+        # whenever the provider changes, since a server round trip would miss CLAUDE.md's own
+        # "live visual feedback"/"tab switching must be instant" bar.
+        "free_filter_reason": _free_filter_reason(provider_models, current_free_flags, current_provider),
+        # Settings -> Providers' own dedicated opencode-local card (same "doesn't fit the generic
+        # API-key provider_row() macro" treatment as the ChatGPT/Copilot sign-in cards right below
+        # it -- see their own comment). A plain PATH scan, not a network/subprocess call, so this
+        # is cheap enough to run on every Settings render, same cost class as an env var read.
+        "opencode_cli_found": shutil.which("opencode") is not None,
+        "opencode_local_provider_id": OPENCODE_LOCAL_PROVIDER_ID,
+        "opencode_local_display_name": OPENCODE_LOCAL_DISPLAY_NAME,
+        "opencode_local_enabled": is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID),
+        # Deliberately NOT exempting current_provider here, unlike added_local_provider_ids above --
+        # real, confirmed operator complaint this fixes: clicking this card's own Remove (a plain,
+        # explicit, confirmed action) genuinely did un-add opencode-local every single time (the
+        # debug log showed it: "llm_settings: provider=opencode-local removed", three separate
+        # clicks, three separate successes) -- but the card kept reappearing anyway because
+        # opencode-local was STILL the saved AI Provider & Model choice (the dropdown's own
+        # selection had been changed client-side, but never actually saved -- that needs its own
+        # explicit Save click, same as every other provider), so this flag kept re-evaluating true
+        # off the SAME exemption added_local_provider_ids needs for a different reason. Remove is a
+        # deliberate, explicit action; it should make the card go away, full stop -- the main
+        # picker's own dropdown still shows opencode-local selected either way (it has its own,
+        # unrelated exemption right above, which it still needs so the dropdown never filters its
+        # own current value out of itself) and keeps working exactly as before. Re-adding it is one
+        # click away in + Add Provider whenever it's wanted back.
+        "opencode_local_added": OPENCODE_LOCAL_PROVIDER_ID in added,
     }
 
 
@@ -6063,13 +6235,18 @@ def _secondary_verification_context() -> dict:
     if current_provider and current_provider not in {pid for pid, _ in choices}:
         all_names = dict(all_provider_choices())
         choices = [*choices, (current_provider, all_names.get(current_provider, current_provider))]
+    model_choices = (
+        get_model_choices(current_provider) or ([current_model] if current_model else [])
+    ) if current_provider else []
     return {
         "secondary_verification_provider": current_provider,
         "secondary_verification_model": current_model,
         "secondary_verification_provider_choices": choices,
-        "secondary_verification_model_choices": (
-            get_model_choices(current_provider) or ([current_model] if current_model else [])
-        ) if current_provider else [],
+        "secondary_verification_model_choices": model_choices,
+        "secondary_verification_model_free_flags": _model_free_flags(current_provider, model_choices) if current_provider else {},
+        # This switch's own last-persisted position -- same "a toggle remembers its own position"
+        # rule every switch in the app follows now.
+        "secondary_verification_free_only": (current or {}).get("free_only", False),
     }
 
 
@@ -6271,7 +6448,12 @@ def _fallback_chain_context(*, error: str | None = None) -> dict:
     # "what's loaded right now" question anyway, not merely a fallback.
 
     def _requires_live_probe(pid: str) -> bool:
-        if is_custom_provider_id(pid) or pid == COPILOT_PROVIDER_ID:
+        # opencode-local's own "live probe" spawns a whole subprocess (agent/opencode_local_provider
+        # .py) -- far heavier than LM Studio/Ollama's plain HTTP probe, so it belongs here even more
+        # than they do; eagerly probing it on every Settings load would start `opencode serve`
+        # unconditionally, the exact per-page-load cost this function's own comment above exists to
+        # avoid.
+        if is_custom_provider_id(pid) or pid in (COPILOT_PROVIDER_ID, OPENCODE_LOCAL_PROVIDER_ID):
             return True
         config = PROVIDER_REGISTRY.get(pid)
         return bool(config and config.is_local)
@@ -6281,6 +6463,11 @@ def _fallback_chain_context(*, error: str | None = None) -> dict:
     with ThreadPoolExecutor(max_workers=max(len(eager_ids), 1)) as executor:
         eager_choices = dict(zip(eager_ids, executor.map(get_model_choices, eager_ids)))
     provider_model_choices = {pid: (eager_choices.get(pid) or []) for pid in provider_ids}
+    # Separate from provider_model_choices on purpose -- that dict's own shape (plain model-id
+    # strings) is load-bearing for the "model not in choices" freshness check and the Jinja row
+    # loop below; a parallel {provider_id: {model_id: is_free}} map lets the "Free models only"
+    # filter (static/js/free_models_filter.js) reach these rows too without risking either.
+    provider_model_free_flags = {pid: _model_free_flags(pid, choices) for pid, choices in provider_model_choices.items()}
     rows = []
     for entry in raw_chain:
         provider_id, model = entry.get("provider"), entry.get("model")
@@ -6292,13 +6479,14 @@ def _fallback_chain_context(*, error: str | None = None) -> dict:
             # up as this row's own selected option -- otherwise the saved choice would silently
             # vanish from the dropdown the moment its turn came up here, with nothing to explain why.
             choices = [model, *choices]
-        rows.append({"provider": provider_id, "model": model, "model_choices": choices})
+        rows.append({"provider": provider_id, "model": model, "model_choices": choices, "free_only": bool(entry.get("free_only"))})
     return {
         "fallback_chain_enabled": bool(saved.get("fallback_chain_enabled")),
         "fallback_chain_rows": rows,
         "fallback_chain_error": error,
         "fallback_chain_provider_ids": dropdown_provider_ids,
         "fallback_chain_provider_model_choices": provider_model_choices,
+        "fallback_chain_provider_model_free_flags": provider_model_free_flags,
         "fallback_chain_provider_names": dict(all_provider_choices()),
         "fallback_chain_deferred_provider_ids": sorted(deferred_ids),
     }
@@ -6340,14 +6528,16 @@ def _render_model_options(request: Request, provider: str, preferred_model: str 
         current_model = preferred_model or custom.get("model") or ""
         models = get_model_choices(provider) or ([current_model] if current_model else [])
         return templates.TemplateResponse(
-            request, "partials/model_options.html", {"provider_models": models, "current_model": current_model}
+            request, "partials/model_options.html",
+            {"provider_models": models, "current_model": current_model, "model_free_flags": _model_free_flags(provider, models)},
         )
 
     if provider == CODEX_PROVIDER_ID:
         saved = load_llm_settings()
         current_model = preferred_model or (saved.get("model") if saved.get("provider") == provider else None) or CODEX_DEFAULT_MODEL
         return templates.TemplateResponse(
-            request, "partials/model_options.html", {"provider_models": list(CODEX_MODELS.keys()), "current_model": current_model}
+            request, "partials/model_options.html",
+            {"provider_models": list(CODEX_MODELS.keys()), "current_model": current_model, "model_free_flags": {}},
         )
 
     if provider == COPILOT_PROVIDER_ID:
@@ -6356,7 +6546,21 @@ def _render_model_options(request: Request, provider: str, preferred_model: str 
         current_model = preferred_model or (saved.get("model") if saved.get("provider") == provider else None) or COPILOT_DEFAULT_MODEL
         models = get_model_choices(provider) or list(COPILOT_MODELS.keys())
         return templates.TemplateResponse(
-            request, "partials/model_options.html", {"provider_models": models, "current_model": current_model}
+            request, "partials/model_options.html",
+            {"provider_models": models, "current_model": current_model, "model_free_flags": _model_free_flags(provider, models)},
+        )
+
+    if provider == OPENCODE_LOCAL_PROVIDER_ID:
+        from agent.opencode_local_provider import OPENCODE_LOCAL_DEFAULT_MODEL
+        saved = load_llm_settings()
+        current_model = preferred_model or (saved.get("model") if saved.get("provider") == provider else None) or OPENCODE_LOCAL_DEFAULT_MODEL
+        # get_model_choices spawns/reuses the shared local server (agent/opencode_local_provider.py)
+        # -- empty (not an error) if the opencode CLI isn't installed on this machine, same "no
+        # models yet" contract LM Studio/Ollama's own live discovery already follows.
+        models = get_model_choices(provider) or [current_model]
+        return templates.TemplateResponse(
+            request, "partials/model_options.html",
+            {"provider_models": models, "current_model": current_model, "model_free_flags": _model_free_flags(provider, models)},
         )
 
     config = PROVIDER_REGISTRY.get(provider)
@@ -6368,7 +6572,8 @@ def _render_model_options(request: Request, provider: str, preferred_model: str 
     ) or os.getenv(config.model_env) or config.model_default
     models = get_model_choices(provider) or [current_model]
     return templates.TemplateResponse(
-        request, "partials/model_options.html", {"provider_models": models, "current_model": current_model}
+        request, "partials/model_options.html",
+        {"provider_models": models, "current_model": current_model, "model_free_flags": _model_free_flags(provider, models)},
     )
 
 
@@ -6425,16 +6630,35 @@ def save_llm(request: Request, provider: str = Form(""), model: str = Form("")) 
     return RedirectResponse(url="/settings", status_code=303)
 
 
+@app.post("/api/settings/free-models-only")
+def save_free_models_only(enabled: str | None = Form(None)) -> Response:
+    """Settings -> "Free models only" switch, next to the main AI Provider & Model picker
+    (agent/settings.py's set_free_models_only) -- same checked/unchecked-via-Form(None) convention
+    as save_toolkit_agent_setting_route above. The visible effect (hiding paid-flagged <option>s
+    across every model picker on the page) is pure client-side, applied instantly on the same
+    change event (static/js/free_models_filter.js, window.asraApplyFreeModelsOnly) -- this route
+    only persists the choice so it survives a reload, the exact "flips on screen at once; the save
+    follows" split this project's own live-visual-feedback rule asks for. 204, no body: nothing on
+    the page needs to re-render from the response.
+    """
+    set_free_models_only(bool(enabled))
+    logger.debug("api: free_models_only=%s", bool(enabled))
+    return Response(status_code=204)
+
+
 @app.post("/api/settings/secondary-verification")
-def save_secondary_verification(provider: str = Form(""), model: str = Form("")) -> Response:
+def save_secondary_verification(provider: str = Form(""), model: str = Form(""), free_only: str = Form("")) -> Response:
     """Settings -> Secondary verification provider -- a single static provider+model pair (never
     the multi-row Reserve providers UI), agent/settings.py's save_secondary_verification_provider.
     Both fields blank clears it (feature off) -- no validation error path needed the way the main
     AI Provider & Model picker has one, since an unset value is a perfectly normal, supported
-    state here, not a mistake to reject."""
+    state here, not a mistake to reject. free_only is this picker's own "Free models only" switch
+    -- a plain checkbox is fine here (unlike chat/library/fallback-chain's own hidden-paired
+    version) since this whole form is a single, always-submitted-together unit with no positional
+    pairing to a list of rows to worry about."""
     clean_provider, clean_model = provider.strip(), model.strip()
-    save_secondary_verification_provider(clean_provider or None, clean_model or None)
-    logger.debug("api: secondary verification provider saved provider=%r model=%r", clean_provider, clean_model)
+    save_secondary_verification_provider(clean_provider or None, clean_model or None, free_only == "on")
+    logger.debug("api: secondary verification provider saved provider=%r model=%r free_only=%s", clean_provider, clean_model, free_only == "on")
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -6444,25 +6668,30 @@ def save_fallback_chain(
     enabled: str = Form(""),
     chain_provider: list[str] = Form([]),
     chain_model: list[str] = Form([]),
+    chain_free_only: list[str] = Form([]),
 ) -> Response:
     """Settings -> Reserve providers -- an opt-in, off-by-default ordered LLM fallback chain built
     from real (provider, model) dropdown rows, not free text (agent/llm_client.py's
     get_next_chain_step docstring has the full incident writeup for why this replaced the old
-    always-on automatic cross-provider fallback). chain_provider/chain_model arrive as same-length,
-    position-paired lists -- one pair per row, in the DOM order the operator arranged them in
-    (browsers serialize a form's repeated-name fields in document order), exactly the order the
-    chain is walked in later.
+    always-on automatic cross-provider fallback). chain_provider/chain_model/chain_free_only arrive
+    as same-length, position-paired lists -- one triple per row, in the DOM order the operator
+    arranged them in (browsers serialize a form's repeated-name fields in document order), exactly
+    the order the chain is walked in later. chain_free_only is each row's own "Free models only"
+    switch -- a definite "true"/"false" string per row (a hidden input paired with the checkbox,
+    settings.html), not a plain checkbox, so it never goes missing/misaligned the way an unchecked
+    bare checkbox would (omitted from the submission entirely, silently shifting every later row's
+    position out from under chain_provider/chain_model's own same-length lists).
     """
     chain: list[dict] = []
     unknown_providers: set[str] = set()
-    for provider_id, model in zip(chain_provider, chain_model):
+    for provider_id, model, free_only in itertools.zip_longest(chain_provider, chain_model, chain_free_only, fillvalue="false"):
         provider_id, model = provider_id.strip(), model.strip()
         if not provider_id or not model:
             continue
         if not is_known_provider_id(provider_id):
             unknown_providers.add(provider_id)
             continue
-        chain.append({"provider": provider_id, "model": model})
+        chain.append({"provider": provider_id, "model": model, "free_only": free_only == "true"})
 
     if unknown_providers:
         # Only reachable via a hand-crafted request -- the real <select> only ever offers a known
@@ -6557,6 +6786,29 @@ def add_custom_provider_route(
             save_provider_base_url(type, base_url.strip())
         add_provider_to_list(type)
         logger.debug("api: built-in provider activated id=%s", type)
+        return RedirectResponse(url="/settings", status_code=303)
+
+    if type == OPENCODE_LOCAL_PROVIDER_ID:
+        # Same real dependency check as the Type dropdown's own disabled-option hint (settings.html)
+        # -- re-checked here, never trusted from the client alone (a disabled <option> can still be
+        # submitted by hand). No key/base_url to save for this one, just the same add_provider_to_list
+        # activation every other built-in gets.
+        if shutil.which("opencode") is None:
+            return templates.TemplateResponse(
+                request,
+                "settings.html",
+                {
+                    "error": "The opencode CLI isn't installed on this machine yet — install it from the Tools tab's \"Dependencies\" row (or run setup_tools.sh), then add this provider again.",
+                    "wordlist_error": None,
+                    **_llm_settings_context(),
+                    **_wordlist_settings_context(),
+                    **_fallback_chain_context(),
+                    **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                },
+                status_code=400,
+            )
+        add_provider_to_list(OPENCODE_LOCAL_PROVIDER_ID)
+        logger.debug("api: opencode-local provider activated")
         return RedirectResponse(url="/settings", status_code=303)
 
     clean_name = name.strip()
@@ -6724,6 +6976,49 @@ def test_codex_session(request: Request) -> HTMLResponse:
     except RuntimeError as exc:
         ok, message = False, str(exc)
     logger.debug("api: codex session test ok=%s", ok)
+    return templates.TemplateResponse(request, "partials/api_key_test_result.html", {"ok": ok, "message": message})
+
+
+@app.post("/api/settings/providers/opencode-local/test", response_class=HTMLResponse)
+def test_opencode_local(request: Request) -> HTMLResponse:
+    """Settings -> Providers' opencode-local card -> Test. A real dependency check, not just "is
+    the CLI on PATH" -- list_opencode_local_models() actually spawns/reuses the shared local
+    `opencode serve` process and asks it for its real model list (agent/opencode_local_provider.py),
+    the same thing a real completion call would need to succeed first. Costs no tokens (opencode's
+    own free models answer with no key/sign-in needed), same "no spend" spirit as the Codex test
+    right above, just verified a different way since there's no OAuth session to refresh here.
+    """
+    from agent.opencode_local_provider import list_opencode_local_models
+
+    models = list_opencode_local_models()
+    # "available" specifically -- the server's own LIVE list (_live_opencode_models inside that
+    # function), not the much bigger models.dev catalog fill-in merged alongside it. The catalog
+    # entry for "opencode" exists regardless of whether this machine's own server is reachable at
+    # all, so counting it here would report "ok" even with the CLI missing or the server down.
+    live_models = {model_id: info for model_id, info in models.items() if info.get("available")}
+    if live_models:
+        free_count = sum(1 for info in live_models.values() if info.get("free"))
+        total_count = len(models)
+        locked_count = total_count - len(live_models)
+        # Deliberately spells out the gap between "answers for free, right now, no sign-in" (this
+        # count) and "listed in the Model dropdown" (the bigger, catalog-filled-in total) -- real,
+        # confirmed operator confusion this fixes: an earlier version of this message just said
+        # "N model(s) available", which read as "that's the entire list" right next to a Model
+        # dropdown that, correctly, shows many more (every other one opencode could run after
+        # `opencode auth login`, agent/opencode_local_provider.py's own catalog fill-in).
+        if locked_count:
+            ok, message = True, (
+                f"Local opencode server reachable — {free_count} free, no-sign-in model(s) answer right now. "
+                f"The Model dropdown above additionally lists {locked_count} more opencode itself supports "
+                f"(sign in with `opencode auth login` on this machine to unlock them)."
+            )
+        else:
+            ok, message = True, f"Local opencode server reachable — {len(live_models)} model(s) available right now ({free_count} free)."
+    elif shutil.which("opencode") is None:
+        ok, message = False, "opencode CLI not found on PATH. Install it from the Tools tab, or run setup_tools.sh."
+    else:
+        ok, message = False, "opencode CLI found, but the local server didn't return any models — check the app's own debug log for details."
+    logger.debug("api: opencode-local test ok=%s live_models=%d total_models=%d", ok, len(live_models), len(models))
     return templates.TemplateResponse(request, "partials/api_key_test_result.html", {"ok": ok, "message": message})
 
 
@@ -6910,11 +7205,13 @@ def save_sound_event_route(event_id: str, enabled: str | None = Form(None), soun
 
 @app.post("/api/settings/providers/{provider_id}/toggle")
 def toggle_builtin_provider_route(provider_id: str) -> Response:
-    """Settings -> Providers row toggle for a built-in (PROVIDER_REGISTRY) provider -- same idea as
-    toggle_custom_provider_route above, for the 8 fixed providers instead of an operator-added
-    instance. Does not touch the saved key/endpoint, only whether this provider is offered in the
-    Reserve providers chain and subagent pickers (agent.llm_client.all_provider_choices)."""
-    if provider_id not in PROVIDER_REGISTRY:
+    """Settings -> Providers row toggle for a built-in (PROVIDER_REGISTRY) provider, OR for
+    opencode-local (same idea as toggle_custom_provider_route above, for the fixed providers
+    instead of an operator-added instance -- opencode-local rides along here too since it's the
+    one other provider is_provider_enabled already works on generically, see its own card in
+    settings.html). Does not touch any saved key/endpoint, only whether this provider is offered
+    in the Reserve providers chain and subagent pickers (agent.llm_client.all_provider_choices)."""
+    if provider_id not in PROVIDER_REGISTRY and provider_id != OPENCODE_LOCAL_PROVIDER_ID:
         raise HTTPException(status_code=400, detail="Unknown provider")
     new_state = not is_provider_enabled(provider_id)
     set_provider_enabled(provider_id, new_state)
@@ -6933,10 +7230,13 @@ def remove_builtin_provider_route(provider_id: str) -> Response:
     from the Providers list again until explicitly added a second time -- a full, honest reset, not
     a half-clear that would leave a still-visible row with nothing real behind it.
     """
-    if provider_id not in PROVIDER_REGISTRY:
+    if provider_id not in PROVIDER_REGISTRY and provider_id != OPENCODE_LOCAL_PROVIDER_ID:
         raise HTTPException(status_code=400, detail="Unknown provider")
-    clear_provider_api_key(provider_id)
-    clear_provider_base_url(provider_id)
+    # opencode-local has no saved key/base_url to clear (see its own module docstring) -- un-adding
+    # it is the whole action, same as a keyless registry provider with nothing else customized.
+    if provider_id in PROVIDER_REGISTRY:
+        clear_provider_api_key(provider_id)
+        clear_provider_base_url(provider_id)
     remove_provider_from_list(provider_id)
     logger.debug("api: built-in provider removed id=%s", provider_id)
     return RedirectResponse(url="/settings", status_code=303)
@@ -7091,9 +7391,21 @@ def _provider_picker_context() -> dict:
     # unlike a PROVIDER_REGISTRY built-in, a custom entry has no separate "key required" concept to
     # check: the operator already supplied whatever key/base_url it needs at creation time.
     custom_providers = [p for p in load_custom_providers() if p.get("enabled", True)]
+    # opencode-local isn't a PROVIDER_REGISTRY row (see agent/opencode_local_provider.py), so it
+    # can't go through configured_provider_ids' own reachable-probe comprehension above -- that
+    # probe is a quick HTTP call against an ALREADY-RUNNING server (LM Studio/Ollama); opencode-
+    # local's equivalent would mean spawning a whole subprocess just to decide whether to list it
+    # as an option here, the exact per-page-load cost this function's own comments already guard
+    # against for the local providers it already has. shutil.which is the cheap, correct substitute
+    # -- same "is this actually here" signal Codex/Copilot get from is_signed_in(), just checking
+    # PATH instead of a token file.
+    opencode_local_ids = [OPENCODE_LOCAL_PROVIDER_ID] if is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID) and shutil.which("opencode") else []
     return {
         "configured_cloud_provider_ids": [pid for pid in configured_provider_ids if not PROVIDER_REGISTRY[pid].is_local],
-        "configured_local_provider_ids": [pid for pid in configured_provider_ids if PROVIDER_REGISTRY[pid].is_local],
+        "configured_local_provider_ids": [
+            *opencode_local_ids,
+            *[pid for pid in configured_provider_ids if PROVIDER_REGISTRY[pid].is_local],
+        ],
         "custom_providers": custom_providers,
         # Same "only offer what's actually usable right now" rule as configured_provider_ids above
         # -- unlike the main Settings picker (which lists it unconditionally, same as an API-key
@@ -7174,15 +7486,29 @@ def _subagent_context() -> dict:
         # see _tool_domain's own docstring for the browser/re/toolkit/web bucketing itself.
         "tool_domains": {entry["name"]: _tool_domain(entry) for entry in installed_tools},
         **_provider_picker_context(),
-        # Pre-fetched per-profile so each edit dialog's model <select> renders the right options
-        # (and the saved model pre-selected) on first page load, before the provider dropdown's
-        # own hx-get ever fires — same source (get_model_choices) the provider-change swap uses,
-        # so the list never disagrees with what picking that provider live would show.
-        "subagent_model_choices": {
-            profile["id"]: _model_choices_with_fallback(profile["provider"], profile.get("model"))
-            for profile in profiles
-            if profile.get("provider") and is_known_provider_id(profile["provider"])
-        },
+        **_subagent_model_context(profiles),
+    }
+
+
+def _subagent_model_context(profiles: list[dict]) -> dict:
+    """subagent_model_choices/subagent_model_free_flags -- pre-fetched per-profile so each edit
+    dialog's model <select> (and its own independent "Free models only" switch, subagents.html)
+    render the right options, with the right data-free attributes, on first page load, before the
+    provider dropdown's own hx-get ever fires. One get_model_choices() call per profile, not two --
+    _model_free_flags is derived from the SAME already-fetched list, not a second live fetch.
+    """
+    choices_by_profile: dict[str, list[str]] = {}
+    free_flags_by_profile: dict[str, dict[str, bool]] = {}
+    for profile in profiles:
+        provider_id = profile.get("provider")
+        if not provider_id or not is_known_provider_id(provider_id):
+            continue
+        choices = _model_choices_with_fallback(provider_id, profile.get("model"))
+        choices_by_profile[profile["id"]] = choices
+        free_flags_by_profile[profile["id"]] = _model_free_flags(provider_id, choices)
+    return {
+        "subagent_model_choices": choices_by_profile,
+        "subagent_model_free_flags": free_flags_by_profile,
     }
 
 
@@ -7541,6 +7867,12 @@ def get_playbook(request: Request) -> HTMLResponse:
         "library_last_provider": library_last_provider,
         "library_last_model": library_last_model,
         "library_last_model_choices": library_last_model_choices,
+        # This switch's own last-persisted position (library_store.py's last_free_only) -- same "a
+        # toggle remembers its own position" rule every switch in the app follows now.
+        "library_free_only": library_settings["last_free_only"],
+        # This picker's own independent "Free models only" switch (playbook.html) needs data-free
+        # on its initial render too, same reasoning as subagent_model_free_flags/chat_model_free_flags.
+        "library_last_model_free_flags": _model_free_flags(library_last_provider, library_last_model_choices) if library_last_provider else {},
         # provider/model picker context (configured_cloud_provider_ids/configured_local_provider_ids/
         # custom_providers/...) for the library panel's own analyze form -- same helper the chat panel
         # and subagent profile picker already share, see its own docstring.
@@ -7710,13 +8042,18 @@ def library_estimate(source_id: str, provider: str = "", model: str = "") -> HTM
 
 
 @app.post("/api/library/{source_id}/analyze", response_class=HTMLResponse)
-async def library_analyze(request: Request, source_id: str, provider: str = Form(""), model: str = Form("")) -> HTMLResponse:
+async def library_analyze(
+    request: Request, source_id: str, provider: str = Form(""), model: str = Form(""), free_only: str = Form("false"),
+) -> HTMLResponse:
     """async def (not sync) is load-bearing here, not stylistic -- library_store.start_analysis
     calls asyncio.create_task, which needs a running event loop. A sync route handler runs in
     Starlette's own worker thread pool with no loop of its own to attach to; an async handler runs
     directly on the main event loop instead, exactly where the fire-and-forget analysis task needs
-    to be created so it keeps running after this request already returned its response."""
-    refusal = library_store.start_analysis(source_id, provider, model)
+    to be created so it keeps running after this request already returned its response.
+
+    free_only arrives as a definite "true"/"false" string (a hidden input paired with the
+    checkbox, playbook.html), same reasoning as chat_turn's own identically-named param."""
+    refusal = library_store.start_analysis(source_id, provider, model, free_only == "true")
     logger.debug("api: library analyze source=%s provider=%s model=%s refusal=%r", source_id, provider, model, refusal)
     message = f"Couldn't start analysis: {refusal}." if refusal else ""
     return HTMLResponse(_render_library_sources(request, message))
@@ -7989,6 +8326,7 @@ def create_subagent_route(
     model: str = Form(""),
     icon: str = Form(""),
     icon_color: str = Form(""),
+    free_only: str = Form(""),
 ) -> Response:
     if not name.strip():
         return templates.TemplateResponse(
@@ -8003,7 +8341,7 @@ def create_subagent_route(
     resolved_icon_color = icon_color if _color_chosen else subagent_icons.random_color()
     add_profile(
         name.strip(), allowed_tools, instructions.strip(), provider.strip() or None, model.strip() or None,
-        icon=resolved_icon, icon_color=resolved_icon_color,
+        icon=resolved_icon, icon_color=resolved_icon_color, free_only=free_only == "on",
     )
     logger.debug("api: subagent profile created name=%r tools=%d icon=%s", name, len(allowed_tools), resolved_icon)
     return RedirectResponse(url="/subagents", status_code=303)
@@ -8072,6 +8410,7 @@ def update_subagent_route(
     model: str = Form(""),
     icon: str = Form(""),
     icon_color: str = Form(""),
+    free_only: str = Form(""),
 ) -> Response:
     if not name.strip():
         return templates.TemplateResponse(
@@ -8084,7 +8423,7 @@ def update_subagent_route(
         update_profile(
             profile_id, name=name.strip(), allowed_tools=allowed_tools, instructions=instructions.strip(),
             provider=provider.strip() or None, model=model.strip() or None,
-            icon=resolved_icon, icon_color=resolved_icon_color,
+            icon=resolved_icon, icon_color=resolved_icon_color, free_only=free_only == "on",
         )
     except ValueError:
         raise HTTPException(status_code=404, detail="Unknown subagent profile")

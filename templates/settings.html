@@ -383,7 +383,7 @@
           </label>
           <label class="flex-1 min-w-0 block">
             <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model</span>
-            <select id="model-select" name="model"
+            <select id="model-select" name="model" data-asra-model-select data-asra-provider-select="provider-select"
                     onchange="var r=document.getElementById('llm-test-result'); if(r) r.textContent='';"
                     class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
               {% include "partials/model_options.html" %}
@@ -393,6 +393,71 @@
           <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form" hx-target="#llm-test-result" hx-swap="innerHTML" hx-disabled-elt="this"
                   class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm shrink-0">Test</button>
         </form>
+        {# disabled + the hint text are set server-side for this INITIAL render only (avoids a
+           flash of "enabled, no explanation" before JS corrects it) -- static/js inline block
+           right below recomputes both live, client-side, the instant the provider/model changes,
+           from #model-select's own data-free attributes, same "no network round trip just to
+           reflect a state the DOM already has" reasoning as free_models_filter.js itself. A
+           provider with nothing free (Mistral, confirmed live: no free tier at all) or nothing
+           priced must disable this -- turning it on would otherwise hide every option and leave
+           an empty, unusable dropdown; a provider where everything already is free (opencode-local
+           today) disables it the other way, because there's nothing left for it to hide. #}
+        <label class="inline-flex items-center gap-2 mt-3 text-[11px] text-secondary {{ 'cursor-pointer' if not free_filter_reason else 'cursor-not-allowed opacity-60' }}">
+          {{ toggle_switch("enabled", checked=(free_models_only and not free_filter_reason), id="free-models-only-toggle", disabled=(free_filter_reason is not none),
+                            onchange="window.asraApplyFreeModelsOnly(this.checked);",
+                            extra_attrs='hx-post="/api/settings/free-models-only" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+          <span class="shrink-0">Free models only</span>
+          <span class="text-tertiary" id="free-models-only-hint">{{ free_filter_reason or "(hides models a provider reports as paid, wherever a price is known)" }}</span>
+        </label>
+        <script>
+          (function () {
+            var toggle = document.getElementById("free-models-only-toggle");
+            var hint = document.getElementById("free-models-only-hint");
+            var label = toggle ? toggle.closest("label") : null;
+            var modelSelect = document.getElementById("model-select");
+            if (!toggle || !hint || !label || !modelSelect) return;
+
+            // window.asraFreeFilterReasonFor (static/js/free_models_filter.js) -- shared with
+            // every per-row toggle (Reserve providers chain rows, subagent profile rows) so the
+            // disable rule never drifts between this one global switch and all of those
+            // independent ones. Recomputed here, client-side, so a provider switch (model-select's
+            // own htmx swap) updates the toggle instantly instead of needing a second round trip.
+            var providerSelect = document.getElementById("provider-select");
+            function reasonFor(select) {
+              return window.asraFreeFilterReasonFor(select, providerSelect ? providerSelect.value : null);
+            }
+
+            // Purely a DISPLAY recompute -- never touches window.ASRA_FREE_MODELS_ONLY (the real
+            // saved preference, set once at page load and only ever changed by the operator
+            // actually flipping this switch). Switching provider/model must not silently turn the
+            // real preference off just because it happens not to apply to THIS list -- switching
+            // to a different provider where it DOES apply has to still read as on there. The
+            // checkbox's own checked attribute shows (saved preference AND usable here), same
+            // "freeOnly && filterUsable" split this project's own sibling dashboard app already
+            // uses -- actually hiding options is free_models_filter.js's own job (it reads the
+            // real saved preference directly, with its own independent per-select "never hide
+            // everything" safety net, so this display-only toggle disagreeing with it is fine).
+            function refresh() {
+              var reason = reasonFor(modelSelect);
+              toggle.disabled = !!reason;
+              label.classList.toggle("cursor-not-allowed", !!reason);
+              label.classList.toggle("opacity-60", !!reason);
+              label.classList.toggle("cursor-pointer", !reason);
+              toggle.checked = !reason && !!window.ASRA_FREE_MODELS_ONLY;
+              hint.textContent = reason || "(hides models a provider reports as paid, wherever a price is known)";
+            }
+
+            // document, not document.body -- same defensive reasoning free_models_filter.js's own
+            // fix comment explains (a script running before <body> exists would otherwise throw);
+            // this inline block itself runs late enough in the page that body already exists, but
+            // matching the safe pattern everywhere avoids relying on where in the page this
+            // happens to sit staying true forever.
+            document.addEventListener("htmx:afterSwap", function (event) {
+              if (event.detail && event.detail.target === modelSelect) refresh();
+            });
+            refresh();
+          })();
+        </script>
 
         {# Connects this section to the Providers list below without repeating "is this thing
            actually going to work" logic in two places — same colored-dot vocabulary as the
@@ -509,8 +574,9 @@
                   </select>
                   <select name="chain_model" data-fallback-chain-model
                           class="flex-1 min-w-0 bg-surface border border-default rounded px-2 py-1.5 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+                    {% set row_free_flags = fallback_chain_provider_model_free_flags.get(row.provider, {}) %}
                     {% for m in row.model_choices %}
-                      <option value="{{ m }}" {% if m == row.model %}selected{% endif %}>{{ m }}</option>
+                      <option value="{{ m }}" {% if m == row.model %}selected{% endif %}{% if m in row_free_flags %} data-free="{{ 'true' if row_free_flags[m] else 'false' }}"{% endif %}>{{ m }}</option>
                     {% endfor %}
                   </select>
                   <button type="button" data-move-up title="Move up"
@@ -534,6 +600,26 @@
                   <button type="button" data-remove-row
                           class="text-[11px] text-secondary hover:text-severity-high transition-colors px-2 shrink-0">Remove</button>
                 </div>
+                {# This row's own, independent "Free models only" switch -- real, confirmed
+                   operator complaint this fixes: one GLOBAL switch (the main AI Provider & Model
+                   picker's own) can't express "free-only for THIS reserve step but not that one",
+                   every row needs its own. Persisted as part of this row's own chain entry
+                   (main.py's save_fallback_chain, agent/settings.py's fallback_chain) -- a real,
+                   confirmed operator complaint this fixes too: every toggle in the app must
+                   remember its own position across a reload, not just filter live and reset to
+                   off. The visible checkbox itself carries no `name` (wired in wireRow() below via
+                   static/js/free_models_filter.js's shared asraApplyFreeFilterToSelect/
+                   asraFreeFilterReasonFor primitives, same disable rule the main switch uses) --
+                   the PAIRED HIDDEN input right after it is what actually submits with Save chain,
+                   kept in sync by the same change handler, so an unchecked row still submits a
+                   definite "false" instead of going missing from chain_free_only's own
+                   same-length, position-paired list the way a bare unchecked checkbox would. #}
+                <label class="flex items-center gap-2 mt-1.5 text-[11px] text-secondary cursor-pointer" data-row-free-wrap>
+                  {{ toggle_switch("row_free_only_visible", checked=row.free_only, extra_attrs='data-row-free-toggle') }}
+                  <input type="hidden" name="chain_free_only" value="{{ 'true' if row.free_only else 'false' }}" data-row-free-only-hidden>
+                  <span class="shrink-0">Free models only</span>
+                  <span class="text-tertiary" data-row-free-hint></span>
+                </label>
                 <div data-test-result class="text-[11px] text-secondary empty:hidden mt-1.5"></div>
               </div>
             {% endfor %}
@@ -551,6 +637,11 @@
          by provider id -- a script tag typed application/json, not inline JS, so it's parsed as data
          (JSON.parse), never executed, regardless of what characters a model name happens to contain. #}
       <script type="application/json" id="fallback-chain-provider-models">{{ fallback_chain_provider_model_choices | tojson }}</script>
+      {# {provider_id: {model_id: is_free}} -- feeds the "Free models only" filter
+         (static/js/free_models_filter.js) for chain rows populated client-side from the JSON
+         island above (populateModelSelect). Separate island, same reasoning as the separate
+         provider_model_free_flags context var (main.py's _fallback_chain_context). #}
+      <script type="application/json" id="fallback-chain-provider-model-free-flags">{{ fallback_chain_provider_model_free_flags | tojson }}</script>
 
       {# Secondary verification provider -- ensemble second-opinion check for Skeptical
          Verification (agent/core.py's _run_skeptical_verification, agent/settings.py's
@@ -568,34 +659,75 @@
           silently resolved by picking one. This is an EXTRA LLM pass per Critical/High finding —
           real added cost, opt in deliberately.
         </p>
-        <form method="post" action="/api/settings/secondary-verification" class="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
-          <label class="flex-1 min-w-0 block">
-            <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Provider</span>
-            <select id="secondary-verification-provider-select" name="provider"
-                    hx-get="/api/settings/model-options" hx-target="#secondary-verification-model-select" hx-trigger="change"
-                    class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-              <option value=""{% if not secondary_verification_provider %} selected{% endif %}>(disabled)</option>
-              {% for provider_id, display_name in secondary_verification_provider_choices %}
-                <option value="{{ provider_id }}"{% if provider_id == secondary_verification_provider %} selected{% endif %}>{{ display_name }}</option>
-              {% endfor %}
-            </select>
+        <form method="post" action="/api/settings/secondary-verification">
+          <div class="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
+            <label class="flex-1 min-w-0 block">
+              <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Provider</span>
+              <select id="secondary-verification-provider-select" name="provider"
+                      hx-get="/api/settings/model-options" hx-target="#secondary-verification-model-select" hx-trigger="change"
+                      class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+                <option value=""{% if not secondary_verification_provider %} selected{% endif %}>(disabled)</option>
+                {% for provider_id, display_name in secondary_verification_provider_choices %}
+                  <option value="{{ provider_id }}"{% if provider_id == secondary_verification_provider %} selected{% endif %}>{{ display_name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="flex-1 min-w-0 block">
+              <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model</span>
+              <select id="secondary-verification-model-select" name="model"
+                      class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+                {% for model in secondary_verification_model_choices %}
+                  <option value="{{ model }}"{% if model == secondary_verification_model %} selected{% endif %}{% if model in secondary_verification_model_free_flags %} data-free="{{ 'true' if secondary_verification_model_free_flags[model] else 'false' }}"{% endif %}>{{ model }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            {{ button("Save", variant="primary", type="submit") }}
+            <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form"
+                    hx-vals='{"target_id": "secondary-verification-test-status"}'
+                    hx-target="#secondary-verification-test-status" hx-swap="outerHTML" hx-disabled-elt="this"
+                    class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm shrink-0">Test</button>
+          </div>
+          {# This picker's own, independent "Free models only" switch -- same per-picker treatment
+             as every Reserve chain row and every subagent row (static/js/free_models_filter.js's
+             shared primitives), not the main picker's global one. #}
+          <label class="flex items-center gap-2 mt-2 text-[11px] text-secondary cursor-pointer" id="secondary-verification-free-wrap">
+            {{ toggle_switch("free_only", checked=secondary_verification_free_only, id="secondary-verification-free-toggle") }}
+            <span class="shrink-0">Free models only</span>
+            <span class="text-tertiary" id="secondary-verification-free-hint"></span>
           </label>
-          <label class="flex-1 min-w-0 block">
-            <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model</span>
-            <select id="secondary-verification-model-select" name="model"
-                    class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-              {% for model in secondary_verification_model_choices %}
-                <option value="{{ model }}"{% if model == secondary_verification_model %} selected{% endif %}>{{ model }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          {{ button("Save", variant="primary", type="submit") }}
-          <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form"
-                  hx-vals='{"target_id": "secondary-verification-test-status"}'
-                  hx-target="#secondary-verification-test-status" hx-swap="outerHTML" hx-disabled-elt="this"
-                  class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm shrink-0">Test</button>
         </form>
         <p><span id="secondary-verification-test-status" class="text-[11px] text-secondary break-words"></span></p>
+        <script>
+          (function () {
+            var toggle = document.getElementById("secondary-verification-free-toggle");
+            var hint = document.getElementById("secondary-verification-free-hint");
+            var wrap = document.getElementById("secondary-verification-free-wrap");
+            var modelSelect = document.getElementById("secondary-verification-model-select");
+            var providerSelect = document.getElementById("secondary-verification-provider-select");
+            if (!toggle || !hint || !wrap || !modelSelect) return;
+            function refresh() {
+              var reason = window.asraFreeFilterReasonFor(modelSelect, providerSelect ? providerSelect.value : null);
+              toggle.disabled = !!reason;
+              wrap.classList.toggle("cursor-not-allowed", !!reason);
+              wrap.classList.toggle("opacity-60", !!reason);
+              wrap.classList.toggle("cursor-pointer", !reason);
+              if (reason) toggle.checked = false;
+              hint.textContent = reason || "";
+              window.asraApplyFreeFilterToSelect(modelSelect, !reason && toggle.checked);
+            }
+            toggle.addEventListener("change", function () {
+              window.asraApplyFreeFilterToSelect(modelSelect, toggle.checked);
+            });
+            document.addEventListener("htmx:afterSwap", function (event) {
+              if (event.detail && event.detail.target === modelSelect) refresh();
+            });
+            try {
+              refresh();
+            } catch (err) {
+              console.error("secondary verification free-only toggle refresh failed (picker still fully usable):", err);
+            }
+          })();
+        </script>
       </div>
       </div>
 
@@ -639,6 +771,83 @@
 
         {% if not visible_cloud_ids and not visible_local_ids and not custom_providers %}
           {{ empty_state("No providers added yet", 'Click "+ Add Provider" above to hook up opencode-zen, a cloud key, a local server, or a custom endpoint.') }}
+        {% endif %}
+
+        {# opencode-local -- not a PROVIDER_REGISTRY row (no API key, no endpoint to configure), so
+           it doesn't go through provider_row()'s API-key form -- same "doesn't fit the generic
+           shape, gets its own small card" treatment as the ChatGPT/Copilot sign-in cards below.
+           Gated by opencode_local_added (main.py), the SAME "actually added, or it's the active
+           choice" rule every registry row's own visible_local_ids uses -- only shown once the
+           operator explicitly added it via "+ Add Provider" (its own TYPE option there checks the
+           CLI is actually installed before allowing that), exactly like every other provider; Test/
+           Toggle/Delete all real and always-live, same reasoning provider_row()'s own comment gives
+           for its buttons. #}
+        {% if opencode_local_added %}
+        <div class="mt-5">
+          <p class="text-[11px] text-secondary uppercase tracking-wider mb-1">Local dependency</p>
+          <p class="text-[11px] text-secondary mb-2">Not one of ASRA's own recon/exploit tools — a free, no-key, no-sign-in LLM backend that spawns the opencode CLI as a local server (Tools tab lists it as a dependency, not a tool).</p>
+          <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-default bg-elevated {{ '' if opencode_local_enabled else 'opacity-60' }}">
+            {{ provider_avatar(active=opencode_cli_found) }}
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="text-[13px] font-medium text-primary truncate">{{ opencode_local_display_name }}</span>
+                {% if not opencode_local_enabled %}
+                  <span class="text-[10px] text-secondary shrink-0">disabled</span>
+                {% elif opencode_cli_found %}
+                  <span class="inline-flex items-center gap-1.5 text-[11px] text-severity-low shrink-0"><span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span>opencode CLI found</span>
+                {% else %}
+                  <span class="inline-flex items-center gap-1.5 text-[11px] text-severity-high shrink-0"><span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span>opencode CLI not found</span>
+                {% endif %}
+              </div>
+              <p id="opencode-local-test-status" class="text-[11px] text-secondary mt-0.5">{% if not opencode_cli_found %}Install it from the Tools tab's "Dependencies" row, or run setup_tools.sh.{% endif %}</p>
+            </div>
+            <div class="shrink-0 flex items-center gap-1">
+              <button type="button" hx-post="/api/settings/providers/{{ opencode_local_provider_id }}/test"
+                      hx-target="#opencode-local-test-status" hx-swap="innerHTML" hx-disabled-elt="this"
+                      hx-on::before-request="this.textContent='Testing…'" hx-on::after-request="this.textContent='Test'"
+                      class="h-8 px-3 text-[12px] font-medium rounded bg-surface border border-default text-secondary hover:text-primary hover:bg-overlay transition-colors">Test</button>
+              {# The same gear/Configure button every other provider's own row has (provider_row()
+                 above) -- real, confirmed operator complaint this fixes: this card only ever had
+                 Test/Toggle/Remove, missing the 4th button every other card shows, which read as
+                 visually inconsistent/incomplete next to them. Opens an info-only dialog (below) --
+                 there's genuinely no key/endpoint to type for this one, so it explains that instead
+                 of showing empty, pointless fields just to look the same. #}
+              <button type="button" title="Configure" onclick="asraOpenDialog('opencode-local-info-dialog')"
+                      class="h-8 w-8 flex items-center justify-center rounded border border-default bg-surface text-secondary hover:text-primary hover:bg-overlay transition-colors">
+                <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                  <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M19.4 13a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V19a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H4a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H10a1.65 1.65 0 0 0 1-1.51V4a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V10a1.65 1.65 0 0 0 1.51 1H20a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <form method="post" action="/api/settings/providers/{{ opencode_local_provider_id }}/toggle" class="contents">
+                <button type="submit" title="{{ 'Disable' if opencode_local_enabled else 'Enable' }}"
+                        class="h-8 w-8 flex items-center justify-center rounded border transition-colors {{ 'provider-toggle-on' if opencode_local_enabled else 'bg-surface border-default text-secondary hover:text-primary' }}">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                    <path d="M12 2v10" stroke-linecap="round"/>
+                    <path d="M18.4 6.6a9 9 0 1 1-12.8 0" stroke-linecap="round"/>
+                  </svg>
+                </button>
+              </form>
+              {# Same confirm-before-submit every other provider's own Remove button already has
+                 (provider_row()'s own identical form above) -- real, confirmed operator complaint
+                 this fixed first: without it, clicking this one submitted silently and instantly,
+                 with no visible reaction at all. This card's own opencode_local_added (main.py)
+                 does NOT exempt the active AI Provider & Model choice the way the dropdown does --
+                 confirming here genuinely makes this card disappear, full stop, every time, even
+                 while opencode-local is still the saved active provider (which keeps working fine
+                 either way -- its own dropdown entry has its own separate exemption). #}
+              <form method="post" action="/api/settings/providers/{{ opencode_local_provider_id }}/remove" class="contents"
+                    onsubmit="return asraConfirmSubmit(event, {title: 'Remove opencode (local server)?', message: 'Removes this card from the Providers list. If it is still your active AI Provider & Model choice above, that keeps working unchanged -- this only removes the card. Add it again anytime from + Add Provider.', confirmLabel: 'Remove'});">
+                <button type="submit" title="Remove"
+                        class="h-8 w-8 flex items-center justify-center rounded border border-default bg-surface text-secondary hover:bg-severity-high/10 hover:border-severity-high/20 hover:text-severity-high transition-colors">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                    <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
         {% endif %}
 
         {% if custom_providers %}
@@ -2005,6 +2214,30 @@
   {% for provider_id in cloud_provider_ids %}{{ provider_dialog(provider_id) }}{% endfor %}
   {% for provider_id in local_provider_ids %}{{ provider_dialog(provider_id) }}{% endfor %}
   {% for p in custom_providers %}{{ custom_provider_edit_dialog(p) }}{% endfor %}
+  {# opencode-local's own Configure dialog -- same gear-button entry point as every registry
+     provider's provider_dialog() above, but purely informational: there is genuinely no key or
+     endpoint to type for it (it spawns the opencode CLI locally, see this card's own description),
+     so this explains that instead of showing empty fields just to look identical. #}
+  <dialog id="opencode-local-info-dialog" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-md backdrop:bg-black/60 backdrop:backdrop-blur-sm">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">{{ opencode_local_display_name }}</span>
+      <button type="button" onclick="document.getElementById('opencode-local-info-dialog').close()"
+              class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div class="flex items-center gap-1.5">
+        {% if opencode_cli_found %}
+          <span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span><span class="text-[11px] text-secondary">opencode CLI found on this machine</span>
+        {% else %}
+          <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span><span class="text-[11px] text-severity-high">opencode CLI not found</span>
+        {% endif %}
+      </div>
+      <p class="text-[11px] text-secondary">Nothing to configure here -- no API key, no base URL, no model to type. This provider spawns the opencode CLI as a local server on this machine and talks to it directly; its own model list is read live once it's running.</p>
+      {% if not opencode_cli_found %}
+        <p class="text-[11px] text-secondary">Install it from the Tools tab's "Dependencies" row, or run setup_tools.sh.</p>
+      {% endif %}
+    </div>
+  </dialog>
 
   {# Data for the Add Provider modal's own type-preset auto-fill JS below -- a script tag typed
      application/json (JSON.parse), not inline JS, so it's parsed as data and never risks breaking
@@ -2022,6 +2255,14 @@
   {% for pid in cloud_provider_ids + local_provider_ids %}
     {% set _ = combined_type_presets.update({pid: {"label": provider_display_names[pid], "default_base_url": provider_base_url_default[pid], "is_builtin": true}}) %}
   {% endfor %}
+  {# opencode-local isn't a PROVIDER_REGISTRY row (no base_url of its own), handled separately from
+     the loop above for that reason -- see its own <option> below. #}
+  {# no_config: true -- unlike every other built-in here, opencode-local has no endpoint/key/model
+     to type at all (it's a local process this machine spawns on its own, see its own module
+     docstring) -- read by the JS below to hide the Base URL/API Key/Model fields entirely for it,
+     instead of showing three fields that do nothing and a "fallback for when live lookup fails"
+     explanation that doesn't apply (there's no endpoint to look up). #}
+  {% set _ = combined_type_presets.update({opencode_local_provider_id: {"label": opencode_local_display_name, "default_base_url": "", "is_builtin": true, "no_config": true}}) %}
   <script type="application/json" id="custom-provider-type-presets">{{ combined_type_presets | tojson }}</script>
 
   <dialog id="add-custom-provider-modal" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-md backdrop:bg-black/60 backdrop:backdrop-blur-sm">
@@ -2044,6 +2285,18 @@
             {% for pid in cloud_provider_ids + local_provider_ids %}
               <option value="{{ pid }}">{{ provider_display_names[pid] }}</option>
             {% endfor %}
+            {# opencode-local -- disabled client-side when the CLI isn't actually on PATH right
+               now (opencode_cli_found, main.py's _llm_settings_context), so the operator sees WHY
+               before even submitting, not just after a server-side rejection. The server (POST
+               /api/settings/providers/custom, add_custom_provider_route) re-checks the same thing
+               before actually adding it either way -- never trust a disabled attribute alone. #}
+            {# Defaults to selected when the CLI is actually usable -- real, explicit operator
+               request: this is the provider most operators reach for first here (free, no key, no
+               sign-in), so it shouldn't need to be hunted for near the bottom of a long built-in
+               list every time. Never defaults selected while disabled (CLI not found) -- a
+               disabled option landing pre-selected would show a grayed-out choice with no way to
+               submit it, worse than just falling back to the list's normal first option. #}
+            <option value="{{ opencode_local_provider_id }}" {% if not opencode_cli_found %}disabled{% else %}selected{% endif %}>{{ opencode_local_display_name }}{% if not opencode_cli_found %} — opencode CLI not installed{% endif %}</option>
           </optgroup>
           <optgroup label="Custom">
             {% for type_id, preset in custom_provider_type_presets.items() %}
@@ -2058,22 +2311,26 @@
         <input type="text" name="name" placeholder="e.g. Team OpenRouter key"
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
       </label>
-      <label class="block">
+      <label class="block" data-add-provider-config-field>
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Base URL</span>
         <input type="text" name="base_url" id="custom-provider-base-url" placeholder="https://..."
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary font-mono placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
       </label>
-      <label class="block">
+      <label class="block" data-add-provider-config-field>
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">API Key <span class="normal-case font-normal text-secondary">(optional)</span></span>
         <input type="password" name="api_key" autocomplete="off" placeholder="sk-..."
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary font-mono placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
       </label>
-      <label class="block">
+      <label class="block" data-add-provider-config-field>
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model <span class="normal-case font-normal text-secondary">(optional &mdash; leave blank)</span></span>
         <input type="text" name="model" placeholder="only needed if the live list below can't load"
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
         <span class="block text-[11px] text-secondary mt-1">You won't normally need this: once added, this provider's own real model dropdown (in AI Provider &amp; Model above, or Reserve providers) queries its endpoint live and lists whatever it actually serves &mdash; nothing to type or guess. This field only matters as a fallback for the rare case that live lookup fails (the endpoint isn't reachable yet, or doesn't expose a model list at all).</span>
       </label>
+      {# Shown instead of the three fields above when the picked Type has nothing to configure at
+         all (opencode-local -- combined_type_presets' own no_config flag, set below) -- a local
+         process this machine spawns on its own, no endpoint/key/model to type. #}
+      <p class="text-[11px] text-secondary hidden" data-add-provider-no-config-note>Nothing to configure &mdash; this provider runs locally on this machine with no endpoint, key, or model to type. Click Add Provider below.</p>
       <div class="flex items-center justify-end gap-2 pt-1">
         {{ button("Add Provider", variant="primary", type="submit") }}
       </div>
@@ -2089,6 +2346,8 @@
       var nameFieldWrapper = document.querySelector("[data-add-provider-name-field]");
       var apiKeyField = document.querySelector('#add-custom-provider-modal input[name="api_key"]');
       var modelField = document.querySelector('#add-custom-provider-modal input[name="model"]');
+      var configFields = document.querySelectorAll('#add-custom-provider-modal [data-add-provider-config-field]');
+      var noConfigNote = document.querySelector('#add-custom-provider-modal [data-add-provider-no-config-note]');
       if (!presetsEl || !typeSelect || !urlField) return;
       var presets = JSON.parse(presetsEl.textContent);
 
@@ -2120,6 +2379,12 @@
           if (nameField && isSwitch) nameField.value = "";
           if (nameFieldWrapper) nameFieldWrapper.classList.remove("hidden");
         }
+        // no_config (opencode-local only, today) -- nothing in Base URL/API Key/Model does
+        // anything for this Type, so hide all three and the explanatory text under Model, and
+        // show one short note instead of three empty-looking fields the operator might otherwise
+        // wonder whether to fill in.
+        configFields.forEach(function (el) { el.classList.toggle("hidden", !!preset.no_config); });
+        if (noConfigNote) noConfigNote.classList.toggle("hidden", !preset.no_config);
       }
 
       typeSelect.addEventListener("change", function () { applyPreset(true); });
@@ -2482,6 +2747,7 @@
       if (!rowsContainer || !addRowButton) return;
 
       var providerModels = JSON.parse(document.getElementById("fallback-chain-provider-models").textContent);
+      var providerModelFreeFlags = JSON.parse(document.getElementById("fallback-chain-provider-model-free-flags").textContent);
       var providerIds = {{ fallback_chain_provider_ids | tojson }};
       var providerNames = {{ fallback_chain_provider_names | tojson }};
       var deferredProviderIds = {{ fallback_chain_deferred_provider_ids | tojson }};
@@ -2508,22 +2774,67 @@
         // browser from trying to "open" the drag data as if it were a dropped link/file.
       });
 
+      // This row's own independent "Free models only" switch (data-row-free-toggle) -- recomputes
+      // disabled/hint from the row's own model <select> (same shared primitives the global switch
+      // uses, static/js/free_models_filter.js) and re-applies filtering at the row's OWN current
+      // checked state, never window.ASRA_FREE_MODELS_ONLY -- every row is fully independent.
+      // Keeps the row's own hidden chain_free_only field (the thing that actually submits with
+      // Save chain) in sync with its visible checkbox -- every place the checkbox's own checked
+      // state can change (a real click, or refreshRowFreeToggle forcing it off) must call this
+      // right after, or the saved chain would silently disagree with what the switch shows.
+      function syncRowFreeHidden(row) {
+        var toggle = row.querySelector("[data-row-free-toggle]");
+        var hidden = row.querySelector("[data-row-free-only-hidden]");
+        if (toggle && hidden) hidden.value = toggle.checked ? "true" : "false";
+      }
+
+      function refreshRowFreeToggle(row) {
+        var toggle = row.querySelector("[data-row-free-toggle]");
+        var hint = row.querySelector("[data-row-free-hint]");
+        var modelSelect = row.querySelector("[data-fallback-chain-model]");
+        var providerSelect = row.querySelector("[data-fallback-chain-provider]");
+        if (!toggle || !hint || !modelSelect) return;
+        var reason = window.asraFreeFilterReasonFor(modelSelect, providerSelect ? providerSelect.value : null);
+        toggle.disabled = !!reason;
+        var wrap = toggle.closest("[data-row-free-wrap]");
+        if (wrap) {
+          wrap.classList.toggle("cursor-not-allowed", !!reason);
+          wrap.classList.toggle("opacity-60", !!reason);
+          wrap.classList.toggle("cursor-pointer", !reason);
+        }
+        if (reason) toggle.checked = false;
+        hint.textContent = reason || "";
+        window.asraApplyFreeFilterToSelect(modelSelect, !reason && toggle.checked);
+        syncRowFreeHidden(row);
+      }
+
       function populateModelSelect(modelSelect, provider, selectedModel) {
+        var row = modelSelect.closest("[data-fallback-chain-row]");
         if (deferredProviderIds.indexOf(provider) !== -1) {
+          // The swapped-in HTML (partials/model_options.html) already carries data-free itself --
+          // nothing extra to do here for the "Free models only" filter.
           fetch("/api/settings/model-options?provider=" + encodeURIComponent(provider))
             .then(function (resp) { return resp.text(); })
-            .then(function (html) { modelSelect.innerHTML = html; });
+            .then(function (html) {
+              modelSelect.innerHTML = html;
+              if (row) refreshRowFreeToggle(row);
+            });
           return;
         }
         var models = providerModels[provider] || [];
+        var freeFlags = providerModelFreeFlags[provider] || {};
         modelSelect.innerHTML = "";
         models.forEach(function (model) {
           var option = document.createElement("option");
           option.value = model;
           option.textContent = model;
           if (model === selectedModel) option.selected = true;
+          if (Object.prototype.hasOwnProperty.call(freeFlags, model)) {
+            option.setAttribute("data-free", freeFlags[model] ? "true" : "false");
+          }
           modelSelect.appendChild(option);
         });
+        if (row) refreshRowFreeToggle(row);
       }
 
       // Boundary state (first row can't move up, last can't move down) is re-derived after every
@@ -2620,6 +2931,28 @@
           draggedRow = null;
           refreshMoveButtonStates();
         });
+
+        // This row's own "Free models only" switch -- wired LAST, deliberately, and defensively
+        // try/caught: real, confirmed incident this guards against -- a stale-cached copy of
+        // free_models_filter.js (browser still serving an old ?v= response) left
+        // window.asraFreeFilterReasonFor undefined, refreshRowFreeToggle() below threw, and
+        // because it used to run BEFORE the Test/Remove/Move/drag wiring above, the thrown error
+        // aborted wireRow() right there -- silently leaving every row's Remove button (and Test,
+        // and the move arrows) completely unwired, for every row, on every page load. Now this is
+        // the last thing wireRow() does, so even if it throws again for some future reason, every
+        // control above it is already wired and working.
+        var rowFreeToggle = row.querySelector("[data-row-free-toggle]");
+        if (rowFreeToggle) {
+          rowFreeToggle.addEventListener("change", function () {
+            window.asraApplyFreeFilterToSelect(modelSelect, rowFreeToggle.checked);
+            syncRowFreeHidden(row);
+          });
+        }
+        try {
+          refreshRowFreeToggle(row);
+        } catch (err) {
+          console.error("refreshRowFreeToggle failed (reserve chain row still fully usable):", err);
+        }
       }
 
       // Existing, server-rendered rows (already-saved chain steps) already have their own <option>s
@@ -2693,6 +3026,39 @@
         testResult.setAttribute("data-test-result", "");
         testResult.className = "text-[11px] text-secondary empty:hidden mt-1.5";
 
+        // This row's own independent "Free models only" switch -- hand-built DOM matching
+        // macros/ui.html's toggle_switch() macro exactly (no `name` -- never part of the saved
+        // chain, purely a client-side filter), see the server-rendered row's own identical markup
+        // and comment for why every row needs its own instead of sharing the global switch.
+        var freeWrap = document.createElement("label");
+        freeWrap.className = "flex items-center gap-2 mt-1.5 text-[11px] text-secondary cursor-pointer";
+        freeWrap.setAttribute("data-row-free-wrap", "");
+        var freeToggleInput = document.createElement("input");
+        freeToggleInput.type = "checkbox";
+        freeToggleInput.className = "sr-only peer";
+        freeToggleInput.setAttribute("data-row-free-toggle", "");
+        var freeToggleVisual = document.createElement("span");
+        freeToggleVisual.className = "w-9 h-5 shrink-0 bg-elevated border border-default rounded-full relative transition-colors duration-150 peer-checked:bg-accent peer-checked:border-accent peer-focus-visible:ring-2 peer-focus-visible:ring-accent/40 peer-focus-visible:ring-offset-1 after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:w-3.5 after:h-3.5 after:bg-white after:rounded-full after:shadow after:transition-transform after:duration-150 peer-checked:after:translate-x-4";
+        // chain_free_only's own hidden, always-submitted twin (see this row's server-rendered
+        // sibling's own comment for why a bare unchecked checkbox can't be trusted here) -- kept
+        // in sync by syncRowFreeHidden() the same way every other row's own hidden input is.
+        var freeToggleHidden = document.createElement("input");
+        freeToggleHidden.type = "hidden";
+        freeToggleHidden.name = "chain_free_only";
+        freeToggleHidden.value = "false";
+        freeToggleHidden.setAttribute("data-row-free-only-hidden", "");
+        var freeLabelText = document.createElement("span");
+        freeLabelText.className = "shrink-0";
+        freeLabelText.textContent = "Free models only";
+        var freeHint = document.createElement("span");
+        freeHint.className = "text-tertiary";
+        freeHint.setAttribute("data-row-free-hint", "");
+        freeWrap.appendChild(freeToggleInput);
+        freeWrap.appendChild(freeToggleHidden);
+        freeWrap.appendChild(freeToggleVisual);
+        freeWrap.appendChild(freeLabelText);
+        freeWrap.appendChild(freeHint);
+
         rowLine.appendChild(dragHandle);
         rowLine.appendChild(providerSelect);
         rowLine.appendChild(modelSelect);
@@ -2701,6 +3067,7 @@
         rowLine.appendChild(testButton);
         rowLine.appendChild(removeButton);
         row.appendChild(rowLine);
+        row.appendChild(freeWrap);
         row.appendChild(testResult);
         rowsContainer.appendChild(row);
 

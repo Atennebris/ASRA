@@ -131,16 +131,81 @@
 
   <label class="block max-w-sm">
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Provider &amp; model</span>
-    <select name="provider" id="subagent-provider-{{ id_suffix }}"
-            hx-get="/api/subagents/model-options" hx-target="#subagent-model-{{ id_suffix }}" hx-trigger="change"
-            class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20 mb-2">
-      {{ provider_options(profile.provider if profile else None) }}
-    </select>
-    <select name="model" id="subagent-model-{{ id_suffix }}"
-            class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-      {{ model_options(profile.provider if profile else None, profile.model if profile else None, subagent_model_choices.get(profile.id, []) if profile else []) }}
-    </select>
+    {# data-custom-select + the wrapping [data-custom-select-wrap] div: static/js/custom_select.js
+       progressively enhances this real <select> into a button-triggered custom popup panel instead
+       of leaving the browser to render its own native dropdown. Real, confirmed operator bug this
+       exists for: inside a <dialog> (this macro's own "modal" layout -- the Edit-subagent dialog),
+       the native <select> popup silently refuses to open at all on the operator's own WebView2
+       runtime build. Two separate CSS-only fix attempts (removing `overflow-hidden` from the
+       <dialog> itself, then from every remaining ancestor between it and the <select>)
+       both failed to resolve it live, confirmed by the operator after a
+       genuine hard-refresh ruled out a stale cached DOM -- so this isn't a CSS clipping problem,
+       it's the native popup itself that this particular WebView2 build won't render inside an open
+       <dialog>, full stop. The real <select> stays exactly as before (same id/name/hx-get, same
+       form submission, same free-only-filter target) -- the enhancement only rewires how it's
+       OPENED, not how it's read or submitted, so nothing else on this page needed to change.
+       `wrap` carries `position: relative` -- the sr-only class the JS adds to the <select> makes
+       it `position: absolute` (Tailwind's sr-only recipe), and an absolutely-positioned element
+       with no OTHER positioned ancestor before it resolves its containing block against the
+       <dialog> itself once that dialog is in the browser's top layer -- the exact "dialog goes
+       blank, scrollHeight inflates" bug this project already hit once with a plain .sr-only input
+       before; giving `wrap` its own `position: relative` here
+       is what stops the same thing happening again. #}
+    <div class="relative mb-2" data-custom-select-wrap>
+      <select name="provider" id="subagent-provider-{{ id_suffix }}" data-custom-select
+              hx-get="/api/subagents/model-options" hx-target="#subagent-model-{{ id_suffix }}" hx-trigger="change"
+              class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        {{ provider_options(profile.provider if profile else None) }}
+      </select>
+    </div>
+    <div class="relative" data-custom-select-wrap>
+      <select name="model" id="subagent-model-{{ id_suffix }}" data-custom-select
+              class="w-full bg-elevated border border-default rounded-lg px-3 py-2 text-sm text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        {{ model_options(profile.provider if profile else None, profile.model if profile else None, subagent_model_choices.get(profile.id, []) if profile else [], subagent_model_free_flags.get(profile.id, {}) if profile else {}) }}
+      </select>
+    </div>
     <span class="block text-[11px] text-secondary mt-1.5">Only providers with a key configured in Settings are listed. Pick a provider to see its real models — no typing.</span>
+    {# This subagent's own, independent "Free models only" switch -- real, confirmed operator
+       complaint this fixes: ASRA's own sibling Reserve providers chain already has one per row
+       (settings.html), and a subagent's own picker needs exactly the same, not a shared global
+       one. Each instance of this macro (the New-subagent form, every open Edit dialog) has its own
+       unique id_suffix, so a plain id-addressed toggle + small per-instance script is enough here
+       -- no closest()/data-attribute scoping needed the way the Reserve chain's truly-repeated,
+       suffix-less rows require. #}
+    <label class="flex items-center gap-2 mt-2 text-[11px] text-secondary cursor-pointer" id="subagent-free-wrap-{{ id_suffix }}">
+      {{ toggle_switch("free_only", checked=(profile.free_only if profile else false), id="subagent-free-toggle-" ~ id_suffix,
+                        onchange="window.asraApplyFreeFilterToSelect(document.getElementById('subagent-model-" ~ id_suffix ~ "'), this.checked);") }}
+      <span class="shrink-0">Free models only</span>
+      <span class="text-tertiary" id="subagent-free-hint-{{ id_suffix }}"></span>
+    </label>
+    <script>
+      (function () {
+        var toggle = document.getElementById("subagent-free-toggle-{{ id_suffix }}");
+        var hint = document.getElementById("subagent-free-hint-{{ id_suffix }}");
+        var wrap = document.getElementById("subagent-free-wrap-{{ id_suffix }}");
+        var modelSelect = document.getElementById("subagent-model-{{ id_suffix }}");
+        var providerSelect = document.getElementById("subagent-provider-{{ id_suffix }}");
+        if (!toggle || !hint || !wrap || !modelSelect) return;
+        function refresh() {
+          var reason = window.asraFreeFilterReasonFor(modelSelect, providerSelect ? providerSelect.value : null);
+          toggle.disabled = !!reason;
+          wrap.classList.toggle("cursor-not-allowed", !!reason);
+          wrap.classList.toggle("opacity-60", !!reason);
+          wrap.classList.toggle("cursor-pointer", !reason);
+          if (reason) toggle.checked = false;
+          hint.textContent = reason || "";
+          window.asraApplyFreeFilterToSelect(modelSelect, !reason && toggle.checked);
+        }
+        document.addEventListener("htmx:afterSwap", function (event) {
+          if (event.detail && event.detail.target === modelSelect) refresh();
+        });
+        try {
+          refresh();
+        } catch (err) {
+          console.error("subagent free-only toggle refresh failed (picker still fully usable):", err);
+        }
+      })();
+    </script>
     {# Same real, minimal-completion Test as Settings' own AI Provider & Model picker
        (main.py's test-llm start/status/cancel, agent/tools/llm_test_job.py) -- lets the operator
        confirm THIS subagent's own provider/model choice actually works before saving, instead of
@@ -174,7 +239,7 @@
       <div class="flex-1 min-h-0 overflow-y-auto overscroll-contain asra-scroll px-5 py-4 space-y-4">
         {{ subagent_fields(profile, id_suffix, tool_grid) }}
       </div>
-      <div class="shrink-0 flex items-center justify-end gap-2 px-5 py-3 border-t border-default bg-surface">
+      <div class="shrink-0 flex items-center justify-end gap-2 px-5 py-3 border-t border-default bg-surface rounded-b-xl">
         {{ button("Save", variant="primary", type="submit") }}
       </div>
     </form>
@@ -319,10 +384,36 @@
        utility (flex) on the dialog element overrides the UA `dialog:not([open]){display:none}`
        rule, which leaves every dialog painted on the page even while closed (they stacked
        over the table, bleeding their controls through). The dialog keeps its default
-       display so open/closed still works; the wrapper owns the layout. #}
-    <dialog id="{{ dialog_id }}" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-4xl overflow-hidden backdrop:bg-black/60 backdrop:backdrop-blur-sm">
+       display so open/closed still works; the wrapper owns the layout.
+
+       Deliberately NO `overflow-hidden` ANYWHERE between the <dialog> and the Provider/Model
+       <select>s -- not on the <dialog> itself, and not on any wrapper div either. Real, confirmed
+       operator complaint this fixes: in the desktop app's own embedded webview (WebView2/Chromium,
+       not a regular Chrome tab), a native <select>'s dropdown popup silently refuses to open at
+       all -- no list, no error, nothing -- when it sits inside a <dialog> with ANY ancestor
+       (the <dialog> element itself, or a plain inner <div>) carrying `overflow-hidden`; a <select>
+       on a plain page, or inside a <dialog> with no `overflow-hidden` ancestor at all (e.g. this
+       project's own Add Provider dialog, settings.html, or base.html's own rescan dialog), opens
+       fine. This is a known Chromium top-layer/overflow-clipping interaction bug between <dialog>
+       and a nested native <select> popup, fixed in newer Chromium releases but still present in
+       whichever WebView2 runtime build the operator's machine has pinned.
+
+       A first attempt at this fix moved `overflow-hidden` down from the <dialog> itself to the
+       plain wrapper <div> just inside it, on the assumption that only the top-layer <dialog>
+       element's OWN `overflow-hidden` was part of the bug and a regular element's wasn't -- that
+       assumption was wrong: the operator hit the exact same silently-dead dropdown again with
+       `overflow-hidden` on that inner div. The bug is triggered by `overflow-hidden` anywhere in
+       the <select>'s ancestor chain up to the <dialog>, not specifically the <dialog> element's
+       own styling. Fixed for real this time by dropping `overflow-hidden` from every ancestor
+       between the <dialog> and the <select>s, and getting the same rounded-corner look a
+       different way: the header and footer (the only two children whose flat rectangular corners
+       would otherwise poke out past the dialog's own rounded-xl) are individually rounded
+       (`rounded-t-xl` / `rounded-b-xl`) instead of relying on a clipping ancestor. The middle
+       scroll region (this form's own "modal" layout wrapper, `overflow-y-auto`) needs no rounding
+       of its own -- it never touches a dialog corner, it sits between the header and footer. #}
+    <dialog id="{{ dialog_id }}" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-4xl backdrop:bg-black/60 backdrop:backdrop-blur-sm">
       <div class="flex flex-col max-h-[85vh]">
-        <div class="flex items-center justify-between px-5 h-12 border-b border-default shrink-0">
+        <div class="flex items-center justify-between px-5 h-12 border-b border-default shrink-0 rounded-t-xl">
           <span class="text-[13px] font-semibold truncate pr-3">Edit {{ profile.name }}</span>
           <button type="button" onclick="document.getElementById('{{ dialog_id }}').close()"
                   class="shrink-0 inline-flex items-center justify-center w-7 h-7 rounded-md text-secondary hover:text-primary hover:bg-elevated transition-colors text-lg leading-none">&times;</button>

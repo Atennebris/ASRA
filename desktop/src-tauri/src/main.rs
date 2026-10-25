@@ -87,8 +87,42 @@ struct StartConfig {
     run_as_root: bool,
     intro_enabled: bool,
     intro_sound_enabled: bool,
+    // Distinguishes "wsl.exe isn't on this machine at all" from "wsl.exe works but zero distros
+    // are registered" -- list_wsl_distros() alone collapses both into an empty `distros`, which is
+    // exactly the ambiguity the start screen's WSL-missing/distro-missing banners need resolved.
+    wsl_installed: bool,
+    // Which distro the "Install a Linux distro" button offers when none exist yet -- read from
+    // ASRA_WSL_AUTO_INSTALL_DISTRO (.env), never hardcoded, so an operator can point it at
+    // Debian/etc. instead of Ubuntu without a code change.
+    wsl_default_distro: String,
     distros: Vec<WslDistro>,
     settings: Vec<EnvSetting>,
+}
+
+// Mirrors install_wsl's two possible jobs. Kept as a String (not a Rust enum) on the wire --
+// serde already round-trips plain strings with zero ceremony, and the frontend has no reason to
+// see anything richer than "install-wsl" | "install-distro".
+#[derive(serde::Deserialize)]
+struct WslSetupArgs {
+    // Only read by install_wsl's #[cfg(windows)] body -- the non-Windows stub takes an unused
+    // `_args: WslSetupArgs` instead, same "real fields, deliberately unread on that platform"
+    // shape Backend's own as_root/distro already use above, same reason: these are Windows-only
+    // concepts (a WSL distro name, an install mode) that still need to deserialize everywhere
+    // since the struct itself has no #[cfg(windows)] of its own -- serde needs it on every
+    // platform to parse the JS-side invoke() payload.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    mode: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    distro: String,
+}
+
+#[derive(serde::Serialize)]
+struct WslSetupStatus {
+    // "running" | "stalled" | "done" -- see get_wsl_setup_status's own comment for why this is
+    // derived from real WSL/distro state on every poll, never from parsing the elevated
+    // process's log output.
+    state: String,
+    log: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -211,6 +245,41 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<std::process:
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(150)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+// Same wedged-wsl.exe protection as run_with_timeout, but also captures stdout/stderr -- needed by
+// test_wsl_setup below, which has to read back what the distro actually said, not just whether it
+// exited. Reads happen only after the child has already exited (confirmed via try_wait before
+// returning), so this is deliberately NOT a general-purpose subprocess runner: it's only safe
+// because every caller here runs a short, fixed, tiny-output smoke-test command (a handful of echo
+// lines), never anything that could fill a pipe buffer before exiting.
+#[cfg(windows)]
+fn run_with_timeout_output(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Some(std::process::Output { status, stdout, stderr });
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(150)),
             _ => {
                 let _ = child.kill();
@@ -517,6 +586,33 @@ fn list_wsl_distros() -> Vec<WslDistro> {
     Vec::new()
 }
 
+// `wsl.exe -l -v` alone can't tell "not installed" apart from "installed, zero distros" -- both
+// print nothing list_wsl_distros() can parse. `--status` is cheap (no VM to spin up) and succeeds
+// (an Ok output, regardless of its own exit code) the instant wsl.exe genuinely exists on PATH --
+// that's the one bit list_wsl_distros() itself can't give a caller.
+#[cfg(windows)]
+fn wsl_is_installed() -> bool {
+    Command::new("wsl.exe")
+        .arg("--status")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn wsl_is_installed() -> bool {
+    false
+}
+
+// ASRA_WSL_AUTO_INSTALL_DISTRO (.env) -- see StartConfig::wsl_default_distro's own comment for why
+// this isn't hardcoded to "Ubuntu" directly at the call site.
+fn default_wsl_install_distro(env_text: &str) -> String {
+    env_value(env_text, "ASRA_WSL_AUTO_INSTALL_DISTRO")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Ubuntu")
+        .to_string()
+}
+
 // ---- process spawn / stop -----------------------------------------------------
 
 #[cfg(windows)]
@@ -726,11 +822,13 @@ fn get_start_config() -> StartConfig {
     // existed nothing recorded how long it took.
     let wsl_probe_start = Instant::now();
     let distros = list_wsl_distros();
+    let wsl_installed = wsl_is_installed();
     let wsl_probe_ms = wsl_probe_start.elapsed().as_millis();
     let settings = parse_env_settings(&env_text);
     eprintln!(
-        "[ASRA-DESKTOP] start screen loaded (os={}, wsl_distros={}, env_settings={}, run_as_root={})",
+        "[ASRA-DESKTOP] start screen loaded (os={}, wsl_installed={}, wsl_distros={}, env_settings={}, run_as_root={})",
         std::env::consts::OS,
+        wsl_installed,
         distros.len(),
         settings.len(),
         env_flag(&env_text, "ASRA_RUN_AS_ROOT")
@@ -738,8 +836,9 @@ fn get_start_config() -> StartConfig {
     append_desktop_log_line(
         &env_text,
         &format!(
-            "start screen loaded: os={} wsl_distros={} wsl_probe_ms={} env_settings={} run_as_root={}",
+            "start screen loaded: os={} wsl_installed={} wsl_distros={} wsl_probe_ms={} env_settings={} run_as_root={}",
             std::env::consts::OS,
+            wsl_installed,
             distros.len(),
             wsl_probe_ms,
             settings.len(),
@@ -756,6 +855,8 @@ fn get_start_config() -> StartConfig {
         run_as_root: env_flag(&env_text, "ASRA_RUN_AS_ROOT"),
         intro_enabled: env_flag_default(&env_text, "ASRA_INTRO_ENABLED", true),
         intro_sound_enabled: env_flag_default(&env_text, "ASRA_INTRO_SOUND_ENABLED", true),
+        wsl_installed,
+        wsl_default_distro: default_wsl_install_distro(&env_text),
         distros,
         settings,
     }
@@ -1158,6 +1259,174 @@ fn notify_session_done(app: AppHandle, title: String, body: String) -> Result<()
     Ok(())
 }
 
+// Kicks off `wsl --install` (mode "install-wsl") or `wsl --install -d <distro>` (mode
+// "install-distro") elevated, for the start screen's own "Install WSL"/"Install <distro>"
+// buttons (see renderSystem()'s wsl_installed/distros-empty branches, dist/index.html). Detached
+// and non-blocking by design -- same fire-and-forget shape as
+// agent/tools/arsenal_install.py's start_arsenal_install, with get_wsl_setup_status below as the
+// poll target the frontend tails every ~2s, mirroring arsenal_install.html's own log window.
+//
+// `wsl --install` needs admin rights (Windows shows its own UAC prompt); elevating is done via
+// `Start-Process -Verb RunAs`, which cannot also redirect the elevated child's stdout/stderr
+// itself (a documented PowerShell limitation) -- so the REAL install work and its log redirection
+// both happen one level down, inside scripts/wsl_setup.ps1, which runs already-elevated and
+// redirects ITS OWN child (wsl.exe) into -LogPath without hitting that restriction at all.
+#[cfg(windows)]
+#[tauri::command]
+fn install_wsl(args: WslSetupArgs) -> Result<(), String> {
+    let repo = repo_dir();
+    let env_text = std::fs::read_to_string(repo.join(".env"))
+        .or_else(|_| std::fs::read_to_string(repo.join(".env.example")))
+        .unwrap_or_default();
+    let app_dir = resolve_app_dir(&env_text);
+    std::fs::create_dir_all(&app_dir)
+        .map_err(|e| format!("could not create {}: {e}", app_dir.display()))?;
+    let log_path = app_dir.join("wsl-setup.log");
+    let distro = if args.distro.trim().is_empty() {
+        default_wsl_install_distro(&env_text)
+    } else {
+        args.distro.clone()
+    };
+
+    // Fresh header on every attempt -- a retry after a cancelled UAC prompt must not show the
+    // previous attempt's stale tail as if it were still relevant.
+    let header = format!(
+        "=== ASRA WSL setup started: mode={} distro={} ({}) ===\r\n",
+        args.mode,
+        distro,
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    std::fs::write(&log_path, header)
+        .map_err(|e| format!("could not write {}: {e}", log_path.display()))?;
+
+    let ps1 = repo.join("scripts").join("wsl_setup.ps1");
+    // One flat argument string, exactly like every other inner-command string this file already
+    // builds for wsl.exe/bash -- Start-Process -ArgumentList accepts a single string and hands it
+    // to the elevated process's own command-line parsing unchanged. Any literal single quote is
+    // doubled for the single-quoted PowerShell string this gets embedded in below.
+    let inner_args = format!(
+        "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -LogPath \"{}\" -Mode \"{}\" -Distro \"{}\"",
+        ps1.display(),
+        log_path.display(),
+        args.mode,
+        distro
+    )
+    .replace('\'', "''");
+    let elevate_cmd = format!("Start-Process powershell.exe -Verb RunAs -ArgumentList '{inner_args}'");
+
+    append_desktop_log_line(
+        &env_text,
+        &format!("WSL setup requested: mode={} distro={}", args.mode, distro),
+    );
+    Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &elevate_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("could not launch WSL setup: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn install_wsl(_args: WslSetupArgs) -> Result<(), String> {
+    Err("WSL is Windows-only".to_string())
+}
+
+// Poll target for the start screen's WSL-setup log window (every ~2s while a setup is in
+// progress). "done" is derived from REAL WSL/distro state (wsl_is_installed + list_wsl_distros),
+// never from parsing the elevated process's own log output -- main.rs never holds that process's
+// handle (Start-Process -Verb RunAs launches a separate process tree), so a log-text sentinel
+// would be the only other option and far more fragile than just re-checking the thing that
+// actually matters. "stalled" is a soft hint (log file untouched for a while, most likely a
+// cancelled/ignored UAC prompt -- both look identical from here) -- never a hard failure, the
+// button stays retryable either way.
+#[cfg(windows)]
+#[tauri::command]
+fn get_wsl_setup_status() -> WslSetupStatus {
+    let repo = repo_dir();
+    let env_text = std::fs::read_to_string(repo.join(".env"))
+        .or_else(|_| std::fs::read_to_string(repo.join(".env.example")))
+        .unwrap_or_default();
+    let log_path = resolve_app_dir(&env_text).join("wsl-setup.log");
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    let distros = list_wsl_distros();
+    let done = wsl_is_installed() && !distros.is_empty();
+
+    const STALL_AFTER: Duration = Duration::from_secs(90);
+    let stalled = !done
+        && std::fs::metadata(&log_path)
+            .and_then(|m| m.modified())
+            .map(|modified| modified.elapsed().unwrap_or(Duration::ZERO) > STALL_AFTER)
+            .unwrap_or(false);
+
+    let state = if done {
+        "done"
+    } else if stalled {
+        "stalled"
+    } else {
+        "running"
+    };
+    WslSetupStatus { state: state.to_string(), log }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn get_wsl_setup_status() -> WslSetupStatus {
+    WslSetupStatus { state: "done".to_string(), log: String::new() }
+}
+
+// "Test WSL setup" button, shown next to the distro picker even when a distro is already
+// detected -- list_wsl_distros()/`wsl -l -v` only proves WSL considers the distro registered, not
+// that it actually boots and works. Real, confirmed failure mode this guards against (see
+// run_with_timeout's own comment): WSL2's VM service can go unresponsive after a long uptime while
+// `wsl -l -v` keeps reporting the distro "Running" regardless -- an operator would otherwise only
+// discover that the hard way, via launch_backend's own 5-minute wait_for_port timeout. This runs
+// the exact same smoke test README.md's own "Verify it worked" step documents (`wsl -- echo ok`),
+// plus a `bash`/`wslpath` presence check since those are the only two things run.bat itself
+// actually needs inside the distro.
+#[cfg(windows)]
+#[tauri::command]
+fn test_wsl_setup(distro: String, as_root: bool) -> Result<String, String> {
+    let label = if distro.is_empty() {
+        "The default WSL distro".to_string()
+    } else {
+        distro.clone()
+    };
+    let inner = "echo ASRA_WSL_OK && command -v bash >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1 && echo ASRA_TOOLS_OK";
+    let mut cmd = Command::new("wsl.exe");
+    apply_wsl_target(&mut cmd, as_root, &distro);
+    cmd.arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg(inner)
+        .creation_flags(CREATE_NO_WINDOW);
+    match run_with_timeout_output(cmd, Duration::from_secs(20)) {
+        Some(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if out.status.success() && stdout.contains("ASRA_WSL_OK") && stdout.contains("ASRA_TOOLS_OK") {
+                Ok(format!("{label} responded, and bash/wslpath are both present — ready for run.bat."))
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+                Err(format!(
+                    "{label} started but the check failed (bash/wslpath missing, or something inside the distro is broken){}",
+                    if detail.is_empty() { String::new() } else { format!(": {detail}") }
+                ))
+            }
+        }
+        None => Err(format!(
+            "{label} did not respond within 20s -- it may be stuck (a known WSL2 failure mode even when `wsl -l -v` still shows it as \"Running\"). Try `wsl --shutdown` in PowerShell, then retry."
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn test_wsl_setup(_distro: String, _as_root: bool) -> Result<String, String> {
+    Err("WSL is Windows-only".to_string())
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1177,7 +1446,10 @@ fn main() {
             save_env,
             open_in_browser,
             open_external_url,
-            notify_session_done
+            notify_session_done,
+            install_wsl,
+            get_wsl_setup_status,
+            test_wsl_setup
         ])
         .on_window_event(|window, event| {
             // The X minimizes to the tray instead of quitting, so a long scan keeps running in the
@@ -1218,8 +1490,22 @@ fn main() {
                 // has to be repeated here or those defaults would silently be lost, not just added
                 // to). Windows/WebView2-only -- a documented no-op on macOS/Linux, safe to call
                 // unconditionally rather than #[cfg(windows)]-gating this whole block.
+                //
+                // msWebOOUI dropped from that disabled-features list -- real, confirmed operator
+                // report this caused: a native <select>'s own dropdown (e.g. a subagent's Provider
+                // picker, templates/subagents.html) silently refused to open AT ALL inside the
+                // desktop app specifically -- no list, no error -- while working fine in a regular
+                // Chrome tab. msWebOOUI is WebView2/Edge's "Web Out-Of-process UI" feature, which
+                // governs exactly this class of popup surface (select dropdowns, among others)
+                // rendering in its own properly-composited process; disabling it forces an
+                // in-process fallback that this WebView2 build apparently fails to render at all
+                // for a <select> living inside a <dialog>. Keeping it enabled costs nothing this
+                // window actually needs -- the backgrounding-throttle fix this block exists for
+                // lives entirely in the three --disable-backgrounding-occluded-windows/
+                // --disable-renderer-backgrounding/--disable-background-timer-throttling flags
+                // below, none of which depend on msWebOOUI being off.
                 .additional_browser_args(
-                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                    "--disable-features=msPdfOOUI,msSmartScreenProtection \
                      --disable-backgrounding-occluded-windows \
                      --disable-renderer-backgrounding \
                      --disable-background-timer-throttling",

@@ -48,7 +48,24 @@ def test_the_active_provider_is_always_listed_even_if_not_explicitly_added(monke
 
 def test_no_local_provider_added_yields_an_empty_local_list(monkeypatch):
     """The template hides an empty <optgroup> entirely; this is the data half of that -- with no
-    local provider added, the Local list is empty rather than every local built-in."""
+    local provider added, the Local list is empty rather than every local built-in. opencode-local
+    (agent/opencode_local_provider.py) is gated by the exact same "actually added, or it's the
+    active choice" rule as every PROVIDER_REGISTRY local provider -- real, confirmed operator
+    complaint an earlier version of this got wrong: it used to show up here unconditionally, with
+    no way to add/remove it from the "// Providers" list at all, breaking the "I control what
+    shows up by adding it myself" expectation every other provider already gives."""
     _only_added(monkeypatch, added_ids=["qwen"], current="opencode-zen")
     ctx = main._llm_settings_context()
     assert ctx["added_local_provider_ids"] == []
+
+
+def test_opencode_local_appears_once_explicitly_added(monkeypatch):
+    _only_added(monkeypatch, added_ids=["qwen", "opencode-local"], current="opencode-zen")
+    ctx = main._llm_settings_context()
+    assert ctx["added_local_provider_ids"] == ["opencode-local"]
+
+
+def test_opencode_local_is_always_listed_when_it_is_the_active_provider(monkeypatch):
+    _only_added(monkeypatch, added_ids=[], current="opencode-local")
+    ctx = main._llm_settings_context()
+    assert ctx["added_local_provider_ids"] == ["opencode-local"]

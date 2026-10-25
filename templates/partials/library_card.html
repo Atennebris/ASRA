@@ -142,7 +142,7 @@
             hx-target="this" hx-swap="innerHTML">&nbsp;</span>
       <button type="button"
               hx-post="/api/library/{{ s.id }}/analyze"
-              hx-include="#library-provider-shared, #library-model-shared"
+              hx-include="#library-provider-shared, #library-model-shared, #library-free-hidden"
               hx-target="#library-sources" hx-swap="outerHTML" hx-sync="#library-sources:replace"
               class="shrink-0 inline-flex items-center gap-1 rounded bg-accent hover:bg-accent-hover text-white px-2.5 py-1 text-[10.5px] font-medium transition-colors">
         Analyze

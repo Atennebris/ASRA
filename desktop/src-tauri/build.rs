@@ -21,6 +21,9 @@ fn main() {
                 "open_in_browser",
                 "open_external_url",
                 "notify_session_done",
+                "install_wsl",
+                "get_wsl_setup_status",
+                "test_wsl_setup",
             ]),
         ),
     )

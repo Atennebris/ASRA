@@ -117,6 +117,32 @@ def get_model_cost(provider_id: str, model_id: str) -> dict | None:
     return {"input": cost["input"], "output": cost["output"]}
 
 
+def is_model_free(provider_id: str, model_id: str) -> bool | None:
+    """True when the catalog prices this model at exactly $0 input AND $0 output, None when the
+    catalog is unreachable/doesn't list it/carries no cost data at all (unknown, never treated as
+    "not free" -- same None-means-unknown contract get_model_cost already documents), False
+    otherwise. Powers the Settings "Free models only" filter (agent/settings.py's
+    free_models_only) for every provider that doesn't have its own live, first-party pricing feed
+    (contrast agent/opencode_local_provider.py's list_opencode_local_models, which reads real-time
+    cost straight from that provider's own running server instead of this third-party snapshot).
+
+    Known, confirmed limitation, not a hypothetical: models.dev's own pricing data for a provider
+    can be stale/placeholder $0.00 for a model that is NOT actually free -- verified live against
+    Mistral's real pricing page (mistral.ai/pricing/api) while building this, where the catalog's
+    own `mistral-medium-2604`/`mistral-large-latest` entries show $0.00/$0.00 despite Mistral
+    charging real, non-zero prices for both. This function still treats that as "free" (same
+    input==0 and output==0 derivation this project's own sibling dashboard app already uses for
+    its own opencode-local catalog, where the zero really is genuine) because there is no reliable
+    way to tell a genuinely-free model apart from a stale catalog entry from this field alone --
+    callers that need certainty for a specific provider should prefer a live, first-party source
+    when one exists, the same way list_opencode_local_models already does for opencode's models.
+    """
+    cost = get_model_cost(provider_id, model_id)
+    if cost is None:
+        return None
+    return cost["input"] == 0 and cost["output"] == 0
+
+
 def list_models(provider_id: str) -> list[str]:
     """Every model id the catalog lists under a provider — powers the Settings model dropdown
     (populated per-provider, not a fixed list). Empty (not an error) if the catalog is

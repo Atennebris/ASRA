@@ -41,7 +41,7 @@ def test_save_secondary_verification_persists_and_redisplays(tmp_path, monkeypat
     )
 
     assert resp.status_code == 303
-    assert settings.get_secondary_verification_provider() == {"provider": "qwen", "model": "qwen-plus"}
+    assert settings.get_secondary_verification_provider() == {"provider": "qwen", "model": "qwen-plus", "free_only": False}
 
     page = client.get("/settings")
     assert 'value="qwen" selected' in page.text

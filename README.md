@@ -71,8 +71,11 @@ each exploit attempt for a per-session approval click in the UI instead.
 - **Resumable sessions** — a crash or restart mid-scan doesn't lose progress; findings/logs are
   persisted the instant they're produced, and an interrupted session resumes from where it left off.
 - **Pluggable LLM providers** — opencode-zen (default, free, no key), Qwen, Mistral, and
-  OpenRouter work out of the box, plus local providers (LM Studio, Ollama) for running entirely
-  offline; adding another OpenAI-compatible provider is one config row, no code changes.
+  OpenRouter work out of the box, plus local providers (LM Studio, Ollama, and opencode's own CLI
+  running as a local server — free, no key, no sign-in, as long as `opencode` is on `PATH`) for
+  running entirely offline; adding another OpenAI-compatible provider is one config row, no code
+  changes. A "Free models only" switch in Settings filters every model picker in the app down to
+  models a provider actually reports as free.
 - **Extensible tool registry** — built-in tools (Nmap, Nuclei, Metasploit, sqlmap, Nikto, WhatWeb,
   Wpscan, Dalfox, ffuf, Subfinder, Arjun, Hydra) plus anything else already on `PATH` (amass,
   gobuster, ...) plus your own scripts via `custom_tools.yaml`. Arjun is the one exception to
@@ -112,6 +115,28 @@ each exploit attempt for a per-session approval click in the UI instead.
   findings, real evidence, and the full human-approval audit trail.
 - **Local-only** — no cloud dependency besides the LLM API call itself, and no database; session
   state is plain JSON on disk.
+
+## Screenshots
+
+ASRA ships with 30+ built-in UI themes (Settings → Customization), from plain light/dark to
+several hacker-aesthetic ones — these are illustrative screenshots from a synthetic demo project
+(no real target, provider, or finding):
+
+**Dashboard** — recent projects at a glance, each with its own status:
+
+![ASRA dashboard — recent projects list with status badges](docs/screenshots/ASRA_screenshot_dashboard.jpg)
+
+**Live run log** (`neo` theme) — every tool call as it happens, phase-tagged and timestamped:
+
+![ASRA session Logs tab in the neo theme — a green falling-code aesthetic](docs/screenshots/ASRA_screenshot_logs_neo_theme.jpg)
+
+**Findings** (`mr-robot` theme) — severity/exploited/qualifies-for-bounty badges per finding:
+
+![ASRA session Findings tab in the mr-robot theme — a red-on-black hacker aesthetic](docs/screenshots/ASRA_screenshot_findings_mrrobot_theme.jpg)
+
+**Plan** (`dracula` theme) — the agent's own live phase → task → subtask breakdown:
+
+![ASRA session Plan tab in the dracula theme — a three-level recon/analyze/exploit task tree](docs/screenshots/ASRA_screenshot_plan_dracula_theme.jpg)
 
 ## Architecture
 
@@ -203,6 +228,12 @@ below) for real.
 
 Skip straight to [Install the security tools](#install-the-security-tools-all-platforms) below if
 you're on Linux or macOS, or if WSL2 + a distro are already installed on this Windows machine.
+
+**Using the desktop launcher?** It detects both cases below itself — WSL missing entirely, or WSL
+present with zero distros registered — and offers an "Install WSL"/"Install `<distro>`" button
+right on the start screen (Windows will still show its own permission prompt; see the manual steps
+below if you'd rather not grant it). The manual steps still apply as-is on `run.bat`/no-desktop-app
+setups, or as a fallback if that button doesn't work for some reason.
 
 1. Open PowerShell **as Administrator** and run:
    ```powershell
@@ -507,7 +538,7 @@ The ones worth knowing about going in:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LLM_PROVIDER` | `opencode-zen` | Which provider to use — `opencode-zen` (free, no key), `qwen`, `mistral`, `openrouter` (each needs its own `*_API_KEY`), or a local `lmstudio`/`ollama` server (no key) |
+| `LLM_PROVIDER` | `opencode-zen` | Which provider to use — `opencode-zen` (free, no key), `qwen`, `mistral`, `openrouter` (each needs its own `*_API_KEY`), a local `lmstudio`/`ollama` server (no key), or `opencode-local` (spawns the `opencode` CLI as a local server — free, no key, needs `opencode` on `PATH`; Settings-only choice, not set via this env var) |
 | `ENABLE_EXPLOIT` | `true` | `false` runs Recon + Analyze only — no exploitation phase at all |
 | `EXPLOIT_REQUIRE_APPROVAL` | `false` | `false` (default): exploitation proceeds autonomously the instant Exploit wants to run something (still fully logged in the audit trail). `true`: pause and wait for a per-session approval click in the UI before each attempt. The allowlist/scope check applies either way — this only gates the human-in-the-loop prompt |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | `120` | Per-call timeout for LLM API responses, before backoff retries kick in |

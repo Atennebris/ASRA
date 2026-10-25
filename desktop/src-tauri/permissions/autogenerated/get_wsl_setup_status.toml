@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-wsl-setup-status"
+description = "Enables the get_wsl_setup_status command without any pre-configured scope."
+commands.allow = ["get_wsl_setup_status"]
+
+[[permission]]
+identifier = "deny-get-wsl-setup-status"
+description = "Denies the get_wsl_setup_status command without any pre-configured scope."
+commands.deny = ["get_wsl_setup_status"]

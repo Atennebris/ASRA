@@ -34,6 +34,10 @@ _DEFAULT_PROFILE = {
     "model": None,
     "icon": "robot",
     "icon_color": "#60a5fa",
+    # This profile's own "Free models only" switch state (subagents.html) -- persisted so it
+    # survives a reload, same "a toggle remembers its own position" rule every switch in the app
+    # follows (real, confirmed operator complaint: it used to silently reset to off every time).
+    "free_only": False,
 }
 
 
@@ -66,7 +70,7 @@ def _write_subagent_profiles(data: dict) -> None:
 
 def add_profile(
     name: str, allowed_tools: list[str], instructions: str, provider: str | None, model: str | None,
-    icon: str | None = None, icon_color: str | None = None,
+    icon: str | None = None, icon_color: str | None = None, free_only: bool = False,
 ) -> dict:
     store = load_subagent_profiles()
     profile = {
@@ -79,6 +83,7 @@ def add_profile(
         "model": model,
         "icon": icon,
         "icon_color": icon_color,
+        "free_only": bool(free_only),
     }
     store["profiles"].append(profile)
     _write_subagent_profiles(store)
@@ -91,7 +96,7 @@ def update_profile(profile_id: str, **fields) -> dict:
     icon_color -- unrecognized keys are ignored rather than raising, same tolerance as the rest of
     this project's "accept a real-world variant" discipline (a caller passing an extra, harmless
     key shouldn't have to know this function's exact whitelist to avoid an error)."""
-    allowed_fields = {"name", "enabled", "allowed_tools", "instructions", "provider", "model", "icon", "icon_color"}
+    allowed_fields = {"name", "enabled", "allowed_tools", "instructions", "provider", "model", "icon", "icon_color", "free_only"}
     store = load_subagent_profiles()
     for profile in store["profiles"]:
         if profile["id"] == profile_id:

@@ -14,6 +14,9 @@
     "allow-save-env",
     "allow-open-in-browser",
     "allow-open-external-url",
-    "allow-notify-session-done"
+    "allow-notify-session-done",
+    "allow-install-wsl",
+    "allow-get-wsl-setup-status",
+    "allow-test-wsl-setup"
   ]
 }

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import provider_options, model_options with context %}
+{% from "macros/ui.html" import provider_options, model_options, toggle_switch with context %}
 {% block title %}ASRA &mdash; Playbook{% endblock %}
 {% block content %}
   {# The Playbook manager: the cross-session technique store (agent/tools/playbook_store.py) made
@@ -145,8 +145,15 @@
     {{ list_html | safe }}
   </div>
 
-  {# Add-technique dialog -- hand-add a single technique the operator already knows. #}
-  <dialog id="playbook-add" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden backdrop:bg-black/50">
+  {# Add-technique dialog -- hand-add a single technique the operator already knows.
+     Deliberately NO `overflow-hidden` on the <dialog> itself -- same real, confirmed desktop-app
+     (WebView2) bug subagents.html's own edit dialog ran into: a native <select> (the Outcome
+     field below) silently refuses to open its own dropdown at all when it sits inside a <dialog>
+     that carries `overflow-hidden`, a known Chromium top-layer/overflow-clipping interaction bug.
+     It only ever existed here to clip the scrolling form's square corners under the dialog's own
+     rounded-lg -- purely cosmetic, and this dialog's own header keeps its rounded top corner
+     regardless (it never scrolls, it's shrink-0). #}
+  <dialog id="playbook-add" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col backdrop:bg-black/50">
     <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
       <span class="text-[13px] font-semibold">Add a technique</span>
       <button type="button" onclick="document.getElementById('playbook-add').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
@@ -309,10 +316,60 @@
         </select>
         <select name="model" id="library-model-shared"
                 class="flex-1 min-w-0 bg-elevated border border-default rounded px-2 py-1 text-[11px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-          {{ model_options(library_last_provider, library_last_model, library_last_model_choices) }}
+          {{ model_options(library_last_provider, library_last_model, library_last_model_choices, library_last_model_free_flags) }}
         </select>
       </div>
       <p class="text-[10px] text-secondary mt-1">Applies to every source's "Analyze" below. Only providers actually configured in Settings are listed.</p>
+      {# This picker's own independent "Free models only" switch -- same per-picker treatment as
+         every other model picker in the app (static/js/free_models_filter.js's shared primitives).
+         Persisted (library_store.py's last_free_only) on every Analyze click, same "a toggle
+         remembers its own position" rule every switch in the app follows -- the hidden twin, not
+         the visible checkbox itself, is what every source card's own Analyze button actually
+         includes (partials/library_card.html's hx-include), same reasoning as the chat picker's
+         own identical pairing: a plain unchecked checkbox going missing from the request would be
+         indistinguishable from "never touched this at all" and silently fail to turn the saved
+         preference back off. #}
+      <label class="flex items-center gap-1.5 mt-1 text-[10px] text-secondary cursor-pointer" id="library-free-wrap">
+        {{ toggle_switch("library_free_only_visible", checked=library_free_only, id="library-free-toggle") }}
+        <input type="hidden" name="free_only" value="{{ 'true' if library_free_only else 'false' }}" id="library-free-hidden">
+        <span class="shrink-0">Free models only</span>
+        <span class="text-tertiary" id="library-free-hint"></span>
+      </label>
+      <script>
+        (function () {
+          var toggle = document.getElementById("library-free-toggle");
+          var hiddenField = document.getElementById("library-free-hidden");
+          var hint = document.getElementById("library-free-hint");
+          var wrap = document.getElementById("library-free-wrap");
+          var modelSelect = document.getElementById("library-model-shared");
+          var providerSelect = document.getElementById("library-provider-shared");
+          if (!toggle || !hiddenField || !hint || !wrap || !modelSelect) return;
+          function syncHidden() { hiddenField.value = toggle.checked ? "true" : "false"; }
+          function refresh() {
+            var reason = window.asraFreeFilterReasonFor(modelSelect, providerSelect ? providerSelect.value : null);
+            toggle.disabled = !!reason;
+            wrap.classList.toggle("cursor-not-allowed", !!reason);
+            wrap.classList.toggle("opacity-60", !!reason);
+            wrap.classList.toggle("cursor-pointer", !reason);
+            if (reason) toggle.checked = false;
+            hint.textContent = reason || "";
+            window.asraApplyFreeFilterToSelect(modelSelect, !reason && toggle.checked);
+            syncHidden();
+          }
+          toggle.addEventListener("change", function () {
+            window.asraApplyFreeFilterToSelect(modelSelect, toggle.checked);
+            syncHidden();
+          });
+          document.addEventListener("htmx:afterSwap", function (event) {
+            if (event.detail && event.detail.target === modelSelect) refresh();
+          });
+          try {
+            refresh();
+          } catch (err) {
+            console.error("library free-only toggle refresh failed (picker still fully usable):", err);
+          }
+        })();
+      </script>
     </div>
 
     <div class="flex-1 overflow-y-auto asra-scroll">

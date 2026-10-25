@@ -792,12 +792,12 @@ def test_stopped_source_can_be_re_analyzed(monkeypatch):
 
 
 def test_load_library_settings_defaults_to_none():
-    assert library_store.load_library_settings() == {"last_provider": None, "last_model": None}
+    assert library_store.load_library_settings() == {"last_provider": None, "last_model": None, "last_free_only": False}
 
 
 def test_save_and_load_last_analysis_llm_roundtrip():
     library_store.save_last_analysis_llm("opencode-zen", "big-pickle")
-    assert library_store.load_library_settings() == {"last_provider": "opencode-zen", "last_model": "big-pickle"}
+    assert library_store.load_library_settings() == {"last_provider": "opencode-zen", "last_model": "big-pickle", "last_free_only": False}
 
 
 def test_start_analysis_saves_the_provider_and_model_it_was_started_with(monkeypatch):
@@ -809,7 +809,7 @@ def test_start_analysis_saves_the_provider_and_model_it_was_started_with(monkeyp
         library_store.start_analysis(sid, "myprovider", "mymodel")
     _run(_main())
 
-    assert library_store.load_library_settings() == {"last_provider": "myprovider", "last_model": "mymodel"}
+    assert library_store.load_library_settings() == {"last_provider": "myprovider", "last_model": "mymodel", "last_free_only": False}
 
 
 # --- 0 = unlimited convention ---

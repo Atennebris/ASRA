@@ -1,4 +1,4 @@
-{% from "macros/ui.html" import provider_options, model_options with context %}
+{% from "macros/ui.html" import provider_options, model_options, toggle_switch with context %}
 {# Chat panel — separate conversation from the session's own tool-call log; never reads
    session.logs directly, only whatever agent/chat.py's snapshot decided to hand the model.
    Several independent, named THREADS per project now (agent/chat.py's chat_threads/
@@ -231,10 +231,60 @@
         <span class="sr-only">Model</span>
         <select name="model" id="chat-model"
                 class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-          {{ model_options(thread.provider, thread.model, chat_model_choices) }}
+          {{ model_options(thread.provider, thread.model, chat_model_choices, chat_model_free_flags) }}
         </select>
       </label>
     </div>
+    {# This picker's own independent "Free models only" switch -- same per-picker treatment as
+       every other model picker in the app (static/js/free_models_filter.js's shared primitives),
+       not the main Settings picker's global one. Kept to one compact line -- this footer is
+       already tight on vertical space. Persisted (chat_settings_store.py's last_free_only) on
+       every message send, same "a toggle remembers its own position" rule every switch in the
+       app follows -- the hidden twin, not the visible checkbox itself, is what actually submits
+       with #chat-form (this whole form resubmits on every message, so a plain unchecked checkbox
+       going missing from the request would be indistinguishable from "never touched this at all"
+       and silently fail to turn the saved preference back off). #}
+    <label class="flex items-center gap-1.5 text-[10px] text-secondary cursor-pointer" id="chat-free-wrap">
+      {{ toggle_switch("chat_free_only_visible", checked=chat_free_only, id="chat-free-toggle") }}
+      <input type="hidden" name="free_only" value="{{ 'true' if chat_free_only else 'false' }}" id="chat-free-hidden">
+      <span class="shrink-0">Free models only</span>
+      <span class="text-tertiary" id="chat-free-hint"></span>
+    </label>
+    <script>
+      (function () {
+        var toggle = document.getElementById("chat-free-toggle");
+        var hiddenField = document.getElementById("chat-free-hidden");
+        var hint = document.getElementById("chat-free-hint");
+        var wrap = document.getElementById("chat-free-wrap");
+        var modelSelect = document.getElementById("chat-model");
+        var providerSelect = document.getElementById("chat-provider");
+        if (!toggle || !hiddenField || !hint || !wrap || !modelSelect) return;
+        function syncHidden() { hiddenField.value = toggle.checked ? "true" : "false"; }
+        function refresh() {
+          var reason = window.asraFreeFilterReasonFor(modelSelect, providerSelect ? providerSelect.value : null);
+          toggle.disabled = !!reason;
+          wrap.classList.toggle("cursor-not-allowed", !!reason);
+          wrap.classList.toggle("opacity-60", !!reason);
+          wrap.classList.toggle("cursor-pointer", !reason);
+          if (reason) toggle.checked = false;
+          hint.textContent = reason || "";
+          window.asraApplyFreeFilterToSelect(modelSelect, !reason && toggle.checked);
+          syncHidden();
+        }
+        toggle.addEventListener("change", function () {
+          window.asraApplyFreeFilterToSelect(modelSelect, toggle.checked);
+          syncHidden();
+        });
+        document.addEventListener("htmx:afterSwap", function (event) {
+          if (event.detail && event.detail.target === modelSelect) refresh();
+        });
+        try {
+          refresh();
+        } catch (err) {
+          console.error("chat free-only toggle refresh failed (picker still fully usable):", err);
+        }
+      })();
+    </script>
     <div class="flex gap-2">
       <div class="relative flex-1 min-w-0">
         {# A <textarea>, not a single-line <input> -- real, confirmed operator complaint: a

@@ -336,7 +336,7 @@ def test_library_analyze_route_first_response_already_shows_analyzing(monkeypatc
 
 def test_library_analyze_route_surfaces_the_concurrency_refusal_message(monkeypatch):
     sid = library_store.add_source(b"content", "a.txt")
-    monkeypatch.setattr(library_store, "start_analysis", lambda source_id, provider, model: "1 analysis run(s) already in progress (limit 1) -- wait for one to finish first")
+    monkeypatch.setattr(library_store, "start_analysis", lambda source_id, provider, model, free_only=False: "1 analysis run(s) already in progress (limit 1) -- wait for one to finish first")
     client = TestClient(main.app)
 
     resp = client.post(f"/api/library/{sid}/analyze", data={"provider": "", "model": ""})

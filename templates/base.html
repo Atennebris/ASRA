@@ -416,6 +416,19 @@
      as load_display_timezone right below -- always reflects whatever was last saved, no server
      restart needed. #}
   <script>window.ASRA_SOUND_SETTINGS = {{ load_sound_settings() | tojson }};</script>
+  {# Settings -> "Free models only" switch's current state, on every page (not just settings.html)
+     -- static/js/free_models_filter.js has to filter every model <select> it finds on whatever
+     page it's on, same page-wide-global reasoning as ASRA_SOUND_SETTINGS right above. #}
+  <script>window.ASRA_FREE_MODELS_ONLY = {{ get_free_models_only() | tojson }};</script>
+  <script src="/static/js/free_models_filter.js?v=2"></script>
+  {# Page-wide (any `select[data-custom-select]`, any page) progressive-enhancement replacement for
+     a native <select>'s own OS-rendered popup -- see static/js/custom_select.js's own top comment
+     for why this exists (a native <select> popup silently refusing to open inside an open <dialog>
+     on the operator's WebView2 runtime build, confirmed real and NOT a CSS-clipping issue). Loaded
+     after free_models_filter.js, not before -- this file's own panel-building logic reads that
+     filter's option.hidden/disabled writes, so the filter's hide/show pass (also wired to
+     htmx:afterSwap) needs to already be registered first. #}
+  <script src="/static/js/custom_select.js?v=2"></script>
   {# window.asraCopyCard/asraCopyLogs, used by every finding/hypothesis/credential/chain card's own
      Copy button (macros/ui.html's copy_button()) on ANY page, Agent mode included -- must be
      loaded here (page-wide), not inside session.html's own Interactive/RE-only conditional block,
@@ -1091,20 +1104,32 @@
     });
   </script>
 
-  {# flex-col + max-h-[90vh] + overflow-hidden: the dialog sizes to its content up to 90vh, then the
-     BODY (not the whole dialog) becomes the single scroll region with the app's own custom
-     scrollbar (.asra-scroll) -- without this the long Agent step-2 form overflowed the viewport and
-     fell back to the browser's own thin default scrollbar on the <dialog> itself (the "no custom
+  {# flex-col + max-h-[90vh]: the dialog sizes to its content up to 90vh, then the BODY (not the
+     whole dialog) becomes the single scroll region with the app's own custom scrollbar
+     (.asra-scroll) -- without this the long Agent step-2 form overflowed the viewport and fell
+     back to the browser's own thin default scrollbar on the <dialog> itself (the "no custom
      scroll, everything cut off" report). Step 1 (the short mode picker) still shrinks to its own
      content, since max-height is only a ceiling. The header stays pinned (shrink-0); the body's
-     min-h-0 is what lets it shrink below its content and actually scroll inside the capped column. #}
-  <dialog id="new-project-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden backdrop:bg-black/50">
-    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
+     min-h-0 is what lets it shrink below its content and actually scroll inside the capped column.
+
+     Deliberately NO `overflow-hidden` on the <dialog> (this used to carry it, purely to clip the
+     header/body's square corners under the dialog's own rounded-lg). Real, confirmed bug this
+     caused, same root cause as the identical pattern once used by templates/subagents.html's Edit
+     dialog (see that file's own long comment on its Provider/Model <select>s for the full
+     Chromium/WebView2 explanation): a native <select>'s dropdown popup -- this dialog has two,
+     `time_budget_preset` and the UA picker in new_project_form.html -- silently refuses to open at
+     all in the desktop app's embedded WebView2 when it sits inside a <dialog> (or any ancestor
+     between the <dialog> and the <select>) carrying `overflow-hidden`. Fixed the same way: the
+     corner-clipping is achieved by rounding the header and body individually (`rounded-t-lg` /
+     `rounded-b-lg`, matching the dialog's own `rounded-lg`) instead of relying on an
+     `overflow-hidden` ancestor to clip them. #}
+  <dialog id="new-project-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-2xl max-h-[90vh] flex flex-col backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0 rounded-t-lg">
       <span class="text-[13px] font-semibold">New project</span>
       <button type="button" onclick="document.getElementById('new-project-modal').close()"
               class="text-secondary hover:text-primary text-lg leading-none">&times;</button>
     </div>
-    <div class="p-4 overflow-y-auto asra-scroll min-h-0">
+    <div class="p-4 overflow-y-auto asra-scroll min-h-0 rounded-b-lg">
       {% include "partials/new_project_form.html" %}
     </div>
   </dialog>

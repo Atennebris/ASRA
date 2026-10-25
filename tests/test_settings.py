@@ -62,6 +62,39 @@ def test_saving_fallback_chain_does_not_erase_a_previously_saved_provider_model(
     assert saved["provider"] == "mistral"
     assert saved["model"] == "mistral-small-latest"
     assert saved["fallback_chain_enabled"] is True
+    assert saved["fallback_chain"] == [{"provider": "qwen", "model": "qwen-plus"}]
+
+
+# --- get_free_models_only/set_free_models_only: Settings -> "Free models only" switch.
+
+
+def test_free_models_only_defaults_to_false_when_never_set():
+    assert settings.get_free_models_only() is False
+
+
+def test_free_models_only_round_trips_true_and_false():
+    settings.set_free_models_only(True)
+    assert settings.get_free_models_only() is True
+
+    settings.set_free_models_only(False)
+    assert settings.get_free_models_only() is False
+
+
+def test_set_free_models_only_does_not_erase_a_previously_saved_provider_model():
+    settings.save_llm_settings("mistral", "mistral-small-latest")
+    settings.set_free_models_only(True)
+
+    saved = settings.load_llm_settings()
+    assert saved["provider"] == "mistral"
+    assert saved["model"] == "mistral-small-latest"
+    assert saved["free_models_only"] is True
+
+
+def test_saving_provider_model_does_not_erase_a_previously_saved_free_models_only():
+    settings.set_free_models_only(True)
+    settings.save_llm_settings("mistral", "mistral-small-latest")
+
+    assert settings.load_llm_settings()["free_models_only"] is True
 
 
 def test_save_fallback_chain_settings_preserves_row_order():
@@ -89,7 +122,7 @@ def test_secondary_verification_provider_is_none_by_default():
 
 def test_save_then_get_secondary_verification_provider_round_trips():
     settings.save_secondary_verification_provider("mistral", "mistral-small-latest")
-    assert settings.get_secondary_verification_provider() == {"provider": "mistral", "model": "mistral-small-latest"}
+    assert settings.get_secondary_verification_provider() == {"provider": "mistral", "model": "mistral-small-latest", "free_only": False}
 
 
 def test_save_secondary_verification_provider_with_blank_values_clears_it():

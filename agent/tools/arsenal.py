@@ -17,6 +17,8 @@ another, and a single global percentage would hide that.
 """
 from __future__ import annotations
 
+import shutil
+
 from agent.tools.tool_inventory import list_tool_availability
 
 # Tier-2 == external subprocess binary (setup_tools.sh's job); Tier-1 == native Python, always
@@ -47,6 +49,26 @@ def _percent(installed: int, total: int) -> int:
     return round(installed * 100 / total) if total else 0
 
 
+def _dependencies() -> list[dict]:
+    """Things setup_tools.sh also provisions that are NOT recon/exploit tools -- today just the
+    opencode CLI (agent/opencode_local_provider.py's "opencode (local server)" LLM provider).
+    Deliberately separate from external/native/modes/verdict above, never folded into any of
+    those counts: this answers "does one particular, optional LLM provider work", not "can the
+    agent run its own tools" -- counting it in would make a fresh install missing only this one
+    optional dependency read as a degraded tool arsenal, which it isn't. The same Install button
+    (setup_tools.sh's own install_opencode_cli) still provisions it -- this list exists purely so
+    its status is actually visible somewhere, not to give it its own separate install path.
+    """
+    return [
+        {
+            "name": "opencode",
+            "label": "opencode CLI",
+            "installed": shutil.which("opencode") is not None,
+            "note": "Dependency for the \"opencode (local server)\" LLM provider (Settings -> AI Provider & Model) — not a recon/exploit tool.",
+        },
+    ]
+
+
 def summarize_arsenal() -> dict:
     """Live snapshot for the Tools page. Never runs anything -- pure read over the registry's own
     installed-check. Shape (all counts are over EXTERNAL tools unless the name says native):
@@ -57,6 +79,8 @@ def summarize_arsenal() -> dict:
         modes:              [{key,label,total,installed,percent,available}], only buckets that
                             actually have at least one external tool, ordered web -> re -> toolkit
         missing/present:    sorted external tool names, for the expandable detail list
+        dependencies:       [{name,label,installed,note}] -- non-tool dependencies (see
+                            _dependencies' own docstring); never affects verdict/percent above.
     """
     inventory = list_tool_availability()
     external = [e for e in inventory if e["tier"] == _EXTERNAL_TIER]
@@ -98,4 +122,5 @@ def summarize_arsenal() -> dict:
         "modes": modes,
         "missing": sorted(e["name"] for e in external_missing),
         "present": sorted(e["name"] for e in external_installed),
+        "dependencies": _dependencies(),
     }

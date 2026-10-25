@@ -61,6 +61,36 @@
   .sys { margin-top: 6px; }
   .sys .note { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.55; }
 
+  .wsl-setup { margin-top: 10px; }
+  .btn-wsl-install { display: block; width: 100%; border: 1px solid var(--line); background: var(--bg);
+        color: var(--fg); border-radius: 9px; padding: 10px 14px; font: inherit; font-size: 12.5px;
+        font-weight: 600; letter-spacing: 0.02em; cursor: pointer; text-align: center; }
+  .btn-wsl-install:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-wsl-install:disabled { opacity: 0.5; cursor: default; }
+  .wsl-setup-status { margin-top: 8px; display: none; }
+  .wsl-setup-status.show { display: block; }
+  .wsl-setup-status .dot-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+  .wsl-setup-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+  .wsl-setup-status.running .dot { background: #e3b341; animation: wsl-setup-pulse 1.1s ease-in-out infinite; }
+  .wsl-setup-status.done .dot { background: #6fbf73; }
+  .wsl-setup-status.stalled .dot { background: #e3b341; }
+  .wsl-setup-status.failed .dot { background: #ff9ea1; }
+  @keyframes wsl-setup-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .wsl-setup-log { margin-top: 6px; max-height: 140px; overflow-y: auto; background: var(--panel2);
+        border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font-size: 10.5px;
+        color: #b9c4d0; white-space: pre-wrap; word-break: break-all; }
+
+  .wsl-test-row { margin-top: 8px; }
+  .btn-wsl-test { border: 1px solid var(--line); background: var(--bg); color: var(--muted);
+        border-radius: 7px; padding: 6px 12px; font: inherit; font-size: 11.5px; font-weight: 600;
+        letter-spacing: 0.02em; cursor: pointer; }
+  .btn-wsl-test:hover { border-color: #33404e; color: var(--fg); }
+  .btn-wsl-test:disabled { opacity: 0.5; cursor: default; }
+  .wsl-test-status { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; display: none; }
+  .wsl-test-status.show { display: block; }
+  .wsl-test-status.ok { color: #6fbf73; }
+  .wsl-test-status.err { color: #ff9ea1; }
+
   details { margin-top: 18px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel2); }
   summary { cursor: pointer; padding: 12px 15px; font-size: 12.5px; color: var(--muted); user-select: none; }
   summary:hover { color: var(--fg); }
@@ -1113,10 +1143,14 @@
             n.textContent = "Only one WSL distro installed — selected automatically.";
             host.appendChild(n);
           }
+          host.appendChild(buildWslTest());
         } else {
           var warn = document.createElement("div"); warn.className = "note";
-          warn.textContent = "No WSL distros detected. Install one (see README) before launching.";
+          warn.textContent = cfg.wsl_installed
+            ? "WSL is installed, but no Linux distro is registered yet."
+            : "WSL (Windows Subsystem for Linux) was not found on this machine.";
           host.appendChild(warn);
+          host.appendChild(buildWslSetup());
         }
       } else {
         var native = document.createElement("div");
@@ -1124,6 +1158,130 @@
         native.textContent = "Detected: " + (cfg.os === "macos" ? "macOS" : "Linux") + " — runs natively (no WSL).";
         host.appendChild(native);
       }
+    }
+
+    // Builds the "Install WSL" / "Install <distro>" block renderSystem() appends when
+    // cfg.distros is empty (either WSL itself is missing, or it's present with zero distros --
+    // the warning text right above this already told the operator which). Returns a detached
+    // node so renderSystem() can keep doing its usual host.innerHTML = "" + appendChild dance.
+    var wslSetupTimer = null;
+
+    function buildWslSetup() {
+      var wrap = document.createElement("div"); wrap.className = "wsl-setup";
+
+      var btn = document.createElement("button");
+      btn.type = "button"; btn.id = "wsl-setup-btn"; btn.className = "btn-wsl-install";
+      btn.textContent = cfg.wsl_installed ? ("Install " + (cfg.wsl_default_distro || "a Linux distro")) : "Install WSL";
+      btn.addEventListener("click", function () {
+        startWslSetup(cfg.wsl_installed ? "install-distro" : "install-wsl");
+      });
+      wrap.appendChild(btn);
+
+      var status = document.createElement("div"); status.id = "wsl-setup-status"; status.className = "wsl-setup-status";
+      var dotRow = document.createElement("div"); dotRow.className = "dot-row";
+      dotRow.appendChild(document.createElement("span")).className = "dot";
+      var label = document.createElement("span"); label.id = "wsl-setup-label";
+      dotRow.appendChild(label);
+      status.appendChild(dotRow);
+      var log = document.createElement("pre"); log.id = "wsl-setup-log"; log.className = "wsl-setup-log";
+      status.appendChild(log);
+      wrap.appendChild(status);
+
+      var note = document.createElement("div"); note.className = "note";
+      note.textContent = "Needs a one-time Windows permission prompt (UAC). See README for the manual steps if you'd rather not grant it.";
+      wrap.appendChild(note);
+
+      return wrap;
+    }
+
+    // "Test WSL setup" -- shown even when a distro is already detected, because list_wsl_distros()
+    // only proves `wsl -l -v` knows about it, never that it actually boots and responds (see
+    // test_wsl_setup's own Rust-side comment for the real WSL2-goes-unresponsive failure mode this
+    // catches). A quick, single-shot check -- same disable-button/inline-status-text pattern the
+    // existing "Force restart ASRA" button already uses, not the polling log window the WSL
+    // install flow needs (this finishes in seconds, nothing to stream).
+    function buildWslTest() {
+      var row = document.createElement("div"); row.className = "wsl-test-row";
+      var btn = document.createElement("button");
+      btn.type = "button"; btn.id = "wsl-test-btn"; btn.className = "btn-wsl-test";
+      btn.textContent = "Test WSL setup";
+      var status = document.createElement("div"); status.id = "wsl-test-status"; status.className = "wsl-test-status";
+      btn.addEventListener("click", async function () {
+        if (!invoke) return;
+        btn.disabled = true;
+        status.className = "wsl-test-status show";
+        status.textContent = "Checking the selected distro responds (bash/wslpath present)…";
+        try {
+          var distroEl = $("distro");
+          var res = await invoke("test_wsl_setup", {
+            distro: distroEl ? distroEl.value : "",
+            asRoot: $("root").checked
+          });
+          status.className = "wsl-test-status show ok";
+          status.textContent = res;
+        } catch (e) {
+          status.className = "wsl-test-status show err";
+          status.textContent = String(e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+      row.appendChild(btn);
+      row.appendChild(status);
+      return row;
+    }
+
+    function setWslStatus(stateClass, labelText) {
+      var status = $("wsl-setup-status");
+      if (!status) return;
+      status.className = "wsl-setup-status show " + stateClass;
+      var label = $("wsl-setup-label");
+      if (label) label.textContent = labelText;
+    }
+
+    async function pollWslSetup() {
+      if (!invoke) return;
+      try {
+        var res = await invoke("get_wsl_setup_status");
+        var log = $("wsl-setup-log");
+        if (log) {
+          var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+          log.textContent = res.log || "";
+          if (atBottom) log.scrollTop = log.scrollHeight;
+        }
+        if (res.state === "done") {
+          clearInterval(wslSetupTimer); wslSetupTimer = null;
+          setWslStatus("done", "Done — refreshing…");
+          cfg = await invoke("get_start_config");
+          renderSystem();
+        } else if (res.state === "stalled") {
+          setWslStatus("stalled", "No progress for a while — this usually means a Windows permission prompt is waiting to be accepted, or it's still downloading. You can click the button again.");
+          var btn = $("wsl-setup-btn"); if (btn) btn.disabled = false;
+        } else {
+          setWslStatus("running", "Installing… this can take a few minutes the first time.");
+        }
+      } catch (e) {
+        clearInterval(wslSetupTimer); wslSetupTimer = null;
+        setWslStatus("failed", String(e));
+        var btn = $("wsl-setup-btn"); if (btn) btn.disabled = false;
+      }
+    }
+
+    async function startWslSetup(mode) {
+      if (!invoke) return;
+      var btn = $("wsl-setup-btn");
+      if (btn) btn.disabled = true;
+      setWslStatus("running", "Requesting Windows permission (look for a UAC prompt)…");
+      try {
+        await invoke("install_wsl", { args: { mode: mode, distro: (cfg && cfg.wsl_default_distro) || "" } });
+      } catch (e) {
+        setWslStatus("failed", String(e));
+        if (btn) btn.disabled = false;
+        return;
+      }
+      if (wslSetupTimer) clearInterval(wslSetupTimer);
+      wslSetupTimer = setInterval(pollWslSetup, 2000);
+      pollWslSetup();
     }
 
     function makeSetting(s) {

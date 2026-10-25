@@ -1,5 +1,10 @@
 {# Swapped into the model <select> whenever the provider <select> changes (hx-get, see
-   settings.html) — the list of valid models depends entirely on which provider is picked. #}
+   settings.html) — the list of valid models depends entirely on which provider is picked.
+   data-free, when known (model_free_flags -- main.py's _model_free_flags), feeds the "Free
+   models only" client-side filter (static/js/free_models_filter.js). A model with no entry in
+   model_free_flags gets no data-free attribute at all -- that filter never hides what it doesn't
+   know is paid, so an absent attribute is the same as "always show this one". #}
+{% set model_free_flags = model_free_flags | default({}) %}
 {% for model_id in provider_models %}
-  <option value="{{ model_id }}" {% if model_id == current_model %}selected{% endif %}>{{ model_id }}</option>
+  <option value="{{ model_id }}" {% if model_id == current_model %}selected{% endif %}{% if model_id in model_free_flags %} data-free="{{ 'true' if model_free_flags[model_id] else 'false' }}"{% endif %}>{{ model_id }}</option>
 {% endfor %}

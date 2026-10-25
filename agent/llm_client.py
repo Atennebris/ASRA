@@ -62,6 +62,17 @@ CODEX_DISPLAY_NAME = "OpenAI (ChatGPT sign-in)"
 # despite being OpenAI-compatible, still can't just be another OpenAICompatProvider instance.
 COPILOT_PROVIDER_ID = "github-copilot"
 COPILOT_DISPLAY_NAME = "GitHub Copilot (sign-in)"
+# "opencode (local server)" -- a third non-PROVIDER_REGISTRY category: not a cloud OAuth sign-in
+# like Codex/Copilot above, and not a plain OpenAICompatProvider endpoint either (its wire protocol
+# is opencode's own session/message API, not chat/completions) -- a real `opencode serve` process
+# spawned on this machine. See agent/opencode_local_provider.py's own module docstring for the full
+# why (it's what actually reaches opencode-zen's free tier, where a plain HTTP client to that same
+# free tier gets rejected -- PROVIDER_REGISTRY["opencode-zen"] above). No API key/sign-in needed --
+# the only thing it depends on is the opencode CLI being installed on this machine, discovered
+# lazily the same way LM Studio/Ollama's own local servers are (empty model list, not an error, if
+# it isn't there yet).
+OPENCODE_LOCAL_PROVIDER_ID = "opencode-local"
+OPENCODE_LOCAL_DISPLAY_NAME = "opencode (local server)"
 # The openai SDK requires a non-empty api_key string even against endpoints that don't check it
 # (opencode-zen's free models work with no key at all).
 _PLACEHOLDER_API_KEY = "not-needed"
@@ -415,7 +426,12 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     # them in their own block instead of mixing them into the cloud-provider list.
     "lmstudio": ProviderConfig(
         models_dev_id="lmstudio",
-        display_name="LM Studio",
+        # "(local)" suffix -- same reasoning as "opencode (local server)"'s own display name: every
+        # provider picker (main picker, "+ Add Provider", Reserve providers, subagent/library) shows
+        # this exact string, and nothing else in any of those dropdowns said "this one runs on your
+        # own machine, no cloud account" the way the Local optgroup heading implies but a flat
+        # provider name list elsewhere (e.g. the Reserve providers chain rows) doesn't repeat.
+        display_name="LM Studio (local)",
         base_url_env="LMSTUDIO_BASE_URL",
         base_url_default="http://127.0.0.1:1234/v1",
         api_key_env="LMSTUDIO_API_KEY",
@@ -430,7 +446,7 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         models_dev_id="ollama-cloud",  # closest models.dev entry; local Ollama has no catalog of
         # its own there, so capability lookups for it are best-effort and routinely miss (handled
         # gracefully -- see get_model_capabilities's None contract).
-        display_name="Ollama",
+        display_name="Ollama (local)",  # same "(local)" suffix reasoning as LM Studio's own entry above
         base_url_env="OLLAMA_BASE_URL",
         base_url_default="http://localhost:11434/v1",
         api_key_env="OLLAMA_API_KEY",
@@ -543,6 +559,21 @@ def _get_copilot_provider(model: str | None, saved: dict) -> LLMProvider:
     return CopilotOAuthProvider(model=resolved_model)
 
 
+def _get_opencode_local_provider(model: str | None, saved: dict) -> LLMProvider:
+    """The "opencode (local server)" counterpart of _get_codex_provider/_get_copilot_provider
+    above -- same reasoning, but nothing to sign in to: raises ValueError only when the opencode
+    CLI genuinely isn't installed (agent/opencode_local_provider.py's own _resolve_opencode_binary),
+    which get_next_chain_step's own `except ValueError: skip` fallback-chain handling already
+    treats exactly like any other "not usable right now" provider.
+    """
+    from agent.opencode_local_provider import OPENCODE_LOCAL_DEFAULT_MODEL, OpenCodeLocalProvider
+
+    saved_model = saved.get("model") if saved.get("provider") == OPENCODE_LOCAL_PROVIDER_ID else None
+    resolved_model = model or saved_model or OPENCODE_LOCAL_DEFAULT_MODEL
+    logger.debug("get_provider: resolved opencode-local model=%s", resolved_model)
+    return OpenCodeLocalProvider(model=resolved_model)
+
+
 def get_provider(provider_id: str | None = None, model: str | None = None) -> LLMProvider:
     """Builds an LLMProvider from PROVIDER_REGISTRY + env, with the Settings-screen choice
     (data/llm_settings.json) as the default between explicit args and .env. Resolution order,
@@ -564,6 +595,8 @@ def get_provider(provider_id: str | None = None, model: str | None = None) -> LL
         return _get_codex_provider(model, saved)
     if resolved_id == COPILOT_PROVIDER_ID:
         return _get_copilot_provider(model, saved)
+    if resolved_id == OPENCODE_LOCAL_PROVIDER_ID:
+        return _get_opencode_local_provider(model, saved)
 
     config = PROVIDER_REGISTRY.get(resolved_id)
     if config is None:
@@ -610,6 +643,11 @@ def all_provider_choices() -> list[tuple[str, str]]:
     """
     cloud = [(pid, cfg.display_name) for pid, cfg in PROVIDER_REGISTRY.items() if not cfg.is_local and is_provider_enabled(pid)]
     local = [(pid, cfg.display_name) for pid, cfg in PROVIDER_REGISTRY.items() if cfg.is_local and is_provider_enabled(pid)]
+    # opencode-local reads as a "Local" option to the operator (no cloud account, runs on this
+    # machine) even though it isn't a PROVIDER_REGISTRY row -- grouped with the is_local built-ins,
+    # not with Codex/Copilot's own sign-in pair, for exactly that reason.
+    if is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID):
+        local = [(OPENCODE_LOCAL_PROVIDER_ID, OPENCODE_LOCAL_DISPLAY_NAME), *local]
     choices = [*cloud, (CODEX_PROVIDER_ID, CODEX_DISPLAY_NAME), (COPILOT_PROVIDER_ID, COPILOT_DISPLAY_NAME), *local]
     choices += [(p["id"], p["name"]) for p in load_custom_providers() if p.get("enabled", True)]
     return choices
@@ -629,8 +667,12 @@ def configured_provider_choices() -> list[tuple[str, str]]:
     Local providers (LM Studio/Ollama) are always included here despite having no key to check --
     whether the local server is actually reachable right now is a live-probe question these
     pickers already handle separately (Reserve providers' own per-row on-demand model lookup), not
-    something this static, non-network-calling function can answer.
+    something this static, non-network-calling function can answer. opencode-local gets its own
+    branch instead (a cheap shutil.which PATH scan, not a live probe, but the closest equivalent
+    this function can afford without actually spawning its local server) -- see that branch below.
     """
+    import shutil
+
     from agent.codex_oauth import is_signed_in as codex_is_signed_in
     from agent.copilot_oauth import is_signed_in as copilot_is_signed_in
 
@@ -642,6 +684,14 @@ def configured_provider_choices() -> list[tuple[str, str]]:
             continue
         if provider_id == COPILOT_PROVIDER_ID:
             if copilot_is_signed_in():
+                configured.append((provider_id, display_name))
+            continue
+        if provider_id == OPENCODE_LOCAL_PROVIDER_ID:
+            # Same "only offer what's actually usable right now" rule LM Studio/Ollama get via
+            # their own reachable_local_ids probe just above this function's own call sites -- a
+            # plain PATH scan (not a subprocess spawn), cheap enough to run here unconditionally,
+            # unlike actually starting the local server just to answer this.
+            if shutil.which("opencode"):
                 configured.append((provider_id, display_name))
             continue
         config = PROVIDER_REGISTRY.get(provider_id)
@@ -656,7 +706,7 @@ def configured_provider_choices() -> list[tuple[str, str]]:
 def is_known_provider_id(provider_id: str) -> bool:
     return (
         provider_id in PROVIDER_REGISTRY
-        or provider_id in (CODEX_PROVIDER_ID, COPILOT_PROVIDER_ID)
+        or provider_id in (CODEX_PROVIDER_ID, COPILOT_PROVIDER_ID, OPENCODE_LOCAL_PROVIDER_ID)
         or get_custom_provider(provider_id) is not None
     )
 
@@ -892,6 +942,10 @@ def _get_model_choices_uncached(provider_id: str) -> list[str]:
     if provider_id == COPILOT_PROVIDER_ID:
         from agent.copilot_provider import COPILOT_MODELS, fetch_copilot_models
         return fetch_copilot_models() or list(COPILOT_MODELS.keys())
+
+    if provider_id == OPENCODE_LOCAL_PROVIDER_ID:
+        from agent.opencode_local_provider import list_opencode_local_models
+        return sorted(list_opencode_local_models())
 
     config = PROVIDER_REGISTRY.get(provider_id)
     if config is None:

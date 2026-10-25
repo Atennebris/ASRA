@@ -622,6 +622,110 @@ def test_configured_provider_choices_includes_enabled_custom_providers(monkeypat
     assert "My Instance" in configured_names
 
 
+# --- opencode-local: a third non-PROVIDER_REGISTRY provider (see agent/opencode_local_provider.py)
+# -- no OAuth sign-in like Codex/Copilot, no key/base_url like a registry row, just "is the
+# opencode CLI there or not", discovered lazily.
+
+
+def test_is_known_provider_id_recognizes_opencode_local():
+    assert llm_client.is_known_provider_id(llm_client.OPENCODE_LOCAL_PROVIDER_ID) is True
+
+
+def test_all_provider_choices_includes_opencode_local_by_default():
+    ids = {pid for pid, _ in llm_client.all_provider_choices()}
+    assert llm_client.OPENCODE_LOCAL_PROVIDER_ID in ids
+
+
+def test_all_provider_choices_excludes_opencode_local_when_disabled(monkeypatch):
+    monkeypatch.setattr(llm_client, "is_provider_enabled", lambda pid: pid != llm_client.OPENCODE_LOCAL_PROVIDER_ID)
+    ids = {pid for pid, _ in llm_client.all_provider_choices()}
+    assert llm_client.OPENCODE_LOCAL_PROVIDER_ID not in ids
+
+
+def test_configured_provider_choices_includes_opencode_local_when_cli_found(monkeypatch):
+    """Same "only offer what's actually usable right now" rule LM Studio/Ollama's own reachability
+    probe already applies for this function -- opencode-local's own cheap equivalent is a plain
+    shutil.which PATH scan (not a live network probe, but the closest this function can afford
+    without spawning the local server just to answer this)."""
+    _clear_all_provider_keys(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/opencode")
+    configured_ids = {pid for pid, _ in llm_client.configured_provider_choices()}
+    assert llm_client.OPENCODE_LOCAL_PROVIDER_ID in configured_ids
+
+
+def test_configured_provider_choices_excludes_opencode_local_when_cli_missing(monkeypatch):
+    _clear_all_provider_keys(monkeypatch)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    configured_ids = {pid for pid, _ in llm_client.configured_provider_choices()}
+    assert llm_client.OPENCODE_LOCAL_PROVIDER_ID not in configured_ids
+
+
+def test_get_provider_routes_opencode_local_to_the_real_provider_class(monkeypatch):
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {})
+    fake_provider = object()
+    captured = {}
+
+    def _fake_ctor(model=None):
+        captured["model"] = model
+        return fake_provider
+
+    with patch("agent.opencode_local_provider.OpenCodeLocalProvider", _fake_ctor):
+        result = get_provider(llm_client.OPENCODE_LOCAL_PROVIDER_ID, "some-model")
+
+    assert result is fake_provider
+    assert captured["model"] == "some-model"
+
+
+def test_get_provider_opencode_local_falls_back_to_default_model(monkeypatch):
+    monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {})
+    captured = {}
+
+    def _fake_ctor(model=None):
+        captured["model"] = model
+        return object()
+
+    with patch("agent.opencode_local_provider.OpenCodeLocalProvider", _fake_ctor):
+        get_provider(llm_client.OPENCODE_LOCAL_PROVIDER_ID)
+
+    from agent.opencode_local_provider import OPENCODE_LOCAL_DEFAULT_MODEL
+    assert captured["model"] == OPENCODE_LOCAL_DEFAULT_MODEL
+
+
+def test_get_provider_opencode_local_uses_saved_model_when_provider_matches(monkeypatch):
+    monkeypatch.setattr(
+        "agent.llm_client.load_llm_settings",
+        lambda: {"provider": llm_client.OPENCODE_LOCAL_PROVIDER_ID, "model": "saved-model"},
+    )
+    captured = {}
+
+    def _fake_ctor(model=None):
+        captured["model"] = model
+        return object()
+
+    with patch("agent.opencode_local_provider.OpenCodeLocalProvider", _fake_ctor):
+        get_provider(llm_client.OPENCODE_LOCAL_PROVIDER_ID)
+
+    assert captured["model"] == "saved-model"
+
+
+def test_get_provider_opencode_local_ignores_saved_model_for_a_different_provider(monkeypatch):
+    monkeypatch.setattr(
+        "agent.llm_client.load_llm_settings",
+        lambda: {"provider": "qwen", "model": "qwen-plus"},
+    )
+    captured = {}
+
+    def _fake_ctor(model=None):
+        captured["model"] = model
+        return object()
+
+    with patch("agent.opencode_local_provider.OpenCodeLocalProvider", _fake_ctor):
+        get_provider(llm_client.OPENCODE_LOCAL_PROVIDER_ID)
+
+    from agent.opencode_local_provider import OPENCODE_LOCAL_DEFAULT_MODEL
+    assert captured["model"] == OPENCODE_LOCAL_DEFAULT_MODEL
+
+
 def test_get_provider_uses_saved_settings_over_env(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "opencode-zen")
     monkeypatch.setattr("agent.llm_client.load_llm_settings", lambda: {"provider": "qwen", "model": "qwen-plus"})

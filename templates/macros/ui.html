@@ -794,10 +794,10 @@
    (main.py's _model_choices_with_fallback) so the right options — and the saved model pre-selected
    — render on first page load, before the provider dropdown's own hx-get
    (/api/subagents/model-options, shared by every provider_options caller) ever fires. #}
-{% macro model_options(selected_provider, selected_model, model_choices) %}
+{% macro model_options(selected_provider, selected_model, model_choices, model_free_flags={}) %}
   {% if selected_provider %}
     {% for model_id in model_choices %}
-      <option value="{{ model_id }}" {% if model_id == selected_model %}selected{% endif %}>{{ model_id }}</option>
+      <option value="{{ model_id }}" {% if model_id == selected_model %}selected{% endif %}{% if model_id in model_free_flags %} data-free="{{ 'true' if model_free_flags[model_id] else 'false' }}"{% endif %}>{{ model_id }}</option>
     {% endfor %}
   {% else %}
     <option value="">(same as main agent)</option>

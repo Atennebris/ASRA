@@ -14,6 +14,7 @@ _DEFAULTS = {
     "dork_engine_enabled": True,
     "last_provider": None,
     "last_model": None,
+    "last_free_only": False,
     "quick_chat_session_id": None,
 }
 
@@ -47,7 +48,7 @@ def test_load_chat_settings_backfills_a_missing_key_with_its_default(tmp_path, m
     chat_settings_store.CHAT_SETTINGS_STORE_PATH.write_text(json.dumps({"web_fetch_enabled": False}), encoding="utf-8")
 
     assert chat_settings_store.load_chat_settings() == {
-        "web_fetch_enabled": False, "browser_enabled": True, "subagents_enabled": False, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "quick_chat_session_id": None,
+        "web_fetch_enabled": False, "browser_enabled": True, "subagents_enabled": False, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "last_free_only": False, "quick_chat_session_id": None,
     }
 
 
@@ -55,7 +56,7 @@ def test_save_chat_settings_persists_all_three_values(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     saved = chat_settings_store.save_chat_settings(False, True, True)
 
-    expected = {"web_fetch_enabled": False, "browser_enabled": True, "subagents_enabled": True, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "quick_chat_session_id": None}
+    expected = {"web_fetch_enabled": False, "browser_enabled": True, "subagents_enabled": True, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "last_free_only": False, "quick_chat_session_id": None}
     assert saved == expected
     assert chat_settings_store.load_chat_settings() == expected
 
@@ -75,7 +76,7 @@ def test_save_chat_settings_overwrites_a_previous_save(tmp_path, monkeypatch):
     chat_settings_store.save_chat_settings(False, False, False)
 
     assert chat_settings_store.load_chat_settings() == {
-        "web_fetch_enabled": False, "browser_enabled": False, "subagents_enabled": False, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "quick_chat_session_id": None,
+        "web_fetch_enabled": False, "browser_enabled": False, "subagents_enabled": False, "dork_engine_enabled": True, "last_provider": None, "last_model": None, "last_free_only": False, "quick_chat_session_id": None,
     }
 
 

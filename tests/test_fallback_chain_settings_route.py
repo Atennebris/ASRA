@@ -227,7 +227,11 @@ def test_settings_page_shows_the_disabled_state_by_default():
     client = TestClient(main.app)
     resp = client.get("/settings")
     assert resp.status_code == 200
-    checkbox_tag = re.search(r'<input type="checkbox" name="enabled"[^>]*>', resp.text)
+    # Anchored on handleFallbackChainToggle specifically, not just name="enabled" -- that bare
+    # attribute now matches more than one toggle on this page (e.g. the "Free models only" switch
+    # right above this section also uses toggle_switch("enabled", ...), same as every other
+    # independent on/off switch in this app), so the first match is no longer reliably this one.
+    checkbox_tag = re.search(r'<input type="checkbox" name="enabled"[^>]*handleFallbackChainToggle[^>]*>', resp.text)
     assert checkbox_tag is not None
     assert "checked" not in checkbox_tag.group(0)
 
@@ -249,9 +253,9 @@ def test_save_fallback_chain_persists_multiple_ordered_rows_and_redisplays(monke
     saved = settings.load_llm_settings()
     assert saved["fallback_chain_enabled"] is True
     assert saved["fallback_chain"] == [
-        {"provider": "qwen", "model": "qwen-plus"},
-        {"provider": "qwen", "model": "qwen-turbo"},
-        {"provider": "mistral", "model": "mistral-small-latest"},
+        {"provider": "qwen", "model": "qwen-plus", "free_only": False},
+        {"provider": "qwen", "model": "qwen-turbo", "free_only": False},
+        {"provider": "mistral", "model": "mistral-small-latest", "free_only": False},
     ]
 
     page = client.get("/settings")

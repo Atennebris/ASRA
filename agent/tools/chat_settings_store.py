@@ -48,7 +48,7 @@ logger = get_logger("CHAT")
 # Global app data (Documents/ASRA/data, see projects/paths.py), not a repo-relative data/ folder.
 CHAT_SETTINGS_STORE_PATH = resolve_global_app_dir() / "data" / "chat_settings.json"
 
-_BOOL_KEYS = ("web_fetch_enabled", "browser_enabled", "subagents_enabled", "dork_engine_enabled")
+_BOOL_KEYS = ("web_fetch_enabled", "browser_enabled", "subagents_enabled", "dork_engine_enabled", "last_free_only")
 _DEFAULT_SETTINGS = {
     "web_fetch_enabled": True,
     "browser_enabled": True,
@@ -56,6 +56,10 @@ _DEFAULT_SETTINGS = {
     "dork_engine_enabled": True,
     "last_provider": None,
     "last_model": None,
+    # The chat picker's own "Free models only" switch state -- persisted alongside
+    # last_provider/last_model for the same reason: a toggle remembers its own position, same
+    # real, confirmed operator complaint that pair's own docstring describes.
+    "last_free_only": False,
     "quick_chat_session_id": None,
 }
 
@@ -126,14 +130,20 @@ def save_quick_chat_session_id(session_id: str) -> dict:
     return settings
 
 
-def save_last_chat_llm(provider: str | None, model: str | None) -> dict:
+def save_last_chat_llm(provider: str | None, model: str | None, free_only: bool = False) -> dict:
     """Remembers the provider/model the operator just explicitly picked in the chat panel's own
     picker, so the next brand-new thread (_new_thread in agent/chat.py) can be pre-filled with it
-    instead of always resetting to blank ("same as main agent"). Merges onto the existing toggles
-    the same way save_chat_settings does, for the same reason."""
-    settings = {**load_chat_settings(), "last_provider": provider or None, "last_model": model or None}
+    instead of always resetting to blank ("same as main agent"). free_only is that same picker's
+    own "Free models only" switch state, persisted the same way for the same reason -- a toggle
+    remembers its own position. Merges onto the existing toggles the same way save_chat_settings
+    does, for the same reason."""
+    settings = {
+        **load_chat_settings(), "last_provider": provider or None, "last_model": model or None,
+        "last_free_only": bool(free_only),
+    }
     _write_chat_settings(settings)
     logger.debug(
-        "chat_settings_store: saved last_provider=%s last_model=%s", settings["last_provider"], settings["last_model"],
+        "chat_settings_store: saved last_provider=%s last_model=%s last_free_only=%s",
+        settings["last_provider"], settings["last_model"], settings["last_free_only"],
     )
     return settings

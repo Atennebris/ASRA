@@ -2,7 +2,7 @@
 from unittest.mock import patch
 
 import agent.providers.models_dev as models_dev
-from agent.providers.models_dev import list_models
+from agent.providers.models_dev import is_model_free, list_models
 
 
 def _reset_catalog_memo(monkeypatch):
@@ -67,3 +67,29 @@ def test_list_models_returns_empty_list_for_unknown_provider():
 def test_list_models_returns_empty_list_when_catalog_unreachable():
     with patch("agent.providers.models_dev._fetch_catalog", return_value=None):
         assert list_models("opencode") == []
+
+
+def test_is_model_free_true_when_cost_is_exactly_zero():
+    with patch("agent.providers.models_dev.get_model_cost", return_value={"input": 0, "output": 0}):
+        assert is_model_free("opencode", "big-pickle") is True
+
+
+def test_is_model_free_false_when_cost_is_nonzero():
+    with patch("agent.providers.models_dev.get_model_cost", return_value={"input": 0.15, "output": 0.6}):
+        assert is_model_free("mistral", "mistral-small-latest") is False
+
+
+def test_is_model_free_false_when_only_one_side_is_zero():
+    """A model priced at $0 input but real $ output (or vice versa) is not actually free -- both
+    sides must be zero, same "input==0 and output==0" derivation this project's own sibling
+    dashboard app already uses for its own opencode-local catalog."""
+    with patch("agent.providers.models_dev.get_model_cost", return_value={"input": 0, "output": 2.0}):
+        assert is_model_free("some-provider", "some-model") is False
+
+
+def test_is_model_free_none_when_cost_is_unknown():
+    """None (unknown), never False -- get_model_cost returning None means "the catalog doesn't
+    know", not "confirmed paid"; callers (main.py's _model_free_flags) must not treat this as a
+    reason to hide the model from a "Free models only" filter."""
+    with patch("agent.providers.models_dev.get_model_cost", return_value=None):
+        assert is_model_free("unknown-provider", "unknown-model") is None

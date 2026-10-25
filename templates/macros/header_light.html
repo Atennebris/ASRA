@@ -55,3 +55,21 @@
   <span class="hl-comet"></span>
   <span class="hl-garland" aria-hidden="true">{{ header_garland_bulbs() }}</span>
 </span>
+{# The two spans above are server-rendered with hardcoded enabled/lit="true" placeholder state --
+   this app has no server-side concept of this purely client-only (localStorage) preference (see
+   this file's own top comment), so SOME default has to ship in the markup. Real, confirmed bug
+   this inline script fixes: static/js/header_light.js only corrects that placeholder on
+   DOMContentLoaded, which fires only after the ENTIRE document has been parsed -- on every single
+   full-page navigation (this app's own sidebar links are plain <a href>, never hx-boosted, so
+   EVERY tab switch is a fresh page load), the browser can paint this hardcoded "on" state for a
+   moment before that correction lands, which reads exactly like "it turns itself back on when I
+   switch tabs" even though the operator genuinely saved it off. Calling the same apply function
+   here -- synchronously, at the exact point in the document the parser reaches these elements,
+   before anything below them is even parsed yet -- corrects it before the browser ever gets a
+   chance to paint the wrong state at all. Safe to call this early: static/js/header_light.js is
+   loaded from base.html's own <head> with a plain (non-async/non-deferred) <script src>, which
+   blocks parsing and runs to completion before body content like this macro is ever reached, so
+   window.asraHeaderLightApply is already defined by the time the parser gets here. The
+   DOMContentLoaded listener in that file stays too, as a harmless no-op redundant safety net for
+   the (currently unreachable) case this script tag ever ran before that file finished loading. #}
+<script>if (window.asraHeaderLightApply) window.asraHeaderLightApply();</script>

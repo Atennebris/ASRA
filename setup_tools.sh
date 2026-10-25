@@ -1324,6 +1324,31 @@ install_qiling() {
     fi
 }
 
+# --- opencode CLI (agent/opencode_local_provider.py's own "opencode (local server)" LLM
+# provider) -- NOT one of ASRA's own recon/exploit tool-registry entries (agent/tools/builders/*);
+# this is a free, no-signup, no-API-key LLM backend choice (Settings -> AI Provider & Model),
+# spawned on demand as a real `opencode serve` process. Optional: ASRA works fine without it
+# (every other provider still works), just like qiling's own rootfs above. Needs Node.js/npm,
+# which nothing else in this script installs -- confirmed live this project's own WSL2 launch
+# path (CLAUDE.md) does NOT ship either by default, and the opencode binary otherwise only
+# reachable via Windows interop isn't reliable enough for a real local TCP server bind (see
+# agent/opencode_local_provider.py's own module docstring for the live-confirmed reasoning).
+install_opencode_cli() {
+    have opencode && { ok "opencode CLI already installed ($(command -v opencode))"; return 0; }
+    if ! have npm; then
+        log "Installing Node.js/npm (only needed for the opencode CLI below, nothing else here needs it)..."
+        case "$PKG_MANAGER" in
+            apt)    pkg_install nodejs npm ;;
+            dnf)    pkg_install nodejs npm ;;
+            pacman) pkg_install nodejs npm ;;
+            *)      warn "No supported package manager detected — install Node.js/npm manually, then re-run this script, for the opencode-local LLM provider to work."; return 1 ;;
+        esac
+    fi
+    have npm || { fail "npm still not available after attempting to install it — the opencode-local provider will not work until it is."; return 1; }
+    log "Installing opencode CLI (npm install -g opencode-ai)..."
+    $SUDO npm install -g opencode-ai || { fail "npm install -g opencode-ai failed — the opencode-local provider will not work until it succeeds manually."; return 1; }
+}
+
 log ""
 log "${BOLD}ASRA — installing the core tool arsenal (nmap, nuclei, dalfox, msfconsole, sqlmap, nikto, interactsh-client, whatweb, wpscan, ffuf, subfinder, hydra, chromium/playwright, bubblewrap, dnsutils) plus the Reverse Engineering toolset (radare2/r2ghidra/radiff2, gdb, strace, wine, heimdall, upx, osv-scanner, trufflehog, apktool, jadx, binwalk, foundry -- frida-tools/pwntools install via requirements.txt, not this script)${RESET}"
 log "Package manager detected: ${PKG_MANAGER:-none}"
@@ -1368,6 +1393,7 @@ install_tshark
 install_dotnet_ilspycmd
 install_foundry
 install_qiling
+install_opencode_cli
 
 log ""
 log "${BOLD}Summary${RESET} — this is exactly what ASRA's own tool registry health-check will see:"
@@ -1453,6 +1479,15 @@ if have dig; then
     ok "dig/nslookup/host -> $(command -v dig) (custom_exploit_run scripts can shell out for DNS lookups directly)"
 else
     warn "dig/nslookup/host -> not on PATH — custom_exploit_run scripts will need dnspython or DNS-over-HTTPS for DNS lookups instead (see install_dnsutils's own output above)"
+fi
+# Not counted in $missing -- an LLM provider CHOICE (Settings -> AI Provider & Model), not one of
+# ASRA's own recon/exploit tools; every other provider (opencode-zen, Qwen, Mistral, ...) works
+# fine without this (see install_opencode_cli's own comment above for why it needs its own install
+# step at all).
+if have opencode; then
+    ok "opencode -> $(command -v opencode) (the \"opencode (local server)\" LLM provider is available)"
+else
+    warn "opencode -> not on PATH — the \"opencode (local server)\" LLM provider will not work until this is retried (see install_opencode_cli's own output above); every other LLM provider is unaffected"
 fi
 
 # python3 IS counted in $missing -- unlike perl/ruby below, ./run.sh itself cannot even start

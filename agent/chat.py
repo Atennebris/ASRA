@@ -1608,7 +1608,7 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
 
 
 def append_pending_chat_message(
-    session_id: str, user_message: str, provider: str | None, model: str | None,
+    session_id: str, user_message: str, provider: str | None, model: str | None, free_only: bool | None = None,
 ) -> tuple[dict, bool]:
     """The fast, synchronous half of a chat turn — appends the operator's message (to the currently
     ACTIVE thread) and flips that thread's pending=True immediately, so the panel can render it as
@@ -1656,7 +1656,12 @@ def append_pending_chat_message(
             thread["provider"] = provider or None
         if model is not None:
             thread["model"] = model or None
-        chat_settings_store.save_last_chat_llm(thread["provider"], thread["model"])
+        # free_only=None (a resend call site that doesn't know about the picker's own switch)
+        # keeps whatever was already persisted instead of silently resetting it to off.
+        existing_free_only = chat_settings_store.load_chat_settings()["last_free_only"]
+        chat_settings_store.save_last_chat_llm(
+            thread["provider"], thread["model"], existing_free_only if free_only is None else free_only,
+        )
 
     thread["messages"].append({"role": "user", "at": now, "segments": [{"type": "text", "content": user_message}]})
     thread["pending"] = True

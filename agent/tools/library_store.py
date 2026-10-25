@@ -130,33 +130,41 @@ def load_library_settings() -> dict:
     always reset to blank ("same as main agent") on every page load/reload, so a favorite
     provider/model had to be re-picked every single time instead of being remembered."""
     path = _settings_path()
+    _defaults = {"last_provider": None, "last_model": None, "last_free_only": False}
     if not path.exists():
-        return {"last_provider": None, "last_model": None}
+        return dict(_defaults)
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         logger.debug("library: settings.json unreadable (%s) -- treating as unset", exc)
-        return {"last_provider": None, "last_model": None}
+        return dict(_defaults)
     if not isinstance(data, dict):
-        return {"last_provider": None, "last_model": None}
+        return dict(_defaults)
     provider = data.get("last_provider")
     model = data.get("last_model")
     return {
         "last_provider": provider if isinstance(provider, str) and provider else None,
         "last_model": model if isinstance(model, str) and model else None,
+        # This picker's own "Free models only" switch state (playbook.html) -- persisted the same
+        # way as last_provider/last_model, for the same reason: a toggle remembers its own
+        # position, same real, confirmed operator complaint that pair's own docstring describes.
+        "last_free_only": bool(data.get("last_free_only")),
     }
 
 
-def save_last_analysis_llm(provider: str | None, model: str | None) -> None:
+def save_last_analysis_llm(provider: str | None, model: str | None, free_only: bool = False) -> None:
     path = _settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".json.tmp")
-    settings = {"last_provider": provider or None, "last_model": model or None}
+    settings = {"last_provider": provider or None, "last_model": model or None, "last_free_only": bool(free_only)}
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
     tmp_path.replace(path)
-    logger.debug("library: saved last_provider=%s last_model=%s", settings["last_provider"], settings["last_model"])
+    logger.debug(
+        "library: saved last_provider=%s last_model=%s last_free_only=%s",
+        settings["last_provider"], settings["last_model"], settings["last_free_only"],
+    )
 
 
 def _source_dir(source_id: str) -> Path:
@@ -900,7 +908,7 @@ async def _run_analysis_chunks(source_id: str, llm: Any, chunks: list[str]) -> N
     logger.debug("library: analysis finished source=%s ingested=%d/%d candidate(s)", source_id, ingested, len(candidates))
 
 
-def start_analysis(source_id: str, provider_id: str, model: str) -> str:
+def start_analysis(source_id: str, provider_id: str, model: str, free_only: bool = False) -> str:
     """Fires the (possibly many-minute, many-LLM-call) analysis off as a background asyncio task
     and returns immediately -- the library panel polls get_source(source_id)'s own
     status/chunks_done/chunks_total fields for progress. Like every other in-memory async task in
@@ -931,7 +939,7 @@ def start_analysis(source_id: str, provider_id: str, model: str) -> str:
         return ""
     llm, chunks = prepared
 
-    save_last_analysis_llm(provider_id, model)
+    save_last_analysis_llm(provider_id, model, free_only)
     task = asyncio.create_task(_run_analysis_chunks(source_id, llm, chunks))
     _RUNNING_ANALYSES[source_id] = task
     task.add_done_callback(lambda _t, sid=source_id: _RUNNING_ANALYSES.pop(sid, None))
