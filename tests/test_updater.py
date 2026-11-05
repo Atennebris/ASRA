@@ -103,3 +103,22 @@ def test_apply_noop_when_current(monkeypatch):
     monkeypatch.setattr(updater, "_git", _responder())
     result = updater.apply_update()
     assert result["ok"] and result.get("no_op")
+
+
+def test_update_check_on_startup_defaults_true_when_unset(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(updater, "_ENV_PATH", str(env_path))
+    assert updater.load_update_check_on_startup() is True
+
+
+def test_update_check_on_startup_save_then_load_roundtrips(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(updater, "_ENV_PATH", str(env_path))
+
+    updater.save_update_check_on_startup(False)
+    assert updater.load_update_check_on_startup() is False
+
+    updater.save_update_check_on_startup(True)
+    assert updater.load_update_check_on_startup() is True

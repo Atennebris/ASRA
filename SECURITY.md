@@ -115,8 +115,10 @@ everything:
 The repo's own `data/` folder (gitignored, `.gitkeep`'d so the directory layout survives a fresh
 clone) is not where any of the above actually end up — everything above resolves through
 `projects/paths.py`'s `resolve_global_app_dir()`/`resolve_projects_base_dir()` into your real OS
-"Documents" folder instead (see the README's Configuration section for the `PROJECTS_DIR`/
-`APP_DATA_DIR` overrides, and its Uninstalling section for exactly what to delete and where).
+"Documents" folder instead (see [docs/Documentation_en.md](docs/Documentation_en.md#configuration)
+for the `PROJECTS_DIR`/`APP_DATA_DIR` overrides, and its
+[Uninstalling section](docs/Documentation_en.md#uninstalling--removing-everything) for exactly what
+to delete and where).
 
 If you're filing a bug report or sharing logs for troubleshooting, scrub API keys, credentials, and
 any real (non-demo) target details first.

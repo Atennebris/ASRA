@@ -64,6 +64,20 @@ def _wsl_folder_to_windows_path(folder: Path) -> str:
     return posix
 
 
+def resolve_path_for_windows_shell(path: Path) -> str:
+    """A path this process can read/write, translated into the string the NATIVE Windows-side
+    desktop shell (desktop/src-tauri/src/main.rs -- it never runs inside WSL2 itself, only this
+    Python backend does) needs to act on the SAME file. Reuses the exact translation
+    resolve_open_target already relies on (_wsl_folder_to_windows_path) rather than a second copy
+    of that regex -- needed by agent/desktop_update.py so a file this process downloads/verifies
+    under /mnt/c/... can be handed to a Tauri command as a real C:\\... path. A no-op on native
+    Linux/macOS, where the shell and this process already share one plain filesystem and there is
+    no translation to do."""
+    if _is_wsl():
+        return _wsl_folder_to_windows_path(path)
+    return str(path)
+
+
 def resolve_open_target(path: Path) -> dict:
     """Decides how the operator can actually open `path` (an RE-mode target file/folder,
     session["target"] -- see agent/tools/builders/re_target.py) in a real file manager. A file

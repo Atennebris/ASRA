@@ -39,7 +39,7 @@ import markdown
 import markupsafe
 from markupsafe import Markup
 
-from agent import updater
+from agent import desktop_update, updater
 from agent.chat import (
     _find_thread,
     _get_active_thread,
@@ -141,7 +141,7 @@ from agent.tools import library_store
 from agent.tools import playbook_store
 from agent.tools import toolkit_intruder
 from projects import icons as project_icons
-from projects.paths import resolve_open_target
+from projects.paths import resolve_open_target, resolve_path_for_windows_shell
 from agent.tools.toolkit_proxy import get_toolkit_proxy_manager
 from agent.tools.toolkit_query import QuerySyntaxError, compile_query
 from agent.tools import toolkit_racer
@@ -391,7 +391,9 @@ async def _lifespan(_app: FastAPI):
     library_store.reconcile_orphaned_analyses()
     # Quiet background update check at startup (git fetch is network I/O -> off the event loop, and
     # never blocks the server coming up). Result is cached for the Settings page + sidebar indicator.
-    if os.getenv("UPDATE_CHECK_ON_STARTUP", "true").strip().lower() in ("true", "1", "yes"):
+    # Settings -> Updates' own "Check for updates at startup" switch (agent/updater.py) owns this --
+    # not a raw os.getenv read, so a toggle saved there is actually honored on the next launch.
+    if updater.load_update_check_on_startup():
         _task = asyncio.create_task(asyncio.to_thread(updater.refresh_cache, True))
         _startup_bg_tasks.add(_task)
         _task.add_done_callback(_startup_bg_tasks.discard)
@@ -5942,6 +5944,41 @@ def api_updates_apply(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request, "partials/update_status.html", {"u": status, "result": result})
 
 
+@app.get("/api/desktop-update/status", response_class=HTMLResponse)
+def api_desktop_update_status(request: Request) -> HTMLResponse:
+    """Settings -> Updates' desktop-shell card initial render -- no startup cache/network call for
+    this one (unlike the git-based panel above), so this is always the empty "not checked" state
+    until the operator clicks Check."""
+    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": None, "stage_result": None})
+
+
+@app.get("/api/desktop-update/check", response_class=HTMLResponse)
+def api_desktop_update_check(request: Request) -> HTMLResponse:
+    """Compares the running desktop shell's own version against the latest GitHub Release."""
+    status = desktop_update.check_for_desktop_update()
+    logger.debug(
+        "api: desktop update check applicable=%s available=%s error=%s",
+        status.applicable, status.available, status.error,
+    )
+    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": status, "stage_result": None})
+
+
+@app.post("/api/desktop-update/stage", response_class=HTMLResponse)
+def api_desktop_update_stage(request: Request) -> HTMLResponse:
+    """Downloads + checksum-verifies the asset for this platform, then re-renders with an
+    "Install & restart" button carrying the staged path -- translated to a real Windows-shaped
+    path up front (resolve_path_for_windows_shell) since the Rust shell that will act on it never
+    runs inside WSL2 even when this backend does."""
+    status = desktop_update.check_for_desktop_update()
+    result = {"ok": False, "message": "No update detected — click Check first."}
+    if status.available:
+        result = desktop_update.stage_desktop_update(status)
+        if result.get("ok"):
+            result["windows_path"] = resolve_path_for_windows_shell(Path(result["path"]))
+    logger.debug("api: desktop update stage ok=%s", result.get("ok"))
+    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": status, "stage_result": result})
+
+
 @app.get("/api/updates/indicator", response_class=HTMLResponse)
 def api_updates_indicator(request: Request) -> HTMLResponse:
     """Tiny sidebar badge (base.html, polled) — shows a dot only when an update is available."""
@@ -6320,6 +6357,13 @@ def _intro_settings_context() -> dict:
     return {"intro_enabled": load_intro_enabled(), "intro_sound_enabled": load_intro_sound_enabled()}
 
 
+def _update_settings_context() -> dict:
+    """Settings -> Updates -- whether main.py's startup hook runs the quiet background update
+    check at all (agent/updater.py, .env-backed same as intro settings above). Read fresh
+    per-request, same as every other Settings context helper here."""
+    return {"update_check_on_startup": updater.load_update_check_on_startup()}
+
+
 def _chat_settings_context() -> dict:
     """Settings -> Chat -- the chat panel's own capability toggles (web_fetch/browser/dork_engine/
     subagents), shared by a project's own chat sidebar and the standalone Quick Chat alike. Every
@@ -6504,7 +6548,7 @@ def get_settings(request: Request) -> HTMLResponse:
         "settings.html",
         {
             "error": None, "wordlist_error": None,
-            **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+            **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             **tools_context,
         },
     )
@@ -6620,7 +6664,7 @@ def save_llm(request: Request, provider: str = Form(""), model: str = Form("")) 
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -6707,7 +6751,7 @@ def save_fallback_chain(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(error=error),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -6803,7 +6847,7 @@ def add_custom_provider_route(
                     **_llm_settings_context(),
                     **_wordlist_settings_context(),
                     **_fallback_chain_context(),
-                    **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                    **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
                 },
                 status_code=400,
             )
@@ -6831,7 +6875,7 @@ def add_custom_provider_route(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -6883,7 +6927,7 @@ def edit_custom_provider_route(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7180,6 +7224,17 @@ def save_intro_sound_enabled_route(enabled: str | None = Form(None)) -> Response
     return Response(status_code=204)
 
 
+@app.post("/api/settings/updates/check-on-startup")
+def save_update_check_on_startup_route(enabled: str | None = Form(None)) -> Response:
+    """Settings -> Updates' "Check for updates at startup" switch -- persisted straight to .env
+    (agent/updater.py's load/save_update_check_on_startup), same convention as the intro toggles
+    above, since main.py's own startup hook reads it before any request-scoped Settings machinery
+    exists. Takes effect on the next launch, not this running process."""
+    updater.save_update_check_on_startup(bool(enabled))
+    logger.debug("api: update check on startup saved enabled=%s", bool(enabled))
+    return Response(status_code=204)
+
+
 @app.post("/api/settings/sounds/master")
 def save_sound_master_route(enabled: str | None = Form(None)) -> Response:
     """Settings -> Customization -> Sounds top-level switch -- everything under it stays off regardless of each
@@ -7270,7 +7325,7 @@ def download_wordlist_route(request: Request, source_url: str = Form(""), name: 
             request, "settings.html",
             {
                 "error": None, "wordlist_error": "Enter a URL to download from.",
-                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7282,7 +7337,7 @@ def download_wordlist_route(request: Request, source_url: str = Form(""), name: 
             request, "settings.html",
             {
                 "error": None, "wordlist_error": str(exc),
-                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7319,7 +7374,7 @@ def install_capability_route(request: Request, capability_id: str) -> Response:
                 **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(),
                 **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(),
                 **_capability_settings_context(install_error={"capability_id": capability_id, **result}),
-                **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
             },
             status_code=400,
         )

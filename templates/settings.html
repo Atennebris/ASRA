@@ -1097,7 +1097,20 @@
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Updates") }}
         <p class="text-[12px] text-secondary mb-3">Check for and apply new versions from the git repository.</p>
+        <label class="flex items-start gap-3 cursor-pointer mb-3">
+          {{ toggle_switch("enabled", checked=update_check_on_startup, extra_attrs='hx-post="/api/settings/updates/check-on-startup" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+          <span>
+            <span class="block text-sm font-medium text-primary">Check for updates at startup</span>
+            <span class="block text-[11px] text-secondary mt-0.5">On by default. Takes effect on your next launch, not this session. Off still lets you check manually below.</span>
+          </span>
+        </label>
         <div id="update-panel" hx-get="/api/updates/status" hx-trigger="load" hx-swap="innerHTML"></div>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Desktop app") }}
+        <p class="text-[12px] text-secondary mb-3">The installed launcher binary itself (Windows/Linux/macOS) — a separate thing from the code above, since `desktop/bin/` isn't part of the git repo. Only relevant when running via the desktop app.</p>
+        <div id="desktop-update-panel" hx-get="/api/desktop-update/status" hx-trigger="load" hx-swap="innerHTML"></div>
       </div>
 
       {# Native toolkit's own agent/chat/subagent access (Sequencer's and Racer's toggles were each

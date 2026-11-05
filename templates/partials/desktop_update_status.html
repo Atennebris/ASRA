@@ -1,0 +1,58 @@
+{# Settings -> Updates' desktop-shell card body (inner content of #desktop-update-panel). Rendered
+   by /api/desktop-update/status (empty placeholder, no startup check for this one), /api/
+   desktop-update/check, and /api/desktop-update/stage. `d` is a DesktopUpdateStatus or None;
+   `stage_result` is stage_desktop_update()'s dict (plus a `windows_path` key added by the route)
+   or None.
+
+   Separate from the git-based #update-panel above on purpose -- that one updates the Python/web
+   code via `git pull`; this one is the ONLY path that can ever refresh the installed launcher
+   binary itself (desktop/bin/*.exe is gitignored, see agent/desktop_update.py's own docstring),
+   so conflating the two into one "Update now" button would silently never update the binary half
+   at all. #}
+{% if d is none %}
+  <p class="text-[13px] text-secondary">Not checked yet — click “Check for desktop updates”.</p>
+{% elif not d.applicable %}
+  <p class="text-[13px] text-secondary">Not running via the desktop app right now — nothing to check (this card is for the installed launcher binary, not the code above).</p>
+{% else %}
+  <p class="text-[12px] text-secondary">Installed desktop app version:
+    <span class="text-primary font-medium">{{ d.current_version }}</span>
+  </p>
+
+  {% if d.error %}
+    <div class="mt-2 text-[13px] text-accent">{{ d.error }}</div>
+  {% elif d.available %}
+    <div class="mt-2 text-[13px] text-primary">Desktop app v{{ d.latest_version }} is available.</div>
+    {% if stage_result and not stage_result.ok %}
+      <div class="mt-1 text-[12px] text-accent">{{ stage_result.message }}</div>
+    {% elif stage_result and stage_result.ok %}
+      <div class="mt-1 text-[12px] text-secondary">Downloaded and checksum-verified against the release's own SHA256SUMS.txt — ready to install.</div>
+    {% endif %}
+  {% else %}
+    <div class="mt-2 text-[13px] text-primary">You're on the latest desktop app version.</div>
+  {% endif %}
+
+  <div id="desktop-update-apply-error" class="mt-2 text-[12px] text-accent"></div>
+
+  <div class="mt-3 flex items-center gap-2">
+    <button type="button"
+      hx-get="/api/desktop-update/check" hx-target="#desktop-update-panel" hx-swap="innerHTML"
+      class="px-3 h-8 rounded text-[12px] bg-elevated text-primary hover:bg-surface border border-default transition-colors">
+      Check for desktop updates
+    </button>
+    {% if d.available and not d.error and not (stage_result and stage_result.ok) %}
+      <button type="button"
+        hx-post="/api/desktop-update/stage" hx-target="#desktop-update-panel" hx-swap="innerHTML"
+        class="px-3 h-8 rounded text-[12px] bg-elevated text-primary hover:bg-surface border border-default transition-colors">
+        Download &amp; verify
+      </button>
+    {% endif %}
+    {% if stage_result and stage_result.ok %}
+      <button type="button"
+        data-desktop-update-apply
+        data-staged-path="{{ stage_result.windows_path }}"
+        class="px-3 h-8 rounded text-[12px] bg-accent text-white font-medium">
+        Install &amp; restart
+      </button>
+    {% endif %}
+  </div>
+{% endif %}

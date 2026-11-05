@@ -13,6 +13,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dotenv import dotenv_values, find_dotenv, set_key
+
 from agent.utils.logger import get_logger
 
 logger = get_logger("UPDATE")
@@ -20,6 +22,27 @@ logger = get_logger("UPDATE")
 # Repo root: agent/updater.py -> agent/ -> repo root.
 _REPO = Path(__file__).resolve().parent.parent
 _GIT_TIMEOUT_SECONDS = 30
+
+# Whether main.py's startup hook runs the quiet background check at all (Settings -> Updates'
+# "Check for updates at startup" switch). Same .env-backed convention as agent/intro_settings.py --
+# read once at process startup, before any JSON-store-backed Settings value would normally be
+# consulted, so .env (already the one config surface every launch path agrees on) is simpler here
+# than introducing a second on-disk store for a single boolean. Defaults to true when absent, same
+# as the existing env var's own .env.example comment already promises.
+_UPDATE_CHECK_ON_STARTUP_VAR = "UPDATE_CHECK_ON_STARTUP"
+_ENV_PATH = find_dotenv(usecwd=True) or str(_REPO / ".env")
+
+
+def load_update_check_on_startup() -> bool:
+    raw = dotenv_values(_ENV_PATH).get(_UPDATE_CHECK_ON_STARTUP_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def save_update_check_on_startup(enabled: bool) -> None:
+    set_key(_ENV_PATH, _UPDATE_CHECK_ON_STARTUP_VAR, "true" if enabled else "false")
+    logger.debug("save_update_check_on_startup: %s=%s", _UPDATE_CHECK_ON_STARTUP_VAR, enabled)
 
 
 @dataclass

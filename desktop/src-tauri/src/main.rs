@@ -638,14 +638,23 @@ fn apply_wsl_target(cmd: &mut Command, as_root: bool, distro: &str) {
 #[cfg(windows)]
 fn spawn_backend(repo: &Path, as_root: bool, distro: &str, ui_token: &str) -> std::io::Result<Child> {
     let win_path = repo.to_string_lossy().replace('\'', "'\\''");
-    // Inject the UI token as a prefix env of the inner command so run.sh's own
-    // `source .env` (which has no such line) cannot clobber it. Empty in web mode.
+    // Inject the UI token, plus this binary's own version/platform, as prefix envs of the inner
+    // command so run.sh's own `source .env` cannot clobber them. ASRA_DESKTOP_VERSION/PLATFORM let
+    // the Python backend (agent/desktop_update.py) know whether it's running under the desktop
+    // shell at all, and which GitHub Release asset would match THIS binary if a newer one exists --
+    // std::env::consts::OS, not sys.platform on the Python side, since under this Windows/WSL2
+    // launch path the backend's own sys.platform is always "linux" (see CLAUDE.md's runtime-
+    // architecture rule), which would resolve to the wrong release asset if read from there instead.
     let token_prefix = if ui_token.is_empty() {
         String::new()
     } else {
         format!("ASRA_UI_TOKEN='{ui_token}' ")
     };
-    let inner = format!("cd \"$(wslpath -a '{win_path}')\" && {token_prefix}bash run.sh");
+    let version = env!("CARGO_PKG_VERSION");
+    let platform = std::env::consts::OS;
+    let inner = format!(
+        "cd \"$(wslpath -a '{win_path}')\" && ASRA_DESKTOP_VERSION='{version}' ASRA_DESKTOP_PLATFORM='{platform}' {token_prefix}bash run.sh"
+    );
     let mut cmd = Command::new("wsl.exe");
     apply_wsl_target(&mut cmd, as_root, distro);
     cmd.arg("--")
@@ -663,6 +672,10 @@ fn spawn_backend(repo: &Path, _as_root: bool, _distro: &str, ui_token: &str) -> 
     if !ui_token.is_empty() {
         cmd.env("ASRA_UI_TOKEN", ui_token);
     }
+    // Same desktop-update signal as the Windows branch above -- see its comment for why this has
+    // to come from the shell (std::env::consts::OS), not guessed on the Python side.
+    cmd.env("ASRA_DESKTOP_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env("ASRA_DESKTOP_PLATFORM", std::env::consts::OS);
     cmd.spawn()
 }
 
@@ -860,6 +873,61 @@ fn get_start_config() -> StartConfig {
         distros,
         settings,
     }
+}
+
+// Desktop shell self-update -- the Python backend (agent/desktop_update.py) downloads and
+// SHA256-verifies the new binary against the release's own SHA256SUMS.txt BEFORE ever calling
+// this; this command only ever receives an already-verified path and does the actual file swap +
+// relaunch, the one part only the shell itself (not its own child backend process) can safely do.
+//
+// Windows cannot overwrite or delete a running .exe's file in place, but CAN rename it -- the
+// currently-running process keeps executing fine from its own already-open handle to the
+// renamed-away file, while the original path is freed for the new binary to take. Unix allows an
+// outright overwrite too, but the same rename-based swap works identically there, so one code
+// path covers all three platforms instead of an OS-specific branch. The renamed-away old binary
+// can't be deleted here (still open/locked by THIS running process on Windows) -- it's cleaned up
+// at the START of the NEXT launch instead (see main()'s own startup cleanup below), once nothing
+// holds it open anymore.
+#[tauri::command]
+fn apply_desktop_update(app: AppHandle, staged_path: String) -> Result<(), String> {
+    let staged = PathBuf::from(&staged_path);
+    if !staged.is_file() {
+        return Err(format!("Staged update file not found: {staged_path}"));
+    }
+    let current = std::env::current_exe()
+        .map_err(|e| format!("Could not resolve the running executable's own path: {e}"))?;
+    let backup = current.with_extension("old");
+    // Best-effort: a leftover .old from an update that staged but never got cleaned up (e.g. this
+    // process crashed before its own next startup ran the cleanup) must never block a fresh one.
+    let _ = std::fs::remove_file(&backup);
+
+    std::fs::rename(&current, &backup)
+        .map_err(|e| format!("Could not rename the running executable out of the way: {e}"))?;
+    if let Err(e) = std::fs::rename(&staged, &current) {
+        // Roll back immediately so the install is never left with no exe at its real path at all.
+        let _ = std::fs::rename(&backup, &current);
+        return Err(format!("Could not move the new binary into place (rolled back): {e}"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&current) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(&current, perms);
+        }
+    }
+
+    let mut cmd = Command::new(&current);
+    #[cfg(windows)]
+    cmd.creation_flags(DETACHED_PROCESS);
+    cmd.spawn().map_err(|e| {
+        format!("Swap succeeded, but relaunching failed -- start {} yourself: {e}", current.display())
+    })?;
+
+    app.exit(0);
+    Ok(())
 }
 
 // Real, confirmed bug this floor fixes: the intro (Settings -> Customization -> Visual's "Play
@@ -1428,6 +1496,13 @@ fn test_wsl_setup(_distro: String, _as_root: bool) -> Result<String, String> {
 }
 
 fn main() {
+    // Leftover <exe>.old from a previous apply_desktop_update's rename-swap -- only deletable now,
+    // since the OLD process (which held it open) has fully exited by the time THIS new process
+    // starts. Best-effort and silent: a first-ever launch (nothing to clean up) is the common case.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("old"));
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // Window may be hidden in the tray on a second launch -- show it, don't just focus.
@@ -1442,6 +1517,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_start_config,
             launch_backend,
+            apply_desktop_update,
             force_restart_agent,
             save_env,
             open_in_browser,
