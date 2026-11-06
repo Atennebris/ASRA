@@ -61,6 +61,10 @@
   .sys { margin-top: 6px; }
   .sys .note { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.55; }
 
+  .repo-missing { margin: 16px 0 4px; padding: 13px 15px; border: 1px solid #4a3a1a;
+                  border-left: 3px solid #e3b341; border-radius: 8px; background: var(--panel2); }
+  .repo-missing .hint { font-size: 11.5px; color: var(--muted); line-height: 1.55; margin: 4px 0 10px; }
+  .repo-missing .err { margin-top: 8px; font-size: 11.5px; color: #ff9ea1; line-height: 1.55; display: none; }
   .wsl-setup { margin-top: 10px; }
   .btn-wsl-install { display: block; width: 100%; border: 1px solid var(--line); background: var(--bg);
         color: var(--fg); border-radius: 9px; padding: 10px 14px; font: inherit; font-size: 12.5px;
@@ -439,6 +443,15 @@
 <div class="card">
   <h1>ASRA</h1>
   <p class="sub">Autonomous Security Research Agent — launch</p>
+
+  <div class="repo-missing" id="repo-missing" style="display:none">
+    <div class="title" style="font-size:13px">This .exe is running on its own — no ASRA project found above it.</div>
+    <div class="hint">GitHub Releases ships only this shell binary; it needs the full ASRA project
+      (<code>run.sh</code>, the backend) installed alongside it. Pick a folder and this installs
+      it there, then relaunches from the installed copy automatically.</div>
+    <button class="btn-wsl-install" id="bootstrap-btn" type="button">Choose a folder &amp; install ASRA</button>
+    <div class="err" id="bootstrap-error"></div>
+  </div>
 
   <div class="label">Launch mode</div>
   <div class="modes">
@@ -1350,6 +1363,7 @@
         cfg = await invoke("get_start_config");
         $("root").checked = !!cfg.run_as_root;
         if (cfg.version) $("version-tag").textContent = "v" + cfg.version;
+        $("repo-missing").style.display = cfg.repo_found === false ? "block" : "none";
         renderSystem();
         renderSettings();
       } catch (e) { showError(String(e)); }
@@ -1447,6 +1461,35 @@
         btn.disabled = false;
       }
     });
+
+    // "Choose a folder & install ASRA" -- bootstrap_full_project (main.rs) picks a folder, down-
+    // loads+extracts the full project there, copies this exe into it, and relaunches from that
+    // copy, exiting this process on success -- so there's nothing left to do here on success,
+    // only on failure/cancel does this handler run to completion.
+    var bootstrapBtn = $("bootstrap-btn");
+    if (bootstrapBtn) {
+      bootstrapBtn.addEventListener("click", async function () {
+        if (!invoke) return;
+        var errEl = $("bootstrap-error");
+        if (errEl) { errEl.style.display = "none"; errEl.textContent = ""; }
+        var origText = bootstrapBtn.textContent;
+        bootstrapBtn.disabled = true;
+        bootstrapBtn.textContent = "Installing…";
+        try {
+          await invoke("bootstrap_full_project");
+        } catch (e) {
+          bootstrapBtn.disabled = false;
+          bootstrapBtn.textContent = origText;
+          var msg = String(e);
+          // "cancelled" -- the operator closed the folder picker without choosing one; not a real
+          // error, nothing to alarm them with.
+          if (msg.indexOf("cancelled") === -1 && errEl) {
+            errEl.style.display = "block";
+            errEl.textContent = msg;
+          }
+        }
+      });
+    }
 
     // The desktop window (and a browser tab) is user-resizable at any moment. While #intro is on
     // screen, resize the canvas and rebuild the shatter geometry for the new size so it always fills

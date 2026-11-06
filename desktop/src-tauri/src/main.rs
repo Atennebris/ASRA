@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
@@ -97,6 +98,11 @@ struct StartConfig {
     wsl_default_distro: String,
     distros: Vec<WslDistro>,
     settings: Vec<EnvSetting>,
+    // False when repo_dir()'s own upward search never found run.sh -- i.e. this exe is running
+    // on its own, downloaded straight from a GitHub Release with no ASRA checkout above it. The
+    // start screen uses this to offer bootstrap_full_project's "pick a folder & install" button
+    // instead of only letting the operator hit Start and wait out launch_backend's fast-fail.
+    repo_found: bool,
 }
 
 // Mirrors install_wsl's two possible jobs. Kept as a String (not a Rust enum) on the wire --
@@ -838,24 +844,27 @@ fn get_start_config() -> StartConfig {
     let wsl_installed = wsl_is_installed();
     let wsl_probe_ms = wsl_probe_start.elapsed().as_millis();
     let settings = parse_env_settings(&env_text);
+    let repo_found = repo.join("run.sh").is_file();
     eprintln!(
-        "[ASRA-DESKTOP] start screen loaded (os={}, wsl_installed={}, wsl_distros={}, env_settings={}, run_as_root={})",
+        "[ASRA-DESKTOP] start screen loaded (os={}, wsl_installed={}, wsl_distros={}, env_settings={}, run_as_root={}, repo_found={})",
         std::env::consts::OS,
         wsl_installed,
         distros.len(),
         settings.len(),
-        env_flag(&env_text, "ASRA_RUN_AS_ROOT")
+        env_flag(&env_text, "ASRA_RUN_AS_ROOT"),
+        repo_found
     );
     append_desktop_log_line(
         &env_text,
         &format!(
-            "start screen loaded: os={} wsl_installed={} wsl_distros={} wsl_probe_ms={} env_settings={} run_as_root={}",
+            "start screen loaded: os={} wsl_installed={} wsl_distros={} wsl_probe_ms={} env_settings={} run_as_root={} repo_found={}",
             std::env::consts::OS,
             wsl_installed,
             distros.len(),
             wsl_probe_ms,
             settings.len(),
-            env_flag(&env_text, "ASRA_RUN_AS_ROOT")
+            env_flag(&env_text, "ASRA_RUN_AS_ROOT"),
+            repo_found
         ),
     );
     StartConfig {
@@ -872,6 +881,7 @@ fn get_start_config() -> StartConfig {
         wsl_default_distro: default_wsl_install_distro(&env_text),
         distros,
         settings,
+        repo_found,
     }
 }
 
@@ -930,6 +940,146 @@ fn apply_desktop_update(app: AppHandle, staged_path: String) -> Result<(), Strin
     Ok(())
 }
 
+// An operator who downloaded only the standalone exe from a GitHub Release (no ASRA checkout
+// above it -- see repo_dir()'s own fallback and get_start_config's repo_found) has nothing for
+// launch_backend to actually run; this is the start screen's "pick a folder & install" fix for
+// that. Unlike apply_desktop_update above, this COPIES the running exe rather than renaming it --
+// the original download is left alone where the operator put it, not replaced in place -- then
+// spawns the installed copy and exits, so the session continues seamlessly from the real checkout.
+#[tauri::command]
+fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Choose where to install the full ASRA project")
+        .blocking_pick_folder()
+        .ok_or_else(|| "cancelled".to_string())?;
+    let picked_path = picked
+        .into_path()
+        .map_err(|e| format!("could not resolve the picked folder: {e}"))?;
+
+    // No real repo exists yet at this point (that's the whole reason this command exists) -- this
+    // is only ever used to decide whether DEBUG logging is on and where the global app dir is,
+    // same as open_external_url's own env_text read above, never anything functional.
+    let log_env_text = std::fs::read_to_string(repo_dir().join(".env"))
+        .or_else(|_| std::fs::read_to_string(repo_dir().join(".env.example")))
+        .unwrap_or_default();
+    append_desktop_log_line(
+        &log_env_text,
+        &format!("bootstrap_full_project: installing into {}", picked_path.join("ASRA").display()),
+    );
+
+    // Always nest under one fixed subfolder name, whatever parent the operator picked -- never
+    // write repo files loose into a folder that might already hold unrelated stuff of theirs.
+    let target = picked_path.join("ASRA");
+    if target.join("run.sh").is_file() {
+        // Already bootstrapped here before (a retry, or a second launch of the leftover exe) --
+        // nothing to download again, just adopt it as-is.
+    } else if target.exists() {
+        let has_entries = std::fs::read_dir(&target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if has_entries {
+            return Err(format!(
+                "{} already exists and isn't an ASRA checkout (no run.sh) -- pick an empty or different folder.",
+                target.display()
+            ));
+        }
+        download_and_extract_repo(&target)?;
+    } else {
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("could not create {}: {e}", target.display()))?;
+        download_and_extract_repo(&target)?;
+    }
+
+    let current = std::env::current_exe()
+        .map_err(|e| format!("could not resolve the running executable's own path: {e}"))?;
+    let filename = current
+        .file_name()
+        .ok_or_else(|| "running executable has no file name".to_string())?;
+    let bin_dir = target.join("desktop").join("bin");
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("could not create {}: {e}", bin_dir.display()))?;
+    let installed_exe = bin_dir.join(filename);
+    std::fs::copy(&current, &installed_exe).map_err(|e| {
+        format!("could not copy the running executable into {}: {e}", installed_exe.display())
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&installed_exe) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(&installed_exe, perms);
+        }
+    }
+
+    let mut cmd = Command::new(&installed_exe);
+    #[cfg(windows)]
+    cmd.creation_flags(DETACHED_PROCESS);
+    cmd.spawn().map_err(|e| {
+        format!(
+            "ASRA was installed to {}, but relaunching failed -- start {} yourself: {e}",
+            target.display(),
+            installed_exe.display()
+        )
+    })?;
+
+    append_desktop_log_line(
+        &log_env_text,
+        &format!("bootstrap_full_project: installed and relaunched from {}", installed_exe.display()),
+    );
+    app.exit(0);
+    Ok(())
+}
+
+// Downloads the GitHub source archive matching this exe's own Cargo.toml version (falls back to
+// the main branch if that tag was never pushed -- e.g. a dev build whose release never shipped)
+// and extracts it into `target` with the archive's own top-level "ASRA-<version>/" wrapper
+// stripped. Shells out to curl/tar -- both already bundled on Windows 10+/macOS/Linux -- rather
+// than adding HTTP/zip crates, the same choice every other network-ish thing in this file already
+// makes (wsl.exe, bash, powershell.exe).
+fn download_and_extract_repo(target: &Path) -> Result<(), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let archive = std::env::temp_dir().join(format!("asra-bootstrap-{}.tar.gz", std::process::id()));
+    let tagged_url = format!("https://github.com/Atennebris/ASRA/archive/refs/tags/v{version}.tar.gz");
+    let main_url = "https://github.com/Atennebris/ASRA/archive/refs/heads/main.tar.gz";
+
+    let download = |url: &str| -> bool {
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg("-o")
+            .arg(&archive)
+            .arg(url)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if !download(&tagged_url) && !download(main_url) {
+        let _ = std::fs::remove_file(&archive);
+        return Err(format!(
+            "could not download the ASRA source archive (tried v{version} and main) -- check your internet connection"
+        ));
+    }
+
+    let extract = Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("--strip-components=1")
+        .arg("-C")
+        .arg(target)
+        .status();
+    let _ = std::fs::remove_file(&archive);
+
+    match extract {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("tar exited with status {status} while extracting the ASRA archive")),
+        Err(e) => Err(format!("could not run tar to extract the ASRA archive: {e}")),
+    }
+}
+
 // Real, confirmed bug this floor fixes: the intro (Settings -> Customization -> Visual's "Play
 // launch intro" switch, dist/index.html) was written assuming the backend always takes at least a
 // few seconds to become reachable -- true for a genuinely fresh launch, but NOT true the moment
@@ -961,6 +1111,25 @@ const MIN_INTRO_DISPLAY: Duration = Duration::from_millis(8100);
 async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, String> {
     let launch_start = Instant::now();
     let repo = repo_dir();
+    // repo_dir() falls back to the exe's own (or current) directory when it can't find run.sh
+    // anywhere above it -- which happens whenever someone runs this binary on its own, downloaded
+    // straight from a GitHub Release, without the rest of the ASRA repo next to it. Every step
+    // below (writing .env, spawning `bash run.sh` in WSL/natively, waiting up to 300s for a port)
+    // would otherwise run against that wrong folder and only fail, confusingly, after the full
+    // readiness timeout -- exactly what happened to an operator's friend who grabbed only the
+    // .exe. Catch it here, before touching the filesystem or spawning anything, with a message
+    // that says what's actually missing instead of a bare "did not come up in time".
+    if !repo.join("run.sh").is_file() {
+        let msg = format!(
+            "This isn't a full ASRA checkout -- no run.sh found next to (or above) {}. \
+            This .exe is the desktop shell only; it needs the full ASRA project alongside it. \
+            Clone or download https://github.com/Atennebris/ASRA and put this binary in its \
+            desktop/bin/ folder (or run it via run.bat from inside that project).",
+            repo.display()
+        );
+        append_desktop_log_line(&std::fs::read_to_string(repo.join(".env")).unwrap_or_default(), &msg);
+        return Err(msg);
+    }
     let original = std::fs::read_to_string(repo.join(".env"))
         .or_else(|_| std::fs::read_to_string(repo.join(".env.example")))
         .unwrap_or_default();
@@ -1513,11 +1682,13 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(OwnedBackend(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_start_config,
             launch_backend,
             apply_desktop_update,
+            bootstrap_full_project,
             force_restart_agent,
             save_env,
             open_in_browser,

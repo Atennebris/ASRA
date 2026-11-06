@@ -1,6 +1,6 @@
 [package]
 name = "asra-desktop"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "ASRA desktop shell — native window over the local FastAPI web UI"
 publish = false
@@ -14,6 +14,9 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 tauri-plugin-notification = "2"
+# Native "choose a folder" dialog for bootstrap_full_project (main.rs) -- an operator who only
+# downloaded the standalone exe (no repo) picks where the full ASRA project gets installed.
+tauri-plugin-dialog = "2"
 # Local-time-with-UTC-offset timestamps for this shell's own debug.log lines (see
 # append_desktop_log_line in main.rs) -- matches agent/utils/debug.py's own format exactly, so the
 # same tailing console/window reads both without a second parser.
