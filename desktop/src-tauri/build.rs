@@ -16,6 +16,8 @@ fn main() {
             tauri_build::AppManifest::new().commands(&[
                 "get_start_config",
                 "launch_backend",
+                "apply_desktop_update",
+                "bootstrap_full_project",
                 "force_restart_agent",
                 "save_env",
                 "open_in_browser",

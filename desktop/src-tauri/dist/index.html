@@ -453,6 +453,10 @@
     <div class="err" id="bootstrap-error"></div>
   </div>
 
+  <!-- Hidden entirely while repo_found is false (init()) -- none of this (mode pick, root toggle,
+       WSL info, .env settings, Start) is usable without a real ASRA checkout, and showing it
+       alongside the install banner above just reads as noise/confusion. -->
+  <div id="launcher-body">
   <div class="label">Launch mode</div>
   <div class="modes">
     <label class="mode">
@@ -493,6 +497,7 @@
   </details>
 
   <button class="start" id="start">Start</button>
+  </div>
 
   <div class="error" id="error"></div>
 
@@ -1363,7 +1368,9 @@
         cfg = await invoke("get_start_config");
         $("root").checked = !!cfg.run_as_root;
         if (cfg.version) $("version-tag").textContent = "v" + cfg.version;
-        $("repo-missing").style.display = cfg.repo_found === false ? "block" : "none";
+        var repoFound = cfg.repo_found !== false;
+        $("repo-missing").style.display = repoFound ? "none" : "block";
+        $("launcher-body").style.display = repoFound ? "" : "none";
         renderSystem();
         renderSettings();
       } catch (e) { showError(String(e)); }

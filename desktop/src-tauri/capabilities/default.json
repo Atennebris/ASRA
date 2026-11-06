@@ -10,6 +10,8 @@
     "core:default",
     "allow-get-start-config",
     "allow-launch-backend",
+    "allow-apply-desktop-update",
+    "allow-bootstrap-full-project",
     "allow-force-restart-agent",
     "allow-save-env",
     "allow-open-in-browser",

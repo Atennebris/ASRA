@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bootstrap-full-project"
+description = "Enables the bootstrap_full_project command without any pre-configured scope."
+commands.allow = ["bootstrap_full_project"]
+
+[[permission]]
+identifier = "deny-bootstrap-full-project"
+description = "Denies the bootstrap_full_project command without any pre-configured scope."
+commands.deny = ["bootstrap_full_project"]
