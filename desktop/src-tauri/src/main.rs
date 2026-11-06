@@ -641,8 +641,39 @@ fn apply_wsl_target(cmd: &mut Command, as_root: bool, distro: &str) {
     }
 }
 
+// Real, confirmed gap this fixes: run.sh's own stdout/stderr (first-run venv creation, pip
+// install -- deliberately NOT run with pip's -q, see run.sh's own comment on why silent output
+// there once got mistaken for a hang -- and any Python traceback before uvicorn starts) was never
+// captured at all when launched from this GUI exe (`windows_subsystem = "windows"`, no console to
+// inherit) -- it simply vanished, so a legitimate multi-minute first-time dependency install and a
+// genuinely broken backend were indistinguishable from the start screen: both just showed "Starting
+// backend..." until the 300s readiness timeout, with nothing for the operator to actually look at.
+// Redirecting both streams straight into a file (fresh each launch, `Command::stdout`/`stderr`
+// taking the file's own handle -- no shell redirection or wslpath translation needed, since the
+// child process inherits whichever handle Rust itself already opened on the host side) means the
+// REAL cause -- a pip resolver still working, or a real traceback -- is always on disk and named
+// in the readiness-timeout error below, with no extra manual step (opening a terminal, running
+// run.sh by hand) required to see it.
+fn backend_launch_log_path(env_text: &str) -> PathBuf {
+    resolve_app_dir(env_text).join("backend-launch.log")
+}
+
+fn open_backend_launch_log(env_text: &str) -> std::io::Result<std::fs::File> {
+    let path = backend_launch_log_path(env_text);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(&path)
+}
+
 #[cfg(windows)]
-fn spawn_backend(repo: &Path, as_root: bool, distro: &str, ui_token: &str) -> std::io::Result<Child> {
+fn spawn_backend(
+    repo: &Path,
+    as_root: bool,
+    distro: &str,
+    ui_token: &str,
+    log_file: std::fs::File,
+) -> std::io::Result<Child> {
     let win_path = repo.to_string_lossy().replace('\'', "'\\''");
     // Inject the UI token, plus this binary's own version/platform, as prefix envs of the inner
     // command so run.sh's own `source .env` cannot clobber them. ASRA_DESKTOP_VERSION/PLATFORM let
@@ -667,12 +698,20 @@ fn spawn_backend(repo: &Path, as_root: bool, distro: &str, ui_token: &str) -> st
         .arg("bash")
         .arg("-lc")
         .arg(inner)
-        .creation_flags(CREATE_NO_WINDOW);
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
     cmd.spawn()
 }
 
 #[cfg(not(windows))]
-fn spawn_backend(repo: &Path, _as_root: bool, _distro: &str, ui_token: &str) -> std::io::Result<Child> {
+fn spawn_backend(
+    repo: &Path,
+    _as_root: bool,
+    _distro: &str,
+    ui_token: &str,
+    log_file: std::fs::File,
+) -> std::io::Result<Child> {
     let mut cmd = Command::new("bash");
     cmd.arg("run.sh").current_dir(repo);
     if !ui_token.is_empty() {
@@ -682,6 +721,7 @@ fn spawn_backend(repo: &Path, _as_root: bool, _distro: &str, ui_token: &str) -> 
     // to come from the shell (std::env::consts::OS), not guessed on the Python side.
     cmd.env("ASRA_DESKTOP_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("ASRA_DESKTOP_PLATFORM", std::env::consts::OS);
+    cmd.stdout(log_file.try_clone()?).stderr(log_file);
     cmd.spawn()
 }
 
@@ -1223,7 +1263,9 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
         eprintln!("[ASRA-DESKTOP] backend already up -- adopting it (won't stop it on close)");
     } else {
         let spawn_start = Instant::now();
-        let child = spawn_backend(&repo, args.as_root, &args.distro, &ui_token)
+        let log_file = open_backend_launch_log(&new_env)
+            .map_err(|e| format!("could not open the backend launch log: {e}"))?;
+        let child = spawn_backend(&repo, args.as_root, &args.distro, &ui_token, log_file)
             .map_err(|e| format!("could not start backend: {e}"))?;
         // Only the wsl.exe/bash *process spawn* itself, not the backend becoming reachable --
         // that part is the wait_for_port measurement right below. A slow spawn here (vs. a slow
@@ -1255,7 +1297,26 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
 
     if !ready {
         append_desktop_log_line(&new_env, "backend did not come up within the 300s readiness timeout");
-        return Err("backend did not come up in time".to_string());
+        let log_path = backend_launch_log_path(&new_env);
+        let tail = std::fs::read_to_string(&log_path)
+            .map(|text| {
+                let lines: Vec<&str> = text.lines().collect();
+                let start = lines.len().saturating_sub(40);
+                lines[start..].join("\n")
+            })
+            .unwrap_or_default();
+        return Err(if tail.trim().is_empty() {
+            format!(
+                "backend did not come up in time -- nothing was captured at all in {}, so the process likely never even started (see above for a spawn error)",
+                log_path.display()
+            )
+        } else {
+            format!(
+                "backend did not come up in time -- last output from run.sh (full log: {}):\n{}",
+                log_path.display(),
+                tail
+            )
+        });
     }
 
     if env_flag_default(&new_env, "ASRA_INTRO_ENABLED", true) {

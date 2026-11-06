@@ -120,7 +120,8 @@
         background: var(--accent); color: #fff; font: inherit; font-size: 14px; font-weight: 600;
         letter-spacing: 0.04em; cursor: pointer; }
   .start:disabled { opacity: 0.55; cursor: default; }
-  .error { margin-top: 16px; display: none; font-size: 12.5px; color: #ff9ea1; line-height: 1.6; }
+  .error { margin-top: 16px; display: none; font-size: 12.5px; color: #ff9ea1; line-height: 1.6;
+           white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto; }
   .error.show { display: block; }
   .force-restart-row { margin-top: 10px; }
   .btn-force-restart { display: block; width: 100%; border: 1px solid var(--line); background: var(--bg);
