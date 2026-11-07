@@ -194,9 +194,17 @@ fn port_is_up(port: &str) -> bool {
 // passed). `stall_after` is how long with NO log growth before calling it stuck; `hard_cap` is an
 // absolute ceiling so a truly wedged process (log still trickling, e.g. a retry loop) can't wait
 // forever either.
+//
+// `stall_after` was originally 90s and confirmed live to be too short: pip's "Installing
+// collected packages: ..." line prints ONCE, then goes completely silent for the entire time it
+// actually writes every package's files to disk -- on a real machine, with ~150 packages
+// (several large: frida, semgrep, mitmproxy) and real-time antivirus scanning each file as WSL2
+// writes it, that silent stretch alone ran past 90s with the install still genuinely working.
+// 600s gives that step comfortable room without weakening the stall check's actual purpose
+// (catching a truly dead process, not a quiet-but-alive one).
 fn wait_for_port_adaptive(port: &str, log_path: &Path) -> bool {
-    let hard_cap = Duration::from_secs(1800);
-    let stall_after = Duration::from_secs(90);
+    let hard_cap = Duration::from_secs(2700);
+    let stall_after = Duration::from_secs(600);
     let start = Instant::now();
     let mut last_size = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
     let mut last_progress = Instant::now();
