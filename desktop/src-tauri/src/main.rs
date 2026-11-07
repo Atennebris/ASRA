@@ -180,15 +180,42 @@ fn port_is_up(port: &str) -> bool {
     }
 }
 
-fn wait_for_port(port: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+// Real, confirmed incident this fixes: a fixed 300s readiness timeout has no way to tell apart a
+// genuinely broken backend from a perfectly healthy but slow FIRST-TIME dependency install --
+// confirmed live, a fresh machine installing ~150 packages (several large: frida, semgrep,
+// mitmproxy, playwright) legitimately ran past 300s while `run.sh`'s own log kept growing the
+// whole time, and the readiness wait gave up and reported failure mid-install, with pip still
+// actively working. A single bigger fixed number just moves the same wrong tradeoff to a
+// different value -- it would make a genuinely hung backend (dead network, crashed process) wait
+// that same long before ever saying so. Watching the backend's own launch log for real progress
+// instead of guessing a duration solves both: keep waiting as long as that log keeps growing
+// (there's forward motion, however slow), but give up quickly once it goes quiet for a while
+// (nothing left changing means nothing left to wait for, regardless of how much total time has
+// passed). `stall_after` is how long with NO log growth before calling it stuck; `hard_cap` is an
+// absolute ceiling so a truly wedged process (log still trickling, e.g. a retry loop) can't wait
+// forever either.
+fn wait_for_port_adaptive(port: &str, log_path: &Path) -> bool {
+    let hard_cap = Duration::from_secs(1800);
+    let stall_after = Duration::from_secs(90);
+    let start = Instant::now();
+    let mut last_size = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    let mut last_progress = Instant::now();
+    loop {
         if port_is_up(port) {
             return true;
         }
+        if start.elapsed() >= hard_cap {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(400));
+        let size_now = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+        if size_now != last_size {
+            last_size = size_now;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= stall_after {
+            return false;
+        }
     }
-    false
 }
 
 fn wait_for_port_to_clear(port: &str, timeout: Duration) -> bool {
@@ -1189,7 +1216,7 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
     // repo_dir() falls back to the exe's own (or current) directory when it can't find run.sh
     // anywhere above it -- which happens whenever someone runs this binary on its own, downloaded
     // straight from a GitHub Release, without the rest of the ASRA repo next to it. Every step
-    // below (writing .env, spawning `bash run.sh` in WSL/natively, waiting up to 300s for a port)
+    // below (writing .env, spawning `bash run.sh` in WSL/natively, waiting for a port to open)
     // would otherwise run against that wrong folder and only fail, confusingly, after the full
     // readiness timeout -- exactly what happened to an operator's friend who grabbed only the
     // .exe. Catch it here, before touching the filesystem or spawning anything, with a message
@@ -1319,9 +1346,10 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
     }
 
     let port_for_wait = port.clone();
+    let log_path_for_wait = backend_launch_log_path(&new_env);
     let wait_start = Instant::now();
     let ready = tauri::async_runtime::spawn_blocking(move || {
-        wait_for_port(&port_for_wait, Duration::from_secs(300))
+        wait_for_port_adaptive(&port_for_wait, &log_path_for_wait)
     })
     .await
     .map_err(|e| format!("readiness wait failed: {e}"))?;
@@ -1331,7 +1359,7 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
     );
 
     if !ready {
-        append_desktop_log_line(&new_env, "backend did not come up within the 300s readiness timeout");
+        append_desktop_log_line(&new_env, "backend did not come up -- its own launch log stopped growing (or the 30-minute hard cap was hit) before the port opened");
         let log_path = backend_launch_log_path(&new_env);
         let tail = std::fs::read_to_string(&log_path)
             .map(|text| {
