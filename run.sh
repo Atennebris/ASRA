@@ -33,6 +33,33 @@ fi
 INSTALLED_HASH="$(cat "$INSTALLED_HASH_FILE" 2>/dev/null || true)"
 
 if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
+  # Real, confirmed incident this fixes: some requirements.txt dependencies (unicorn, a pwntools
+  # transitive dep) have no prebuilt wheel for every possible Python ABI/version and fall back to
+  # compiling their native C/C++ code from source -- which needs a real compiler and cmake. On a
+  # genuinely fresh machine (first-ever clone/install, no venv yet) neither is guaranteed to exist:
+  # setup_tools.sh already installs build-essential, but only for its OWN Tier-2 tool arsenal, and
+  # only runs AFTER this script -- too late for pip's build step right below. Confirmed live:
+  # exactly this gap built unicorn's wheel, failed with "Failed to build unicorn", and (before the
+  # desktop shell captured run.sh's own output to a log file) looked indistinguishable from a
+  # silent hang for the full 5-minute readiness timeout. Best-effort (|| true) and silent on
+  # failure -- a locked-down environment where apt-get itself isn't allowed must never block the
+  # venv/pip install that follows just because this convenience step couldn't run.
+  if command -v apt-get >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then
+      _BUILD_TOOLCHAIN_SUDO=""
+    elif command -v sudo >/dev/null 2>&1; then
+      _BUILD_TOOLCHAIN_SUDO="sudo"
+    else
+      _BUILD_TOOLCHAIN_SUDO=""
+    fi
+    if ! command -v cc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1; then
+      echo "Making sure a C/C++ build toolchain (build-essential, cmake) is present -- some Python"
+      echo "packages compile native code if no prebuilt wheel matches this machine's Python version."
+      $_BUILD_TOOLCHAIN_SUDO apt-get update -y >/dev/null 2>&1 || true
+      $_BUILD_TOOLCHAIN_SUDO apt-get install -y build-essential cmake || true
+    fi
+  fi
+
   # No -q here (real, confirmed incident this fixes): pip's own dependency resolver can spend
   # several CPU-bound minutes with ZERO output at all while backtracking through candidate
   # versions before it even starts downloading/building anything -- requirements.txt's own comments

@@ -1301,7 +1301,12 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
         let tail = std::fs::read_to_string(&log_path)
             .map(|text| {
                 let lines: Vec<&str> = text.lines().collect();
-                let start = lines.len().saturating_sub(40);
+                // A real pip wheel-build failure (compiler/cmake invocation + its own diagnostic
+                // output) routinely runs well past 40 lines before pip's final "ERROR: Failed
+                // building wheel for X" summary -- 40 was confirmed too short live: it cut off
+                // exactly before the real underlying compiler error on a genuine pip build failure
+                // (unicorn, a pwntools dependency), leaving only the unhelpful final line visible.
+                let start = lines.len().saturating_sub(150);
                 lines[start..].join("\n")
             })
             .unwrap_or_default();
