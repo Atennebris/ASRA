@@ -1080,9 +1080,39 @@ fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
 // stripped. Shells out to curl/tar -- both already bundled on Windows 10+/macOS/Linux -- rather
 // than adding HTTP/zip crates, the same choice every other network-ish thing in this file already
 // makes (wsl.exe, bash, powershell.exe).
+// GitHub's tag-name archive URL goes through codeload.github.com's own CDN cache, keyed by that
+// URL -- confirmed live, this is a real bug, not a hypothesis: redoing a release in place
+// (deleting and recreating the SAME tag name, this project's established pattern for fixing an
+// already-published version without bumping it) does not reliably bust that cache. An operator
+// re-bootstrapping shortly after a redo-release kept getting an old cached archive back from the
+// unchanged tag URL, silently undoing a real fix with no error anywhere to explain it -- the tag
+// itself was correct on GitHub the whole time, confirmed by fetching it directly and comparing.
+// Archive-by-commit-SHA URLs (.../archive/<sha>.tar.gz) are immutable: a different commit is a
+// different URL, so there's no stale cache entry to ever hit. Resolving the tag to its commit SHA
+// first and downloading THAT URL is what actually avoids the bug.
+fn resolve_tag_commit_sha(version: &str) -> Option<String> {
+    let output = Command::new("curl")
+        .arg("-fsSL")
+        .arg(format!(
+            "https://api.github.com/repos/Atennebris/ASRA/git/refs/tags/v{version}"
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    let after_key = body.find("\"sha\":")? + "\"sha\":".len();
+    let rest = body[after_key..].trim_start().strip_prefix('"')?;
+    let sha = &rest[..rest.find('"')?];
+    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
 fn download_and_extract_repo(target: &Path) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
     let archive = std::env::temp_dir().join(format!("asra-bootstrap-{}.tar.gz", std::process::id()));
+    let sha_url = resolve_tag_commit_sha(version)
+        .map(|sha| format!("https://github.com/Atennebris/ASRA/archive/{sha}.tar.gz"));
     let tagged_url = format!("https://github.com/Atennebris/ASRA/archive/refs/tags/v{version}.tar.gz");
     let main_url = "https://github.com/Atennebris/ASRA/archive/refs/heads/main.tar.gz";
 
@@ -1097,7 +1127,12 @@ fn download_and_extract_repo(target: &Path) -> Result<(), String> {
             .unwrap_or(false)
     };
 
-    if !download(&tagged_url) && !download(main_url) {
+    // SHA URL first (immune to the cache bug above), then the tag URL, then main -- same overall
+    // fallback shape as before, just with the one reliable option tried ahead of the risky one.
+    let downloaded = sha_url.as_deref().map(download).unwrap_or(false)
+        || download(&tagged_url)
+        || download(main_url);
+    if !downloaded {
         let _ = std::fs::remove_file(&archive);
         return Err(format!(
             "could not download the ASRA source archive (tried v{version} and main) -- check your internet connection"
