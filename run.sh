@@ -15,12 +15,61 @@ cd "$(dirname "$0")"
 VENV_DIR="venv"
 INSTALLED_HASH_FILE="$VENV_DIR/.requirements.sha256"
 
-# A directory can exist from an interrupted first run without a working interpreter in it —
-# treat that the same as "no venv yet", not as "already set up".
+# Real, confirmed incident this fixes: unicorn (a pwntools transitive dep, requirements.txt) is
+# pinned by pwntools itself to exclude 2.1.3/2.1.4 ("unicorn!=2.1.3,!=2.1.4,>=2.0.1"), and the
+# remaining allowed version (2.1.2, verified on PyPI) only ships prebuilt wheels for Python
+# 3.7-3.13 -- none for 3.14+. On a machine where the system's bare "python3" already points at
+# 3.14 (confirmed: a fresh Ubuntu 26.04 WSL2 install), pip has no wheel to install at all and
+# falls back to compiling unicorn's vendored QEMU C source from scratch, which is fragile and
+# toolchain-version-sensitive (see the CFLAGS workarounds further below, kept as a fallback for
+# whatever Python ends up used here). Picking an interpreter from this list -- each confirmed via
+# PyPI to actually have a unicorn wheel -- avoids that whole class of problem outright instead of
+# patching around it one compiler error at a time.
+PYTHON_CANDIDATES="python3.13 python3.12 python3.11 python3.10"
+PYTHON_BIN=""
+for _cand in $PYTHON_CANDIDATES; do
+  if command -v "$_cand" >/dev/null 2>&1; then
+    PYTHON_BIN="$_cand"
+    break
+  fi
+done
+if [ -z "$PYTHON_BIN" ] && command -v apt-get >/dev/null 2>&1; then
+  if [ "$(id -u)" -eq 0 ]; then
+    _PY_SUDO=""
+  elif command -v sudo >/dev/null 2>&1; then
+    _PY_SUDO="sudo"
+  else
+    _PY_SUDO=""
+  fi
+  echo "No Python 3.10-3.13 interpreter found -- installing python3.12 so native dependencies"
+  echo "(unicorn and similar) can use a prebuilt wheel instead of compiling from source."
+  $_PY_SUDO apt-get update -y >/dev/null 2>&1 || true
+  $_PY_SUDO apt-get install -y python3.12 python3.12-venv >/dev/null 2>&1 || true
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN="python3.12"
+  fi
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  PYTHON_BIN="python3"
+fi
+
+# A directory can exist from an interrupted first run without a working interpreter in it, or
+# from an earlier run on a Python version with no prebuilt wheel for a native dependency (see
+# above) -- treat both the same as "no venv yet", not as "already set up".
+_RECREATE_VENV=0
 if [ ! -x "$VENV_DIR/bin/python3" ]; then
-  echo "No virtual environment found — creating ./venv ..."
+  _RECREATE_VENV=1
+else
+  _VENV_PY_VERSION="$("$VENV_DIR/bin/python3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  case " $PYTHON_CANDIDATES " in
+    *" python$_VENV_PY_VERSION "*) ;; # already on a known-good version -- keep it
+    *) _RECREATE_VENV=1 ;;
+  esac
+fi
+if [ "$_RECREATE_VENV" = "1" ]; then
+  echo "Creating ./venv with $PYTHON_BIN ..."
   rm -rf "$VENV_DIR"
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
 # sha256sum is GNU coreutils (Linux/WSL2 default); macOS ships shasum instead — try both so this
@@ -87,18 +136,24 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
   # Merging stderr into stdout at the shell level, before anything leaves this process, guarantees
   # both land in the exact same byte stream in the right order no matter what happens upstream.
   #
-  # CFLAGS="-include sys/mman.h" is a targeted workaround for a real, confirmed build failure,
-  # once the block above actually surfaced it: unicorn's vendored QEMU C source
-  # (qemu/util/osdep.c) uses mprotect()/PROT_READ/PROT_WRITE/PROT_EXEC/PROT_NONE without including
-  # <sys/mman.h> itself -- harmless on older toolchains (the symbols/macros came in transitively
-  # from some other header), but a hard compile error on a newer GCC (confirmed: GCC 15.2.0) where
-  # that transitive path no longer holds. This can't be fixed from here (it's third-party vendored
-  # C inside the unicorn sdist, not our code) -- forcing the one missing header in via the
-  # compiler's own -include flag, applied to every file this pip install compiles, is the standard
-  # workaround for exactly this class of "old vendored C, newer toolchain" breakage. CMake picks up
-  # CFLAGS from the environment at configure time, which is why exporting it before invoking pip
-  # (rather than editing unicorn's own build files) is enough to reach the actual compiler command.
-  CFLAGS="-include sys/mman.h ${CFLAGS:-}" "$VENV_DIR/bin/pip" install -r requirements.txt 2>&1
+  # Two confirmed, real failure modes building unicorn (a pwntools transitive dep) from source on
+  # a newer GCC (confirmed: GCC 15.2.0), both in unicorn's vendored QEMU C source, not our code --
+  # can't be fixed by editing anything here, only by changing what the compiler sees:
+  #   1. qemu/util/osdep.c uses mprotect()/PROT_READ/PROT_WRITE/PROT_EXEC/PROT_NONE without
+  #      including <sys/mman.h> itself -- harmless on older toolchains (came in transitively from
+  #      some other header), a hard compile error now that it doesn't. Fixed by force-including
+  #      the one header via -include, applied to every file this pip install compiles.
+  #   2. qemu/util/oslib-posix.c calls memalign() the same way, no include -- but this is a
+  #      DIFFERENT failure class: a missing function prototype, which GCC 15 defaults to a hard
+  #      error (-Werror=implicit-function-declaration under its new default -std=gnu23) where
+  #      older GCC only ever warned. -include can't fix every such call one file at a time as more
+  #      turn up -- -std=gnu17 restores the old "warning, not error" behavior project-wide for
+  #      this one build, which is safe here because the actual libc symbols (mprotect, memalign,
+  #      ...) always existed and link fine; only the compile-time strictness changed.
+  # CMake picks up CFLAGS from the environment at configure time, which is why exporting it before
+  # invoking pip (rather than editing unicorn's own build files) is enough to reach the real
+  # compiler command for every file it builds.
+  CFLAGS="-include sys/mman.h -std=gnu17 ${CFLAGS:-}" "$VENV_DIR/bin/pip" install -r requirements.txt 2>&1
   # The `httpx` PyPI package (an HTTP client library this project imports as `import httpx`) also
   # drops an unused console-script shim at venv/bin/httpx. With the venv on PATH that shim SHADOWS
   # ProjectDiscovery's real `httpx` recon scanner (/usr/local/bin/httpx) -- confirmed live: it made
