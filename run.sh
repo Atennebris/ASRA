@@ -78,7 +78,15 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
   echo "install or after requirements.txt changes. Real progress prints below; let it finish rather"
   echo "than assuming it's stuck."
   "$VENV_DIR/bin/pip" install --upgrade pip
-  "$VENV_DIR/bin/pip" install -r requirements.txt
+  # 2>&1 here is deliberate, not redundant with the desktop shell's own stdout+stderr capture:
+  # confirmed live -- a real wheel-build failure (unicorn) reached the operator's error banner as
+  # just "finished with status 'error'" / "Failed to build unicorn", with pip's own detailed
+  # "subprocess-exited-with-error" block (the actual compiler/cmake error) missing entirely, even
+  # with a generous log tail -- strongly suggesting that block went out on a separate stream that
+  # didn't survive the bash-in-WSL -> wsl.exe -> desktop-shell relay as cleanly as stdout did.
+  # Merging stderr into stdout at the shell level, before anything leaves this process, guarantees
+  # both land in the exact same byte stream in the right order no matter what happens upstream.
+  "$VENV_DIR/bin/pip" install -r requirements.txt 2>&1
   # The `httpx` PyPI package (an HTTP client library this project imports as `import httpx`) also
   # drops an unused console-script shim at venv/bin/httpx. With the venv on PATH that shim SHADOWS
   # ProjectDiscovery's real `httpx` recon scanner (/usr/local/bin/httpx) -- confirmed live: it made
