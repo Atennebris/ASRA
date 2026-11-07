@@ -52,12 +52,17 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
     else
       _BUILD_TOOLCHAIN_SUDO=""
     fi
-    if ! command -v cc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1; then
-      echo "Making sure a C/C++ build toolchain (build-essential, cmake) is present -- some Python"
-      echo "packages compile native code if no prebuilt wheel matches this machine's Python version."
-      $_BUILD_TOOLCHAIN_SUDO apt-get update -y >/dev/null 2>&1 || true
-      $_BUILD_TOOLCHAIN_SUDO apt-get install -y build-essential cmake || true
-    fi
+    # Checking only for `cc`/`cmake` isn't enough -- confirmed live: a machine can already have a C
+    # compiler (so that check skips this whole block) while still missing python3-dev (Python.h),
+    # which build-essential/cmake don't provide either way -- compiling ANY C extension against
+    # CPython's own API needs those headers, and their absence is exactly what was still breaking
+    # unicorn's build after the cc/cmake fix alone. So always run this (cheap, idempotent, apt
+    # no-ops in seconds if everything's already installed) instead of gating on a partial check.
+    echo "Making sure a C/C++ build toolchain (build-essential, cmake, python3-dev) is present --"
+    echo "some Python packages compile native code if no prebuilt wheel matches this machine's"
+    echo "Python version, and that needs both a compiler and Python's own C headers."
+    $_BUILD_TOOLCHAIN_SUDO apt-get update -y >/dev/null 2>&1 || true
+    $_BUILD_TOOLCHAIN_SUDO apt-get install -y build-essential cmake python3-dev || true
   fi
 
   # No -q here (real, confirmed incident this fixes): pip's own dependency resolver can spend
