@@ -33,24 +33,36 @@ for _cand in $PYTHON_CANDIDATES; do
     break
   fi
 done
-if [ -z "$PYTHON_BIN" ] && command -v apt-get >/dev/null 2>&1; then
-  if [ "$(id -u)" -eq 0 ]; then
-    _PY_SUDO=""
-  elif command -v sudo >/dev/null 2>&1; then
-    _PY_SUDO="sudo"
-  else
-    _PY_SUDO=""
+if [ -z "$PYTHON_BIN" ]; then
+  # Real, confirmed incident this fixes: an earlier version of this fallback tried apt-get
+  # installing python3.12 directly (with the deadsnakes PPA as a second attempt) -- that is still
+  # fundamentally betting on what one specific Linux distro's package repos happen to carry on one
+  # specific day, and it failed silently on a real operator's machine with no error anywhere,
+  # quietly falling back to whatever "python3" already was -- the exact version with no prebuilt
+  # wheel for unicorn, the whole problem this exists to avoid. uv (https://astral.sh/uv) sidesteps
+  # the OS package manager entirely: "uv python install" downloads a self-contained, prebuilt
+  # CPython build straight from Astral's own python-build-standalone project, the same way on
+  # every Linux distro and version, with no OS repo contents for it to ever depend on.
+  export PATH="$HOME/.local/bin:$PATH"
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "No Python 3.10-3.13 interpreter found on this system -- installing uv"
+    echo "(https://astral.sh/uv) to fetch one directly instead of relying on apt."
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true
+    export PATH="$HOME/.local/bin:$PATH"
   fi
-  echo "No Python 3.10-3.13 interpreter found -- installing python3.12 so native dependencies"
-  echo "(unicorn and similar) can use a prebuilt wheel instead of compiling from source."
-  $_PY_SUDO apt-get update -y >/dev/null 2>&1 || true
-  $_PY_SUDO apt-get install -y python3.12 python3.12-venv >/dev/null 2>&1 || true
-  if command -v python3.12 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.12"
+  if command -v uv >/dev/null 2>&1; then
+    uv python install 3.12 >/dev/null 2>&1 || true
+    _UV_PYTHON="$(uv python find 3.12 2>/dev/null || true)"
+    if [ -n "$_UV_PYTHON" ] && [ -x "$_UV_PYTHON" ]; then
+      PYTHON_BIN="$_UV_PYTHON"
+    fi
   fi
 fi
 if [ -z "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
+  echo "WARNING: no Python 3.10-3.13 interpreter available (even via uv) -- falling back to the"
+  echo "system's own default python3. Native dependencies with no wheel for that version (e.g."
+  echo "unicorn) will have to compile from source, which may fail."
 fi
 
 # A directory can exist from an interrupted first run without a working interpreter in it, or
@@ -126,6 +138,12 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
   echo "Installing dependencies from requirements.txt -- this can take several minutes on a fresh"
   echo "install or after requirements.txt changes. Real progress prints below; let it finish rather"
   echo "than assuming it's stuck."
+  # Deliberately printed right here, not just once at venv-creation time further up: a failure
+  # deep in a native build (unicorn and similar) can push hundreds of "Using cached X" lines
+  # between venv creation and the actual error, easily falling outside even a generous captured
+  # log tail -- this line survives next to any such failure, so it's always possible to tell
+  # which interpreter actually ended up running the install without digging up the full log file.
+  echo "Using interpreter: $PYTHON_BIN ($("$VENV_DIR/bin/python3" --version 2>&1))"
   "$VENV_DIR/bin/pip" install --upgrade pip
   # 2>&1 here is deliberate, not redundant with the desktop shell's own stdout+stderr capture:
   # confirmed live -- a real wheel-build failure (unicorn) reached the operator's error banner as
