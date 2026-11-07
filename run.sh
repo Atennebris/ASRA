@@ -86,7 +86,19 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
   # didn't survive the bash-in-WSL -> wsl.exe -> desktop-shell relay as cleanly as stdout did.
   # Merging stderr into stdout at the shell level, before anything leaves this process, guarantees
   # both land in the exact same byte stream in the right order no matter what happens upstream.
-  "$VENV_DIR/bin/pip" install -r requirements.txt 2>&1
+  #
+  # CFLAGS="-include sys/mman.h" is a targeted workaround for a real, confirmed build failure,
+  # once the block above actually surfaced it: unicorn's vendored QEMU C source
+  # (qemu/util/osdep.c) uses mprotect()/PROT_READ/PROT_WRITE/PROT_EXEC/PROT_NONE without including
+  # <sys/mman.h> itself -- harmless on older toolchains (the symbols/macros came in transitively
+  # from some other header), but a hard compile error on a newer GCC (confirmed: GCC 15.2.0) where
+  # that transitive path no longer holds. This can't be fixed from here (it's third-party vendored
+  # C inside the unicorn sdist, not our code) -- forcing the one missing header in via the
+  # compiler's own -include flag, applied to every file this pip install compiles, is the standard
+  # workaround for exactly this class of "old vendored C, newer toolchain" breakage. CMake picks up
+  # CFLAGS from the environment at configure time, which is why exporting it before invoking pip
+  # (rather than editing unicorn's own build files) is enough to reach the actual compiler command.
+  CFLAGS="-include sys/mman.h ${CFLAGS:-}" "$VENV_DIR/bin/pip" install -r requirements.txt 2>&1
   # The `httpx` PyPI package (an HTTP client library this project imports as `import httpx`) also
   # drops an unused console-script shim at venv/bin/httpx. With the venv on PATH that shim SHADOWS
   # ProjectDiscovery's real `httpx` recon scanner (/usr/local/bin/httpx) -- confirmed live: it made
