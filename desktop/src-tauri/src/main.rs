@@ -1040,8 +1040,31 @@ fn get_start_config() -> StartConfig {
 // can't be deleted here (still open/locked by THIS running process on Windows) -- it's cleaned up
 // at the START of the NEXT launch instead (see main()'s own startup cleanup below), once nothing
 // holds it open anymore.
+// Retrofit for an install that existed BEFORE this version shipped the release-based project
+// updater (agent/updater.py's non-git fallback for a tarball-bootstrapped install, compared
+// against GitHub Releases instead of git refs -- see that module's own docstring). Such a folder
+// has no .git AND no .asra_installed_version marker yet, so without this it would never
+// participate in that check at all -- this fix would silently never reach anyone who installed
+// before it shipped. The very first time its operator updates the EXE through the normal UI (this
+// function), seed "0.0.0" (an always-behind value, same convention as the Rust bootstrap's own
+// main-fallback case) into its companion project folder -- the operator then sees a real project-
+// update signal from that point on instead of being stuck forever on whatever code version they
+// originally bootstrapped.
+fn seed_version_marker_if_needed() {
+    let dir = repo_dir();
+    if dir.join(".git").exists() {
+        return; // a real git checkout already has its own update path (agent/updater.py's git branch)
+    }
+    let marker = dir.join(".asra_installed_version");
+    if marker.exists() {
+        return; // already seeded -- a post-fix bootstrap wrote the real version, don't overwrite it
+    }
+    let _ = std::fs::write(&marker, "0.0.0");
+}
+
 #[tauri::command]
 fn apply_desktop_update(app: AppHandle, staged_path: String) -> Result<(), String> {
+    seed_version_marker_if_needed();
     let staged = PathBuf::from(&staged_path);
     if !staged.is_file() {
         return Err(format!("Staged update file not found: {staged_path}"));
