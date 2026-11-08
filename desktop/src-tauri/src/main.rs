@@ -63,6 +63,11 @@ struct Backend {
     as_root: bool,
     #[cfg_attr(not(windows), allow(dead_code))]
     distro: String,
+    // Carried along so spawn_backend_watchdog can respawn with the SAME token after an unexpected
+    // death -- without it, an automatic restart would silently lock the operator's already-open
+    // window out of its own backend (desktop mode's ASRA_UI_TOKEN gate), defeating the point of
+    // restarting automatically at all. Empty for web-mode launches, which never use a token.
+    ui_token: String,
 }
 struct OwnedBackend(Mutex<Option<Backend>>);
 
@@ -968,6 +973,113 @@ fn stop_backend(owned: &OwnedBackend) {
     }
 }
 
+// How often spawn_backend_watchdog below polls the backend's port once it's confirmed up -- a
+// plain internal tuning knob with no UI/`.env` exposure, same hardcoded-duration style this file
+// already uses for wait_for_port_to_clear's own 8s and wait_for_port_adaptive's own 2700s above.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+// Caps how many times the watchdog will auto-restart a backend that keeps dying within
+// WATCHDOG_RESTART_WINDOW -- without this, a persistently broken environment (WSL itself wedged,
+// not just this one process) would spin forever, repeatedly relaunching into the same failure
+// instead of ever surfacing it to the operator the way force_restart_agent's own error message
+// already does for a manual restart.
+const WATCHDOG_MAX_RESTARTS: usize = 3;
+const WATCHDOG_RESTART_WINDOW: Duration = Duration::from_secs(600);
+
+// Real incident this exists because of: ASRA's own backend (inside WSL2) was killed from outside
+// this app entirely -- the whole WSL2 distro got torn down and rebuilt by the Windows host mid-
+// session (confirmed after the fact via `wsl.exe -- last reboot`/`journalctl --list-boots`; see
+// agent/utils/crash_diagnostics.py's own module docstring for the full incident). Nothing on this
+// side ever noticed: launch_backend only watches the port WHILE waiting for the very first
+// readiness check, never again afterward -- the operator's only sign anything had happened was a
+// UI that quietly stopped responding until they noticed and relaunched by hand. This keeps
+// watching for as long as the window stays open, and tries to bring the backend back up the same
+// way launch_backend originally did, instead of leaving that noticing-and-relaunching to a human.
+//
+// `initial_pid` lets a stale watchdog from an EARLIER launch recognize a newer one has since
+// replaced OwnedBackend's slot (a manual force_restart_agent + Start click while this thread was
+// still polling the old one) and quietly step aside, rather than two watchdogs racing to restart
+// the same dead backend at once.
+fn spawn_backend_watchdog(app: AppHandle, repo: PathBuf, port: String, initial_pid: u32) {
+    std::thread::spawn(move || {
+        let mut tracked_pid = initial_pid;
+        let mut restart_times: Vec<Instant> = Vec::new();
+        loop {
+            std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+
+            let (as_root, distro, ui_token) = {
+                let state = app.state::<OwnedBackend>();
+                let guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
+                match guard.as_ref() {
+                    Some(backend) if backend.child.id() == tracked_pid => {
+                        (backend.as_root, backend.distro.clone(), backend.ui_token.clone())
+                    }
+                    // Either an intentional stop (Quit/force_restart_agent) already took the slot,
+                    // or a newer launch_backend call replaced it with its own backend (which has
+                    // its own watchdog) -- either way, nothing left for THIS thread to do.
+                    _ => return,
+                }
+            };
+
+            if port_is_up(&port) {
+                continue;
+            }
+
+            let env_text = std::fs::read_to_string(repo.join(".env")).unwrap_or_default();
+            let now = Instant::now();
+            restart_times.retain(|t| now.duration_since(*t) < WATCHDOG_RESTART_WINDOW);
+            if restart_times.len() >= WATCHDOG_MAX_RESTARTS {
+                let msg = format!(
+                    "watchdog: backend port {port} went down and was already auto-restarted {} times in \
+                    the last {}s -- giving up automatic restart, something is persistently wrong \
+                    (check {}/backend-launch.log). Click Start manually once it's fixed.",
+                    restart_times.len(), WATCHDOG_RESTART_WINDOW.as_secs(), resolve_app_dir(&env_text).display(),
+                );
+                eprintln!("[ASRA-DESKTOP] {msg}");
+                append_desktop_log_line(&env_text, &msg);
+                return;
+            }
+
+            eprintln!("[ASRA-DESKTOP] watchdog: backend port {port} went down unexpectedly -- attempting automatic restart");
+            append_desktop_log_line(
+                &env_text,
+                &format!("watchdog: backend port {port} went down unexpectedly (process died, or the host/WSL2 itself was torn down) -- attempting automatic restart"),
+            );
+            // The old child is already gone one way or another (that's WHY the port went down) --
+            // this just frees the slot so the respawn below can claim it.
+            app.state::<OwnedBackend>().0.lock().unwrap_or_else(|p| p.into_inner()).take();
+            restart_times.push(now);
+
+            let log_file = match open_backend_launch_log(&env_text) {
+                Ok(f) => f,
+                Err(e) => {
+                    append_desktop_log_line(&env_text, &format!("watchdog: could not open backend launch log for restart: {e}"));
+                    continue;
+                }
+            };
+            let child = match spawn_backend(&repo, as_root, &distro, &ui_token, log_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    append_desktop_log_line(&env_text, &format!("watchdog: restart spawn failed: {e}"));
+                    continue;
+                }
+            };
+            tracked_pid = child.id();
+            app.state::<OwnedBackend>().0.lock().unwrap_or_else(|p| p.into_inner()).replace(Backend {
+                child,
+                as_root,
+                distro: distro.clone(),
+                ui_token: ui_token.clone(),
+            });
+
+            let ready = wait_for_port_adaptive(&port, &app);
+            append_desktop_log_line(
+                &env_text,
+                &format!("watchdog: automatic restart {} (pid={tracked_pid})", if ready { "succeeded -- backend is reachable again" } else { "spawned but the backend never became reachable" }),
+            );
+        }
+    });
+}
+
 // ---- commands -----------------------------------------------------------------
 
 #[tauri::command]
@@ -1523,6 +1635,7 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
             child,
             as_root: args.as_root,
             distro: args.distro.clone(),
+            ui_token: ui_token.clone(),
         });
     }
 
@@ -1566,6 +1679,20 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
                 tail
             )
         });
+    }
+
+    // Only for a backend THIS launch actually spawned (never an adopted one -- see OwnedBackend's
+    // own "Adoption can't set a token on a server we didn't start" comment above; this app
+    // deliberately never manages an adopted backend's lifecycle at all, and the watchdog is part
+    // of that same lifecycle). Real incident this exists because of: see crash_diagnostics.py's
+    // own module docstring (agent/utils/crash_diagnostics.py) for the full story -- the backend
+    // was killed from outside this app entirely (the host WSL2 instance itself was torn down mid-
+    // session) and nothing on this side ever noticed; the operator's only sign was a UI that
+    // quietly stopped responding until they noticed and relaunched by hand.
+    if !already_up {
+        if let Some(initial_pid) = app.state::<OwnedBackend>().0.lock().unwrap().as_ref().map(|b| b.child.id()) {
+            spawn_backend_watchdog(app.clone(), repo.clone(), port.clone(), initial_pid);
+        }
     }
 
     if env_flag_default(&new_env, "ASRA_INTRO_ENABLED", true) {

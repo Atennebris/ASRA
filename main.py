@@ -255,6 +255,7 @@ from agent.tools.native import (
     save_identity_credentials,
 )
 from agent.utils import lazy_openai
+from agent.utils import crash_diagnostics
 from agent.utils.debug import current_session_id, is_debug_enabled
 from agent.utils.logger import get_logger
 from agent.utils.report_export import (
@@ -386,6 +387,11 @@ async def _lifespan(_app: FastAPI):
     finally blocks) already handles a session's own context the moment ITS run ends; this covers
     everything still open when the server itself goes down, so a graceful shutdown never leaves an
     orphaned browser/proxy process behind (invisible to session.json-based orphan recovery)."""
+    # Read BEFORE this run's own first heartbeat overwrites it -- see crash_diagnostics' own
+    # docstring for the real incident (an unexplained silent stop) this detects on the next boot.
+    crash_diagnostics.check_previous_run_and_log()
+    crash_diagnostics.write_heartbeat()
+    heartbeat_task = asyncio.create_task(crash_diagnostics.heartbeat_loop())
     _startup_progress("Recovering any interrupted sessions...")
     _mark_orphaned_sessions_interrupted()
     _reconcile_orphaned_chat_threads_sweep()
@@ -421,6 +427,12 @@ async def _lifespan(_app: FastAPI):
     backup_worker_task = asyncio.create_task(auto_backup_worker_loop())
     _startup_progress(f"Ready — open http://127.0.0.1:{os.getenv('PORT', '8000')}")
     yield
+    # First, before anything else below gets a chance to hang/raise: if the process dies partway
+    # through this cleanup (or the host pulls the VM out from under it a moment later), this marker
+    # is still the most up-to-date evidence of what was running right before -- see
+    # crash_diagnostics' own docstring for the real incident with no such evidence at all.
+    crash_diagnostics.write_heartbeat(clean_shutdown=True, shutdown_reason="lifespan shutdown (graceful ASGI stop)")
+    heartbeat_task.cancel()
     fleet_worker_task.cancel()
     backup_worker_task.cancel()
     await get_browser_manager().shutdown()

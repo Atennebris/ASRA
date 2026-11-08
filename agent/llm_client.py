@@ -34,6 +34,7 @@ from agent.custom_providers import (
 )
 from agent.providers.models_dev import get_model_capabilities, list_models, validate_model_known
 from agent.settings import is_provider_enabled, load_llm_settings
+from agent.utils.crash_diagnostics import log_memory_snapshot
 from agent.utils.debug import current_session_id, truncate_for_log
 from agent.utils.errors import describe_exception
 from agent.utils.logger import get_logger
@@ -1534,6 +1535,7 @@ class OpenAICompatProvider:
             "llm_client: request provider=%s model=%s mode=native messages=%d tools=%d",
             self.provider_id, self._model, len(messages), len(tools or []),
         )
+        log_memory_snapshot(logger, "llm_client: before request")
 
         response = _create_completion_with_backoff(
             lambda: self._client.chat.completions.create(**request_kwargs, **self._auth_header_override()),
@@ -1572,6 +1574,7 @@ class OpenAICompatProvider:
             "llm_client: request provider=%s model=%s mode=prompt messages=%d tools=%d",
             self.provider_id, self._model, len(prompted_messages), len(tools),
         )
+        log_memory_snapshot(logger, "llm_client: before request")
 
         response = _create_completion_with_backoff(
             lambda: self._client.chat.completions.create(

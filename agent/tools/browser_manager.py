@@ -29,6 +29,7 @@ from agent.tools.allowed_targets import extract_hostname, is_target_out_of_scope
 from agent.tools.browser_stealth import STEALTH_INIT_SCRIPT, derive_stealth_user_agent, launch_headless
 from agent.tools.native import get_identity_browser_creds, interpret_missing_identity
 from agent.tools.toolkit_proxy import get_toolkit_proxy_manager
+from agent.utils.crash_diagnostics import log_memory_snapshot
 from agent.utils.debug import truncate_for_log
 from agent.utils.logger import get_logger
 from sessions.store import get_session_folder
@@ -274,6 +275,7 @@ class BrowserSessionManager:
             headless = launch_headless()
             self._browser = await self._playwright.chromium.launch(headless=headless)
             logger.debug("browser_manager: shared Chromium browser launched (headless=%s)", headless)
+            log_memory_snapshot(logger, "browser_manager: after Chromium launch")
             if self._stealth_user_agent is None:
                 # One throwaway context+page, immediately discarded -- the only way to learn the
                 # REAL UA this exact installed Chromium build reports, so the derived stealth UA
