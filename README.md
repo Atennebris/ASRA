@@ -2,7 +2,6 @@
 Autonomous Security Research Agent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Documentation](https://img.shields.io/badge/documentation-full%20reference-blue.svg)](docs/Documentation_en.md)
 [![Docs: English](https://img.shields.io/badge/docs-English-informational.svg)](docs/Documentation_en.md)
 [![Docs: Русский](https://img.shields.io/badge/docs-Русский-informational.svg)](docs/Documentation_ru.md)
 
