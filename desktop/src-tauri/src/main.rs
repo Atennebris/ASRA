@@ -192,22 +192,32 @@ fn port_is_up(port: &str) -> bool {
 // (there's forward motion, however slow), but give up quickly once it goes quiet for a while
 // (nothing left changing means nothing left to wait for, regardless of how much total time has
 // passed). `stall_after` is how long with NO log growth before calling it stuck; `hard_cap` is an
-// absolute ceiling so a truly wedged process (log still trickling, e.g. a retry loop) can't wait
-// forever either.
+// absolute ceiling so a truly wedged process (alive but stuck) can't wait forever either.
 //
-// `stall_after` was originally 90s and confirmed live to be too short: pip's "Installing
-// collected packages: ..." line prints ONCE, then goes completely silent for the entire time it
-// actually writes every package's files to disk -- on a real machine, with ~150 packages
-// (several large: frida, semgrep, mitmproxy) and real-time antivirus scanning each file as WSL2
-// writes it, that silent stretch alone ran past 90s with the install still genuinely working.
-// 600s gives that step comfortable room without weakening the stall check's actual purpose
-// (catching a truly dead process, not a quiet-but-alive one).
-fn wait_for_port_adaptive(port: &str, log_path: &Path) -> bool {
+// Earlier versions of this guessed "stuck" from log silence (pip's own undifferentiated
+// "Installing collected packages: ..." phase prints that line ONCE, then goes completely silent
+// for however long writing every package's files to disk actually takes) -- first 90s, then 600s,
+// each confirmed too short live by a real install that was still genuinely working past that
+// point, on a slow/antivirus-laden real machine with ~150 packages. Guessing a bigger silence
+// threshold was never going to stop being a guess. The actual fact that mattered the whole time
+// is directly observable instead: whether the backend's own OS process (the wsl.exe/bash run.sh
+// invocation spawn_backend started) has exited. While it's still running, the install/launch is
+// still making progress no matter how long any one phase stays quiet; once it exits without the
+// port ever opening, that's an immediate, authoritative failure -- no silence threshold to tune.
+fn backend_process_has_exited(app: &AppHandle) -> bool {
+    let owned = app.state::<OwnedBackend>();
+    let mut guard = owned.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_mut() {
+        Some(backend) => matches!(backend.child.try_wait(), Ok(Some(_))),
+        // Nothing to poll (e.g. the "adopted an already-running backend" path never stores a
+        // child) -- can't observe exit this way, so never treat that as a failure signal.
+        None => false,
+    }
+}
+
+fn wait_for_port_adaptive(port: &str, app: &AppHandle) -> bool {
     let hard_cap = Duration::from_secs(2700);
-    let stall_after = Duration::from_secs(600);
     let start = Instant::now();
-    let mut last_size = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
-    let mut last_progress = Instant::now();
     loop {
         if port_is_up(port) {
             return true;
@@ -215,14 +225,10 @@ fn wait_for_port_adaptive(port: &str, log_path: &Path) -> bool {
         if start.elapsed() >= hard_cap {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(400));
-        let size_now = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
-        if size_now != last_size {
-            last_size = size_now;
-            last_progress = Instant::now();
-        } else if last_progress.elapsed() >= stall_after {
+        if backend_process_has_exited(app) {
             return false;
         }
+        std::thread::sleep(Duration::from_millis(400));
     }
 }
 
@@ -1354,10 +1360,10 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
     }
 
     let port_for_wait = port.clone();
-    let log_path_for_wait = backend_launch_log_path(&new_env);
+    let app_for_wait = app.clone();
     let wait_start = Instant::now();
     let ready = tauri::async_runtime::spawn_blocking(move || {
-        wait_for_port_adaptive(&port_for_wait, &log_path_for_wait)
+        wait_for_port_adaptive(&port_for_wait, &app_for_wait)
     })
     .await
     .map_err(|e| format!("readiness wait failed: {e}"))?;
@@ -1367,7 +1373,7 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
     );
 
     if !ready {
-        append_desktop_log_line(&new_env, "backend did not come up -- its own launch log stopped growing (or the 30-minute hard cap was hit) before the port opened");
+        append_desktop_log_line(&new_env, "backend did not come up -- its own process exited without the port ever opening (or the 45-minute hard cap was hit)");
         let log_path = backend_launch_log_path(&new_env);
         let tail = std::fs::read_to_string(&log_path)
             .map(|text| {
