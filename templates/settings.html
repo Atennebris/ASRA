@@ -393,6 +393,27 @@
           <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form" hx-target="#llm-test-result" hx-swap="innerHTML" hx-disabled-elt="this"
                   class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm shrink-0">Test</button>
         </form>
+        <script>
+          (function () {
+            // See main.py's _requires_live_probe/_llm_settings_context -- when the CURRENT
+            // provider needs a real live probe (opencode-local spawns a whole subprocess for this;
+            // local LM Studio/Ollama/custom endpoints/Copilot need their own real round trip),
+            // /settings deliberately does NOT fetch its real model list server-side anymore and
+            // just renders the saved model as a placeholder instead. Real, confirmed incident this
+            // fixes: the old eager fetch routinely exceeded opencode-local's own 20s readiness
+            // timeout and froze the whole /settings page on every single load. This fetches the
+            // real list the moment the page is up, the same /api/settings/model-options round trip
+            // the provider-select's own hx-get already uses on a manual change, via htmx.ajax so it
+            // fires the normal htmx lifecycle (the free-models-only toggle refresh right below
+            // already listens for htmx:afterSwap on this exact target, no extra wiring needed here).
+            var deferredProviderIds = {{ fallback_chain_deferred_provider_ids | tojson }};
+            var currentProvider = {{ current_provider | tojson }};
+            if (deferredProviderIds.indexOf(currentProvider) === -1) return;
+            htmx.ajax("GET", "/api/settings/model-options?provider=" + encodeURIComponent(currentProvider), {
+              target: "#model-select", swap: "innerHTML",
+            });
+          })();
+        </script>
         {# disabled + the hint text are set server-side for this INITIAL render only (avoids a
            flash of "enabled, no explanation" before JS corrects it) -- static/js inline block
            right below recomputes both live, client-side, the instant the provider/model changes,
@@ -680,6 +701,16 @@
                   <option value="{{ model }}"{% if model == secondary_verification_model %} selected{% endif %}{% if model in secondary_verification_model_free_flags %} data-free="{{ 'true' if secondary_verification_model_free_flags[model] else 'false' }}"{% endif %}>{{ model }}</option>
                 {% endfor %}
               </select>
+              {% if secondary_verification_model_choices_deferred %}
+                <script>
+                  // See main.py's _secondary_verification_context/_requires_live_probe -- same
+                  // deferral as the main AI Provider & Model picker above, applied to this saved
+                  // secondary-verification provider too.
+                  htmx.ajax("GET", "/api/settings/model-options?provider={{ secondary_verification_provider | urlencode }}", {
+                    target: "#secondary-verification-model-select", swap: "innerHTML",
+                  });
+                </script>
+              {% endif %}
             </label>
             {{ button("Save", variant="primary", type="submit") }}
             <button type="button" hx-post="/api/settings/test-llm/start" hx-include="closest form"

@@ -14,7 +14,10 @@
        {% if running %}hx-get="/api/tools/nuclei-packs/{{ key }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
        class="bg-surface border border-default rounded-lg p-3">
     <div class="flex items-center gap-2 mb-2">
-      {% if running %}
+      {% if running and status.running_too_long %}
+        <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0 animate-pulse"></span>
+        <p class="text-[12px] font-semibold text-severity-high">Still syncing after {{ (status.elapsed_seconds // 60) }} min &mdash; this is taking unusually long.</p>
+      {% elif running %}
         <span class="w-1.5 h-1.5 rounded-full bg-severity-medium shrink-0 animate-pulse"></span>
         <p class="text-[12px] font-semibold text-primary">Syncing templates&hellip;</p>
       {% elif status.succeeded %}
@@ -29,7 +32,16 @@
       {% endif %}
     </div>
     <pre class="text-[10.5px] font-mono text-secondary bg-elevated rounded p-2 overflow-x-auto max-h-56 overflow-y-auto whitespace-pre-wrap">{{ status.log or "Waiting for output..." }}</pre>
-    {% if not running %}
+    {% if running %}
+      {# Confirmed real incident this fixes: a hung sync previously had no recovery path at all
+         short of restarting the whole server -- always offered while running, not gated behind
+         running_too_long, so the operator never has to wait out the stall threshold just to bail. #}
+      <button type="button" hx-post="/api/tools/nuclei-packs/{{ key }}/cancel" hx-target="#nuclei-pack-install-view-{{ key }}" hx-swap="outerHTML"
+              hx-confirm="Cancel this sync? Any progress on this pack's clone will be lost."
+              class="mt-2 inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-severity-high border border-severity-high/40 hover:bg-severity-high/10 h-7 px-3 text-[11px]">
+        Cancel
+      </button>
+    {% else %}
       <button type="button" hx-get="/api/tools/nuclei-packs" hx-target="#nuclei-packs-list" hx-swap="outerHTML"
               class="mt-2 inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-7 px-3 text-[11px]">
         Refresh

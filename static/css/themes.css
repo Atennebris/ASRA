@@ -2592,6 +2592,30 @@ select, option {
   user-select: none;
   -webkit-user-select: none;
 }
+/* Real, confirmed bug (2026-11-08, live-reproduced with Playwright against this exact page):
+   .header-light-fixture is position:absolute with no explicit z-index, deliberately -- the comment
+   block above explains why it can't be negative (that broke the lamp's own click-to-toggle). Per
+   CSS2.1 Appendix E's painting order, ANY positioned element with z-index:auto still paints ABOVE
+   every non-positioned in-flow sibling regardless of DOM order -- so on a bar wide enough that the
+   lamp's own --hl-x position (68% of the bar's width, an explicit shipped default -- see
+   .header-light's own comment) lands on top of a REAL action button, the lamp's drawn shade/bulb
+   visually covers that button AND (since .hl-lamp-btn itself opts back into pointer-events:auto)
+   intercepts real clicks meant for it. Confirmed live: Playbook's own header bar (5 buttons --
+   Library/Add technique/Export/Import/Seed pack, the widest action-button row in this app) puts
+   "Library" directly under the lamp at common viewport widths in the empty-playbook state, reading
+   as the button having "teleported" behind/into the lamp. Every real control sharing one of these
+   bars (buttons, links, the Settings style-preview swatches excepted -- those are non-interactive)
+   needs to unconditionally win that paint order, not just the ones that happen not to overlap --
+   giving a direct child of the bar an explicit z-index moves it into CSS2.1's later, higher-
+   numbered paint layer, the one spot in the painting order z-index:auto alone can never reach.
+   :has() is already relied on elsewhere in this app (Settings' own CSS-only radio tabs) for the
+   same "no JS, no per-template edit" reasoning. Scoped to :has(> .header-light-fixture) specifically
+   so this never touches an unrelated .relative element elsewhere in the app that has nothing to do
+   with this fixture. */
+.relative:has(> .header-light-fixture) > *:not(.header-light):not(.header-light-fixture) {
+  position: relative;
+  z-index: 1;
+}
 /* Color source: "auto" rides the theme accent (via currentColor), "fixed"/"temperature" swap in the
    operator's chosen --hl-color; every light layer below reads currentColor, so one property drives
    them all at once. Matched against both .header-light (the real page's glow, and settings.html's

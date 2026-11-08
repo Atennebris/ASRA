@@ -1,8 +1,16 @@
 {# Sidebar update badge (base.html), polled from /api/updates/indicator. Renders a small dot only
-   when an update is available; empty otherwise (the poll target simply stays blank). #}
+   when an update is available (project code OR the desktop shell binary -- see main.py's
+   api_updates_indicator for why both are checked); empty otherwise (the poll target simply stays
+   blank). #}
 {% if available %}
-<a href="/settings" class="flex items-center gap-1.5 text-[10px] text-accent hover:opacity-80"
-   title="{{ behind }} update{{ '' if behind == 1 else 's' }} available — open Settings">
-  <span class="w-1.5 h-1.5 rounded-full bg-accent shrink-0"></span>update available
+{% if project_available and shell_available %}
+  {% set label = "update available (app + code)" %}
+{% elif shell_available %}
+  {% set label = "app update available" %}
+{% else %}
+  {% set label = behind|string + " update" + ("" if behind == 1 else "s") + " available" %}
+{% endif %}
+<a href="/settings" class="flex items-center gap-1.5 text-[10px] text-accent hover:opacity-80" title="Open Settings">
+  <span class="w-1.5 h-1.5 rounded-full bg-accent shrink-0"></span>{{ label }}
 </a>
 {% endif %}

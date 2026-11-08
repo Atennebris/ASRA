@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from zoneinfo import available_timezones
 
@@ -34,6 +36,18 @@ logger = get_logger("API")
 SETTINGS_PATH = resolve_global_app_dir() / "data" / "timezone_settings.json"
 
 _AVAILABLE_TIMEZONES = sorted(available_timezones())
+
+# Very short-TTL cache for _load_raw() -- real, confirmed incident (2026-11-08): main.py's
+# _human_dt Jinja filter calls load_display_timezone() (and therefore _load_raw(), a real disk
+# read + JSON parse with no caching at all) once per timestamp rendered -- a single real session
+# page with a lot of history (findings/logs/chat messages) profiled at 949 separate _human_dt
+# calls, each paying its own fresh open+read+json.parse of this same unchanged file, ~3.2s of a
+# ~4.1s total render on its own (cProfile against the real route-handler call, not a guess). Same
+# shape and same short TTL as agent/settings.py's own _settings_cache (that file's docstring has
+# the full "why 2s, why self-invalidate on write" reasoning -- identical here).
+_RAW_CACHE_TTL_SECONDS = float(os.getenv("TIMEZONE_SETTINGS_CACHE_TTL_SECONDS", "2"))
+_raw_cache: tuple[float, dict] | None = None
+_raw_cache_lock = threading.Lock()
 
 
 def display_timezone_choices() -> list[str]:
@@ -69,24 +83,39 @@ def _detect_machine_timezone() -> str:
 def _load_raw() -> dict:
     """Shared by every load_*/save_* below so a save to one field (e.g. show_clock) never
     clobbers another (e.g. timezone) that happens to already be on disk -- each save_* reads the
-    current file, updates only its own key, and writes the whole dict back."""
+    current file, updates only its own key, and writes the whole dict back. Cached (see
+    _raw_cache_ttl_seconds above) since this is called once PER TIMESTAMP _human_dt renders, not
+    once per page."""
+    global _raw_cache
+    now = time.monotonic()
+    with _raw_cache_lock:
+        if _raw_cache is not None and now - _raw_cache[0] < _RAW_CACHE_TTL_SECONDS:
+            return dict(_raw_cache[1])
     if SETTINGS_PATH.exists():
         try:
             with SETTINGS_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict):
+                data = {}
         except (json.JSONDecodeError, OSError) as exc:
             logger.debug("timezone_settings: unreadable (%s) -- starting fresh", exc)
-    return {}
+            data = {}
+    else:
+        data = {}
+    with _raw_cache_lock:
+        _raw_cache = (now, data)
+    return dict(data)
 
 
 def _save_raw(data: dict) -> None:
+    global _raw_cache
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = SETTINGS_PATH.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, SETTINGS_PATH)
+    with _raw_cache_lock:
+        _raw_cache = None
 
 
 def load_display_timezone() -> str:

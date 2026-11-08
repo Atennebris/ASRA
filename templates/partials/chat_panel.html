@@ -235,6 +235,19 @@
         </select>
       </label>
     </div>
+    {% if chat_model_choices_deferred %}
+      <script>
+        // See main.py's _chat_context/_requires_live_probe -- this thread's saved provider needs a
+        // real live probe (opencode-local spawns a whole subprocess, ~4s; local/custom endpoints
+        // need a real network round trip), so the page render above deliberately left #chat-model's
+        // real list empty rather than pay that cost on every single Chat page load. Fetches it now,
+        // the same /api/subagents/model-options round trip the provider-select's own hx-get above
+        // already uses on a manual change.
+        htmx.ajax("GET", "/api/subagents/model-options?provider={{ thread.provider | urlencode }}", {
+          target: "#chat-model", swap: "innerHTML",
+        });
+      </script>
+    {% endif %}
     {# This picker's own independent "Free models only" switch -- same per-picker treatment as
        every other model picker in the app (static/js/free_models_filter.js's shared primitives),
        not the main Settings picker's global one. Kept to one compact line -- this footer is

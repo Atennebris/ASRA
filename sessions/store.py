@@ -183,6 +183,11 @@ def _build_summary(data: dict) -> dict:
     }
 
 
+_SUMMARIES_CACHE_TTL_SECONDS = float(os.getenv("SESSION_SUMMARIES_CACHE_TTL_SECONDS", "1"))
+_summaries_cache: tuple[float, list[dict]] | None = None
+_summaries_cache_lock = threading.Lock()
+
+
 def list_session_summaries() -> list[dict]:
     """Fast summaries for every session -- the Projects list, the sidebar's active-session poll,
     and the home page's recent-projects poll all call this (via main.py's own _load_all_sessions)
@@ -191,7 +196,28 @@ def list_session_summaries() -> list[dict]:
     any session_id missing from the cache (created before this existed, or the cache file itself is
     missing/corrupt) is read once here and backfilled into the cache, so the slow path only ever
     happens once per session, never on the next poll 5 seconds later.
+
+    ALSO wrapped in a very short (1s default) in-memory TTL cache -- real, confirmed incident
+    (2026-11-08): even with the on-disk summary index above, this still does a real path.exists()
+    stat PER SESSION on every call (141 real sessions on the machine this was profiled on), and
+    main.py's get_session_page calls this TWICE in one render (_rescanned_as_summaries,
+    agent/core.py's compute_provider_leaderboard) -- paying that whole stat sweep twice for
+    identical results a few microseconds apart. Self-invalidated on every save_session() (this
+    module's own primary write path), so this only ever collapses repeat reads WITHIN the same
+    brief window, same shape/reasoning as agent/settings.py's own _settings_cache.
     """
+    global _summaries_cache
+    now = time.monotonic()
+    with _summaries_cache_lock:
+        if _summaries_cache is not None and now - _summaries_cache[0] < _SUMMARIES_CACHE_TTL_SECONDS:
+            return list(_summaries_cache[1])
+    results = _list_session_summaries_uncached()
+    with _summaries_cache_lock:
+        _summaries_cache = (now, results)
+    return list(results)
+
+
+def _list_session_summaries_uncached() -> list[dict]:
     summary_index = _load_summary_index()
     cache_dirty = False
 
@@ -1187,6 +1213,10 @@ def save_session(session_id: str, data: dict) -> None:
         # already durably written above, is) -- a failure here must never fail the actual save.
         logger.debug("save_session: failed to refresh summary cache for id=%s (%s)", session_id, exc)
 
+    global _summaries_cache
+    with _summaries_cache_lock:
+        _summaries_cache = None
+
 
 def reload_merge_save(session_id: str, apply: Callable[[dict], None]) -> dict | None:
     """Reload-merge-save: loads whatever is CURRENTLY on disk for this session, lets `apply` mutate
@@ -1259,6 +1289,10 @@ def delete_session(session_id: str) -> bool:
                 _save_summary_index(summary_index)
     except OSError as exc:
         logger.debug("delete_session: failed to drop summary cache entry for id=%s (%s)", session_id, exc)
+
+    global _summaries_cache
+    with _summaries_cache_lock:
+        _summaries_cache = None
 
     logger.debug("delete_session: id=%s folder=%s found=%s", session_id, project_dir, found)
     return found

@@ -108,7 +108,17 @@
   // the now-undefined function threw a second error, and the actual filter never ran once, on any
   // page, for anyone -- confirmed live via the real browser console. `document` itself always
   // exists this early, even in <head>, and event bubbling to it works identically to body.
-  document.addEventListener("htmx:afterSwap", applyToPage);
+  // Real, confirmed perf issue: this used to run on EVERY htmx swap anywhere in the app, including
+  // the sidebar's own always-on 5s/20s/60s background polls that can never contain a model
+  // <select> -- a full-document querySelectorAll on every one of those ticks, forever, on every
+  // page, not just Settings. Skip unless the swapped-in content could plausibly contain/be one of
+  // the selects this filter actually cares about.
+  document.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.detail && event.detail.target;
+    if (target && !(target.matches && target.matches("select[data-asra-model-select]"))
+        && !(target.querySelector && target.querySelector("select[data-asra-model-select]"))) return;
+    applyToPage();
+  });
   document.addEventListener("DOMContentLoaded", applyToPage);
   if (document.readyState !== "loading") applyToPage();
 

@@ -209,7 +209,15 @@
   window.asraOnDomReady(function () {
     requestAnimationFrame(function () { requestAnimationFrame(function () { restoreScrollPositions("force"); }); });
   });
-  document.addEventListener("htmx:afterSwap", function () {
+  // Real, confirmed perf issue: this used to run on EVERY htmx swap anywhere in the app, including
+  // the sidebar's own always-on 5s/20s/60s background polls (active-session badge, system-health
+  // dot, update indicator) that live OUTSIDE #main-content and can never affect its own scroll
+  // position -- a querySelector("main") + querySelectorAll("[data-scroll-persist]") pass on every
+  // one of those ticks, forever, on every page. Skip unless the swap actually touched
+  // #main-content (or something inside it).
+  document.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.detail && event.detail.target;
+    if (target && !target.closest("#main-content")) return;
     requestAnimationFrame(function () { restoreScrollPositions("gentle"); });
   });
 })();

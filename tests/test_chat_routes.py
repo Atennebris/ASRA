@@ -246,6 +246,40 @@ def test_chat_post_persists_provider_and_model_choice(tmp_path, monkeypatch):
     assert thread["model"] == "qwen-max"
 
 
+def test_chat_context_defers_a_provider_that_needs_a_live_probe(tmp_path, monkeypatch):
+    """Real, confirmed incident (2026-11-08): opencode-local as a chat thread's saved provider used
+    to make every single Chat page load block behind a whole `opencode serve` subprocess spawn
+    (~4-6s, confirmed live from debug.log and a captured traceback) -- TWO separate call sites, not
+    one: _chat_context's own _model_choices_with_fallback (-> get_model_choices) eager call, AND
+    (even after deferring that one) _model_free_flags(provider, model_choices) called with the
+    non-empty [current_model] placeholder _chat_context substitutes while deferred -- a non-empty
+    list defeats _model_free_flags' own "empty model_ids -> {}" guard, so its opencode-local branch
+    (list_opencode_local_models) spawned the subprocess anyway, from inside the supposedly-deferred
+    path. Both must be covered."""
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "run_chat_turn_background", MagicMock())
+    client = TestClient(main.app)
+    session_id = _create_session(client, "Chat Live Probe Defer")
+    client.post(
+        f"/api/session/{session_id}/chat",
+        data={"message": "hi", "provider": "opencode-local", "model": "big-pickle"},
+    )
+
+    choices_probe = MagicMock(side_effect=AssertionError("get_model_choices must not be called eagerly for a provider that needs a live probe"))
+    monkeypatch.setattr(main, "get_model_choices", choices_probe)
+    free_flags_probe = MagicMock(side_effect=AssertionError("list_opencode_local_models must not be called eagerly for a deferred provider"))
+    monkeypatch.setattr("agent.opencode_local_provider.list_opencode_local_models", free_flags_probe)
+
+    session = load_session(session_id)
+    context = main._chat_context(session)
+
+    assert context["chat_model_choices_deferred"] is True
+    assert context["chat_model_choices"] == ["big-pickle"]
+    assert context["chat_model_free_flags"] == {}
+    choices_probe.assert_not_called()
+    free_flags_probe.assert_not_called()
+
+
 # --- _render_chat_messages: the source of truth chat_stream's own hash-diff depends on ---
 
 

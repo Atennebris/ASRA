@@ -1,6 +1,6 @@
 [package]
 name = "asra-desktop"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "ASRA desktop shell — native window over the local FastAPI web UI"
 publish = false

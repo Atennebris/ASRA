@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 
 from agent.utils.logger import get_logger
 from projects.paths import resolve_global_app_dir
@@ -20,17 +22,41 @@ logger = get_logger("API")
 # Global app data (Documents/ASRA/data, see projects/paths.py), not a repo-relative data/ folder.
 SETTINGS_PATH = resolve_global_app_dir() / "data" / "llm_settings.json"
 
+# Very short-TTL cache for load_llm_settings() -- real, confirmed incident (2026-11-08): callers
+# that check something per-provider (main.py's _provider_picker_context, looping over every
+# PROVIDER_REGISTRY entry) end up calling this -- a real disk read + JSON parse, no caching at all
+# -- once PER PROVIDER, ~80 times on a single /playbook or /subagents render alone (profiled:
+# ~0.25s of that one render's own ~0.6s total, purely from this). Self-invalidating on every write
+# (_write_llm_settings below is the one shared path every save in this module goes through), so a
+# Save in Settings is reflected on the very next read regardless of the TTL -- this only ever
+# collapses repeat reads WITHIN the same brief window, never serves a stale copy of an edit this
+# same process just made. Short (2s) default on purpose: unlike model-choices/tool-availability
+# (external, slow-to-probe facts), this file holds the operator's own core provider/model choice,
+# which should never feel laggy to update even from an unrelated process editing it directly.
+_SETTINGS_CACHE_TTL_SECONDS = float(os.getenv("LLM_SETTINGS_CACHE_TTL_SECONDS", "2"))
+_settings_cache: tuple[float, dict] | None = None
+_settings_cache_lock = threading.Lock()
+
 
 def load_llm_settings() -> dict:
+    global _settings_cache
+    now = time.monotonic()
+    with _settings_cache_lock:
+        if _settings_cache is not None and now - _settings_cache[0] < _SETTINGS_CACHE_TTL_SECONDS:
+            return dict(_settings_cache[1])
     if not SETTINGS_PATH.exists():
-        return {}
-    try:
-        with SETTINGS_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.debug("llm_settings: unreadable (%s) — treating as unset", exc)
-        return {}
-    return data if isinstance(data, dict) else {}
+        data: dict = {}
+    else:
+        try:
+            with SETTINGS_PATH.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("llm_settings: unreadable (%s) — treating as unset", exc)
+            loaded = {}
+        data = loaded if isinstance(loaded, dict) else {}
+    with _settings_cache_lock:
+        _settings_cache = (now, data)
+    return dict(data)
 
 
 def _write_llm_settings(data: dict) -> None:
@@ -38,11 +64,14 @@ def _write_llm_settings(data: dict) -> None:
     Reserve providers chain are edited from two separate Settings forms but share this one JSON
     file, so every write here MERGES onto whatever's already on disk (via each caller's own
     load_llm_settings() read first) rather than clobbering the other form's own saved keys."""
+    global _settings_cache
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = SETTINGS_PATH.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, SETTINGS_PATH)
+    with _settings_cache_lock:
+        _settings_cache = None
 
 
 def save_llm_settings(provider: str, model: str) -> None:

@@ -129,6 +129,7 @@ from agent.tools.project_backup import (
     restore_backup as restore_project_backup,
 )
 from agent.tools.nuclei_template_packs import (
+    cancel_pack as cancel_nuclei_pack,
     install_pack as install_nuclei_pack,
     list_packs as list_nuclei_packs,
     pack_status as nuclei_pack_status,
@@ -393,10 +394,19 @@ async def _lifespan(_app: FastAPI):
     # never blocks the server coming up). Result is cached for the Settings page + sidebar indicator.
     # Settings -> Updates' own "Check for updates at startup" switch (agent/updater.py) owns this --
     # not a raw os.getenv read, so a toggle saved there is actually honored on the next launch.
+    # Covers the project's own files (agent/updater.py -- git-based for a clone, or the release-
+    # marker fallback for a non-git exe-only bootstrap install) AND the desktop shell binary itself
+    # (agent/desktop_update.py) in the SAME pass, so the sidebar badge reflects either signal
+    # without the operator ever needing to open Settings first. desktop_update.check_for_desktop_update
+    # is a no-op (no network call at all) when not launched via the desktop shell, so this is safe
+    # to always schedule regardless of launch method.
     if updater.load_update_check_on_startup():
         _task = asyncio.create_task(asyncio.to_thread(updater.refresh_cache, True))
         _startup_bg_tasks.add(_task)
         _task.add_done_callback(_startup_bg_tasks.discard)
+        _desktop_task = asyncio.create_task(asyncio.to_thread(desktop_update.refresh_cache))
+        _startup_bg_tasks.add(_desktop_task)
+        _desktop_task.add_done_callback(_startup_bg_tasks.discard)
     # Off the request path on purpose -- see lazy_openai.warm_up's own docstring for the real
     # incident (a first Settings "Test" click eating the SDK's full ~10-15s import cost) this avoids.
     _openai_warm_task = asyncio.create_task(asyncio.to_thread(lazy_openai.warm_up))
@@ -469,18 +479,28 @@ def _desktop_ui_token_ok(websocket: WebSocket) -> bool:
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
-# Force every render to re-read the .html from disk instead of serving a compiled cached copy.
-# auto_reload alone isn't enough here: it decides "reload?" from the file's mtime, and this project
-# runs inside WSL2 with the repo on a Windows drive mounted at /mnt/c, where mtime
-# updates propagate unreliably across the 9p mount — so an edited template kept serving its stale
-# cached version until a full server restart. The server is launched with uvicorn.run(app) (no
-# --reload, see the __main__ block), which makes that especially painful: nothing else picks the
-# change up either. Setting cache = None disables the compiled-template cache entirely, so the
-# loader re-reads the file on every render — a negligible cost for a local single-operator tool, and
-# template edits now show up on a plain browser refresh with no restart. (This FastAPI/Starlette
-# Jinja2Templates only accepts a pre-built env, not env kwargs, so it's configured after creation.)
-templates.env.auto_reload = True
-templates.env.cache = None
+# Real, confirmed incident (2026-11-08): this used to unconditionally force every render to
+# re-read AND re-compile the .html from disk (cache = None) instead of serving a compiled cached
+# copy, on the stated assumption that this is "negligible cost for a local single-operator tool" --
+# measured live and that assumption was simply wrong. Every single route, including the simplest,
+# mostly-static ones (/toolkit, /terminal, /special-agents), measured ~300ms server-side purely
+# from re-parsing+re-compiling base.html plus every macro/partial it includes on EVERY request --
+# heavier pages (settings.html at 3000+ lines) measured over a full second -- and this floor cost
+# sits underneath literally every full-page sidebar navigation (none of them are htmx-boosted, see
+# base.html's own comment on why), which is exactly why the operator could visibly see
+# static/js/progress_bar.js's own loading bar animate across the screen rather than the navigation
+# completing imperceptibly fast. The ORIGINAL reason this existed is real and still needs solving
+# for active template development, not imagined away: auto_reload alone isn't enough on its own,
+# because it decides "reload?" from the file's mtime, and this project runs inside WSL2 with the
+# repo on a Windows drive mounted at /mnt/c, where mtime updates propagate unreliably across the 9p
+# mount -- so an edited template could keep serving its stale cached version until a full server
+# restart, with the server launched via uvicorn.run(app) (no --reload, see the __main__ block)
+# giving nothing else a chance to pick the change up either. Resolved by making this explicitly
+# opt-in via env instead of a single hardcoded, silently-expensive default for every real run: off
+# (fast, cached, compiled once) unless a developer actively iterating on templates turns it on.
+if os.getenv("ASRA_TEMPLATE_HOT_RELOAD", "false").lower() == "true":
+    templates.env.auto_reload = True
+    templates.env.cache = None
 
 # The exact asymmetry the comment above describes -- templates hot-reload, this file (and every
 # Python module it imports) does NOT, since uvicorn.run(app) below runs with no --reload -- has a
@@ -2017,7 +2037,22 @@ def _chat_context(session: dict) -> dict:
     """
     thread = _get_active_thread(session)
     provider = thread.get("provider")
-    model_choices = _model_choices_with_fallback(provider, thread.get("model")) if provider and is_known_provider_id(provider) else []
+    known_provider = bool(provider and is_known_provider_id(provider))
+    # Real, confirmed incident (2026-11-08, same class as the other _requires_live_probe call sites
+    # below): this used to call _model_choices_with_fallback eagerly regardless of how expensive the
+    # thread's saved provider is to probe -- for opencode-local that's a whole `opencode serve`
+    # subprocess spawn (~4s), and the chat panel renders on EVERY session-page load, so navigating to
+    # Chat with opencode-local as the last-used provider blocked the entire page behind that spawn.
+    # Deferred here the same way Settings/Subagents/Playbook already are -- the real list is fetched
+    # client-side instead, once on load, via /api/subagents/model-options (chat_panel.html).
+    chat_model_choices_deferred = known_provider and _requires_live_probe(provider)
+    if chat_model_choices_deferred:
+        current_model = thread.get("model")
+        model_choices = [current_model] if current_model else []
+    elif known_provider:
+        model_choices = _model_choices_with_fallback(provider, thread.get("model"))
+    else:
+        model_choices = []
     return {
         "session": session,
         "thread": thread,
@@ -2034,9 +2069,18 @@ def _chat_context(session: dict) -> dict:
         # (/api/subagents/model-options, shared with the subagent picker) ever fires — same
         # reasoning as subagent_model_choices in _subagent_context.
         "chat_model_choices": model_choices,
+        "chat_model_choices_deferred": chat_model_choices_deferred,
         # This picker's own independent "Free models only" switch (chat_panel.html) needs
-        # data-free on its initial render too, same reasoning as subagent_model_free_flags.
-        "chat_model_free_flags": _model_free_flags(provider, model_choices) if provider else {},
+        # data-free on its initial render too, same reasoning as subagent_model_free_flags. Deferred
+        # providers must skip this call entirely, not just rely on _model_free_flags' own "empty
+        # model_ids -> {}" guard -- real, confirmed incident (2026-11-08): when deferred, model_choices
+        # is the non-empty [current_model] placeholder (so the <select> still shows the right pre-
+        # selection), which is non-empty, so that guard never fires -- _model_free_flags's own
+        # opencode-local branch then spawned the whole `opencode serve` subprocess synchronously
+        # right here, defeating the deferral above entirely (confirmed live via a traceback captured
+        # inside _get_shared_server: get_quick_chat -> _chat_context -> _model_free_flags ->
+        # list_opencode_local_models -> _get_shared_server, ~5-6s before GET /chat could respond).
+        "chat_model_free_flags": {} if chat_model_choices_deferred else (_model_free_flags(provider, model_choices) if provider else {}),
         # This switch's own last-persisted position (chat_settings_store.py's last_free_only) --
         # same "a toggle remembers its own position" rule every switch in the app follows now.
         "chat_free_only": load_chat_settings()["last_free_only"],
@@ -5981,12 +6025,24 @@ def api_desktop_update_stage(request: Request) -> HTMLResponse:
 
 @app.get("/api/updates/indicator", response_class=HTMLResponse)
 def api_updates_indicator(request: Request) -> HTMLResponse:
-    """Tiny sidebar badge (base.html, polled) — shows a dot only when an update is available."""
-    status = updater.cached_status()
+    """Tiny sidebar badge (base.html, polled) — shows a dot when EITHER the project's own files
+    (git-based for a clone, or the release-marker fallback for a non-git exe-only bootstrap
+    install -- see agent/updater.py) OR the desktop shell binary itself (agent/desktop_update.py)
+    has an update available, so every install shape surfaces the same signal regardless of how it
+    got onto the operator's machine."""
+    project = updater.cached_status()
+    shell = desktop_update.cached_status()
+    project_available = bool(project and project.available)
+    shell_available = bool(shell and shell.available)
     return templates.TemplateResponse(
         request,
         "partials/update_indicator.html",
-        {"available": bool(status and status.available), "behind": status.behind if status else 0},
+        {
+            "available": project_available or shell_available,
+            "project_available": project_available,
+            "shell_available": shell_available,
+            "behind": project.behind if project else 0,
+        },
     )
 
 
@@ -6091,6 +6147,24 @@ def _free_filter_reason(
     return None
 
 
+def _requires_live_probe(pid: str) -> bool:
+    """True for a provider whose model list can only be answered by a real live probe that's
+    heavier than a plain HTTP call -- opencode-local spawns a whole subprocess
+    (agent/opencode_local_provider.py), local LM Studio/Ollama need a live reachability check,
+    Copilot and every custom endpoint need their own real round trip. Confirmed real incident this
+    exists to prevent: /settings eagerly probing one of these on every single page load -- for
+    opencode-local specifically, that meant spawning (and, on failure, re-spawning) a whole
+    `opencode serve` subprocess synchronously inside the request, routinely exceeding that
+    provider's own 20s readiness timeout and leaving the WHOLE /settings page unresponsive for that
+    long, PLUS the same cost again on every Test/Save/model-dropdown-change click. Anything this
+    returns True for must be deferred to the on-demand /api/settings/model-options endpoint
+    (already used for this exact purpose elsewhere on this page) instead of called eagerly here."""
+    if is_custom_provider_id(pid) or pid in (COPILOT_PROVIDER_ID, OPENCODE_LOCAL_PROVIDER_ID):
+        return True
+    config = PROVIDER_REGISTRY.get(pid)
+    return bool(config and config.is_local)
+
+
 def _llm_settings_context() -> dict:
     saved = load_llm_settings()
     current_provider = saved.get("provider") or os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER)
@@ -6125,8 +6199,25 @@ def _llm_settings_context() -> dict:
             saved.get("model") if saved.get("provider") == current_provider else None
         ) or os.getenv(config.model_env) or config.model_default
 
-    provider_models = get_model_choices(current_provider) or ([current_model] if current_model else [])
-    current_free_flags = _model_free_flags(current_provider, provider_models)
+    # See _requires_live_probe's own docstring for the real incident this deferral fixes -- the
+    # current provider is exactly the one case the old code always probed eagerly regardless (it's
+    # "in use", not merely offered), which is precisely why opencode-local blocked every /settings
+    # load once it became the active provider. The deferred provider's real list is fetched
+    # client-side instead (settings.html's own inline script, same /api/settings/model-options
+    # round trip the provider-select's hx-get already uses on a manual change).
+    current_provider_deferred = _requires_live_probe(current_provider)
+    if current_provider_deferred:
+        provider_models = [current_model] if current_model else []
+    else:
+        provider_models = get_model_choices(current_provider) or ([current_model] if current_model else [])
+    # Must skip _model_free_flags entirely when deferred, not rely on its own "empty model_ids ->
+    # {}" guard -- real, confirmed incident (2026-11-08, found live via main.py's own _chat_context
+    # sharing this exact shape): provider_models above is the non-empty [current_model] placeholder
+    # when deferred (needed so the <select> still shows the right pre-selection), so that guard
+    # never fires and _model_free_flags' own opencode-local branch spawns the whole `opencode serve`
+    # subprocess synchronously right here -- defeating this deferral entirely whenever opencode-local
+    # is the saved main provider, exactly the per-page-load cost _requires_live_probe exists to avoid.
+    current_free_flags = {} if current_provider_deferred else _model_free_flags(current_provider, provider_models)
     provider_key_status = {pid: bool(get_provider_api_key(cfg)) for pid, cfg in PROVIDER_REGISTRY.items()}
     provider_base_url_value = {pid: os.getenv(cfg.base_url_env) or "" for pid, cfg in PROVIDER_REGISTRY.items()}
     added = get_added_providers()
@@ -6272,15 +6363,29 @@ def _secondary_verification_context() -> dict:
     if current_provider and current_provider not in {pid for pid, _ in choices}:
         all_names = dict(all_provider_choices())
         choices = [*choices, (current_provider, all_names.get(current_provider, current_provider))]
-    model_choices = (
-        get_model_choices(current_provider) or ([current_model] if current_model else [])
-    ) if current_provider else []
+    # Real, confirmed incident (2026-11-08, same class as _llm_settings_context/_chat_context/
+    # _subagent_model_context): must defer here too, exactly the same way -- the saved secondary
+    # verification provider is "in use" every bit as much as the main AI Provider & Model choice,
+    # so an unguarded eager get_model_choices() call here spawns a whole `opencode serve`
+    # subprocess synchronously on every single /settings load whenever opencode-local is picked
+    # as the secondary verifier. The deferred placeholder below must stay non-empty only for
+    # model_choices (so the <select> still pre-selects the saved model) -- _model_free_flags is
+    # skipped entirely when deferred, not merely given that non-empty placeholder, since a non-
+    # empty list defeats its own "empty model_ids -> {}" guard and triggers the exact same spawn.
+    secondary_verification_deferred = bool(current_provider) and _requires_live_probe(current_provider)
+    if secondary_verification_deferred:
+        model_choices = [current_model] if current_model else []
+    else:
+        model_choices = (
+            get_model_choices(current_provider) or ([current_model] if current_model else [])
+        ) if current_provider else []
     return {
         "secondary_verification_provider": current_provider,
         "secondary_verification_model": current_model,
         "secondary_verification_provider_choices": choices,
         "secondary_verification_model_choices": model_choices,
-        "secondary_verification_model_free_flags": _model_free_flags(current_provider, model_choices) if current_provider else {},
+        "secondary_verification_model_choices_deferred": secondary_verification_deferred,
+        "secondary_verification_model_free_flags": {} if secondary_verification_deferred else (_model_free_flags(current_provider, model_choices) if current_provider else {}),
         # This switch's own last-persisted position -- same "a toggle remembers its own position"
         # rule every switch in the app follows now.
         "secondary_verification_free_only": (current or {}).get("free_only", False),
@@ -6483,26 +6588,22 @@ def _fallback_chain_context(*, error: str | None = None) -> dict:
     # on EVERY /settings load's own critical path even for an operator who has never touched the
     # (off-by-default) fallback chain feature and runs no local LLM server at all. Real, confirmed
     # incident this fixes: /settings measured ~2s server-side on a cold cache purely from probing
-    # LM Studio/Ollama nobody had running. Below, only providers actually already in use (a saved
-    # chain row, or the current primary provider/model) get probed eagerly; every other
-    # network-probe-requiring provider is resolved on demand instead, by the row's own
-    # provider-select change handler (settings.html) hitting the same
-    # /api/settings/model-options endpoint the main AI Provider & Model picker already uses for
+    # LM Studio/Ollama nobody had running. Every network-probe-requiring provider is resolved on
+    # demand instead, by the row's own provider-select change handler (settings.html) hitting the
+    # same /api/settings/model-options endpoint the main AI Provider & Model picker already uses for
     # exactly this reason -- a live check is the semantically correct thing for a local server's
     # "what's loaded right now" question anyway, not merely a fallback.
-
-    def _requires_live_probe(pid: str) -> bool:
-        # opencode-local's own "live probe" spawns a whole subprocess (agent/opencode_local_provider
-        # .py) -- far heavier than LM Studio/Ollama's plain HTTP probe, so it belongs here even more
-        # than they do; eagerly probing it on every Settings load would start `opencode serve`
-        # unconditionally, the exact per-page-load cost this function's own comment above exists to
-        # avoid.
-        if is_custom_provider_id(pid) or pid in (COPILOT_PROVIDER_ID, OPENCODE_LOCAL_PROVIDER_ID):
-            return True
-        config = PROVIDER_REGISTRY.get(pid)
-        return bool(config and config.is_local)
-
-    deferred_ids = {pid for pid in provider_ids if pid not in referenced_ids and _requires_live_probe(pid)}
+    #
+    # Deliberately NOT excluding referenced_ids (the current primary provider, or one already saved
+    # in a chain row) from this, even though it IS "already in use" -- a real, confirmed incident
+    # this fixes: that exception used to make the CURRENT provider eager regardless, which is
+    # exactly backwards for opencode-local (its own live probe spawns a whole subprocess, see
+    # _requires_live_probe's own docstring) -- becoming the active provider is precisely what put it
+    # on every single /settings load's critical path, now routinely exceeding its own 20s readiness
+    # timeout and freezing the whole page. A referenced deferred provider still renders correctly:
+    # its row/picker falls back to showing just the saved model until the client-side fetch lands
+    # (see _llm_settings_context and the row-population script below), never a blank dropdown.
+    deferred_ids = {pid for pid in provider_ids if _requires_live_probe(pid)}
     eager_ids = [pid for pid in provider_ids if pid not in deferred_ids]
     with ThreadPoolExecutor(max_workers=max(len(eager_ids), 1)) as executor:
         eager_choices = dict(zip(eager_ids, executor.map(get_model_choices, eager_ids)))
@@ -7551,19 +7652,44 @@ def _subagent_model_context(profiles: list[dict]) -> dict:
     render the right options, with the right data-free attributes, on first page load, before the
     provider dropdown's own hx-get ever fires. One get_model_choices() call per profile, not two --
     _model_free_flags is derived from the SAME already-fetched list, not a second live fetch.
+
+    Real, confirmed incident (2026-11-08, same class as main.py's own _requires_live_probe): this
+    used to call get_model_choices eagerly for EVERY profile regardless of how expensive that
+    profile's own provider is to probe -- for opencode-local that's a whole subprocess spawn, for
+    local/custom endpoints a real network round trip, and every open dialog for every profile is
+    rendered server-side upfront (not lazily on open), so /subagents paid N such probes on every
+    single load. Deferred ones get an empty list here and are fetched client-side instead, once on
+    page load, via the same /api/subagents/model-options round trip the provider-select's own
+    hx-get already uses on a manual change (see subagents.html's own subagent_fields macro).
     """
     choices_by_profile: dict[str, list[str]] = {}
     free_flags_by_profile: dict[str, dict[str, bool]] = {}
+    deferred_by_profile: dict[str, bool] = {}
     for profile in profiles:
         provider_id = profile.get("provider")
         if not provider_id or not is_known_provider_id(provider_id):
             continue
-        choices = _model_choices_with_fallback(provider_id, profile.get("model"))
+        if _requires_live_probe(provider_id):
+            deferred_by_profile[profile["id"]] = True
+            current_model = profile.get("model")
+            choices = [current_model] if current_model else []
+            # Real, confirmed incident (2026-11-08, found live via main.py's own _chat_context
+            # sharing this exact shape): must skip _model_free_flags entirely here, not just rely
+            # on its own "empty model_ids -> {}" guard -- `choices` above is the non-empty
+            # [current_model] placeholder (needed so the <select> still shows the right pre-
+            # selection), so that guard never fires, and _model_free_flags' own opencode-local
+            # branch spawns the whole `opencode serve` subprocess synchronously, defeating this
+            # deferral entirely for any profile with a saved opencode-local model.
+            free_flags = {}
+        else:
+            choices = _model_choices_with_fallback(provider_id, profile.get("model"))
+            free_flags = _model_free_flags(provider_id, choices)
         choices_by_profile[profile["id"]] = choices
-        free_flags_by_profile[profile["id"]] = _model_free_flags(provider_id, choices)
+        free_flags_by_profile[profile["id"]] = free_flags
     return {
         "subagent_model_choices": choices_by_profile,
         "subagent_model_free_flags": free_flags_by_profile,
+        "subagent_model_choices_deferred": deferred_by_profile,
     }
 
 
@@ -7911,7 +8037,19 @@ def get_playbook(request: Request) -> HTMLResponse:
     library_settings = library_store.load_library_settings()
     library_last_provider = library_settings["last_provider"] or ""
     library_last_model = library_settings["last_model"] or ""
-    library_last_model_choices = get_model_choices(library_last_provider) if library_last_provider else []
+    # Real, confirmed incident (2026-11-08, same class as main.py's own _requires_live_probe):
+    # this used to eagerly call get_model_choices(library_last_provider) on EVERY /playbook load
+    # regardless of how expensive that provider's own probe is -- for opencode-local specifically
+    # that's a whole subprocess spawn-and-wait, for local LM Studio/Ollama/custom endpoints a real
+    # network round trip, landing on this page's own critical path for an operator who may not
+    # even be about to use the Library panel this visit. Deferred to the same on-demand
+    # /api/library/model-options round trip the provider-select's own hx-get already uses on a
+    # manual change (playbook.html's own inline script fires it once on load too, when deferred).
+    library_model_choices_deferred = _requires_live_probe(library_last_provider) if library_last_provider else False
+    library_last_model_choices = (
+        [] if library_model_choices_deferred or not library_last_provider
+        else get_model_choices(library_last_provider)
+    )
     return templates.TemplateResponse(request, "playbook.html", {
         "list_html": _render_playbook_list(request),
         "total": total,
@@ -7922,6 +8060,7 @@ def get_playbook(request: Request) -> HTMLResponse:
         "library_last_provider": library_last_provider,
         "library_last_model": library_last_model,
         "library_last_model_choices": library_last_model_choices,
+        "library_model_choices_deferred": library_model_choices_deferred,
         # This switch's own last-persisted position (library_store.py's last_free_only) -- same "a
         # toggle remembers its own position" rule every switch in the app follows now.
         "library_free_only": library_settings["last_free_only"],
@@ -8656,6 +8795,16 @@ def post_nuclei_pack_install(request: Request, key: str) -> HTMLResponse:
 def get_nuclei_pack_status(request: Request, key: str) -> HTMLResponse:
     """Polled every 2s by the install view while a pack sync is in flight -- stops polling on its
     own once the process exits (same pattern as /api/tools/arsenal/install/status)."""
+    return templates.TemplateResponse(
+        request, "partials/nuclei_pack_install.html", {"status": nuclei_pack_status(key), "key": key, "blocked": False})
+
+
+@app.post("/api/tools/nuclei-packs/{key}/cancel", response_class=HTMLResponse)
+def post_nuclei_pack_cancel(request: Request, key: str) -> HTMLResponse:
+    """Terminates a stuck/unwanted sync -- real, confirmed incident this fixes: a hung install
+    previously had no recovery path short of restarting the whole server."""
+    result = cancel_nuclei_pack(key)
+    logger.debug("nuclei pack cancel: key=%s status=%s", key, result.get("status"))
     return templates.TemplateResponse(
         request, "partials/nuclei_pack_install.html", {"status": nuclei_pack_status(key), "key": key, "blocked": False})
 

@@ -95,10 +95,21 @@ _DEFAULT_READY_TIMEOUT_SECONDS = 20
 _PERMISSION_POLL_INTERVAL_SECONDS = 0.4
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
 _SERVER_LOG_TAIL_LINES = 50
+# Confirmed real incident: Settings loading the model list, the model dropdown changing, "Test",
+# and "Save" each independently call into _get_shared_server() -- with no cooldown, a server that
+# just failed to start got re-spawned from scratch by the very next one of these, every ~20s,
+# indefinitely, with no backoff. This caches the last failure for a short window so independent UI
+# actions within it get the same cached error immediately instead of each paying their own full
+# spawn-and-wait cost.
+_DEFAULT_FAILURE_COOLDOWN_SECONDS = 15
 
 
 def _ready_timeout_seconds() -> float:
     return float(os.getenv("OPENCODE_LOCAL_READY_TIMEOUT_SECONDS", str(_DEFAULT_READY_TIMEOUT_SECONDS)))
+
+
+def _failure_cooldown_seconds() -> float:
+    return float(os.getenv("OPENCODE_LOCAL_FAILURE_COOLDOWN_SECONDS", str(_DEFAULT_FAILURE_COOLDOWN_SECONDS)))
 
 # Written as this server's own project-local opencode.json -- see module docstring for why a
 # runtime PATCH /config doesn't stick but this file, present in the server's CWD at startup, does.
@@ -144,6 +155,22 @@ def _resolve_opencode_binary() -> str:
             "(`npm install -g opencode-ai`, or see https://opencode.ai) in this machine's own "
             "shell -- under this project's WSL2 launch path (see CLAUDE.md), that means installed "
             "*inside* WSL2, not just on the Windows side -- then try this provider again."
+        )
+    # Confirmed real incident: WSL2 appends the Windows PATH to the Linux one by default, so
+    # shutil.which("opencode") can resolve a Windows-side npm global install exposed under
+    # /mnt/c/... instead of a native Linux binary. Launching THAT from here goes through the
+    # WSL/Windows process-interop layer on every single call, which is slow enough (observed:
+    # routinely exceeding this provider's own 20s readiness timeout) that the server never gets
+    # detected as ready and this code just restarts it forever on a new port -- and `process.kill()`
+    # on the WSL-side interop stub may not actually stop the real Windows-hosted process, leaking
+    # live opencode servers. Refuse outright rather than silently eating the cost on every call.
+    if binary.startswith("/mnt/"):
+        raise ValueError(
+            f"The opencode CLI found on PATH ({binary}) is the Windows-side install exposed "
+            "through WSL2's PATH interop, not a native Linux binary -- running it from here is slow "
+            "enough to make this provider unreliable (and process cleanup on failure may not fully "
+            "stop it). Install opencode *inside* WSL2 instead: open a WSL2 shell (not PowerShell/cmd) "
+            "and run `npm install -g opencode-ai`, then try this provider again."
         )
     return binary
 
@@ -227,11 +254,15 @@ class _SharedServer:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+        shutil.rmtree(self.sandbox_dir, ignore_errors=True)
         logger.debug("opencode_local_provider: shared server stopped")
 
 
 _shared_server: _SharedServer | None = None
 _shared_server_lock = threading.Lock()
+# See _DEFAULT_FAILURE_COOLDOWN_SECONDS above.
+_last_failure_at: float = 0.0
+_last_failure_message: str = ""
 
 
 def _start_server() -> _SharedServer:
@@ -254,31 +285,56 @@ def _start_server() -> _SharedServer:
 
     base_url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + _ready_timeout_seconds()
-    with httpx.Client(timeout=2.0) as probe:
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
+    try:
+        with httpx.Client(timeout=2.0) as probe:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    tail = "\n".join(log_drain.tail) or "(no output)"
+                    raise ValueError(f"The local opencode server exited before it was ready:\n{tail}")
+                try:
+                    if probe.get(f"{base_url}/config").is_success:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.2)
+            else:
+                process.kill()
                 tail = "\n".join(log_drain.tail) or "(no output)"
-                raise ValueError(f"The local opencode server exited before it was ready:\n{tail}")
-            try:
-                if probe.get(f"{base_url}/config").is_success:
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.2)
-        else:
-            process.kill()
-            tail = "\n".join(log_drain.tail) or "(no output)"
-            raise ValueError(f"The local opencode server did not become ready in time:\n{tail}")
+                raise ValueError(f"The local opencode server did not become ready in time:\n{tail}")
+    except ValueError:
+        # The temp sandbox dir (holding just a generated opencode.json) is otherwise never cleaned
+        # up on a failed start -- confirmed real incident: every failed attempt left its
+        # /tmp/asra-opencode-local-* directory behind forever.
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        raise
 
     logger.info("opencode_local_provider: local opencode server ready base_url=%s", base_url)
     return _SharedServer(base_url=base_url, process=process, sandbox_dir=sandbox_dir, log_drain=log_drain)
 
 
 def _get_shared_server() -> _SharedServer:
-    global _shared_server
+    global _shared_server, _last_failure_at, _last_failure_message
     with _shared_server_lock:
-        if _shared_server is None or not _shared_server.is_alive():
+        if _shared_server is not None and _shared_server.is_alive():
+            return _shared_server
+        cooldown = _failure_cooldown_seconds()
+        elapsed = time.monotonic() - _last_failure_at
+        if _last_failure_at and elapsed < cooldown:
+            # Confirmed real incident: Settings page load, the model dropdown, "Test", and "Save"
+            # each independently reach this function -- without this cooldown, a server that just
+            # failed to start got re-spawned from scratch by the very next one of these, every
+            # ~20s, forever, with no backoff (see module docstring / CLAUDE.md known-bug-patterns).
+            raise ValueError(
+                f"{_last_failure_message}\n(retrying again in {cooldown - elapsed:.0f}s -- "
+                "repeated immediate retries were suppressed)"
+            )
+        try:
             _shared_server = _start_server()
+        except ValueError as exc:
+            _last_failure_at = time.monotonic()
+            _last_failure_message = str(exc)
+            raise
+        _last_failure_at = 0.0
         return _shared_server
 
 

@@ -24,13 +24,12 @@ from dataclasses import dataclass
 
 import httpx
 
+from agent.update_release_info import HTTP_TIMEOUT_SECONDS, fetch_latest_release, parse_version
 from agent.utils.logger import get_logger
 from projects.paths import resolve_global_app_dir
 
 logger = get_logger("UPDATE")
 
-_RELEASES_API_URL = "https://api.github.com/repos/Atennebris/ASRA/releases/latest"
-_HTTP_TIMEOUT_SECONDS = 15.0
 _DOWNLOAD_TIMEOUT_SECONDS = 120.0
 
 # std::env::consts::OS on the Rust side (main.rs) yields exactly these three strings -- matched
@@ -58,13 +57,6 @@ class DesktopUpdateStatus:
     error: str | None = None
 
 
-def _parse_version(text: str) -> tuple[int, ...] | None:
-    try:
-        return tuple(int(part) for part in text.strip().lstrip("v").split("."))
-    except ValueError:
-        return None
-
-
 def check_for_desktop_update() -> DesktopUpdateStatus:
     """Compares the running desktop shell's own version (reported by main.rs at launch) against
     the latest tagged GitHub Release. Never raises -- network/HTTP/JSON errors all land in
@@ -83,14 +75,10 @@ def check_for_desktop_update() -> DesktopUpdateStatus:
         return status
     status.asset_name = asset_name
 
-    try:
-        with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            resp = client.get(_RELEASES_API_URL)
-            resp.raise_for_status()
-            release = resp.json()
-    except Exception as exc:  # noqa: BLE001 - network/HTTP/JSON errors all reported the same way
-        status.error = f"Could not reach GitHub Releases: {exc}"
-        logger.debug("check_for_desktop_update: releases/latest failed: %s", exc)
+    release = fetch_latest_release()
+    if release is None:
+        status.error = "Could not reach GitHub Releases."
+        logger.debug("check_for_desktop_update: releases/latest fetch failed")
         return status
 
     tag_name = str(release.get("tag_name", ""))
@@ -106,7 +94,7 @@ def check_for_desktop_update() -> DesktopUpdateStatus:
     sums_url = assets.get("SHA256SUMS.txt")
     if sums_url:
         try:
-            with httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
                 sums_resp = client.get(sums_url)
                 sums_resp.raise_for_status()
             for line in sums_resp.text.splitlines():
@@ -117,8 +105,8 @@ def check_for_desktop_update() -> DesktopUpdateStatus:
         except Exception as exc:  # noqa: BLE001 - checksum lookup failing is not fatal to detection
             logger.debug("check_for_desktop_update: SHA256SUMS.txt fetch failed: %s", exc)
 
-    current_parsed = _parse_version(current_version)
-    latest_parsed = _parse_version(status.latest_version)
+    current_parsed = parse_version(current_version)
+    latest_parsed = parse_version(status.latest_version)
     status.available = bool(current_parsed and latest_parsed and latest_parsed > current_parsed)
     logger.debug(
         "check_for_desktop_update: current=%s latest=%s available=%s platform=%s",
@@ -169,3 +157,20 @@ def stage_desktop_update(status: DesktopUpdateStatus) -> dict:
         dest.chmod(dest.stat().st_mode | 0o111)
     logger.debug("stage_desktop_update: staged %s (%d bytes, checksum verified)", dest, dest.stat().st_size)
     return {"ok": True, "path": str(dest)}
+
+
+# Startup cache -- same convention as agent/updater.py's own _cached_status, so the sidebar
+# indicator can show "a new exe is available" immediately on load instead of only after the
+# operator happens to open Settings (that round trip is still what populates the Settings panel's
+# own detail card; this cache just backs the lightweight sidebar dot).
+_cached_status: DesktopUpdateStatus | None = None
+
+
+def cached_status() -> DesktopUpdateStatus | None:
+    return _cached_status
+
+
+def refresh_cache() -> DesktopUpdateStatus:
+    global _cached_status
+    _cached_status = check_for_desktop_update()
+    return _cached_status

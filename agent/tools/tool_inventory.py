@@ -10,11 +10,53 @@ here rather than a second, separately-drifting guess.
 """
 from __future__ import annotations
 
+import os
+import threading
+import time
+
 from agent.tools.registry import TOOL_REGISTRY, categories_of
 from agent.tools.runner import tool_is_installed
 
+# Short-TTL cache for list_tool_availability() -- real, confirmed incident (2026-11-08): this used
+# to re-check EVERY registered tool (tool_is_installed, a real shutil.which()/availability_check()
+# per tool -- dozens of them) on every single render of /settings (the Tools tab) and /subagents
+# (its own tool checklist), landing a real, measurable multi-hundred-ms cost on both pages' every
+# single load even though which tools are installed essentially never changes except right after
+# the operator explicitly installs/uninstalls one. Same TTL-cache shape as agent/llm_client.py's
+# own get_model_choices cache: a mutation that can change the real answer (an arsenal/nuclei-pack
+# install or uninstall completing) explicitly invalidates it so the result still updates right
+# away, not only after the TTL expires.
+_TOOL_AVAILABILITY_CACHE_TTL_SECONDS = float(os.getenv("TOOL_AVAILABILITY_CACHE_TTL_SECONDS", "30"))
+_tool_availability_cache: tuple[float, list[dict]] | None = None
+_tool_availability_cache_lock = threading.Lock()
+
+
+def invalidate_tool_availability_cache() -> None:
+    """Drop the cached tool-availability list so the next list_tool_availability() call re-checks
+    every tool live. Call after any install/uninstall that can change what's actually on disk."""
+    global _tool_availability_cache
+    with _tool_availability_cache_lock:
+        _tool_availability_cache = None
+
 
 def list_tool_availability() -> list[dict]:
+    """Cached wrapper over _list_tool_availability_uncached (TTL:
+    TOOL_AVAILABILITY_CACHE_TTL_SECONDS). See invalidate_tool_availability_cache for how an
+    install/uninstall bypasses the TTL. Returns a fresh copy (list of fresh dicts) every call, even
+    on a cache hit -- callers elsewhere filter this into new lists but never mutate an entry dict
+    in place today, and a fresh copy keeps it that way guaranteed, not just true by convention."""
+    global _tool_availability_cache
+    now = time.monotonic()
+    with _tool_availability_cache_lock:
+        if _tool_availability_cache is not None and now - _tool_availability_cache[0] < _TOOL_AVAILABILITY_CACHE_TTL_SECONDS:
+            return [dict(entry) for entry in _tool_availability_cache[1]]
+    entries = _list_tool_availability_uncached()
+    with _tool_availability_cache_lock:
+        _tool_availability_cache = (now, entries)
+    return [dict(entry) for entry in entries]
+
+
+def _list_tool_availability_uncached() -> list[dict]:
     """Sorted by name for a stable, predictable UI listing order. Each entry:
     {"name", "categories", "tier", "installed", "description"} -- categories is always a tuple
     (categories_of already normalizes a single-category ToolSpec the same way), tier is 1 (native

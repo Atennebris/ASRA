@@ -39,7 +39,17 @@
     fillConfigured();
   }
   // Settings tab bodies can be swapped in by htmx after initial load -- re-mask any that arrive.
-  document.body && document.body.addEventListener("htmx:afterSwap", fillConfigured);
+  // Real, confirmed perf issue: this used to run on EVERY htmx swap anywhere in the app, including
+  // the sidebar's own always-on 5s/20s/60s background polls (active-session badge, system-health
+  // dot, update indicator) that can never contain a tool-key field -- a full-document
+  // querySelectorAll on every one of those ticks, forever, on every page, not just Settings. Skip
+  // unless the swapped-in content could plausibly contain one.
+  document.body && document.body.addEventListener("htmx:afterSwap", function (event) {
+    var target = event.detail && event.detail.target;
+    if (target && !(target.matches && target.matches("[data-tool-key-field]"))
+        && !(target.querySelector && target.querySelector("[data-tool-key-field]"))) return;
+    fillConfigured();
+  });
 
   document.addEventListener("focusin", function (event) {
     var el = event.target;

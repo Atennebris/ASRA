@@ -73,6 +73,18 @@ name). Forced false here, same "module-level default so every test starts alread
 posture as DEBUG above -- tests/test_toolkit_proxy.py's own tests override it back per-test via
 monkeypatch to exercise the enabled path, same as every other explicit-override test in this file.
 
+agent/settings.py's load_llm_settings() and agent/tools/tool_inventory.py's list_tool_availability()
+each gained a short-TTL in-memory cache (2026-11-08, a real performance fix -- both were being
+re-read/re-computed from scratch, unconditionally, once per PROVIDER/TOOL on every Settings-ish
+page render). Same leak class as everything above, just in a cache dict instead of a real file:
+the monkeypatched SETTINGS_PATH per test above does NOT help here, since the cache holds the
+already-loaded DATA keyed by nothing but "when was this last read" -- a test earlier in the same
+process that populated it (even against ITS OWN throwaway SETTINGS_PATH) leaves a stale value that
+a LATER test, with a dict new path and fresh expectations, would otherwise see for up to the TTL.
+Confirmed real incident: introducing these two caches broke 8 previously-green tests this exact way
+the same turn they were added, caught immediately by this project's own "full suite, not just the
+area touched" self-check discipline. Reset both directions, same as every other module-global above.
+
 agent/core.py's own in-memory, keyed-by-session_id dicts (_stop_events, _approval_events,
 _re_stop_intent, _instruction_queues, _exhausted_chain_steps, _claimed_chain_steps) are the same
 leak class again, module-global and never cleared between tests. Real incident this entry exists
@@ -122,6 +134,8 @@ def _never_touch_real_app_state(tmp_path, monkeypatch):
     import agent.tools.subagent_store as subagent_store_mod
     import agent.tools.chat_settings_store as chat_settings_store_mod
     import agent.tools.toolkit_settings_store as toolkit_settings_store_mod
+    import agent.tools.tool_inventory as tool_inventory_mod
+    import agent.timezone_settings as timezone_settings_mod
 
     paths_mod.resolve_global_app_dir.cache_clear()
     paths_mod.resolve_projects_base_dir.cache_clear()
@@ -151,6 +165,11 @@ def _never_touch_real_app_state(tmp_path, monkeypatch):
     # asserting on a chat/phase/subagent tool list, exactly what surfaced as three real, spuriously
     # failing tests in tests/test_chat.py the moment that real file gained its 6th key (Sequencer).
     monkeypatch.setattr(toolkit_settings_store_mod, "TOOLKIT_AGENT_SETTINGS_STORE_PATH", tmp_path / "asra-toolkit-agent-settings.json")
+    # Real incident this closes: main.py's _human_dt Jinja filter calls load_display_timezone()
+    # unconditionally for every timestamp rendered -- an operator's own real Settings -> Timezone
+    # choice on the machine running these tests would otherwise leak into any test asserting on a
+    # rendered timestamp string, same leak class as every other *_STORE_PATH mock above.
+    monkeypatch.setattr(timezone_settings_mod, "SETTINGS_PATH", tmp_path / "asra-timezone-settings.json")
     # Real incident this closes: main.py's _fallback_chain_context/_secondary_verification_context
     # both added a real, live reachability probe for LM Studio/Ollama (_reachable_local_provider_ids)
     # so an unstarted local server no longer looks like a pickable, configured provider in Settings.
@@ -168,6 +187,10 @@ def _never_touch_real_app_state(tmp_path, monkeypatch):
     core_mod._instruction_queues.clear()
     core_mod._exhausted_chain_steps.clear()
     core_mod._claimed_chain_steps.clear()
+    settings_mod._settings_cache = None
+    tool_inventory_mod._tool_availability_cache = None
+    timezone_settings_mod._raw_cache = None
+    store_mod._summaries_cache = None
 
     yield
 
@@ -179,3 +202,7 @@ def _never_touch_real_app_state(tmp_path, monkeypatch):
     core_mod._instruction_queues.clear()
     core_mod._exhausted_chain_steps.clear()
     core_mod._claimed_chain_steps.clear()
+    settings_mod._settings_cache = None
+    tool_inventory_mod._tool_availability_cache = None
+    timezone_settings_mod._raw_cache = None
+    store_mod._summaries_cache = None

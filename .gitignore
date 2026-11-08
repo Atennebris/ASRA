@@ -33,6 +33,11 @@ node_modules/
 
 asra.txt
 
+# Per-install version marker (desktop/src-tauri/src/main.rs's bootstrap_full_project writes this
+# next to a non-git, exe-only install so agent/updater.py's release-based fallback can detect
+# updates) -- generated runtime state, never something to commit; a real git clone never has it.
+/.asra_installed_version
+
 # Personal tool registrations (local paths/binaries differ per machine) — see
 # custom_tools.example.yaml for the committed template
 /custom_tools.yaml

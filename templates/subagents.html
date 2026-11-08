@@ -164,6 +164,19 @@
         {{ model_options(profile.provider if profile else None, profile.model if profile else None, subagent_model_choices.get(profile.id, []) if profile else [], subagent_model_free_flags.get(profile.id, {}) if profile else {}) }}
       </select>
     </div>
+    {% if profile and subagent_model_choices_deferred.get(profile.id) %}
+      <script>
+        // See main.py's _subagent_model_context/_requires_live_probe -- this profile's saved
+        // provider needs a real live probe (opencode-local spawns a whole subprocess; local/custom
+        // endpoints need a real round trip), so the page render above deliberately left this
+        // dialog's real model list empty rather than pay that cost, per profile, on every single
+        // /subagents load. Fetches it now, the same /api/subagents/model-options round trip the
+        // provider-select's own hx-get already uses on a manual change.
+        htmx.ajax("GET", "/api/subagents/model-options?provider={{ profile.provider | urlencode }}", {
+          target: "#subagent-model-{{ id_suffix }}", swap: "innerHTML",
+        });
+      </script>
+    {% endif %}
     <span class="block text-[11px] text-secondary mt-1.5">Only providers with a key configured in Settings are listed. Pick a provider to see its real models — no typing.</span>
     {# This subagent's own, independent "Free models only" switch -- real, confirmed operator
        complaint this fixes: ASRA's own sibling Reserve providers chain already has one per row

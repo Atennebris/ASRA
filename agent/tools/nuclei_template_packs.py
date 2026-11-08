@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -84,6 +85,13 @@ PACKS: list[dict] = [
 _PACKS_BY_KEY = {pack["key"]: pack for pack in PACKS}
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _LOG_TAIL_LINES = int(os.getenv("NUCLEI_PACK_INSTALL_LOG_TAIL_LINES", "200"))
+# How long a sync can run before the UI starts flagging it as abnormally long (still polling, not
+# auto-cancelled -- the operator decides). Real, confirmed incident this fixes: an install had no
+# way to signal "this has been running far longer than normal" and no way to recover short of
+# restarting the whole server -- the UI just polled silently, indefinitely, with no signal either
+# way. Generous on purpose: the heaviest pack here (wordfence-cve, ~81k templates) genuinely can
+# take several real minutes just to load once installed, so the clone itself needs real headroom.
+_STALL_SECONDS = int(os.getenv("NUCLEI_PACK_INSTALL_STALL_SECONDS", str(15 * 60)))
 
 # Same "in-memory only, keyed by what's running" shape as arsenal_install._STATE -- a live Popen
 # handle isn't JSON-serializable and only means anything within this process's own lifetime; the
@@ -139,6 +147,15 @@ def _is_running(key: str) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def _any_pack_running() -> tuple[str | None, str | None]:
+    """(key, label) of whichever OTHER pack is currently syncing, or (None, None) if none is --
+    used to refuse starting a second install concurrently (see install_pack's own comment for why)."""
+    for other_key in _STATE:
+        if _is_running(other_key):
+            return other_key, _PACKS_BY_KEY[other_key]["label"]
+    return None, None
+
+
 def list_packs() -> list[dict]:
     """Static registry + live installed/running state, for the Tools tab. `installed` is a real
     directory check (survives a server restart), not remembered install-button state."""
@@ -165,10 +182,18 @@ def pack_status(key: str) -> dict:
         log = "\n".join(log.splitlines()[-_LOG_TAIL_LINES:])
     except FileNotFoundError:
         log = ""
+    started_at = state.get("started_at")
+    elapsed = (time.time() - started_at) if (running and started_at) else None
     return {
         "key": key,
         "label": pack["label"],
         "running": running,
+        # True once a still-running sync has gone well past _STALL_SECONDS -- a real, visible signal
+        # for the operator instead of the install view just polling silently forever with nothing to
+        # show for it (confirmed real incident: a stuck sync looked identical to a normal one in
+        # progress, with no way to tell them apart short of waiting indefinitely).
+        "running_too_long": bool(elapsed and elapsed > _STALL_SECONDS),
+        "elapsed_seconds": int(elapsed) if elapsed is not None else None,
         "returncode": returncode,
         "succeeded": (returncode == 0 and _pack_dir(pack["repo"]).is_dir()) if returncode is not None else None,
         "log": log,
@@ -187,6 +212,21 @@ def install_pack(key: str) -> dict:
                 "message": "nuclei isn't installed. Install it from the Tools tab's Arsenal section first."}
     if _is_running(key):
         return {"status": "running", **pack_status(key)}
+    # Confirmed real incident: two packs started close together both hung indefinitely, regardless
+    # of pack size -- that symmetry points at nuclei holding its own lock on the shared templates
+    # directory during an update rather than a plain slow-network explanation. Refusing a second
+    # concurrent sync outright is simpler and safer than letting two `nuclei -update-templates`
+    # invocations race over the same directory/lock.
+    other_key, other_label = _any_pack_running()
+    if other_key:
+        return {
+            "status": "error",
+            "message": (
+                f"'{other_label}' is still syncing -- nuclei locks its own templates directory "
+                "during an update, so installing two packs at once can make both hang. Wait for the "
+                "current one to finish (or cancel it) first."
+            ),
+        }
 
     pack = _PACKS_BY_KEY[key]
     repo = pack["repo"]
@@ -203,6 +243,15 @@ def install_pack(key: str) -> dict:
 
     env = dict(os.environ)
     env["GITHUB_TEMPLATE_REPO"] = repo
+    # Confirmed via real on-disk install logs from this exact flow: nuclei's GITHUB_TEMPLATE_REPO
+    # clone step lands under its own $HOME-relative "nuclei-templates/github/<repo>" regardless of
+    # -update-template-dir below -- that flag apparently only governs the official-template
+    # self-update, not this custom-repo clone. Forcing HOME here makes nuclei's own ambient
+    # "$HOME/nuclei-templates" default resolve to exactly _TEMPLATES_DIR instead, the same fixed,
+    # ASRA-controlled, OS-user-independent location this module's own docstring already promises --
+    # without this, the clone lands somewhere pack_status()/_pack_dir() never look, and a genuinely
+    # successful install reads back here as "Sync failed".
+    env["HOME"] = str(_TEMPLATES_DIR.parent)
     logger.debug("nuclei_template_packs: installing pack=%s repo=%s -> %s", key, repo, log_path)
     log_handle = log_path.open("a", encoding="utf-8")
     proc = subprocess.Popen(
@@ -213,6 +262,30 @@ def install_pack(key: str) -> dict:
     _STATE[key] = {"proc": proc, "log_path": log_path, "started_at": time.time()}
     logger.debug("nuclei_template_packs: started pid=%s for pack=%s", proc.pid, key)
     return {"status": "started", **pack_status(key)}
+
+
+def cancel_pack(key: str) -> dict:
+    """Terminates a stuck/unwanted sync. Confirmed real incident this fixes: there was previously no
+    way to recover a hung install short of restarting the whole server -- the operator had to sit
+    through an indefinite, silent poll with zero recourse. start_new_session=True (install_pack) put
+    the subprocess in its own process group, so terminate/kill here reaches the real `nuclei` process
+    and whatever it spawned, not just this Popen handle."""
+    if key not in _PACKS_BY_KEY:
+        return {"status": "error", "message": f"Unknown template pack: {key!r}"}
+    state = _STATE.get(key)
+    proc = state.get("proc") if state else None
+    if proc is None or proc.poll() is not None:
+        return {"status": "error", "message": "Nothing is running for this pack."}
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+    except ProcessLookupError:
+        pass
+    logger.debug("nuclei_template_packs: cancelled pack=%s pid=%s", key, proc.pid)
+    return {"status": "cancelled", **pack_status(key)}
 
 
 def uninstall_pack(key: str) -> dict:

@@ -102,10 +102,18 @@ def test_fallback_chain_context_queries_only_referenced_providers_concurrently(m
         assert context["fallback_chain_provider_model_choices"][pid] == []
 
 
-def test_fallback_chain_context_still_eagerly_probes_a_deferred_provider_already_in_the_chain(monkeypatch):
-    """A local/custom/Copilot provider that's actually IN the saved chain must still be probed
-    eagerly -- otherwise its own row would render with an empty model dropdown, a real regression
-    versus the pre-deferral behavior, just because it happens to be the deferrable kind."""
+def test_fallback_chain_context_defers_a_referenced_provider_too(monkeypatch):
+    """A local/custom/Copilot/opencode-local provider stays deferred even when it's referenced (the
+    current primary provider, or already in a saved chain row) -- real, confirmed incident this
+    fixes: the old code made an EXCEPTION for referenced providers and probed them eagerly
+    regardless, which is exactly backwards for opencode-local (its own "probe" spawns a whole
+    subprocess) -- becoming the active provider is precisely what put it on every single /settings
+    load's critical path, routinely exceeding its own 20s readiness timeout and freezing the whole
+    page. Its row still shows the saved model as a placeholder (never an empty dropdown) via the
+    same "selected choice stays visible even if not in live choices" fallback _fallback_chain_context
+    already applies -- the real list is fetched client-side afterward (settings.html's own inline
+    script for the main picker, and the Reserve-providers row script's existing
+    deferredProviderIds-gated fetch), not tested here (no browser in this test)."""
     from agent import settings
     settings.save_fallback_chain_settings(True, [{"provider": "lmstudio", "model": "local-model"}])
 
@@ -113,9 +121,14 @@ def test_fallback_chain_context_still_eagerly_probes_a_deferred_provider_already
     monkeypatch.setattr(main, "get_model_choices", lambda pid: calls.append(pid) or [f"{pid}-model"])
 
     context = main._fallback_chain_context()
-    assert "lmstudio" not in context["fallback_chain_deferred_provider_ids"]
-    assert "lmstudio" in calls
-    assert context["fallback_chain_provider_model_choices"]["lmstudio"] == ["lmstudio-model"]
+    assert "lmstudio" in context["fallback_chain_deferred_provider_ids"]
+    assert "lmstudio" not in calls
+    # provider_model_choices itself is the raw (now-empty-for-a-deferred-provider) eager map; the
+    # row's own model_choices is what the template actually renders, and keeps the saved selection
+    # visible via the same "stays visible even if not in live choices" fallback as any other row.
+    assert context["fallback_chain_provider_model_choices"]["lmstudio"] == []
+    [row] = context["fallback_chain_rows"]
+    assert row["model_choices"] == ["local-model"]
 
 
 def test_settings_page_renders_the_reserve_providers_section():

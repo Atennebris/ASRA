@@ -319,6 +319,19 @@
           {{ model_options(library_last_provider, library_last_model, library_last_model_choices, library_last_model_free_flags) }}
         </select>
       </div>
+      {% if library_model_choices_deferred %}
+        <script>
+          // See main.py's get_playbook/_requires_live_probe -- the saved Library provider needs a
+          // real live probe (opencode-local spawns a whole subprocess; local/custom endpoints need
+          // a real round trip), so the page render above deliberately left this picker's real model
+          // list empty rather than pay that cost on every single /playbook load. Fetches it now,
+          // the same /api/library/model-options round trip the provider-select's own hx-get already
+          // uses on a manual change, via htmx.ajax so it fires the normal htmx lifecycle.
+          htmx.ajax("GET", "/api/library/model-options?provider={{ library_last_provider | urlencode }}", {
+            target: "#library-model-shared", swap: "innerHTML",
+          });
+        </script>
+      {% endif %}
       <p class="text-[10px] text-secondary mt-1">Applies to every source's "Analyze" below. Only providers actually configured in Settings are listed.</p>
       {# This picker's own independent "Free models only" switch -- same per-picker treatment as
          every other model picker in the app (static/js/free_models_filter.js's shared primitives).

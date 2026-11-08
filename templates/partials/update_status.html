@@ -10,6 +10,9 @@
       <span class="text-primary font-medium">{{ u.current_sha }}</span>{% if u.current_subject %} — {{ u.current_subject }}{% endif %}
     </p>
   {% endif %}
+  {% if u.install_kind == "release" %}
+    <p class="text-[11px] text-secondary">This install has no git history (installed from a downloaded source archive) — updates are checked against GitHub Releases instead.</p>
+  {% endif %}
 
   {% if result %}
     <div class="mt-2 text-[13px] {{ '' if result.ok else 'text-accent' }}">{{ result.message }}</div>
@@ -21,7 +24,13 @@
   {% if u.error %}
     <div class="mt-2 text-[13px] text-accent">{{ u.error }}</div>
   {% elif u.available %}
-    <div class="mt-2 text-[13px] text-primary">{{ u.behind }} update{{ '' if u.behind == 1 else 's' }} available{% if u.upstream %} <span class="text-secondary">(from {{ u.upstream }})</span>{% endif %}</div>
+    <div class="mt-2 text-[13px] text-primary">
+      {% if u.install_kind == "release" %}
+        A new version is available{% if u.remote_sha %} (v{{ u.remote_sha }}){% endif %}
+      {% else %}
+        {{ u.behind }} update{{ '' if u.behind == 1 else 's' }} available{% if u.upstream %} <span class="text-secondary">(from {{ u.upstream }})</span>{% endif %}
+      {% endif %}
+    </div>
     {% if u.changelog %}
       <ul class="mt-2 space-y-0.5 max-h-40 overflow-y-auto asra-scroll">
         {% for line in u.changelog %}<li class="text-[12px] text-secondary">• {{ line }}</li>{% endfor %}
@@ -47,7 +56,7 @@
     {% if u.available and not u.dirty and u.ahead == 0 %}
       <button type="button"
         hx-post="/api/updates/apply" hx-target="#update-panel" hx-swap="innerHTML"
-        hx-confirm="Update ASRA now (git pull)? Restart afterward to load the new version."
+        hx-confirm="{% if u.install_kind == 'release' %}Download and install the latest ASRA release now?{% else %}Update ASRA now (git pull)?{% endif %} Restart afterward to load the new version."
         class="px-3 h-8 rounded text-[12px] bg-accent text-white font-medium">
         Update now
       </button>

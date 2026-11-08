@@ -1297,9 +1297,18 @@ fn download_and_extract_repo(target: &Path) -> Result<(), String> {
 
     // SHA URL first (immune to the cache bug above), then the tag URL, then main -- same overall
     // fallback shape as before, just with the one reliable option tried ahead of the risky one.
-    let downloaded = sha_url.as_deref().map(download).unwrap_or(false)
-        || download(&tagged_url)
-        || download(main_url);
+    // Which one actually succeeded decides what gets written into the version marker below: the
+    // sha/tag paths land exactly on this exe's own tagged release, but the main fallback means no
+    // matching tag existed yet, so there's no real version number to record.
+    let (downloaded, resolved_version) = if sha_url.as_deref().map(download).unwrap_or(false) {
+        (true, version.to_string())
+    } else if download(&tagged_url) {
+        (true, version.to_string())
+    } else if download(main_url) {
+        (true, "0.0.0".to_string())
+    } else {
+        (false, String::new())
+    };
     if !downloaded {
         let _ = std::fs::remove_file(&archive);
         return Err(format!(
@@ -1317,7 +1326,15 @@ fn download_and_extract_repo(target: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(&archive);
 
     match extract {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => {
+            // This install has no .git metadata at all (GitHub's archive endpoint never includes
+            // it) -- without this marker, agent/updater.py's git-based update check would have no
+            // way to ever learn a newer release exists. "0.0.0" (the main-fallback case) always
+            // compares as behind, so that install still surfaces an update signal rather than
+            // silently never checking again.
+            let _ = std::fs::write(target.join(".asra_installed_version"), &resolved_version);
+            Ok(())
+        }
         Ok(status) => Err(format!("tar exited with status {status} while extracting the ASRA archive")),
         Err(e) => Err(format!("could not run tar to extract the ASRA archive: {e}")),
     }
