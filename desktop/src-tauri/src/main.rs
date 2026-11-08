@@ -103,6 +103,16 @@ struct StartConfig {
     // start screen uses this to offer bootstrap_full_project's "pick a folder & install" button
     // instead of only letting the operator hit Start and wait out launch_backend's fast-fail.
     repo_found: bool,
+    // Set only on the ONE launch right after bootstrap_full_project relaunched this exe's freshly
+    // installed copy (via the ASRA_JUST_INSTALLED env var it sets on that spawn) -- the install
+    // path, so the start screen can tell the operator plainly where the real app now lives and
+    // that the originally downloaded .exe elsewhere (e.g. Downloads) was only the installer.
+    // Real, confirmed incident this exists because of: bootstrap_full_project's own success path
+    // was a silent exit()+relaunch with nothing user-visible at all -- an operator who closed the
+    // new window without reading its title bar had no way to tell the install even happened, and
+    // re-ran the original Downloads .exe later expecting it to now work, landing back on the same
+    // "pick a folder & install" screen with no idea why "already installed" didn't stick.
+    just_installed: Option<String>,
 }
 
 // Mirrors install_wsl's two possible jobs. Kept as a String (not a Rust enum) on the wire --
@@ -150,6 +160,12 @@ fn repo_dir() -> PathBuf {
         dir.pop();
         loop {
             if dir.join("run.sh").is_file() {
+                // Keep the marker in sync with reality on every successful direct resolution, not
+                // just right after bootstrap_full_project's own install -- so an operator who later
+                // just drags the whole installed folder to a different drive/path (no reinstall, no
+                // button click) has the marker catch up automatically the next time they launch the
+                // one real exe that lives inside that folder, instead of it quietly going stale.
+                record_install_location(&dir);
                 return dir;
             }
             if !dir.pop() {
@@ -157,7 +173,51 @@ fn repo_dir() -> PathBuf {
             }
         }
     }
+    // This exe's own upward search found nothing -- it may simply be a DIFFERENT copy than the one
+    // bootstrap_full_project relaunched after installing (e.g. the original download, left alone
+    // on purpose where the operator put it -- see that function's own comment). Check the one
+    // fixed, zero-config marker every copy of this exe agrees on before giving up, so ANY copy
+    // keeps working once ASRA has been installed anywhere on this machine, not just the one path
+    // bootstrap happened to relaunch from. Real, confirmed incident this exists because of: without
+    // this, re-running the originally downloaded .exe after a successful install landed back on
+    // the "pick a folder & install" screen with no way to tell an install already happened
+    // elsewhere -- the operator has to remember and keep using one specific exe path forever,
+    // which is exactly the inconvenience this fallback removes.
+    if let Some(installed) = recorded_install_location() {
+        if installed.join("run.sh").is_file() {
+            return installed;
+        }
+    }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+// Fixed, zero-config location every copy of this exe resolves identically, with no .env and no
+// existing project required to find it -- resolve_app_dir("") already defaults to this same
+// Documents/ASRA path with no override applied, exactly what's needed before any real install
+// (and its own possibly-customized APP_DATA_DIR) exists at all.
+fn install_location_marker_path() -> PathBuf {
+    resolve_app_dir("").join("install_location.txt")
+}
+
+fn recorded_install_location() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(install_location_marker_path()).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+// Best-effort: a failure to record this must never block the install/relaunch it's attached to --
+// worst case, only this one fallback path is unavailable, the direct upward search still works
+// for whichever copy was actually relaunched.
+fn record_install_location(target: &Path) {
+    let marker = install_location_marker_path();
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, target.to_string_lossy().as_bytes());
 }
 
 fn port_from_env_text(text: &str) -> String {
@@ -963,6 +1023,7 @@ fn get_start_config() -> StartConfig {
         distros,
         settings,
         repo_found,
+        just_installed: std::env::var("ASRA_JUST_INSTALLED").ok().filter(|s| !s.is_empty()),
     }
 }
 
@@ -1073,15 +1134,22 @@ fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
         download_and_extract_repo(&target)?;
     }
 
+    // Recorded as soon as `target` is confirmed to hold a real checkout -- see repo_dir()'s own
+    // fallback for why: this is what lets ANY copy of this exe (including the operator's original
+    // download, left alone right where they put it) find this same install on its own next launch,
+    // not just the freshly relaunched copy below.
+    record_install_location(&target);
+
     let current = std::env::current_exe()
         .map_err(|e| format!("could not resolve the running executable's own path: {e}"))?;
     let filename = current
         .file_name()
         .ok_or_else(|| "running executable has no file name".to_string())?;
-    let bin_dir = target.join("desktop").join("bin");
-    std::fs::create_dir_all(&bin_dir)
-        .map_err(|e| format!("could not create {}: {e}", bin_dir.display()))?;
-    let installed_exe = bin_dir.join(filename);
+    // Placed directly at the installed project's own root (not desktop/bin/, where a git-clone
+    // developer's own cargo-built copy lives) -- an exe-only operator never sees or cares about
+    // that internal layout, they just want the one obvious thing to double-click sitting right
+    // where they can see it when they open the folder they picked.
+    let installed_exe = target.join(filename);
     std::fs::copy(&current, &installed_exe).map_err(|e| {
         format!("could not copy the running executable into {}: {e}", installed_exe.display())
     })?;
@@ -1099,6 +1167,7 @@ fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
     let mut cmd = Command::new(&installed_exe);
     #[cfg(windows)]
     cmd.creation_flags(DETACHED_PROCESS);
+    cmd.env("ASRA_JUST_INSTALLED", target.to_string_lossy().to_string());
     cmd.spawn().map_err(|e| {
         format!(
             "ASRA was installed to {}, but relaunching failed -- start {} yourself: {e}",
@@ -1111,8 +1180,66 @@ fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
         &log_env_text,
         &format!("bootstrap_full_project: installed and relaunched from {}", installed_exe.display()),
     );
+
+    // The originally downloaded installer .exe (e.g. sitting in Downloads) has done its one job
+    // and would otherwise just sit there forever as a confusing leftover duplicate -- clean it up
+    // automatically instead of leaving the operator to notice and delete it themselves. Skipped
+    // when it's already the same file as the installed copy (re-running bootstrap from inside an
+    // existing install, pointed at that same install) -- nothing to delete out from under itself.
+    if current != installed_exe {
+        self_delete_after_exit(&current, &log_env_text);
+    }
+
     app.exit(0);
     Ok(())
+}
+
+// Deletes `path` once the CURRENT process has exited and released its lock on it. A running
+// executable's own file can't just be removed in place on Windows (ERROR_SHARING_VIOLATION --
+// the OS keeps it locked while it's the image of a running process) the way apply_desktop_update's
+// rename-in-place trick works around for a same-directory self-update; here `path` is somewhere
+// else entirely (wherever the operator originally downloaded it), so there's no later startup of
+// THAT file to run a cleanup pass on it either -- it needs to go away on its own, shortly after
+// this process exits. On Unix, deleting a running binary's own file works immediately (unlinking
+// only removes the directory entry; the process keeps using its already-open inode), so no helper
+// is needed there at all.
+fn self_delete_after_exit(path: &Path, log_env_text: &str) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C")
+            // `ping -n 2 127.0.0.1` is the standard trick for "wait ~1s with no console/GUI
+            // prompt" in a detached cmd -- `timeout` refuses to run without a real attached
+            // console, which this DETACHED_PROCESS deliberately has none of.
+            .arg(format!(
+                "ping -n 2 127.0.0.1 >nul & del /f /q \"{}\"",
+                path.display()
+            ))
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        match cmd.spawn() {
+            Ok(_) => append_desktop_log_line(
+                log_env_text,
+                &format!("bootstrap_full_project: scheduled cleanup of the original installer at {}", path.display()),
+            ),
+            Err(e) => append_desktop_log_line(
+                log_env_text,
+                &format!("bootstrap_full_project: could not schedule cleanup of {}: {e} (harmless leftover file)", path.display()),
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::remove_file(path) {
+            Ok(()) => append_desktop_log_line(
+                log_env_text,
+                &format!("bootstrap_full_project: removed the original installer at {}", path.display()),
+            ),
+            Err(e) => append_desktop_log_line(
+                log_env_text,
+                &format!("bootstrap_full_project: could not remove {}: {e} (harmless leftover file)", path.display()),
+            ),
+        }
+    }
 }
 
 // Downloads the GitHub source archive matching this exe's own Cargo.toml version (falls back to

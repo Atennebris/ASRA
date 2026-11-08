@@ -65,6 +65,10 @@
                   border-left: 3px solid #e3b341; border-radius: 8px; background: var(--panel2); }
   .repo-missing .hint { font-size: 11.5px; color: var(--muted); line-height: 1.55; margin: 4px 0 10px; }
   .repo-missing .err { margin-top: 8px; font-size: 11.5px; color: #ff9ea1; line-height: 1.55; display: none; }
+  .just-installed { margin: 16px 0 4px; padding: 13px 15px; border: 1px solid #1f4a2e;
+                     border-left: 3px solid #3fb96a; border-radius: 8px; background: var(--panel2); }
+  .just-installed .hint { font-size: 11.5px; color: var(--muted); line-height: 1.55; margin: 4px 0 10px; }
+  .just-installed code { word-break: break-all; }
   .wsl-setup { margin-top: 10px; }
   .btn-wsl-install { display: block; width: 100%; border: 1px solid var(--line); background: var(--bg);
         color: var(--fg); border-radius: 9px; padding: 10px 14px; font: inherit; font-size: 12.5px;
@@ -452,6 +456,18 @@
       it there, then relaunches from the installed copy automatically.</div>
     <button class="btn-wsl-install" id="bootstrap-btn" type="button">Choose a folder &amp; install ASRA</button>
     <div class="err" id="bootstrap-error"></div>
+  </div>
+
+  <!-- Shown exactly once, right after bootstrap_full_project relaunches this exe's freshly
+       installed copy -- see StartConfig's just_installed field for why: the old silent
+       exit()+relaunch left the operator with no way to tell where the real app ended up at all. -->
+  <div class="just-installed" id="just-installed" style="display:none">
+    <div class="title" style="font-size:13px">ASRA installed to <code id="just-installed-path"></code></div>
+    <div class="hint">The file you downloaded did its one job and removed itself -- this is the
+      real app from now on. Feel free to pin it or make a shortcut to it; the whole folder can also
+      be moved to a different drive/location later if you want, it'll keep working from wherever
+      it ends up.</div>
+    <button class="btn-wsl-install" id="just-installed-dismiss" type="button">Got it</button>
   </div>
 
   <!-- Hidden entirely while repo_found is false (init()) -- none of this (mode pick, root toggle,
@@ -1372,6 +1388,10 @@
         var repoFound = cfg.repo_found !== false;
         $("repo-missing").style.display = repoFound ? "none" : "block";
         $("launcher-body").style.display = repoFound ? "" : "none";
+        if (cfg.just_installed) {
+          $("just-installed-path").textContent = cfg.just_installed;
+          $("just-installed").style.display = "block";
+        }
         renderSystem();
         renderSettings();
       } catch (e) { showError(String(e)); }
@@ -1496,6 +1516,13 @@
             errEl.textContent = msg;
           }
         }
+      });
+    }
+
+    var justInstalledDismiss = $("just-installed-dismiss");
+    if (justInstalledDismiss) {
+      justInstalledDismiss.addEventListener("click", function () {
+        $("just-installed").style.display = "none";
       });
     }
 
