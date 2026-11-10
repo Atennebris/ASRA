@@ -42,31 +42,37 @@ def test_build_command_bytecode_without_0x_prefix_is_passed_through_unchanged():
 
 def test_parse_real_shaped_issues_output():
     parsed = parse_mythril_output(_REAL_SHAPED_ISSUES_OUTPUT)
-    assert parsed == {
-        "findings": [
-            {
-                "title": "Integer Arithmetic Bugs", "severity": "High", "swc_id": "101",
-                "description": "The subtraction can result in an integer underflow.",
-                "function": "withdraw(uint256)",
-            }
-        ]
-    }
+    assert parsed["observed"] == {"total_findings": 1}
+    assert parsed["inferred"]["findings"] == [
+        {
+            "title": "Integer Arithmetic Bugs", "severity": "High", "swc_id": "101",
+            "description": "The subtraction can result in an integer underflow.",
+            "function": "withdraw(uint256)",
+        }
+    ]
+    assert "confidence_caveat" in parsed["inferred"]
+    assert parsed["unknown"] == {}
+    assert parsed["_evidence"]["untrusted_content"] is True
 
 
 def test_parse_clean_output_returns_empty_findings_not_an_error():
-    assert parse_mythril_output(_CLEAN_OUTPUT) == {"findings": []}
+    parsed = parse_mythril_output(_CLEAN_OUTPUT)
+    assert parsed["observed"] == {"total_findings": 0}
+    assert parsed["inferred"]["findings"] == []
 
 
 def test_parse_tolerates_a_bare_json_list_of_issues_not_just_a_dict_wrapper():
     parsed = parse_mythril_output('[{"title": "Reentrancy", "severity": "High"}]')
-    assert parsed == {
-        "findings": [{"title": "Reentrancy", "severity": "High", "swc_id": None, "description": None, "function": None}]
-    }
+    assert parsed["inferred"]["findings"] == [
+        {"title": "Reentrancy", "severity": "High", "swc_id": None, "description": None, "function": None}
+    ]
 
 
 def test_parse_non_json_output_falls_back_to_raw_text():
     parsed = parse_mythril_output("Error: could not connect to any node\n")
-    assert parsed == {"raw_output": "Error: could not connect to any node"}
+    assert parsed["raw_output"] == "Error: could not connect to any node"
+    assert "findings" in parsed["unknown"]
+    assert parsed["observed"] == {}
 
 
 def test_build_command_rejects_control_characters():

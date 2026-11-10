@@ -18,15 +18,17 @@ def _patch_which(monkeypatch, found: bool):
     monkeypatch.setattr("shutil.which", lambda name: ("/usr/local/bin/opencode" if found else None) if name == "opencode" else None)
 
 
-def test_not_offered_in_add_provider_dropdown_when_cli_missing(monkeypatch):
+def test_still_addable_but_labelled_in_add_provider_dropdown_when_cli_missing(monkeypatch):
+    """Never disabled: the install button lives on the provider's own card, so blocking the add
+    would leave a first-time operator with no way to reach it."""
     _patch_which(monkeypatch, found=False)
     client = TestClient(main.app)
     resp = client.get("/settings")
     assert resp.status_code == 200
     idx = resp.text.index('<option value="opencode-local"')
-    tag = resp.text[idx : idx + 120]
-    assert "disabled" in tag
-    assert "not installed" in tag
+    tag = resp.text[idx : idx + 160]
+    assert "disabled" not in tag
+    assert "not installed yet" in tag
 
 
 def test_offered_in_add_provider_dropdown_when_cli_found(monkeypatch):
@@ -47,13 +49,16 @@ def test_not_in_main_picker_or_own_card_before_adding(monkeypatch):
     assert "opencode (local server)" not in main_picker
 
 
-def test_add_provider_route_rejects_when_cli_missing(monkeypatch):
+def test_add_provider_route_adds_even_when_cli_missing_and_the_card_then_offers_the_install(monkeypatch):
     _patch_which(monkeypatch, found=False)
     client = TestClient(main.app)
-    resp = client.post("/api/settings/providers/custom", data={"type": "opencode-local"})
-    assert resp.status_code == 400
-    assert "not installed" in resp.text
-    assert OPENCODE_LOCAL_PROVIDER_ID not in get_added_providers()
+    resp = client.post("/api/settings/providers/custom", data={"type": "opencode-local"}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert OPENCODE_LOCAL_PROVIDER_ID in get_added_providers()
+    page = client.get("/settings").text
+    card = page[page.index('id="opencode-local-test-status"'):]
+    card = card[: card.index("</p>")]
+    assert "/api/tools/opencode/install/start?reload=true" in card and "not installed" in card
 
 
 def test_add_then_visible_everywhere_then_remove_then_gone(monkeypatch):

@@ -71,7 +71,19 @@ def build_nuclei_command(params: dict) -> list[str]:
     # request/response bodies never used downstream -- confirmed live against an approved test
     # target (ginandjuice.shop, full default tag set): -omit-raw cut identical-match output from
     # 278KB to 39KB, a ~7x reduction, with the exact same set of matched template-ids.
-    command = ["nuclei", "-u", target, "-jsonl", "-silent", "-omit-raw"]
+    # -duc (disable update check): a real scan must never block on nuclei's own "is a newer
+    # official template set available" network check -- real, confirmed incident (Live-Nation-
+    # HackerOne-usr_0f5c71): a full scan against an approved live target (ginandjuice.shop) with
+    # this exact tag/template setup did not finish even within 1800s, and a short diagnostic run
+    # (-stats) showed why -- it never got past "[INF] Your current nuclei-templates vX are
+    # outdated. Latest is vY", with zero scan progress for the entire window. That update step
+    # (syncing the official set into a WSL2/drvfs-mounted Windows path -- many small files, known
+    # slow) was the real bottleneck, not the tag/template count being scanned. -duc here does NOT
+    # mean templates never refresh -- installing/reinstalling any extra pack from the Tools tab
+    # (nuclei_template_packs.py's install_pack) already runs a real `nuclei -update-templates` as
+    # its own explicit, operator-triggered, non-blocking background job; a scan just never
+    # triggers that check implicitly on its own again.
+    command = ["nuclei", "-u", target, "-jsonl", "-silent", "-omit-raw", "-duc"]
     # Always pinned to a fixed, ASRA-controlled directory (agent/tools/nuclei_template_packs.py),
     # never left at nuclei's own $HOME-relative default -- the desktop launcher's "Run the agent as
     # root" toggle means this same project runs as different OS users across launches,
@@ -109,8 +121,27 @@ def build_nuclei_command(params: dict) -> list[str]:
     return command
 
 
+def _as_str_list(value) -> list[str]:
+    """Nuclei template YAML lets several `info:` fields (classification.cve-id, reference) be
+    either a single scalar or a list -- normalizes both shorthands into a plain list so downstream
+    code never has to guess which shape a given template used."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    return [str(value)]
+
+
 def parse_nuclei_output(stdout: str) -> list[dict]:
-    """Extracts findings from Nuclei's -jsonl output (one JSON object per line)."""
+    """Extracts findings from Nuclei's -jsonl output (one JSON object per line).
+
+    A CVE-tagged template's `info:` block already carries the CVE id(s), CVSS score/vector and a
+    description + advisory/PoC references -- nuclei puts all of that straight in its own JSON
+    output. Earlier this only kept template_id/name/severity/matched_at/matcher_name and silently
+    dropped the rest, so the agent had to go fetch that context separately even though nuclei had
+    already handed it over for free. Absent for a non-CVE template (empty list / None), never an
+    error.
+    """
     findings = []
     for line in stdout.splitlines():
         line = line.strip()
@@ -122,6 +153,7 @@ def parse_nuclei_output(stdout: str) -> list[dict]:
             continue
 
         info = record.get("info", {})
+        classification = info.get("classification") or {}
         findings.append(
             {
                 "template_id": record.get("template-id"),
@@ -134,6 +166,11 @@ def parse_nuclei_output(stdout: str) -> list[dict]:
                 # can't give (those two are the same generic "Global WAF Detect Matchers" string
                 # for every WAF it can recognize). None for every other, non-global-matcher template.
                 "matcher_name": record.get("matcher-name"),
+                "cve_ids": [cid.upper() for cid in _as_str_list(classification.get("cve-id"))],
+                "cvss_score": classification.get("cvss-score"),
+                "cvss_vector": classification.get("cvss-metrics"),
+                "description": info.get("description"),
+                "references": _as_str_list(info.get("reference")),
             }
         )
     return findings

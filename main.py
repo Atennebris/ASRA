@@ -39,11 +39,13 @@ import markdown
 import markupsafe
 from markupsafe import Markup
 
-from agent import desktop_update, updater
+from agent import desktop_update, public_ip, updater
+from agent import settings_transfer
 from agent.chat import (
     _find_thread,
     _get_active_thread,
     append_pending_chat_message,
+    save_chat_picker,
     cancel_queued_chat_message,
     compact_chat_thread,
     delete_chat_thread,
@@ -99,6 +101,21 @@ from agent.tools.capability_install import has_sudo_password, install_capability
 from agent.tools.capability_paths import get_capability_status, load_tool_paths, save_tool_path
 from agent.tools.capability_registry import OPTIONAL_CAPABILITIES, get_capability
 from agent.tools.chat_settings_store import load_chat_settings, save_chat_settings, save_quick_chat_session_id
+from agent.tools.custom_tools_root import (
+    capture_usage_hint,
+    discover_custom_tool_candidates,
+    get_custom_tools_root,
+    save_custom_tools_root,
+    test_custom_tools_root,
+)
+from agent.tools.custom_tools_store import (
+    CUSTOM_TOOL_CATEGORIES,
+    add_custom_tool,
+    load_custom_tools,
+    remove_custom_tool,
+    set_custom_tool_enabled,
+    update_custom_tool,
+)
 from agent.tools.dork_engine import SEARCH_ENGINES as DORK_SEARCH_ENGINES
 from agent.tools.dork_engine import DEFAULT_ENGINE as DORK_DEFAULT_ENGINE
 from agent.tools.dork_engine import build_dork_result, list_dork_categories
@@ -115,11 +132,22 @@ from agent.tools.tool_inventory import list_tool_availability
 from agent.tools.arsenal import summarize_arsenal
 from agent.tools.arsenal_install import (
     approx_download_size_gb,
+    approx_heavy_download_size_gb,
     arsenal_install_status,
     can_autostart,
+    heavy_arsenal_install_status,
+    heavy_can_autostart,
     measure_arsenal_size_gb,
     start_arsenal_install,
+    start_heavy_arsenal_install,
 )
+from agent.opencode_cli import (
+    INSTALL_ACTION as OPENCODE_INSTALL_ACTION,
+    diagnose_opencode_cli,
+    managed_opencode_path,
+    opencode_cli_installed,
+)
+from agent.opencode_install import install_status as opencode_install_status, start_install as start_opencode_install
 from agent.tools.project_backup import (
     auto_backup_worker_loop,
     create_backup as create_project_backup,
@@ -202,12 +230,7 @@ from agent.copilot_oauth import get_valid_copilot_token
 from agent.copilot_oauth import load_tokens as load_copilot_tokens
 from agent.copilot_oauth import start_login_flow as start_copilot_login_flow
 from agent.copilot_provider import COPILOT_MODELS
-from agent.intro_settings import (
-    load_intro_enabled,
-    load_intro_sound_enabled,
-    save_intro_enabled,
-    save_intro_sound_enabled,
-)
+from agent.intro_settings import LAUNCH_SCREENS, load_launch_screen, save_launch_screen
 from agent.sound_settings import (
     SOUND_EVENTS,
     SOUND_PROFILES,
@@ -258,6 +281,7 @@ from agent.utils import lazy_openai
 from agent.utils import crash_diagnostics
 from agent.utils.debug import current_session_id, is_debug_enabled
 from agent.utils.logger import get_logger
+from agent.utils.static_url import make_static_url
 from agent.utils.report_export import (
     EXPORT_FORMATS,
     build_report_data,
@@ -489,8 +513,14 @@ def _desktop_ui_token_ok(websocket: WebSocket) -> bool:
     return secrets.compare_digest(provided, token)
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+_STATIC_DIR = Path("static")
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 templates = Jinja2Templates(directory="templates")
+# `{{ static_url("/static/js/x.js") }}` in templates -- appends the file's own mtime as ?v= so an
+# edited css/js is never served stale from the browser/webview cache (agent/utils/static_url.py).
+templates.env.globals["static_url"] = make_static_url(
+    _STATIC_DIR, cache_seconds=float(os.getenv("STATIC_URL_CACHE_SECONDS", "10"))
+)
 # Real, confirmed incident (2026-11-08): this used to unconditionally force every render to
 # re-read AND re-compile the .html from disk (cache = None) instead of serving a compiled cached
 # copy, on the stated assumption that this is "negligible cost for a local single-operator tool" --
@@ -606,6 +636,8 @@ templates.env.globals["load_clock_show_time"] = load_clock_show_time
 templates.env.globals["load_clock_show_zone_label"] = load_clock_show_zone_label
 templates.env.globals["load_clock_show_date"] = load_clock_show_date
 templates.env.globals["load_clock_style"] = load_clock_style
+# base.html's sidebar "My IP" block reads its auto-hide delay from env at render time (never the IP itself).
+templates.env.globals["public_ip_autohide_seconds"] = public_ip.autohide_seconds
 # Same "callable global, invoked fresh at render time" reasoning as load_display_timezone above --
 # base.html emits window.ASRA_SOUND_SETTINGS from this on every page (not just settings.html), since
 # static/js/sound_events.js's own event watchers (new finding, session done, ...) need to fire from
@@ -651,6 +683,26 @@ def _human_dt(value: str | None) -> str:
 
 
 templates.env.filters["human_dt"] = _human_dt
+
+
+def _human_duration(milliseconds: float | int | None) -> str:
+    """A tool/LLM duration a human can read at a glance: '850ms', '8.8s', '9m 41s', '1h 02m'.
+    static/js/live_elapsed.js formats a running row's live timer the same way, so a row reads
+    identically while it ticks and after it finishes. Empty for a missing value."""
+    if milliseconds is None:
+        return ""
+    total_ms = max(0, int(milliseconds))
+    if total_ms < 1000:
+        return f"{total_ms}ms"
+    if total_ms < 60_000:
+        return f"{total_ms / 1000:.1f}s"
+    total_seconds = total_ms // 1000
+    if total_seconds < 3600:
+        return f"{total_seconds // 60}m {total_seconds % 60:02d}s"
+    return f"{total_seconds // 3600}h {(total_seconds % 3600) // 60:02d}m"
+
+
+templates.env.filters["human_duration"] = _human_duration
 
 
 # The card "Copy" buttons (session_fragment.html) copy a normalized, structured plain-text block
@@ -3834,6 +3886,9 @@ def _interactive_log_entries(session: dict) -> list[dict]:
                 reward = message.get("reward") or {}
                 entries.append({
                     "at": at,
+                    "sort_at": at,
+                    "started_at": None,
+                    "duration_ms": None,
                     "name": f"+{reward.get('delta', 1)} {reward.get('kind', 'reward')}",
                     "arg_summary": reward.get("label"),
                     "output": reward.get("detail"),
@@ -3844,25 +3899,40 @@ def _interactive_log_entries(session: dict) -> list[dict]:
             for segment in message.get("segments", []):
                 if segment.get("type") != "tool_call":
                     continue
+                is_done = segment.get("done", True)
+                started_at = segment.get("started_at") or at
                 entries.append({
-                    "at": at,
+                    # What the row DISPLAYS: the moment the result actually landed -- never the
+                    # reply message's own creation time, which every tool call in that reply shares
+                    # and which a slow tool outlives by minutes (a 10-minute strace_run showed the
+                    # time its model reply was written). A still-running row has no result time yet.
+                    "at": (segment.get("finished_at") or at) if is_done else None,
+                    # What the row is ORDERED by: fixed at start, so a finishing tool never shuffles rows.
+                    "sort_at": started_at,
+                    "started_at": started_at,
+                    "duration_ms": segment.get("duration_ms"),
                     "name": segment.get("name", "?"),
                     "arg_summary": segment.get("arg_summary"),
+                    "llm": segment.get("llm"),
                     "output": segment.get("output"),
                     "error": bool(segment.get("error")),
-                    "done": segment.get("done", True),
+                    "done": is_done,
                 })
     for log_entry in session.get("logs", []):
         command = log_entry.get("command") or ""
         entries.append({
             "at": log_entry.get("at"),
+            "sort_at": log_entry.get("at"),
+            "started_at": None,
+            "duration_ms": log_entry.get("duration_ms"),
             "name": command.split()[0] if command else (log_entry.get("phase") or "?"),
             "arg_summary": command,
+            "llm": log_entry.get("llm"),
             "output": log_entry.get("output") or log_entry.get("thought"),
             "error": log_entry.get("status") not in ("ok", "success"),
             "done": True,
         })
-    entries.sort(key=lambda e: e["at"] or "")
+    entries.sort(key=lambda e: e["sort_at"] or "")
     # Stable, position-based id -- entries are append-only (nothing ever reorders or gets removed
     # from the sources this flattens), so the same real entry keeps the same idx across repeated
     # calls as new ones land after it. interactive_log.html turns this into a real DOM id so
@@ -5638,6 +5708,18 @@ def chat_turn(
     return HTMLResponse(_render_chat_messages(request, session) + _render_chat_header_oob(request, session))
 
 
+@app.post("/api/session/{session_id}/chat/picker", response_class=HTMLResponse)
+def chat_picker_route(
+    session_id: str, provider: str = Form(""), model: str = Form(""), free_only: str | None = Form(None),
+) -> HTMLResponse:
+    """Chat panel's provider/model/free-only pickers -- fired on every change so a pick survives a
+    page refresh (agent/chat.py's save_chat_picker has the full why). No body: the picker already
+    shows what was just chosen, there is nothing to swap in."""
+    if not save_chat_picker(session_id, provider, model, None if free_only is None else free_only == "true"):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return HTMLResponse("")
+
+
 @app.post("/api/session/{session_id}/chat/stop", response_class=HTMLResponse)
 def stop_chat_turn_route(request: Request, session_id: str, thread_id: str = Form(...)) -> HTMLResponse:
     """The "thinking…" indicator's own Stop button (chat_messages.html) -- mirrors /interrupt above
@@ -5975,6 +6057,19 @@ def get_system_health(request: Request) -> HTMLResponse:
     # this one tell "my code is newer than this running instance's" apart from "it's current".
     response.headers["X-ASRA-Source-Mtime"] = str(_SOURCE_MTIME_AT_STARTUP)
     return response
+
+
+@app.get("/api/public-ip")
+async def api_public_ip() -> JSONResponse:
+    """Sidebar "My IP" block (base.html): this machine's current egress IPv4/IPv6, fetched only when
+    the operator clicks reveal -- never polled, so a VPN switch shows up on the very next reveal.
+    no-store because the address is confidential and must not linger in any browser/proxy cache."""
+    results = await public_ip.get_public_ips()
+    payload = {
+        family: {"address": result.address, "error": result.error}
+        for family, result in results.items()
+    }
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/updates/status", response_class=HTMLResponse)
@@ -6316,14 +6411,17 @@ def _llm_settings_context() -> dict:
         # _free_filter_reason's own docstring). Computed here only for this INITIAL render, before
         # any provider switch -- static/js (inline script just below the toggle, settings.html)
         # recomputes the same thing client-side from #model-select's own live data-free attributes
-        # whenever the provider changes, since a server round trip would miss CLAUDE.md's own
+        # whenever the provider changes, since a server round trip would miss the project's own
         # "live visual feedback"/"tab switching must be instant" bar.
         "free_filter_reason": _free_filter_reason(provider_models, current_free_flags, current_provider),
         # Settings -> Providers' own dedicated opencode-local card (same "doesn't fit the generic
         # API-key provider_row() macro" treatment as the ChatGPT/Copilot sign-in cards right below
         # it -- see their own comment). A plain PATH scan, not a network/subprocess call, so this
         # is cheap enough to run on every Settings render, same cost class as an env var read.
-        "opencode_cli_found": shutil.which("opencode") is not None,
+        "opencode_cli_found": opencode_cli_installed(),
+        # The specific reason ("only on the Windows side", "not installed in WSL2 (Ubuntu)") plus
+        # the matching button label -- so the card says what is actually wrong, not just "not found".
+        "opencode_cli_status": diagnose_opencode_cli(),
         "opencode_local_provider_id": OPENCODE_LOCAL_PROVIDER_ID,
         "opencode_local_display_name": OPENCODE_LOCAL_DISPLAY_NAME,
         "opencode_local_enabled": is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID),
@@ -6466,12 +6564,11 @@ def _sound_settings_context() -> dict:
 
 
 def _intro_settings_context() -> dict:
-    """Settings -> Customization -> Visual -- whether the desktop shell's own pre-launch intro
-    animation plays, and whether its synthesized sound (ambient drone + the three glass-impact
-    hits) plays alongside it (agent/intro_settings.py, both written straight to .env since the
-    Rust desktop shell reads them before this backend exists). Read fresh per-request, same as
-    every other Settings context helper here."""
-    return {"intro_enabled": load_intro_enabled(), "intro_sound_enabled": load_intro_sound_enabled()}
+    """Settings -> Customization -> Visual's "Launch screen" -- which of intro / dragon progress
+    bar / nothing the desktop shell shows while the backend starts (agent/intro_settings.py,
+    written straight to .env since the Rust desktop shell reads it before this backend exists).
+    Read fresh per-request, same as every other Settings context helper here."""
+    return {"launch_screen": load_launch_screen()}
 
 
 def _update_settings_context() -> dict:
@@ -6656,6 +6753,9 @@ def get_settings(request: Request) -> HTMLResponse:
     # operator ask to fold Tools into Settings rather than its own sidebar entry).
     tools_context = _grouped_tools_context(list_tool_availability())
     tools_context["nuclei_packs"] = list_nuclei_packs()
+    tools_context["custom_tools_root"] = get_custom_tools_root()
+    tools_context["custom_tools"] = load_custom_tools()
+    tools_context["custom_tool_categories"] = CUSTOM_TOOL_CATEGORIES
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -6946,24 +7046,12 @@ def add_custom_provider_route(
         return RedirectResponse(url="/settings", status_code=303)
 
     if type == OPENCODE_LOCAL_PROVIDER_ID:
-        # Same real dependency check as the Type dropdown's own disabled-option hint (settings.html)
-        # -- re-checked here, never trusted from the client alone (a disabled <option> can still be
-        # submitted by hand). No key/base_url to save for this one, just the same add_provider_to_list
-        # activation every other built-in gets.
-        if shutil.which("opencode") is None:
-            return templates.TemplateResponse(
-                request,
-                "settings.html",
-                {
-                    "error": "The opencode CLI isn't installed on this machine yet — install it from the Tools tab's \"Dependencies\" row (or run setup_tools.sh), then add this provider again.",
-                    "wordlist_error": None,
-                    **_llm_settings_context(),
-                    **_wordlist_settings_context(),
-                    **_fallback_chain_context(),
-                    **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
-                },
-                status_code=400,
-            )
+        # Deliberately NOT gated on the CLI being installed: the provider's own card is where the
+        # one-click "Install opencode" button lives, so refusing to add it until the CLI exists would
+        # leave a new operator with no way to reach that button from here (a dead end on the very
+        # first attempt). A missing CLI is reported -- specifically, with the fix -- on that card.
+        # No key/base_url to save for this one, just the same add_provider_to_list activation every
+        # other built-in gets.
         add_provider_to_list(OPENCODE_LOCAL_PROVIDER_ID)
         logger.debug("api: opencode-local provider activated")
         return RedirectResponse(url="/settings", status_code=303)
@@ -7148,6 +7236,8 @@ def test_opencode_local(request: Request) -> HTMLResponse:
     from agent.opencode_local_provider import list_opencode_local_models
 
     models = list_opencode_local_models()
+    opencode_status = diagnose_opencode_cli()
+    action = None
     # "available" specifically -- the server's own LIVE list (_live_opencode_models inside that
     # function), not the much bigger models.dev catalog fill-in merged alongside it. The catalog
     # entry for "opencode" exists regardless of whether this machine's own server is reachable at
@@ -7171,12 +7261,48 @@ def test_opencode_local(request: Request) -> HTMLResponse:
             )
         else:
             ok, message = True, f"Local opencode server reachable — {len(live_models)} model(s) available right now ({free_count} free)."
-    elif shutil.which("opencode") is None:
-        ok, message = False, "opencode CLI not found on PATH. Install it from the Tools tab, or run setup_tools.sh."
+    elif not opencode_status.usable:
+        ok, message = False, opencode_status.explanation()
+        action = OPENCODE_INSTALL_ACTION if opencode_status.auto_install else None
     else:
         ok, message = False, "opencode CLI found, but the local server didn't return any models — check the app's own debug log for details."
     logger.debug("api: opencode-local test ok=%s live_models=%d total_models=%d", ok, len(live_models), len(models))
-    return templates.TemplateResponse(request, "partials/api_key_test_result.html", {"ok": ok, "message": message})
+    return templates.TemplateResponse(request, "partials/api_key_test_result.html", {
+        "ok": ok, "message": message, "action": action,
+        "install_label": opencode_status.install_label,
+    })
+
+
+def _render_opencode_install(request: Request, reload_page: bool, result: dict | None = None) -> HTMLResponse:
+    """The opencode install panel (partials/opencode_install.html) -- shared by the start and the
+    polled status route. `result` is start_opencode_install()'s own return when called from start:
+    a "manual"/"unsupported" status renders the blocked message (with the exact command to run by
+    hand) instead of a log view for an install that never began. `reload_page` is set by buttons on
+    the Settings page, whose OTHER server-rendered parts (the opencode card's "CLI found" badge, the
+    Add Provider dropdown's disabled option) go stale the moment the install succeeds -- the panel
+    reloads the page once it does, so those never lag the real state."""
+    blocked = result is not None and result["status"] not in ("started", "running")
+    context = {"blocked": blocked, "opencode": diagnose_opencode_cli(), "reload_page": reload_page}
+    if blocked:
+        context.update(blocked_message=result.get("message", "Install unavailable."), blocked_command=result.get("command"))
+    else:
+        context["status"] = opencode_install_status()
+    return templates.TemplateResponse(request, "partials/opencode_install.html", context)
+
+
+@app.post("/api/tools/opencode/install/start", response_class=HTMLResponse)
+def post_opencode_install_start(request: Request, reload: bool = False) -> HTMLResponse:
+    """"Install opencode" button (Settings AI Provider test result, the opencode-local card, Tools ->
+    Check arsenal -> Dependencies): downloads the official CLI release in the background
+    (agent/opencode_install.py) and hands back the live log view, which polls the status route below."""
+    result = start_opencode_install(managed_opencode_path().parent)
+    logger.debug("api: opencode install start -> %s", result["status"])
+    return _render_opencode_install(request, reload, result)
+
+
+@app.get("/api/tools/opencode/install/status", response_class=HTMLResponse)
+def get_opencode_install_status(request: Request, reload: bool = False) -> HTMLResponse:
+    return _render_opencode_install(request, reload)
 
 
 @app.post("/api/settings/providers/github-copilot/login/start")
@@ -7316,24 +7442,16 @@ def save_clock_style_route(style: str = Form("")) -> Response:
 
 
 @app.post("/api/settings/intro")
-def save_intro_enabled_route(enabled: str | None = Form(None)) -> Response:
-    """Settings -> Customization -> Visual's "Play launch intro" switch -- persisted straight to
-    .env (agent/intro_settings.py) rather than this app's usual on-disk JSON stores, since the
-    Rust desktop shell's own get_start_config() reads it directly from .env on the NEXT launch,
-    before this backend even exists. This already-running process has no live use for the new
-    value itself."""
-    save_intro_enabled(bool(enabled))
-    logger.debug("api: intro enabled saved enabled=%s", bool(enabled))
-    return Response(status_code=204)
-
-
-@app.post("/api/settings/intro-sound")
-def save_intro_sound_enabled_route(enabled: str | None = Form(None)) -> Response:
-    """Settings -> Customization -> Visual's "Play intro sound" switch -- same .env-backed
-    convention as save_intro_enabled_route above (agent/intro_settings.py), since the Rust desktop
-    shell reads it directly on the NEXT launch, before this backend exists."""
-    save_intro_sound_enabled(bool(enabled))
-    logger.debug("api: intro sound enabled saved enabled=%s", bool(enabled))
+def save_launch_screen_route(style: str = Form(...)) -> Response:
+    """Settings -> Customization -> Visual's "Launch screen" picker ("intro", "dragon" or "none")
+    -- persisted straight to .env (agent/intro_settings.py) rather than this app's usual on-disk
+    JSON stores, since the Rust desktop shell's own get_start_config() reads it directly from .env
+    on the NEXT launch, before this backend even exists. This already-running process has no live
+    use for the new value itself."""
+    if style not in LAUNCH_SCREENS:
+        raise HTTPException(status_code=400, detail=f"unknown launch screen: {style!r}")
+    save_launch_screen(style)
+    logger.debug("api: launch screen saved style=%s", style)
     return Response(status_code=204)
 
 
@@ -7459,11 +7577,17 @@ def download_wordlist_route(request: Request, source_url: str = Form(""), name: 
 
 
 @app.post("/api/settings/wordlists/assign")
-def assign_wordlist_route(role: str = Form(""), path: str = Form("")) -> Response:
+def assign_wordlist_route(request: Request, role: str = Form(""), path: str = Form("")) -> Response:
+    """Wordlist role dropdowns save on change. The htmx path (what the page really uses) answers 204
+    and the page stays exactly where it is -- a full redirect here used to reload Settings and drop
+    the operator back on its first tab on every single pick. The plain-form redirect stays as the
+    no-JS fallback."""
     if role not in ASSIGNABLE_ROLES:
         raise HTTPException(status_code=400, detail="Unknown wordlist role")
     set_assignment(role, path.strip() or None)
     logger.debug("api: wordlist assignment role=%s path=%r", role, path)
+    if request.headers.get("HX-Request"):
+        return Response(status_code=204)
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -7511,6 +7635,55 @@ def save_sudo_password_route(password: str = Form("")) -> Response:
     save_sudo_password(password)
     logger.debug("api: sudo password %s", "saved" if password.strip() else "cleared")
     return RedirectResponse(url="/settings", status_code=303)
+
+
+# Settings -> General -> Transfer settings (agent/settings_transfer.py holds all the logic). Every
+# route answers JSON because the dialogs drive them with fetch() and never navigate away. A rejected
+# payload is a 400 with a message meant for the owner; no route ever logs a payload or passphrase.
+templates.env.globals["settings_transfer_encryption_available"] = settings_transfer.ENCRYPTION_AVAILABLE
+
+
+@app.post("/api/settings/transfer/export")
+def settings_transfer_export(include_sensitive: str = Form(""), passphrase: str = Form("")) -> JSONResponse:
+    wants_sensitive = include_sensitive == "true"
+    try:
+        payload = settings_transfer.export_settings(include_sensitive=wants_sensitive, passphrase=passphrase or None)
+    except settings_transfer.SettingsTransferError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    sealed = payload.get("sensitive")
+    logger.debug("api: settings export sensitive=%s", sealed is not None)
+    return JSONResponse({
+        "ok": True,
+        "code": settings_transfer.encode_code(payload),
+        "file_json": json.dumps(payload, indent=2, ensure_ascii=False),
+        "filename": f"asra-settings-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",
+        "sections": settings_transfer.export_summary(payload),
+        "sensitive_included": sealed is not None,
+        "encrypted": bool(sealed and sealed["encrypted"]),
+    })
+
+
+@app.post("/api/settings/transfer/preview")
+def settings_transfer_preview(data: str = Form(""), passphrase: str = Form("")) -> JSONResponse:
+    try:
+        summary = settings_transfer.preview_input(data, passphrase or None)
+    except settings_transfer.SettingsTransferError as exc:
+        logger.debug("api: settings import preview rejected")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    logger.debug("api: settings import preview sections=%d sensitive=%s", len(summary["sections"]), summary["has_sensitive"])
+    return JSONResponse({"ok": True, "preview": summary})
+
+
+@app.post("/api/settings/transfer/apply")
+def settings_transfer_apply(data: str = Form(""), passphrase: str = Form(""), include_sensitive: str = Form("")) -> JSONResponse:
+    try:
+        results = settings_transfer.apply_input(data, passphrase or None, include_sensitive=include_sensitive == "true")
+    except settings_transfer.SettingsTransferError as exc:
+        logger.debug("api: settings import rejected, nothing applied")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    all_applied = all(result["status"] == "applied" for result in results)
+    logger.debug("api: settings import applied=%d all_ok=%s", len(results), all_applied)
+    return JSONResponse({"ok": all_applied, "results": results})
 
 
 def _provider_picker_context() -> dict:
@@ -7567,7 +7740,7 @@ def _provider_picker_context() -> dict:
     # against for the local providers it already has. shutil.which is the cheap, correct substitute
     # -- same "is this actually here" signal Codex/Copilot get from is_signed_in(), just checking
     # PATH instead of a token file.
-    opencode_local_ids = [OPENCODE_LOCAL_PROVIDER_ID] if is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID) and shutil.which("opencode") else []
+    opencode_local_ids = [OPENCODE_LOCAL_PROVIDER_ID] if is_provider_enabled(OPENCODE_LOCAL_PROVIDER_ID) and opencode_cli_installed() else []
     return {
         "configured_cloud_provider_ids": [pid for pid in configured_provider_ids if not PROVIDER_REGISTRY[pid].is_local],
         "configured_local_provider_ids": [
@@ -8708,7 +8881,8 @@ def get_arsenal_install_confirm(request: Request) -> HTMLResponse:
         request, "partials/arsenal_confirm.html",
         {"preflight": can_autostart(),
          "measured_gb": measure_arsenal_size_gb(),
-         "approx_gb": approx_download_size_gb()},
+         "approx_gb": approx_download_size_gb(),
+         "heavy": False},
     )
 
 
@@ -8719,11 +8893,11 @@ def post_arsenal_install_start(request: Request, include_wordlists: bool = Form(
     result = start_arsenal_install(include_wordlists=include_wordlists)
     if result["status"] in ("started", "running"):
         return templates.TemplateResponse(
-            request, "partials/arsenal_install.html", {"status": arsenal_install_status(), "blocked": False})
+            request, "partials/arsenal_install.html", {"status": arsenal_install_status(), "blocked": False, "heavy": False})
     return templates.TemplateResponse(
         request, "partials/arsenal_install.html",
         {"blocked": True, "blocked_message": result.get("message", "Install unavailable."),
-         "blocked_command": result.get("command")},
+         "blocked_command": result.get("command"), "heavy": False},
     )
 
 
@@ -8732,7 +8906,112 @@ def get_arsenal_install_status(request: Request) -> HTMLResponse:
     """Polled every 2s by the install view while a run is in flight -- tails the install log and
     stops polling on its own once the process exits (agent/tools/arsenal_install.py)."""
     return templates.TemplateResponse(
-        request, "partials/arsenal_install.html", {"status": arsenal_install_status(), "blocked": False})
+        request, "partials/arsenal_install.html", {"status": arsenal_install_status(), "blocked": False, "heavy": False})
+
+
+@app.get("/api/tools/arsenal/heavy-install/confirm", response_class=HTMLResponse)
+def get_arsenal_heavy_install_confirm(request: Request) -> HTMLResponse:
+    """Same confirm step as get_arsenal_install_confirm, for the "Install (heavy)" button --
+    no measured size (see arsenal_install.py's own comment on why only the base arsenal gets a
+    real `du`-measured number)."""
+    return templates.TemplateResponse(
+        request, "partials/arsenal_confirm.html",
+        {"preflight": heavy_can_autostart(),
+         "measured_gb": None,
+         "approx_gb": approx_heavy_download_size_gb(),
+         "heavy": True},
+    )
+
+
+@app.post("/api/tools/arsenal/heavy-install/start", response_class=HTMLResponse)
+def post_arsenal_heavy_install_start(request: Request) -> HTMLResponse:
+    """Same shape as post_arsenal_install_start, for setup_tools_heavy.sh -- no include_wordlists
+    option (that's the base script's own opt-in, meaningless here)."""
+    result = start_heavy_arsenal_install()
+    if result["status"] in ("started", "running"):
+        return templates.TemplateResponse(
+            request, "partials/arsenal_install.html", {"status": heavy_arsenal_install_status(), "blocked": False, "heavy": True})
+    return templates.TemplateResponse(
+        request, "partials/arsenal_install.html",
+        {"blocked": True, "blocked_message": result.get("message", "Install unavailable."),
+         "blocked_command": result.get("command"), "heavy": True},
+    )
+
+
+@app.get("/api/tools/arsenal/heavy-install/status", response_class=HTMLResponse)
+def get_arsenal_heavy_install_status(request: Request) -> HTMLResponse:
+    """Polled every 2s by the install view while a heavy run is in flight -- its own independent
+    state from the base installer (agent/tools/arsenal_install.py's _HEAVY_STATE)."""
+    return templates.TemplateResponse(
+        request, "partials/arsenal_install.html", {"status": heavy_arsenal_install_status(), "blocked": False, "heavy": True})
+
+
+@app.post("/api/tools/custom-root/test", response_class=HTMLResponse)
+def post_custom_tools_root_test(request: Request, path: str = Form("")) -> HTMLResponse:
+    """Settings -> Tools -> "Custom tools path" -> "Test path": a live, non-persisting check of the
+    CANDIDATE value in the field (never the already-saved one) -- renders the found/missing list
+    plus the real "Save path" form (carrying this exact tested value), so Save only ever appears
+    after a Test has actually run on it (agent/tools/custom_tools_root.py)."""
+    result = test_custom_tools_root(path)
+    result["custom_candidates"] = discover_custom_tool_candidates(path)
+    logger.debug(
+        "api: custom tools root test path=%r found=%d missing=%d custom_candidates=%d",
+        result["path"], len(result["found"]), len(result["missing"]), len(result["custom_candidates"]),
+    )
+    return templates.TemplateResponse(request, "partials/custom_tools_root_test_result.html", {"result": result})
+
+
+@app.post("/api/tools/custom-root/save")
+def post_custom_tools_root_save(path: str = Form("")) -> Response:
+    """Saves the root (already translated to its WSL2 mount form by Test, carried through as a
+    hidden field) -- same "plain form POST, redirect on success" shape as the sibling sudo-password/
+    capability-path save routes just above."""
+    save_custom_tools_root(path)
+    logger.debug("api: custom tools root %s", f"saved ({path!r})" if path.strip() else "cleared")
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@app.post("/api/tools/custom-tools/add")
+def post_custom_tool_add(name: str = Form(...), path: str = Form(...)) -> Response:
+    """Settings -> Tools -> Custom tools -- "Add" on a discovered candidate
+    (discover_custom_tool_candidates). The only explicit confirmation step this registration gets
+    -- capture_usage_hint's own --help capture happens here, synchronously, same "capture now,
+    editable immediately after" flow agent/tools/custom_tools_root.py's own docstring describes;
+    nothing is saved before this click. A full-page redirect, not htmx, so the new entry appears
+    in the "Custom tools" list below through the ordinary GET /settings render -- same convention
+    every other registering POST on this tab already uses (capability path, sudo password, the
+    custom-root save above)."""
+    description = capture_usage_hint(path)
+    add_custom_tool(name=name, path=path, description=description, requires_target=True, category="custom")
+    logger.debug("api: custom tool added name=%r path=%r", name, path)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@app.post("/api/tools/custom-tools/{tool_id}/toggle")
+def post_custom_tool_toggle(tool_id: str, enabled: str | None = Form(None)) -> Response:
+    """Same shape as save_clock_display_route -- one toggle, one independent request, 204 (no
+    body) since hx-swap="none" never touches the DOM; the checkbox's own native checked state is
+    the entire visual feedback, already instant before this request even resolves."""
+    if set_custom_tool_enabled(tool_id, bool(enabled)) is None:
+        raise HTTPException(status_code=404, detail="Unknown custom tool")
+    logger.debug("api: custom tool id=%s enabled=%s", tool_id, bool(enabled))
+    return Response(status_code=204)
+
+
+@app.post("/api/tools/custom-tools/{tool_id}/update")
+def post_custom_tool_update(tool_id: str, description: str = Form(""), category: str = Form("custom"), requires_target: str | None = Form(None)) -> Response:
+    if update_custom_tool(tool_id, description=description, requires_target=bool(requires_target), category=category) is None:
+        raise HTTPException(status_code=404, detail="Unknown custom tool")
+    logger.debug("api: custom tool id=%s updated category=%s requires_target=%s", tool_id, category, bool(requires_target))
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@app.post("/api/tools/custom-tools/{tool_id}/delete")
+def post_custom_tool_delete(tool_id: str) -> Response:
+    if not remove_custom_tool(tool_id):
+        raise HTTPException(status_code=404, detail="Unknown custom tool")
+    logger.debug("api: custom tool id=%s removed", tool_id)
+    return RedirectResponse(url="/settings", status_code=303)
 
 
 @app.get("/api/tools/nuclei-packs", response_class=HTMLResponse)

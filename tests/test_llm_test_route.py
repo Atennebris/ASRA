@@ -199,3 +199,72 @@ def test_two_target_ids_run_fully_concurrently_not_one_at_a_time(monkeypatch):
         time.sleep(0.01)
     assert llm_test_job.test_status("row-a")["state"] == "ok"
     assert llm_test_job.test_status("row-b")["state"] == "ok"
+
+
+def _start_hanging_test(monkeypatch, key, provider, model, hang_seconds=3.0):
+    """Starts a test whose fake completion ignores stop_check for `hang_seconds` -- an in-flight HTTP
+    request that cannot be interrupted, the real shape of a dead free-tier model."""
+    release = __import__("threading").Event()
+
+    def hanging_complete(stop_check):
+        release.wait(timeout=hang_seconds)
+        return LLMResponse(content="late", tool_calls=[])
+
+    monkeypatch.setattr(llm_test_job, "get_provider", lambda p, m: _FakeLLM(on_complete=hanging_complete))
+    llm_test_job.start_test(key, provider, model)
+    return release
+
+
+def test_cancel_ends_the_test_immediately_even_while_a_request_is_still_in_flight(monkeypatch):
+    """Real incident (debug.log 22:41:10 -> 22:42:38): Cancel was clicked but the job stayed
+    "running" ~88s until the hung request returned on its own."""
+    release = _start_hanging_test(monkeypatch, "cancel-key", "openrouter", "dead-model")
+    state = llm_test_job.cancel_test("cancel-key")
+    assert state["running"] is False and state["state"] == "cancelled"
+    release.set()  # the orphaned worker finishing late must not overwrite "cancelled"
+    time.sleep(0.1)
+    assert llm_test_job.test_status("cancel-key")["state"] == "cancelled"
+
+
+def test_a_new_test_for_a_different_model_supersedes_a_hung_one_instead_of_being_swallowed(monkeypatch):
+    """Real incident (debug.log 22:41:41 and 22:42:03): after one bad model hung on the main picker,
+    every later Test click on other providers was answered "already has a test running" and the panel
+    kept showing the OLD job's progress -- so no provider appeared to pass."""
+    release = _start_hanging_test(monkeypatch, "main-key", "openrouter", "dead-model")
+    monkeypatch.setattr(llm_test_job, "get_provider", lambda p, m: _FakeLLM(response=LLMResponse(content="pong", tool_calls=[])))
+    result = llm_test_job.start_test("main-key", "opencode-zen", "big-pickle")
+    assert result["status"] == "started"
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and llm_test_job.test_status("main-key")["running"]:
+        time.sleep(0.01)
+    status = llm_test_job.test_status("main-key")
+    assert (status["provider"], status["model"], status["state"]) == ("opencode-zen", "big-pickle", "ok")
+    release.set()
+    time.sleep(0.1)
+    assert llm_test_job.test_status("main-key")["state"] == "ok"  # stale worker can't clobber the new result
+
+
+def test_clicking_test_again_on_the_same_model_does_not_start_a_second_job(monkeypatch):
+    release = _start_hanging_test(monkeypatch, "same-key", "openrouter", "slow-model")
+    assert llm_test_job.start_test("same-key", "openrouter", "slow-model")["status"] == "already_running"
+    release.set()
+
+
+def test_test_gives_up_after_the_configured_timeout_instead_of_replaying_the_scan_retry_budget(monkeypatch):
+    monkeypatch.setenv("LLM_TEST_TIMEOUT_SECONDS", "0.2")
+    release = _start_hanging_test(monkeypatch, "timeout-key", "openrouter", "dead-model", hang_seconds=3.0)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and llm_test_job.test_status("timeout-key")["running"]:
+        time.sleep(0.02)
+    status = llm_test_job.test_status("timeout-key")
+    assert status["state"] == "error" and "openrouter/dead-model" in status["message"]
+    release.set()
+
+
+def test_running_status_names_the_provider_and_model_being_tested(monkeypatch):
+    release = _start_hanging_test(monkeypatch, "label-key", "opencode-zen", "big-pickle")
+    client = TestClient(main.app)
+    resp = client.get("/api/settings/test-llm/status", params={"target_id": "label-key"})
+    assert "opencode-zen/big-pickle" in resp.text
+    llm_test_job.cancel_test("label-key")
+    release.set()

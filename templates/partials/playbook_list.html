@@ -132,14 +132,21 @@
             {% if t.vuln_class %}<span class="px-1.5 py-0.5 rounded-full border border-default text-secondary uppercase tracking-wide">{{ t.vuln_class }}</span>{% endif %}
           </div>
 
-          {# CVEs + live threat-intel (KEV / EPSS), stamped by refresh_threat_intel. KEV = actively
-             exploited in the wild -> loud red. #}
+          {# CVEs + live threat-intel (KEV / EPSS / CVSS / public PoC), stamped by
+             refresh_threat_intel. KEV = actively exploited in the wild -> loud red. #}
           {% if t.cves %}
             <div class="flex flex-wrap items-center gap-1.5 mt-1.5 text-[9.5px]">
               {% for cve in t.cves %}<span class="px-1.5 py-0.5 rounded-full border border-default text-secondary font-mono">{{ cve }}</span>{% endfor %}
               {% if t.kev %}<span class="px-1.5 py-0.5 rounded-full border border-severity-high/50 bg-severity-high/10 text-severity-high font-semibold uppercase tracking-wide" title="In CISA's Known Exploited Vulnerabilities catalog — actively exploited in the wild">KEV · actively exploited</span>{% endif %}
               {% if t.get('epss_max') is not none %}<span class="px-1.5 py-0.5 rounded-full border border-severity-medium/40 text-severity-medium" title="EPSS — probability this is exploited in the wild">EPSS {{ (t.epss_max * 100) | round | int }}%</span>{% endif %}
+              {% if t.get('cve_cvss_score') is not none %}<span class="px-1.5 py-0.5 rounded-full border border-default text-secondary" title="{{ t.cve_cvss_vector or 'CVSS base score, from the CVE Program record' }}">CVSS {{ t.cve_cvss_score }}</span>{% endif %}
+              {% for repo in (t.get('poc_repos') or [])[:3] %}
+                <a href="{{ repo.url }}" target="_blank" rel="noopener" class="px-1.5 py-0.5 rounded-full border border-accent/40 text-accent hover:bg-accent/10" title="Public repo referencing this CVE (poc-in-github, unofficial) — a lead to verify, not proof it works · {{ repo.stars }}★">PoC: {{ repo.repo }}</a>
+              {% endfor %}
             </div>
+          {% endif %}
+          {% if t.get('cve_description') %}
+            <p class="mt-1.5 text-[10.5px] text-secondary/90 leading-relaxed">{{ t.cve_description }}</p>
           {% endif %}
 
           <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[10px] text-secondary/70">

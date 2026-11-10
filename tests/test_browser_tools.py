@@ -111,6 +111,82 @@ def test_dispatch_browser_tool_navigate_defaults_wait_until_to_domcontentloaded_
     assert captured["wait_until"] == "domcontentloaded"
 
 
+def test_dispatch_browser_tool_navigate_downgrades_networkidle_for_a_previously_unreliable_host(monkeypatch):
+    """Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): the model picked
+    wait_until="networkidle" against an analytics-heavy page (continuous tracking beacons -- the
+    network never actually goes idle) and hit the same 45s Playwright timeout 3 separate times in
+    one session, self-correcting back to domcontentloaded every time but never remembering the
+    lesson between calls. Once this session's own recon_result already knows networkidle doesn't
+    work against this host, a further networkidle request must be downgraded automatically instead
+    of repeating a known-doomed wait."""
+    captured = {}
+
+    class _FakeManager:
+        async def navigate(self, session_id, target, wait_until, out_of_scope_entries, identity):
+            captured["wait_until"] = wait_until
+            return {"status": "ok"}
+
+    monkeypatch.setattr(core, "get_browser_manager", lambda: _FakeManager())
+
+    _run(core._dispatch_browser_tool(
+        "browser_navigate",
+        {
+            "target": "https://example.com/", "wait_until": "networkidle", "_session_id": "usr_nav",
+            "_session": {"recon_result": {"networkidle_unreliable_hosts": ["example.com"]}},
+        },
+    ))
+
+    assert captured["wait_until"] == "domcontentloaded"
+
+
+def test_dispatch_browser_tool_navigate_remembers_a_networkidle_timeout_for_next_time(monkeypatch):
+    """Companion to the downgrade test above: the first real networkidle timeout against a host
+    must actually get recorded, so the NEXT call against that same host (this session) is the one
+    that gets downgraded -- otherwise the lesson above would have nothing to read from."""
+    class _FakeManager:
+        async def navigate(self, session_id, target, wait_until, out_of_scope_entries, identity):
+            return {"status": "error", "error": f"navigation to {target!r} failed: Page.goto: Timeout 45000ms exceeded."}
+
+    monkeypatch.setattr(core, "get_browser_manager", lambda: _FakeManager())
+    saved_session = {"recon_result": {}}
+    mutated_session_ids = []
+
+    def fake_reload_merge_save(session_id, mutate):
+        mutated_session_ids.append(session_id)
+        mutate(saved_session)
+
+    monkeypatch.setattr(core, "_reload_merge_save", fake_reload_merge_save)
+
+    result = _run(core._dispatch_browser_tool(
+        "browser_navigate",
+        {"target": "https://example.com/", "wait_until": "networkidle", "_session_id": "usr_nav", "_session": {}},
+    ))
+
+    assert result["status"] == "error"
+    assert mutated_session_ids == ["usr_nav"]
+    assert saved_session["recon_result"]["networkidle_unreliable_hosts"] == ["example.com"]
+
+
+def test_dispatch_browser_tool_navigate_does_not_record_an_unrelated_error_as_networkidle_timeout(monkeypatch):
+    """Regression guard for the fix above: a real, different error (not a Playwright navigation
+    timeout) against a networkidle call must never get misfiled as "networkidle is unreliable
+    here" -- only an actual Timeout-N-exceeded failure counts."""
+    class _FakeManager:
+        async def navigate(self, session_id, target, wait_until, out_of_scope_entries, identity):
+            return {"status": "error", "error": f"navigation to {target!r} failed: net::ERR_NAME_NOT_RESOLVED"}
+
+    monkeypatch.setattr(core, "get_browser_manager", lambda: _FakeManager())
+    mutated_session_ids = []
+    monkeypatch.setattr(core, "_reload_merge_save", lambda session_id, mutate: mutated_session_ids.append(session_id))
+
+    _run(core._dispatch_browser_tool(
+        "browser_navigate",
+        {"target": "https://example.com/", "wait_until": "networkidle", "_session_id": "usr_nav", "_session": {}},
+    ))
+
+    assert mutated_session_ids == []
+
+
 def test_dispatch_browser_tool_close_session_calls_manager_and_returns_ok(monkeypatch):
     closed = []
 

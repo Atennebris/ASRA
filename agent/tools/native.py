@@ -398,25 +398,39 @@ def wayback_urls(params: dict) -> dict:
     return result
 
 
-def _latest_common_crawl_cdx_api(client: httpx.Client) -> str | None:
+# How many of the newest live Common Crawl indexes common_crawl_urls will try, newest first,
+# before giving up -- see _common_crawl_cdx_apis' own docstring for why more than just the single
+# newest one is needed. 1 extra fallback (2 total) is enough to recover from the known "freshly
+# published index is still warming up" window without burning the caller's whole timeout budget
+# retrying indefinitely.
+_COMMON_CRAWL_MAX_INDEXES_TRIED = 2
+
+
+def _common_crawl_cdx_apis(client: httpx.Client) -> list[str]:
     """Common Crawl publishes a NEW crawl (a new index id, e.g. "CC-MAIN-2024-42") every few
     weeks and eventually retires old ones -- collinfo.json is the public, unauthenticated listing
     of every currently-live index, newest first, so this never hardcodes an id that will
     eventually 404 once that crawl ages out. Cached like every other cache_get/cache_set tool
     result here (agent/tools/cache.py's default TTL), so a whole scan's worth of
     common_crawl_urls calls resolves this exactly once, not once per call.
+
+    Returns every currently-live index's cdx-api URL, newest first, instead of just the single
+    newest one -- real, confirmed incident this fixes: a freshly-published newest index (brand new
+    that week) returned a plain 504 Gateway Time-out under load on EVERY single call in one real
+    session (7/7, across 4 different domains/IPs), with the entire common_crawl_urls recon source
+    producing zero URLs for the whole engagement. collinfo.json already lists every other still-live
+    (and typically already-stable) index right alongside the newest one -- common_crawl_urls below
+    falls back through this same list on a 504 instead of giving up after the newest index alone.
     """
     cached = cache_get("common_crawl_collinfo", "latest")
     if cached is not None:
-        return cached.get("cdx_api")
+        return cached.get("cdx_apis") or []
     resp = client.get("https://index.commoncrawl.org/collinfo.json")
     resp.raise_for_status()
     collections = resp.json()
-    if not collections:
-        return None
-    cdx_api = collections[0].get("cdx-api")
-    cache_set("common_crawl_collinfo", "latest", {"cdx_api": cdx_api})
-    return cdx_api
+    cdx_apis = [c["cdx-api"] for c in collections if c.get("cdx-api")]
+    cache_set("common_crawl_collinfo", "latest", {"cdx_apis": cdx_apis})
+    return cdx_apis
 
 
 def common_crawl_urls(params: dict) -> dict:
@@ -438,28 +452,67 @@ def common_crawl_urls(params: dict) -> dict:
         _persist_candidate_urls(params.get("_session_id"), cached)
         return cached
 
+    # Common Crawl's CDX index is keyed by registrable domain/hostname (it matches against
+    # archived page URLs, which are almost never fetched by bare IP) -- a bare-IP query essentially
+    # never matches anything real, so this returns a quick, honest empty result instead of spending
+    # a real network round-trip (and a slot in the newest-index-may-504 retry below) on a query
+    # that was never going to find real captures either way. Pass the actual hostname instead.
+    try:
+        ipaddress.ip_address(domain)
+    except ValueError:
+        pass
+    else:
+        result = {
+            "status": "ok",
+            "note": "Common Crawl's CDX index is keyed by hostname, not a bare IP -- pass the actual domain/hostname instead.",
+            **declutter_urls([]),
+        }
+        cache_set("common_crawl_urls", domain, result)
+        return result
+
     timeout = float(params.get("timeout") or 45.0)
     try:
         with httpx.Client(timeout=timeout) as client:
-            cdx_api = _latest_common_crawl_cdx_api(client)
-            if cdx_api is None:
+            cdx_apis = _common_crawl_cdx_apis(client)
+            if not cdx_apis:
                 return {"status": "error", "error": "could not resolve Common Crawl's own current index (collinfo.json returned nothing usable)"}
             query_params = {"url": f"{domain}/*", "output": "json", "collapse": "urlkey", "limit": 500, "fl": "url"}
-            resp = client.get(cdx_api, params=query_params)
-            if resp.status_code == 404:
-                result = {"status": "ok", **declutter_urls([])}
-                cache_set("common_crawl_urls", domain, result)
-                return result
-            resp.raise_for_status()
             urls: list[str] = []
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if not line:
+            found = False
+            last_server_error: str | None = None
+            # Newest-first, falling back to the next-newest LIVE index on a 5xx from the index
+            # server itself (a freshly published index is known to 504 under load for a while --
+            # see _common_crawl_cdx_apis' own docstring). A 404 ("No Captures found") is a real,
+            # final, empty answer and stops here immediately, never treated as a reason to keep
+            # trying older indexes.
+            for cdx_api in cdx_apis[:_COMMON_CRAWL_MAX_INDEXES_TRIED]:
+                resp = client.get(cdx_api, params=query_params)
+                if resp.status_code == 404:
+                    found = True
+                    break
+                if resp.status_code >= 500:
+                    last_server_error = f"{resp.status_code} from {cdx_api}"
                     continue
-                try:
-                    urls.append(json.loads(line)["url"])
-                except (json.JSONDecodeError, KeyError):
-                    continue
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        urls.append(json.loads(line)["url"])
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+                found = True
+                break
+            if not found:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Common Crawl's own index server kept failing across the "
+                        f"{len(cdx_apis[:_COMMON_CRAWL_MAX_INDEXES_TRIED])} most recent indexes tried "
+                        f"(last: {last_server_error})"
+                    ),
+                }
     except httpx.HTTPError as exc:
         return {"status": "error", "error": describe_exception(exc)}
 
@@ -1219,7 +1272,13 @@ def interpret_ssl_cert_info_failure(result: dict) -> str | None:
         "CDN/proxy edge (Cloudflare and similar), that's expected: the proxy relies on SNI (the "
         "hostname you connect as) to route to the right certificate/origin, and a bare IP offers no "
         "meaningful SNI value. Retrying this exact IP will fail the same way again -- retry against "
-        "the real hostname that resolves to this IP instead, so the correct SNI is sent."
+        "the real hostname that resolves to this IP instead, so the correct SNI is sent. A "
+        "wildcard-DNS workaround like '<ip>.nip.io' or '<ip>.sslip.io' will NOT fix this and will "
+        "fail identically: the SNI value sent is still that literal made-up string, not a hostname "
+        "the origin actually recognizes -- confirmed live, a real session tried exactly this and got "
+        "the identical handshake failure. Use an ACTUAL hostname this engagement already knows "
+        "resolves to this IP (check this session's own recon data -- e.g. a certificate SAN entry, "
+        "or a subdomain already confirmed to point here), not an invented one."
     )
 
 

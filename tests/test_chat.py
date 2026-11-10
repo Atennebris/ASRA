@@ -466,6 +466,7 @@ def test_chat_tool_specs_both_enabled_includes_web_fetch_and_every_browser_tool(
 def test_chat_tool_specs_both_disabled_is_empty(tmp_path, monkeypatch):
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, False, False)
 
     assert _chat_tool_specs() == []
@@ -477,6 +478,7 @@ def test_chat_tool_specs_includes_dork_search_when_enabled(tmp_path, monkeypatch
     test_chat_tool_specs_both_enabled_includes_web_fetch_and_every_browser_tool above."""
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, False, True)
 
     names = {spec.name for spec in _chat_tool_specs()}
@@ -489,6 +491,7 @@ def test_chat_tool_specs_subagents_enabled_but_no_profile_configured_omits_deleg
     enabled Subagent profiles, same gate agent/core.py's own _subagent_delegation_extras applies."""
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, True, False)
     monkeypatch.setattr("agent.chat.get_enabled_profiles", lambda *a, **k: [])
 
@@ -498,6 +501,7 @@ def test_chat_tool_specs_subagents_enabled_but_no_profile_configured_omits_deleg
 def test_chat_tool_specs_subagents_enabled_with_a_profile_includes_delegation_tools(tmp_path, monkeypatch):
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, True, False)
     monkeypatch.setattr("agent.chat.get_enabled_profiles", lambda *a, **k: [{"name": "recon-helper"}])
 
@@ -512,6 +516,7 @@ def test_chat_tool_specs_interactive_mode_forces_delegation_regardless_of_toggle
     chat_settings toggle off, unlike plain "agent" mode chat just above."""
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, False, False)
     monkeypatch.setattr("agent.chat.get_enabled_profiles", lambda *a, **k: [{"name": "recon-helper"}])
 
@@ -527,6 +532,7 @@ def test_chat_tool_specs_standalone_mode_respects_the_toggle_like_agent_mode(tmp
     chat, even with a Subagent profile enabled."""
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, False, False)
     monkeypatch.setattr("agent.chat.get_enabled_profiles", lambda: [{"name": "recon-helper"}])
 
@@ -543,10 +549,18 @@ def _isolate_toolkit_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(toolkit_settings_store, "TOOLKIT_AGENT_SETTINGS_STORE_PATH", tmp_path / "toolkit_agent_settings.json")
 
 
+def _toolkit_all_off(tmp_path, monkeypatch):
+    """The native toolkit toggles default to ON, so any test asserting an EXACT chat tool set (or an
+    empty one) must pin them off explicitly or the toolkit tools join the expected set."""
+    from agent.tools import toolkit_settings_store
+    _isolate_toolkit_settings(tmp_path, monkeypatch)
+    toolkit_settings_store.save_toolkit_agent_settings({})
+
+
 def test_chat_tool_specs_omits_toolkit_tools_when_every_toggle_is_off(tmp_path, monkeypatch):
     from agent.tools import chat_settings_store
     _isolate_chat_settings(tmp_path, monkeypatch)
-    _isolate_toolkit_settings(tmp_path, monkeypatch)
+    _toolkit_all_off(tmp_path, monkeypatch)
     chat_settings_store.save_chat_settings(False, False, False, False)
 
     assert _chat_tool_specs() == []
@@ -2015,3 +2029,24 @@ def test_compact_chat_thread_unknown_session_raises():
     with patch("agent.chat.load_session", return_value=None):
         with pytest.raises(ValueError, match="Unknown session"):
             _run(compact_chat_thread("usr_missing"))
+
+
+def test_run_chat_tool_loop_records_start_finish_time_duration_and_llm_origin_on_tool_segments():
+    """The Logs row shows when the tool's RESULT landed and how long the tool ran -- not the time the
+    model's reply was created (a slow tool outlives that by minutes)."""
+    ctx = _ctx("usr_loop_timing")
+    tool_call = ToolCallRequest(id="c1", name="suggest_next_steps", arguments={"steps": ["Check login"]})
+    responses = [LLMResponse(content=None, tool_calls=[tool_call]), LLMResponse(content="ok", tool_calls=[])]
+    ctx.llm = SimpleNamespace(provider_id="openrouter", model="nemotron", complete=MagicMock(side_effect=responses))
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    session = _session(ctx.session_id, chat_threads=[{**_new_thread(), "id": "thread_1", "messages": [_msg("user", "go")]}], active_chat_thread_id="thread_1")
+
+    p1, p2 = _patch_chat_persistence(session, "thread_1")
+    with p1, p2:
+        _run(_run_chat_tool_loop(ctx, "thread_1", messages, [], mode="interactive"))
+
+    segment = next(s for s in session["chat_threads"][0]["messages"][-1]["segments"] if s["type"] == "tool_call")
+    assert segment["done"] is True
+    assert segment["started_at"] <= segment["finished_at"]
+    assert isinstance(segment["duration_ms"], int) and segment["duration_ms"] >= 0
+    assert segment["llm"]["provider"] == "openrouter" and segment["llm"]["model"] == "nemotron"

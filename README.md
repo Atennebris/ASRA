@@ -4,6 +4,8 @@ Autonomous Security Research Agent
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docs: English](https://img.shields.io/badge/docs-English-informational.svg)](docs/Documentation_en.md)
 [![Docs: Русский](https://img.shields.io/badge/docs-Русский-informational.svg)](docs/Documentation_ru.md)
+[![Discord](https://img.shields.io/badge/Discord-Join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/D998kaDm79)
+[![XERJ Corpus Hub](https://hub.xerj.org/contributors/Atennebris/badge.svg)](https://hub.xerj.org/contributors/Atennebris)
 
 An autonomous pentesting agent: point it at an authorized target and it recons, analyzes, and
 exploits — driven by an LLM through a ReAct tool-calling loop, streamed live in the browser. Runs

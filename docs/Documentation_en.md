@@ -78,7 +78,13 @@ a per-session approval click in the UI instead.
   OpenRouter work out of the box, plus local providers (LM Studio, Ollama, opencode's own CLI as a
   local server) for running entirely offline. Adding another OpenAI-compatible provider is one
   config row, no code changes. A "Free models only" switch in Settings filters every model picker
-  down to models a provider reports as free.
+  down to models a provider reports as free. The opencode local server needs the opencode CLI
+  where ASRA itself runs — under Windows that means *inside* WSL2 (a Windows-side install can't
+  be used from there). When it's missing the error says exactly what was found (nothing, or only
+  the Windows copy) and an **Install opencode** button next to it (Settings → AI Provider &
+  Model, the opencode card, Tools → Check arsenal → Dependencies) downloads the official CLI
+  release into ASRA's own folder with live progress — no Node.js, no admin rights, the same on
+  Linux, WSL2 and macOS. `OPENCODE_INSTALL_VERSION` pins a version.
 - **Extensible tool registry** — built-in tools (Nmap, Nuclei, Metasploit, sqlmap, Nikto, WhatWeb,
   Wpscan, Dalfox, ffuf, Subfinder, Arjun, Hydra) plus anything else already on `PATH` (amass,
   gobuster, ...) plus your own scripts via `custom_tools.yaml`. Arjun is the one exception to
@@ -113,6 +119,11 @@ a per-session approval click in the UI instead.
   findings, real evidence, and the full human-approval audit trail.
 - **Local-only** — no cloud dependency besides the LLM API call itself, and no database; session
   state is plain JSON on disk.
+- **"My IP" sidebar block** — a small, hidden-by-default block between the Settings nav item and
+  the clock shows your current egress IPv4/IPv6 (a bug bounty program often asks for the tester's
+  own IP) — click the eye icon to reveal it, fetched fresh on that click only (never polled, so
+  switching a VPN shows its new exit IP on the very next reveal), auto-hidden again after
+  `PUBLIC_IP_AUTOHIDE_SECONDS` or as soon as the tab is hidden.
 
 ## Screenshots
 
@@ -123,7 +134,9 @@ screenshots from a synthetic demo project (no real target, provider, or finding)
 
 ![ASRA dashboard — recent projects list with status badges](screenshots/ASRA_screenshot_dashboard.jpg)
 
-**Live run log** (`neo` theme) — every tool call as it happens, phase-tagged and timestamped:
+**Live run log** (`neo` theme) — every tool call as it happens, phase-tagged and timestamped, with the `provider/model` that
+produced the step and how long that LLM request took in seconds (same label in Agent, Interactive
+and Reverse Engineering modes, and on chat tool-call cards):
 
 ![ASRA session Logs tab in the neo theme](screenshots/ASRA_screenshot_logs_neo_theme.jpg)
 
@@ -299,18 +312,84 @@ auto-discovers *additional* recon/exploit tools (e.g. `amass`, `dnsx`, `httpx`, 
 install those separately; they're optional extensions, not part of this script.
 
 The same script also installs the Reverse Engineering project mode's own toolset: **radare2**
-(plus the `r2ghidra` plugin via `r2pm` for decompilation, and `radiff2`, bundled with it), **gdb**,
+(plus the `r2ghidra` plugin via `r2pm` for decompilation, and `radiff2`, bundled with it — a
+`disassemble_function`/`decompile_function` call against a specific, already-seen function reuses a
+small on-disk name→address cache from an earlier call on the same unchanged file instead of
+re-running the full, expensive whole-binary analysis every time; set
+`RADARE2_WARM_PROJECT_CACHE=false` to always run the full analysis instead, byte-identical to not
+having this at all), **gdb**,
 **strace** (syscall/behavioral triage), **wine** (runs a Windows PE target directly for dynamic
 analysis), **heimdall** (EVM bytecode decompilation, via its own `bifrost` installer, which pulls a
 Rust/Cargo toolchain via `rustup` first if missing), **upx** (packed-binary unpacking),
 **osv-scanner** and **trufflehog** (source-repo dependency/secret scanning), **apktool** and
 **jadx** (Android APK decompilation), **binwalk** (firmware analysis), **tshark** (packet capture —
-`dumpcap` is granted `cap_net_raw`/`cap_net_admin` via `setcap` so live capture never needs root),
-and **scanmem** (live-process memory scan/patch — also granted `cap_sys_ptrace` via `setcap`;
-Linux-only). `slither`, `semgrep`, `pyevmasm` (Solidity analysis / SAST / EVM disassembly),
+`dumpcap` is granted `cap_net_raw`/`cap_net_admin` via `setcap` so live capture never needs root;
+pass `raw_payload: true` to also pull the full TCP/UDP segment payload as hex, for a target's own
+custom binary protocol tshark has no built-in dissector for — a game's netcode, a proprietary
+control channel), and **scanmem** (live-process memory scan/patch — also granted `cap_sys_ptrace`
+via `setcap`; reaches a Linux/WSL2 process only — pass `platform: "windows"` on the same
+`memscan_*` tools to reach a REAL Windows process instead, via the desktop app's own live-memory
+bridge, described below). `slither`, `semgrep`, `pyevmasm` (Solidity analysis / SAST / EVM disassembly),
 `frida` (dynamic instrumentation), `pwntools`, and `scapy` (exploit-primitive/packet scripting for
 `custom_re_script`) are plain Python packages, installed into the venv by `run.sh` like every other
-`requirements.txt` dependency — nothing extra to run for those six.
+`requirements.txt` dependency — nothing extra to run for those six. `pwntools` is also a real,
+always-available Reverse Engineering mode tool on its own (`pwntools_analysis`, no install step
+needed) — generates a cyclic pattern to crash a target with, finds a captured crash value's exact
+byte offset into that pattern, and parses a real core dump file into structured crash facts
+(signal, program counter, stack pointer, fault address, a short raw stack dump) — post-mortem
+analysis that complements `gdb_run`'s own live breakpoint debugging rather than duplicating it.
+`binary_semantic_diff` is a third always-available Reverse Engineering mode tool built on top of
+radare2/Ghidra (no install step beyond what they already need): a semantic (not byte-level — that's
+`radiff2`) diff between two versions of the same binary. It first compares cheap inventory
+(radare2 symbols/imports — functions added, removed, or changed in size) and, by default, resolves
+the genuinely ambiguous case (same name, same size) with a bounded Ghidra decompile-and-content-
+digest comparison per function, degrading to the cheap diff alone if Ghidra isn't available.
+
+**Windows live-memory bridge (desktop app only).** ASRA's own agent process runs inside WSL2 even
+when launched "on Windows" (see Architecture below), so `scanmem` — the default backend behind
+`memscan_attach`/`memscan_scan`/`memscan_list`/`memscan_write`/`memscan_detach` — can only ever
+reach a Linux/WSL2 process, never a real native Windows one (a Windows game client, for instance).
+Passing `platform: "windows"` on those same tools routes instead through a small bridge built into
+the desktop shell (`desktop/src-tauri`) itself: that process already runs natively on Windows, so
+it can `OpenProcess`/`ReadProcessMemory`/`WriteProcessMemory` against a real Windows process
+directly, exposed to the WSL2-side agent over a local, per-launch-token-protected TCP listener
+(bound only to `127.0.0.1` and the WSL-facing virtual network adapter — never a real LAN
+interface). Same classic scan/narrow/list/write-by-index workflow and safety property as the
+Linux path (a write only ever targets a match this session's own scan already found, never a raw
+address). Requires launching ASRA via the desktop app on Windows — a plain `run.sh`/`run.bat`
+launch has no bridge to reach, and the tool returns a clear error explaining that rather than
+failing silently. `ASRA_MEM_BRIDGE_ENABLED` (`.env`, default `true`) and `ASRA_MEM_BRIDGE_PORT`
+(default `47219`) control it.
+
+Two more always-available (pure-Python, no install step) Reverse Engineering mode tools cover JS/
+Electron client-side analysis, a category otherwise fully blind: **`js_bundle_graph`** decodes a
+bundled JS file's own source map (Source Map v3) to recover each ORIGINAL source file's real
+content — a file-by-file structural breakdown (imports/exports/functions/classes), and exactly
+where a real secret or an undocumented API route is actually readable (the unminified original,
+not the bundle's own minified text); complements `js_bundle_scan`'s own secret/endpoint pattern
+scan (run both for full coverage — one reconstructs, the other scans). **`electron_surface`**
+statically maps an Electron app's own IPC/contextBridge/preload security surface from a `.asar`
+archive or an already-extracted app directory (no app launched, no external `asar` tool needed —
+its own from-scratch Pickle-header parser) — every `ipcMain`/`ipcRenderer`/`contextBridge` call
+site, `webPreferences`/`nodeIntegration`/`contextIsolation`/`sandbox` settings, native `.node`
+addons, and (given the main Electron binary's own path too) Electron Fuses — the compile-time
+toggles controlling whether `--inspect`/`ELECTRON_RUN_AS_NODE` are honored at runtime. For LIVE
+observation of an already-running Electron/SPA renderer instead of static files, the same module
+also exposes a small JS expression (`window.require`/`window.process.versions.electron`/exposed
+`contextBridge` globals) meant to run through the existing `browser_evaluate` tool against the
+agent's own already-open browser session — no second browser/CDP connection.
+
+A fourth always-available Reverse Engineering mode tool, **`go_buildinfo`**, reads a Go binary's own
+embedded build/module metadata — module path, dependency list with versions and checksums, and
+build settings (GOOS/GOARCH, CGO_ENABLED, VCS revision). `mode="buildinfo"` (default) uses
+`go version -m` when a real Go toolchain is installed; without one, it falls back to locating the
+exact same plain-text block directly inside the binary (Go has embedded it that way, verbatim,
+since 1.18 specifically so tooling can find it without a toolchain) — the toolchain-backed read is
+authoritative, the fallback is a heuristic byte scan and is flagged as such (`inferred`, with a
+confidence caveat) in the result. `mode="nm_symbols"` reads the binary's own symbol table via
+`go tool nm` — this one genuinely needs a Go toolchain, with no text-based fallback possible for a
+real binary section. Dependency names alone often point straight at a known-vulnerable third-party
+library worth checking before decompiling anything.
 
 #### macOS
 
@@ -331,6 +410,14 @@ https://github.com/projectdiscovery/interactsh/releases and put it on PATH. `set
 Linux/WSL2-only (apt/dnf/pacman) — macOS uses Homebrew instead. ffuf also needs a wordlist on
 macOS — `setup_tools.sh`'s auto-installed one is Linux-only; grab e.g. SecLists'
 `Discovery/Web-Content/common.txt` manually and point `FFUF_WORDLIST_PATH` at it.
+
+`setup_tools_heavy.sh` (the "Install (heavy)" button's own script, see below) also runs on macOS
+the same way — `bash setup_tools_heavy.sh` from a real terminal, same as `setup_tools.sh` above
+(the Settings-page button itself is Linux/WSL2-only, same restriction as **Install**). It installs
+a JDK + sigrok-cli + adb + WABT via Homebrew (`openjdk`, `sigrok-cli`, `--cask
+android-platform-tools`, `wabt`) and Ghidra itself from its own GitHub release (not Homebrew) —
+pwntools/pwndbg/pyelftools/unicorn/unblob install the same way on every OS (plain pip/git, no
+package-manager branch at all).
 
 Chromium/Playwright doesn't need Homebrew — `playwright install` is cross-platform:
 ```bash
@@ -360,6 +447,84 @@ terminal, or for confirming the arsenal is still intact later.
   passwordless `sudo` if configured, and otherwise shows the exact `sudo bash setup_tools.sh`
   command to paste into a real terminal — it never prompts for a password inside the page.
 - **Linux/WSL2 only** — the button reports itself unsupported on native Windows or macOS.
+- **Install (heavy)** runs a separate, larger, slower script (`setup_tools_heavy.sh`, ~15-25 GB) for
+  tools deliberately kept out of the fast base install above: headless Ghidra (+ the JDK it needs),
+  pwntools/pwndbg/pyelftools/unicorn, sigrok-cli, unblob, adb, and WABT. Same confirm/background/
+  log-tail mechanism as **Install**, just a second button and its own log — never counted toward
+  the base arsenal's own readiness percentage, so not installing it never reads as "something's
+  missing" on an otherwise fully-provisioned machine. Ghidra is a real, callable Reverse
+  Engineering mode tool once installed (program info, function list, pseudo-C decompilation,
+  disassembly, cross-references, control-flow graphs, p-code def-use graphs — the same
+  `decompile_function`-style shape radare2/r2ghidra already offers, generally more accurate on
+  complex/obfuscated binaries). A persistent per-project server process (started on the first call
+  against a given binary, reused by every later call) keeps the real cost — a full analysis, which
+  can take minutes on a large/complex target — to a one-time charge: every later call against the
+  SAME unchanged binary reuses the already-running server and typically finishes in well under a
+  second, confirmed live (~0.4s vs. the ~54s a fresh server start needs). The server shuts itself
+  down after 15 minutes of inactivity (`GHIDRA_SERVER_IDLE_TIMEOUT_SECONDS`) and self-heals
+  automatically if it's ever killed abruptly or its own project state gets corrupted. Beyond the
+  read-only modes above: `value_flow` extends the p-code def-use graph with each value's actual
+  concrete content (a constant's real hex value, a recovered parameter's name/type/register, a
+  compiler temporary vs. a real register/address), the function's own recovered parameter list and
+  return type, and a compiled switch statement's resolved jump-table targets; `inspect_native_data_type`
+  shows a struct/union/enum's real member layout (offsets, field names, bitfield bit-ranges);
+  `set_address_name` and `annotate_native_function` WRITE to the analysis database (rename a
+  function/label, or leave a persistent comment on a function) and verify the write by reading it
+  straight back before reporting success; `fix_no_return_flags` clears incorrectly-set no-return
+  flags (both a small known-returning-libc-import allowlist and any local function whose body
+  genuinely contains a real return instruction) that would otherwise make Ghidra's own analyzer
+  silently truncate a caller's disassembly right after a call. `fix_mips_soft_float` (32-bit MIPS
+  binaries only) fixes Ghidra's own MIPS32 model, which assumes HARD-float o32 (float/double in
+  `$f12`/`$f14`/`$f0`) — a soft-float o32 target (a real embedded/MIPS toolchain configuration, not
+  every MIPS binary) passes float/double through the same integer registers/stack as any other
+  same-size value instead, so every float-typed function's actual arguments/return would otherwise
+  be read from the wrong place. It reports `applicable: false` with zero database change on
+  anything that isn't genuinely 32-bit MIPS, and defaults to `dry_run: true` — reporting every
+  function/function-pointer-type that WOULD be reassigned to the corrected calling convention with
+  no writes at all — until an explicit follow-up call with `dry_run: false` actually installs it.
+  `unblob`, `sigrok-cli`, and `adb` are
+  also real, callable Reverse Engineering mode tools once installed: `unblob` extracts firmware/
+  container formats (complements `binwalk`, not a replacement — more handlers, automatic
+  recursion); `sigrok-cli` captures logic-analyzer signals (its own `scan` mode always reports a
+  built-in demo driver even with no real hardware attached, so that alone never proves a device is
+  connected — real capture beyond the demo driver needs one); `adb` gives live Android device/
+  emulator access (shell commands, APK install, file pull, logcat) — needs a real connected device
+  or running emulator for anything beyond listing (an empty list is the honest, valid answer when
+  neither is present). **`wasm_analyze`** is likewise real and callable once WABT is installed
+  (the same "Install (heavy)" button, or `brew install wabt` on macOS) — static analysis for a
+  compiled WebAssembly (`.wasm`) module, increasingly common in a browser/web-client target (a
+  game's physics/crypto core, an anti-bot check compiled to WASM instead of JS): `mode="validate"`
+  is a cheap well-formedness check; `mode="info"` (the default) lists every import/export/
+  function/memory/table/global by name and signature — often enough on its own to answer "what
+  does this module do"; `mode="disassemble"` gives a per-function WASM instruction listing;
+  `mode="decompile_wat"` re-encodes the whole module as readable WebAssembly Text (WAT) — a
+  lossless, structured textual form, the closest a stack-machine bytecode like WASM has to a
+  native decompiler's pseudocode. **`native_binary_metadata`** is a third always-available (pure-Python, no
+  install step) Reverse Engineering mode tool: `mode="rust_cargo_auditable"` extracts a Rust
+  binary's real embedded dependency list (name/version/kind) directly from its own `.dep-v0` ELF
+  section, no external tool needed; `mode="hermes"` and `mode="flutter"` confirm (via magic-byte
+  header parsing alone) whether a file is React Native's Hermes JS bytecode or a Flutter/Dart AOT
+  snapshot, and read what the header itself declares (bytecode format version; the engine
+  snapshot-hash) — detection only for those two, since a real decompiler for either format is a
+  new install this tool doesn't assume is present; `mode="dotnet_nativeaot"` reads a .NET binary
+  published with `PublishAot=true` (which contains no managed IL for `ilspycmd` to decompile at
+  all) — it finds and parses the binary's own embedded "RTR" (ReadyToRun) directory directly from
+  the file bytes: real format/version plus every section's type/flags/start-end address range, no
+  external tool or Ghidra needed for this inventory-level read.
+- **Custom tools path** lets you point ASRA at a folder of tools you already have on disk, never
+  installed through either button above (e.g. carried over from another machine). Accepts a
+  Windows-style path (`C:\path\to\tools`) and translates it to its WSL2 form itself; "Test path" shows what
+  it actually finds there before you save it. Searches a bounded depth under that root for each
+  tool's exact executable name, not just the folder itself or its own `bin/` subfolder — a real
+  nested install (e.g. Ghidra's own `<root>/ghidra_<version>/support/analyzeHeadless` layout) is
+  found automatically, whatever an individual operator's own folder structure happens to be.
+- **Custom tools** registers a binary ASRA's own registry has no builder for at all — "Test path"
+  above also lists any executable it finds that matches no known tool, with an "Add" button per
+  candidate. Once added and enabled, it becomes a real, named tool the agent (and its subagents)
+  can call — using whichever flags its own usage text (captured automatically, editable after)
+  documents — sandboxed the same way model-written exploit scripts already are, since this is an
+  arbitrary binary the project has no track record with. A toggle, description, category, and
+  "requires a live target" checkbox are editable per tool at any time.
 
 ## Stage 2: install and run ASRA
 
@@ -432,9 +597,18 @@ finishes.
 `EXPLOIT_REQUIRE_APPROVAL`, the saved sudo password, and anything else in `.env.example` can be set
 before the backend starts, with no text-editor step. Two settings get dedicated controls: **Run
 the agent as root** (Windows/WSL2 only — does nothing on native Linux/macOS, since there's no WSL2
-layer to target) and the pre-launch intro animation's on/off + sound toggle. If a previous launch
+layer to target) and the launch screen (Settings → Customization → Visual → **Launch screen**:
+the animated intro, shown by default; a dragon progress bar where a dragon grows into its own
+silhouette as the backend starts; or nothing at all, where the Start button just reads
+"Starting…"; applies on the next launch. The intro's soundtrack is not available yet and is shown
+locked in Settings → Sounds). If a previous launch
 is stuck (WSL2 itself wedged, not just the backend), the start screen also offers **Force restart
 ASRA**, which kills the stuck process/distro state and lets you launch clean.
+
+In **Web** mode the server keeps running after the launcher hands you the URL, so that panel also
+has a red **Stop server** button. It asks first — a scan that is still running is interrupted and
+every open ASRA browser tab stops working until you click Start again; saved projects and findings
+stay on disk — and only then stops the server.
 
 It's optional and additive — `run.bat`/`run.sh` + browser keep working exactly the same. The shell
 lives in `desktop/src-tauri/` (a thin Tauri/Rust wrapper — it renders no UI of its own; the pentest
@@ -490,6 +664,14 @@ An interrupted session (e.g. the server restarted mid-scan) shows up on the sess
 (`/sessions`) as *interrupted*, with a **Resume** button that picks the run back up from the last
 completed phase instead of starting over.
 
+**Tool rows in the logs and chat** show, for each call: the `provider/model` that produced it with
+that model request's answer time (`LLM 3.2s`), the tool's own run time (`9m 41s`) once it has
+finished, and the time its result landed. While a tool is still running the row shows a live
+`running 3m 12s` ticker instead, and no finish time is claimed in advance.
+
+**Zoom the whole UI** with `Ctrl` + `+` / `-` (or `Ctrl` + mouse wheel); `Ctrl` + `0` returns to 100%.
+The level is remembered on this machine (works in the desktop app and in a browser tab alike).
+
 ## Configuration
 
 Every runtime setting lives in `.env` — `.env.example` has the full list with inline explanations.
@@ -497,7 +679,7 @@ The ones worth knowing going in:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LLM_PROVIDER` | `opencode-zen` | Which provider to use — `opencode-zen` (free, no key), `qwen`, `mistral`, `openrouter` (each needs its own `*_API_KEY`), a local `lmstudio`/`ollama` server (no key), or `opencode-local` (spawns the `opencode` CLI as a local server — free, no key, needs `opencode` on `PATH`; Settings-only choice, not set via this env var) |
+| `LLM_PROVIDER` | `opencode-zen` | Which provider to use — `opencode-zen` (free, no key), `qwen`, `mistral`, `openrouter` (each needs its own `*_API_KEY`), a local `lmstudio`/`ollama` server (no key), or `opencode-local` (spawns the `opencode` CLI as a local server — free, no key, needs the opencode CLI — installed with one click from Settings; Settings-only choice, not set via this env var) |
 | `ENABLE_EXPLOIT` | `true` | `false` runs Recon + Analyze only — no exploitation phase at all |
 | `EXPLOIT_REQUIRE_APPROVAL` | `false` | `false` (default): exploitation proceeds autonomously the instant Exploit wants to run something (still fully logged). `true`: pause and wait for a per-session approval click before each attempt. The allowlist/scope check applies either way — this only gates the human-in-the-loop prompt |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | `120` | Per-call timeout for LLM API responses, before backoff retries |
@@ -511,6 +693,9 @@ The ones worth knowing going in:
 | `APP_DATA_DIR` | auto-detected | Where the global debug log is written; defaults to `Documents/ASRA` per OS if unset |
 | `DEBUG` | `false` | Verbose per-category logging — see Development below |
 | `INTERACTSH_CLIENT_PATH` | auto-detected | Override if `interactsh-client` isn't on PATH (blind SSRF/XSS confirmation) |
+| `PUBLIC_IP_V4_URL` / `PUBLIC_IP_V6_URL` | `https://api.ipify.org` / `https://api6.ipify.org` | Plain-text lookup services behind the sidebar's "My IP" block (each must answer a GET with nothing but the address) |
+| `PUBLIC_IP_TIMEOUT_SECONDS` / `PUBLIC_IP_CACHE_SECONDS` | `4` / `5` | Per-lookup timeout, and a tiny server-side cache TTL that only absorbs a double-click — kept short so a VPN switch never shows a stale IP for long |
+| `PUBLIC_IP_AUTOHIDE_SECONDS` | `30` | How long the sidebar's "My IP" block stays revealed before it hides itself again |
 
 The LLM provider/model can also be changed later from `/settings` without editing `.env` again.
 
@@ -519,6 +704,34 @@ exploitation allowlist, per-project credentials, and real scan data under `Docum
 `Documents/ASRA Projects` (see `PROJECTS_DIR`/`APP_DATA_DIR` above) —
 [SECURITY.md](../SECURITY.md#data-asra-stores-locally-know-whats-on-disk) has the complete, exact
 inventory, worth a read before sharing a debug log or a machine.
+
+### Transferring settings to another machine
+
+**Settings → General → Transfer settings** moves your own configuration to another machine of yours.
+*Export settings* gives you one payload in two interchangeable forms — a single pasteable code
+(`ASRA1:…`, copied to the clipboard, no file needed) or the same data as a `.json` file. *Import
+settings* accepts either, shows a preview (which sections, how many items, whether it carries
+sensitive data) and changes nothing until you press **Apply import**. A malformed, oversized or
+foreign payload is rejected as a whole, with a message, and nothing is written.
+
+- **Transferred:** the LLM provider/model choice, the "free models only" switch, secondary
+  verification, the Reserve providers chain, custom LLM providers and provider endpoint overrides,
+  chat and native-toolkit toggles, subagent profiles (they arrive disabled so you can review them),
+  wordlist assignments (by file name, re-resolved on the new machine — a wordlist that isn't there is
+  skipped and reported), timezone and clock, sounds, launch screen and the update-check switch. Import
+  merges: items present in the payload overwrite, everything else on the target is left alone.
+- **Never transferred, even if you choose to include secrets:** absolute paths and install locations
+  (data dir, wordlist files, tool paths, nuclei packs, custom-tools root), projects and sessions,
+  the Quick Chat session id, ChatGPT/Copilot sign-in tokens, and the exploitation allowlist.
+- **With or without sensitive data:** clicking *Export settings* asks first. **Export without
+  sensitive data** (the default) leaves out every API key and the sudo password.
+  **Export including API keys and sudo password** adds them — your own choice and your own risk:
+  anyone who gets that code or file can use those keys and the sudo password, so treat it like a
+  password. You can set an optional **passphrase**: the sensitive part is then encrypted (Fernet with a
+  PBKDF2-HMAC-SHA256 key and a random salt stored in the payload) and the same passphrase is required
+  on import. Without a passphrase those values are in the payload unencrypted, and the dialog says so.
+  If the `cryptography` package isn't installed, the passphrase option is hidden and the sensitive part
+  is never encrypted.
 
 ## Development
 

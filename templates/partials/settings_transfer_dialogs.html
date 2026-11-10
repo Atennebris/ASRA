@@ -1,0 +1,165 @@
+{# Export / Import dialogs for Settings -> General -> "Transfer settings" (settings_transfer_card.html).
+   Behavior lives in static/js/settings_transfer.js; the data rules live in agent/settings_transfer.py.
+   Elements the script shows/hides carry no display utility of their own (flex/grid/...) so the plain
+   `hidden` class always wins. #}
+
+<dialog id="settings-export-dialog" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-lg backdrop:bg-black/60 backdrop:backdrop-blur-sm">
+  <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+    <span class="text-[13px] font-semibold">Export settings</span>
+    <button type="button" data-transfer-action="close" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+  </div>
+
+  <div id="transfer-export-choose" class="p-4 space-y-4">
+    <p class="text-[12px] text-secondary">
+      Choose what goes into the export. You get the same data both as a code you can paste and as a file.
+    </p>
+
+    <div class="space-y-1.5">
+      <button type="button" data-transfer-action="export-plain"
+              class="w-full inline-flex items-center justify-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-2 text-sm font-medium disabled:opacity-40">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Export without sensitive data
+      </button>
+      <p class="text-[11px] text-secondary">Settings only. No API keys, no sudo password, no sign-in tokens.</p>
+    </div>
+
+    <div class="rounded-lg border border-severity-high/30 bg-severity-high/5 p-3 space-y-3">
+      <div class="flex items-start gap-2">
+        <svg class="w-4 h-4 shrink-0 mt-0.5 text-severity-high" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3l10 18H2L12 3z" stroke-linejoin="round"/><path d="M12 10v5M12 18v.01" stroke-linecap="round"/></svg>
+        <p class="text-[12px] text-primary">
+          Anyone who gets this code or file can use these API keys and the sudo password. Treat it like a
+          password: don't post it in chats or tickets. Including them is your own choice and your own risk.
+        </p>
+      </div>
+
+      {% if settings_transfer_encryption_available %}
+        <label class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Passphrase <span class="normal-case font-normal">(optional)</span></span>
+          <input id="transfer-export-passphrase" type="password" autocomplete="new-password"
+                 class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+        <p id="transfer-export-plain-hint" class="text-[11px] text-severity-high">
+          No passphrase: the keys and password are included unencrypted and readable by anyone who has the code or file.
+        </p>
+        <p id="transfer-export-encrypted-hint" class="hidden text-[11px] text-secondary">
+          The keys and password are encrypted with this passphrase (Fernet, PBKDF2). You must enter the same passphrase when importing; it cannot be recovered.
+        </p>
+      {% else %}
+        <input id="transfer-export-passphrase" type="hidden" value="">
+        <p id="transfer-export-plain-hint" class="text-[11px] text-severity-high">
+          The keys and password are NOT encrypted: the optional passphrase needs the "cryptography" package, which is not installed here.
+        </p>
+        <p id="transfer-export-encrypted-hint" class="hidden"></p>
+      {% endif %}
+
+      <button type="button" data-transfer-action="export-sensitive"
+              class="w-full inline-flex items-center justify-center gap-2 rounded-md bg-severity-high/10 text-severity-high border border-severity-high/30 hover:bg-severity-high/20 px-3.5 py-2 text-sm font-medium transition-colors disabled:opacity-40">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3" stroke-linecap="round"/></svg>
+        Export including API keys and sudo password
+      </button>
+    </div>
+
+    <p id="transfer-export-error" role="alert" class="hidden px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-[12px] break-words"></p>
+  </div>
+
+  <div id="transfer-export-result" class="hidden p-4 space-y-3">
+    <p class="text-[13px] font-semibold">Export ready</p>
+    <p id="transfer-export-sensitivity" class="text-[12px] text-secondary"></p>
+    <ul id="transfer-export-sections" class="space-y-1 rounded border border-default bg-elevated px-3 py-2"></ul>
+    <label class="block">
+      <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Settings code</span>
+      <textarea id="transfer-export-code" rows="4" readonly spellcheck="false"
+                class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary break-all focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+    </label>
+    <div class="flex flex-wrap items-center gap-2">
+      <button type="button" data-transfer-action="copy-code"
+              class="inline-flex items-center gap-1.5 rounded-md bg-accent hover:bg-accent-hover text-white px-3 py-1.5 text-[12px] font-medium">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 012-2h9" stroke-linecap="round"/></svg>
+        Copy code
+      </button>
+      <button type="button" data-transfer-action="download-file"
+              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Download file
+      </button>
+      <span id="transfer-copy-status" role="status" class="hidden text-[12px] font-medium"></span>
+      <button type="button" data-transfer-action="export-back" class="ml-auto text-[12px] text-secondary hover:text-primary">Back</button>
+    </div>
+    <p class="text-[11px] text-secondary">The code and the file hold exactly the same data; either one works in Import settings.</p>
+  </div>
+</dialog>
+
+<dialog id="settings-import-dialog" class="bg-surface text-primary border border-default rounded-xl shadow-2xl p-0 w-full max-w-lg backdrop:bg-black/60 backdrop:backdrop-blur-sm">
+  <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+    <span class="text-[13px] font-semibold">Import settings</span>
+    <button type="button" data-transfer-action="close" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+  </div>
+
+  <div class="p-4 space-y-3">
+    <p class="text-[12px] text-secondary">
+      Paste a settings code, or choose an exported file. You will see what it contains before anything is changed.
+    </p>
+    <textarea id="transfer-import-data" rows="4" spellcheck="false" autocomplete="off" placeholder="ASRA1:..."
+              class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary break-all focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+    <div class="flex flex-wrap items-center gap-2">
+      <label class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-primary transition-colors cursor-pointer">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z" stroke-linejoin="round"/><path d="M14 3v5h5" stroke-linejoin="round"/></svg>
+        Choose file
+        <input id="transfer-import-file" type="file" accept=".json,.txt,application/json,text/plain" class="sr-only">
+      </label>
+      <span id="transfer-import-file-name" class="text-[11px] text-secondary break-all"></span>
+      <button id="transfer-import-preview-btn" type="button" data-transfer-action="import-preview"
+              class="ml-auto inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-primary transition-colors disabled:opacity-40">
+        Preview
+      </button>
+    </div>
+
+    <p id="transfer-import-error" role="alert" class="hidden px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-[12px] break-words"></p>
+
+    <div id="transfer-import-preview" class="hidden space-y-3">
+      <div>
+        <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">This code contains</p>
+        <ul id="transfer-import-sections" class="space-y-1 rounded border border-default bg-elevated px-3 py-2"></ul>
+        <p class="text-[11px] text-secondary mt-1">Only the settings listed are changed. Anything not listed stays as it is on this machine.</p>
+      </div>
+
+      <div id="transfer-import-sensitive" class="hidden rounded-lg border border-severity-high/30 bg-severity-high/5 p-3 space-y-2">
+        <div class="flex items-start gap-2">
+          <svg class="w-4 h-4 shrink-0 mt-0.5 text-severity-high" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3" stroke-linecap="round"/></svg>
+          <p id="transfer-import-sensitive-text" class="text-[12px] text-primary"></p>
+        </div>
+        <div id="transfer-import-passphrase-wrap" class="hidden">
+          <label class="block">
+            <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Passphrase</span>
+            <input id="transfer-import-passphrase" type="password" autocomplete="off"
+                   class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+        </div>
+        <div id="transfer-import-include-wrap">
+          <label class="flex items-start gap-2 cursor-pointer">
+            <input id="transfer-import-include" type="checkbox" checked class="mt-0.5">
+            <span class="text-[12px] text-primary">Also import the API keys and sudo password (they replace the ones saved here).</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="flex justify-end">
+        <button id="transfer-import-apply" type="button" data-transfer-action="import-apply" disabled
+                class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed">
+          Apply import
+        </button>
+      </div>
+    </div>
+
+    <div id="transfer-import-results" class="hidden space-y-2">
+      <p id="transfer-import-done" role="status" class="hidden text-[12px] font-medium text-primary"></p>
+      <ul id="transfer-import-result-list" class="space-y-1 rounded border border-default bg-elevated px-3 py-2"></ul>
+      <div id="transfer-import-reload" class="hidden text-right">
+        <button type="button" data-transfer-action="import-reload"
+                class="rounded-md border border-default bg-elevated hover:bg-overlay px-3 py-1.5 text-[12px] text-primary">Reload Settings</button>
+      </div>
+    </div>
+  </div>
+</dialog>
+
+<script src="{{ static_url('/static/js/settings_transfer.js') }}"></script>

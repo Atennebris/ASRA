@@ -131,6 +131,74 @@ def test_common_crawl_urls_errors_when_collinfo_returns_nothing_usable(monkeypat
     assert result["status"] == "error"
 
 
+def test_common_crawl_urls_falls_back_to_the_next_newest_index_on_a_504(monkeypatch):
+    """Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): the single newest
+    index (freshly published that week) returned a plain 504 Gateway Time-out on EVERY call in one
+    real session (7/7, across 4 different domains/IPs) -- the whole recon source produced zero
+    URLs for the entire engagement, even though collinfo.json lists other, typically-stable older
+    indexes right alongside the newest one."""
+    _isolate_cache(monkeypatch)
+    collinfo = [
+        {"id": "CC-MAIN-2026-43", "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-43-index"},
+        {"id": "CC-MAIN-2026-42", "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-42-index"},
+    ]
+    seen_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen_urls.append(url)
+        if "collinfo.json" in url:
+            return httpx.Response(200, json=collinfo)
+        if "2026-43-index" in url:
+            return httpx.Response(504, text="Gateway Time-out")
+        return httpx.Response(200, text=json.dumps({"url": "https://example.com/recovered"}))
+
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(handler))
+
+    result = common_crawl_urls({"domain": "example.com"})
+
+    assert result["status"] == "ok"
+    assert result["urls"] == ["https://example.com/recovered"]
+    assert any("2026-42-index" in url for url in seen_urls)  # the fallback index was actually queried
+
+
+def test_common_crawl_urls_errors_when_every_tried_index_keeps_failing(monkeypatch):
+    _isolate_cache(monkeypatch)
+    collinfo = [
+        {"id": "CC-MAIN-2026-43", "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-43-index"},
+        {"id": "CC-MAIN-2026-42", "cdx-api": "https://index.commoncrawl.org/CC-MAIN-2026-42-index"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "collinfo.json" in str(request.url):
+            return httpx.Response(200, json=collinfo)
+        return httpx.Response(504, text="Gateway Time-out")
+
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(handler))
+
+    result = common_crawl_urls({"domain": "example.com"})
+
+    assert result["status"] == "error"
+    assert "504" in result["error"]
+
+
+def test_common_crawl_urls_short_circuits_on_a_bare_ip_without_a_network_call(monkeypatch):
+    """Common Crawl's CDX index is keyed by hostname, not IP -- querying it with a bare IP
+    essentially never matches a real captured URL, so this should return a quick empty result
+    without spending a real network round-trip at all."""
+    _isolate_cache(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make any network call for a bare IP domain")
+
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(handler))
+
+    result = common_crawl_urls({"domain": "198.202.211.1"})
+
+    assert result["status"] == "ok"
+    assert result["urls"] == []
+
+
 def test_common_crawl_urls_is_registered_with_recon_category():
     import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
     from agent.tools.registry import get_tool

@@ -4,6 +4,7 @@
    _interactive_log_entries and handed here as `entries`. Fetched fresh each time the modal opens
    (session.html's shared Interactive/RE branch), not live-streamed -- a review view, not a
    running feed. #}
+{% from "macros/ui.html" import llm_origin, tool_timing %}
 {% if not entries %}
   <div class="flex flex-col items-center justify-center text-center py-12 px-6">
     <svg class="w-7 h-7 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -41,7 +42,11 @@
             {% endif %}
             <span class="font-mono font-semibold text-primary shrink-0">{{ e.name }}</span>
             {% if e.arg_summary %}<span class="font-mono text-secondary/70 truncate flex-1 min-w-0">{{ e.arg_summary }}</span>{% else %}<span class="flex-1"></span>{% endif %}
-            <span class="text-secondary/60 shrink-0 whitespace-nowrap">{{ e.at | human_dt }}</span>
+            {{ llm_origin(e.llm, running=not e.done) }}
+            {{ tool_timing(e.done, e.duration_ms, e.started_at) }}
+            {# Only once the result exists: the time of the model's reply (shared by every call in
+               it) used to sit here, minutes before a slow tool actually finished. #}
+            {% if e.at %}<span class="text-secondary/60 shrink-0 whitespace-nowrap">{{ e.at | human_dt }}</span>{% endif %}
           </summary>
           <div class="border-t border-default px-3 py-2">
             <pre class="whitespace-pre-wrap break-words text-[10px] font-mono text-secondary max-h-56 overflow-y-auto asra-scroll">{{ e.output or "(no output recorded)" }}</pre>

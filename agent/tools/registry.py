@@ -62,6 +62,16 @@ class ToolSpec:
     # exact run that actually found something as "error" and never even hand its JSON to the output
     # parser, silently making the tool look broken precisely when it worked.
     ok_exit_codes: frozenset[int] = field(default_factory=lambda: frozenset({0}))
+    # Optional per-tool timeout override, checked FIRST by runner.py's _timeout_for -- before the
+    # usual scan/exploit-category env var -- for a tool whose own real-world duration doesn't fit
+    # either generic bucket. Deliberately generic (not a hardcoded tool-name check inside
+    # _timeout_for) so the NEXT tool found to need its own budget plugs in here the same way,
+    # without touching the timeout function itself. Real, confirmed incident this exists for:
+    # nuclei (Live-Nation-HackerOne-usr_0f5c71) -- TOOL_TIMEOUT_SECONDS=600 was consistently not
+    # enough against a real target, 4/4 attempts across two hosts. Both None (the default, every
+    # existing tool) keeps the old scan/exploit-category behavior unchanged.
+    timeout_env_var: str | None = None
+    timeout_default_seconds: int | None = None
     # tool_tier=2 only, optional: a tool that can come back "ok" (real exit code, no error) while
     # still silently degraded in a way the tool's own output already names a fix for — nmap's host
     # discovery ping getting blocked by a firewall/CDN (extremely common: ICMP is routinely
@@ -96,6 +106,18 @@ class ToolSpec:
     # tier-1 tool) keeps the old always-True behavior unchanged; set this to a cheap, cached
     # zero-argument predicate to make availability reflect reality instead.
     availability_check: Callable[[], bool] | None = None
+    # tool_tier=2 only: whether this tool is provisioned by setup_tools_heavy.sh (the "heavy"/
+    # extended arsenal -- larger/slower tools like Ghidra, pwntools/pwndbg, sigrok-cli, unblob,
+    # adb, WABT, ...) rather than the fast base setup_tools.sh. A separate bool from
+    # tool_tier itself on purpose: tool_tier already distinguishes native(1)/external(2) --
+    # "which script provisions an external tool" is an independent question, not a third tier
+    # value that would conflate the two. agent/tools/arsenal.py's summarize_arsenal() counts heavy
+    # tools in their own heavy_total/heavy_installed bucket, entirely separate from the base
+    # arsenal's own external_total/verdict/percent/modes -- a heavy tool the operator never
+    # installs (by design, via the separate "Install (heavy)" button) must never make the ordinary
+    # "Check arsenal"/"Install" verdict read as perpetually degraded for something it was never
+    # responsible for provisioning.
+    heavy: bool = False
     # tool_tier=2 only, optional: a memoization key for a tool whose output is a pure, deterministic
     # function of its inputs, so re-running the identical command on an unchanged input file is
     # provably wasted work. Given (the just-built command, params), returns a cache key string, or
@@ -108,6 +130,21 @@ class ToolSpec:
     # changes the output (the full command AND the input file's mtime), so a modified target busts
     # it automatically.
     result_cache_key: Callable[[list[str], dict], str | None] | None = None
+    # tool_tier=2 only, optional: a tool whose own wrapper subprocess deliberately always exits 0 --
+    # even when the real operation failed -- so a caught internal exception reads as a clean result
+    # rather than the wrapper script itself crashing (qiling_runner.py's own module docstring/main()
+    # explain why). That means run_tool()'s normal exit-code-based status ("ok" for any ok_exit_codes
+    # member) can never see the failure; it only ever shows up nested inside the parsed JSON payload.
+    # Given that payload (the SAME dict the tool's own output parser just produced), returns an error
+    # message when the payload itself reports a failure the exit code didn't, or None when it
+    # genuinely succeeded. _apply_output_parser (agent/core.py) applies this right after parsing,
+    # downgrading an "ok" result to "failed" with that message -- the one place both the exit-code
+    # status and the parsed payload are available together. Real, confirmed incident this exists for:
+    # qiling_emulate's rootfs/loader failures (missing Windows registry dir, qiling not importable,
+    # ...) always came back {"status": "ok", ...} at the top level, so the chat UI showed a plain
+    # successful tool call -- a green dot -- for a run that never actually emulated anything, with
+    # the real failure visible only to a model (or operator) that happened to read the raw JSON text.
+    parsed_error_override: Callable[[dict], str | None] | None = None
 
     # requires_allowed_target=True is the default expectation for exploit/post_exploit tools,
     # but not an absolute rule: msf_module_search is category="exploit"

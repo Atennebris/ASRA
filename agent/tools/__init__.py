@@ -2,18 +2,22 @@
 import sys
 
 from agent.tools.amass_runner import amass_available, amass_enum
+from agent.tools.builders.adb import build_adb_command
 from agent.tools.builders.apktool import build_apktool_command
+from agent.tools.builders.binary_semantic_diff import binary_semantic_diff_available, run_binary_semantic_diff
 from agent.tools.builders.binwalk import build_binwalk_command
-from agent.tools.builders.qiling import build_qiling_command, qiling_available
+from agent.tools.builders.qiling import build_qiling_command, qiling_available, qiling_parsed_error_override
 from agent.tools.builders.dalfox import build_dalfox_command
 from agent.tools.builders.exploit import build_exploit_command, build_msf_module_search_command
 from agent.tools.builders.ffuf import build_ffuf_command
 from agent.tools.builders.frida import build_frida_ps_command, build_frida_trace_command
 from agent.tools.builders.gdb import build_gdb_command
+from agent.tools.builders.ghidra import ghidra_available, run_ghidra
 from agent.tools.builders.heimdall import build_heimdall_command
 from agent.tools.builders.ilspycmd import build_ilspycmd_command
 from agent.tools.builders.jadx import build_jadx_command
 from agent.tools.builders.mythril import build_mythril_command
+from agent.tools.builders.native_binary_metadata import run_native_binary_metadata
 from agent.tools.builders.nikto import build_nikto_command
 from agent.tools.builders.nmap import (
     build_nmap_command,
@@ -22,21 +26,32 @@ from agent.tools.builders.nmap import (
 )
 from agent.tools.builders.nuclei import build_nuclei_command
 from agent.tools.builders.osv_scanner import build_osv_scanner_command
-from agent.tools.builders.radare2 import build_radare2_command, radare2_result_cache_key
+from agent.tools.builders.pwntools_analysis import run_pwntools_analysis
+from agent.tools.builders.radare2 import (
+    build_radare2_command,
+    radare2_result_cache_key,
+    retry_radare2_write_on_permission_denied,
+)
 from agent.tools.builders.radiff2 import build_radiff2_command
 from agent.tools.builders.semgrep import build_semgrep_command
 from agent.tools.builders.slither import build_slither_command
+from agent.tools.builders.sigrok_cli import build_sigrok_cli_command
 from agent.tools.builders.sqlmap import build_sqlmap_command
 from agent.tools.builders.strace import run_strace, strace_available
 from agent.tools.builders.subfinder import build_subfinder_command
 from agent.tools.builders.tshark import build_tshark_capture_command, build_tshark_read_pcap_command
 from agent.tools.builders.trufflehog import build_trufflehog_command
+from agent.tools.builders.unblob import run_unblob, unblob_available
+from agent.tools.builders.go_buildinfo import run_go_buildinfo
+from agent.tools.builders.wasm import run_wasm_analyze, wasm_analyze_available
 from agent.tools.builders.upx import build_upx_command
 from agent.tools.builders.whatweb import build_whatweb_command
 from agent.tools.builders.wpscan import build_wpscan_command
 from agent.tools.discovery import discover_known_tools, load_custom_tools
 from agent.tools.dork_engine import SEARCH_ENGINES as _DORK_SEARCH_ENGINES
 from agent.tools.dork_engine import dork_search_native, list_dork_categories
+from agent.tools.bundle_runtime_graph import run_bundle_runtime_graph
+from agent.tools.electron_surface import run_electron_surface
 from agent.tools.memscan_manager import (
     SCAN_MODES,
     VALUE_TYPES,
@@ -46,6 +61,7 @@ from agent.tools.memscan_manager import (
     memscan_scan,
     memscan_write,
 )
+from agent.tools.js_bundle_graph import run_js_bundle_graph
 from agent.tools.native import (
     afl_fuzz_start,
     api_schema_discovery,
@@ -287,6 +303,16 @@ register_tool(
         build_command=build_nuclei_command,
         requires_allowed_target=False,
         installed_by_default=True,
+        # Own timeout budget, not the generic TOOL_TIMEOUT_SECONDS every other "scan" tool shares
+        # -- see ToolSpec.timeout_env_var's own docstring and build_nuclei_command's -duc comment
+        # for the real incident (Live-Nation-HackerOne-usr_0f5c71) this exists for. 1200s is a
+        # reasoned safety-net default, not a tightly measured one (the live -duc isolation test
+        # meant to pin this exactly was interrupted by an unrelated out-of-memory kill, not a code
+        # failure) -- re-verify with a live timed -duc run against an approved target
+        # (ginandjuice.shop) when that's possible again, and adjust if it proves too tight or
+        # unnecessarily generous.
+        timeout_env_var="NUCLEI_TIMEOUT_SECONDS",
+        timeout_default_seconds=1200,
         description=(
             "Runs Nuclei vulnerability templates against a URL/host — active checks, not just "
             "passive banner matching (default tags: cve,vuln,exposure,rce,misconfig,takeover,"
@@ -3683,6 +3709,13 @@ register_tool(
         # Every read analysis re-runs a full `aaa` (~2m30s on a large binary); the identical command
         # on an unchanged file is byte-identical, so memoize it (write/hex_patch opts itself out).
         result_cache_key=radare2_result_cache_key,
+        # A `-w` write (hex_patch/hex_patch_asm) that fails with a plain OS-level permission error
+        # has nothing for the generic LLM "corrected retry" to usefully fix -- see
+        # retry_radare2_write_on_permission_denied's own docstring for the real incident (a patch
+        # dead-ended on `Permission denied`, and the weak free model's own "fixes" then corrupted
+        # the call's `analysis` field entirely). Same deterministic, code-level retry mechanism
+        # nmap's own retry_command_on_result already uses for "Host seems down".
+        retry_command_on_result=retry_radare2_write_on_permission_denied,
         requires_allowed_target=False,
         installed_by_default=True,
         description=(
@@ -3698,7 +3731,11 @@ register_tool(
             "letting r2's own assembler compute the correct machine code instead of hand-crafting "
             "hex bytes yourself; prefer this over hex_patch for anything beyond a trivial NOP). "
             "Both patch modes write real bytes to the file on disk; a one-time .asra-bak backup of "
-            "the original is made automatically the first time this session patches a given file."
+            "the original is made automatically the first time this session patches a given file. "
+            "A result list longer than 50 entries (functions/xrefs_to/strings/symbols/imports/"
+            "exports on a large binary) comes back paged: the response carries total_entries and "
+            "next_offset, plus a full_dump_path to the complete untruncated list on disk -- pass "
+            "that same next_offset back as this call's own 'offset' to get the next page."
         ),
         parameters_schema={
             "type": "object",
@@ -3708,6 +3745,10 @@ register_tool(
                     "type": "string",
                     "enum": ["info", "imports", "exports", "strings", "symbols", "sections", "entrypoint", "functions", "disassemble_function", "decompile_function", "xrefs_to", "hex_view", "hex_search", "hex_patch", "hex_patch_asm"],
                     "description": "Which analysis to run.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Only meaningful when a previous call on this same analysis/address came back with next_offset set (the result list was longer than 50 entries) -- pass that next_offset value here to get the next page. Omit on a first call.",
                 },
                 "address": {
                     "type": "string",
@@ -3818,6 +3859,501 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="ghidra",
+        category="re",
+        tool_tier=1,
+        executable="analyzeHeadless",
+        build_command=None,
+        native_function=run_ghidra,
+        # See agent/tools/builders/ghidra.py's own module docstring for why this is tier-1 (a
+        # file-based result + a project-reuse decision that has to happen before a command can
+        # even be built) despite naming a real external executable, the same shape
+        # agent/tools/custom_tool_runtime.py's own minted ToolSpecs already use.
+        availability_check=ghidra_available,
+        requires_allowed_target=False,
+        installed_by_default=False,
+        heavy=True,
+        description=(
+            "Ghidra's own headless decompiler -- static analysis of a local binary (ELF/PE/"
+            "Mach-O), complementing radare2's decompile_function with Ghidra's own, generally "
+            "higher-quality decompiler for complex/obfuscated binaries. mode=\"info\": program "
+            "metadata (format, language, image base, entry/exit addresses, function count). "
+            "mode=\"functions\": the function list (name, entry address, size). "
+            "mode=\"decompile_function\": pseudo-C for one function (target=its name or address). "
+            "mode=\"disassemble_function\": raw disassembly for one function. "
+            "mode=\"xrefs_to\": every reference TO a function/address, with the calling function's "
+            "own name where resolvable. mode=\"cfg\": the function's control-flow graph -- each "
+            "basic block's own address range plus its successor edges (each tagged with a real "
+            "flow type: CONDITIONAL_JUMP/UNCONDITIONAL_JUMP/FALL_THROUGH/CALL/...), including "
+            "edges leaving the function's own body (e.g. a CALL to another function). "
+            "mode=\"pcode_def_use\": the function's p-code operations (decompiler's own "
+            "intermediate representation -- address, mnemonic, output/input values) plus, for "
+            "each value, which operation defined it and which operations consume it -- useful for "
+            "tracing exactly where a value (e.g. a length check, a decrypted key byte) actually "
+            "comes from and where it flows to, at a finer grain than the pseudocode text alone. "
+            "mode=\"value_flow\": everything pcode_def_use gives, PLUS the function's own recovered "
+            "parameters (name + inferred type), the function's inferred return type, each jump "
+            "table's resolved case targets (for a compiled switch statement), and a concrete value "
+            "classification per value (constant/register/address/compiler-temporary, with the "
+            "actual hex value for a constant/address, and whether it IS one of the function's own "
+            "parameters) -- use this instead of pcode_def_use whenever you need the ACTUAL value a "
+            "register/variable carries, not just which operations touch it. "
+            "mode=\"inspect_native_data_type\": a struct/union/enum's member layout (target=the "
+            "type's name, e.g. \"struct timeval\", or an address where a typed value is already "
+            "defined) -- each member's offset, length, field name, and own type; bitfield members "
+            "additionally report their bit offset/size. "
+            "mode=\"set_address_name\" (WRITES to the analysis database): renames a function, or "
+            "creates/renames a label at a non-function address (target=the function name/address "
+            "to rename, value=the new name) -- the write is verified by reading the name back "
+            "before returning; a mismatch between the requested and actually-applied name (e.g. a "
+            "collision) is reported in \"unknown\", not silently swallowed. "
+            "mode=\"annotate_native_function\" (WRITES to the analysis database): sets a persistent "
+            "comment on a function (target=the function name/address, value=the comment text), "
+            "shown directly above that function in Ghidra's own listing -- same write-then-verify "
+            "discipline as set_address_name. "
+            "mode=\"fix_no_return_flags\" (WRITES to the analysis database, no target/value needed): "
+            "clears incorrectly-set no-return flags that make Ghidra's own analyzer silently "
+            "truncate a caller's disassembly right after a call -- both on a small fixed allowlist "
+            "of externally-imported libc/runtime functions known to be mis-flagged, and on any "
+            "LOCAL function whose own body genuinely contains a real return instruction despite "
+            "being flagged no-return; re-fits every caller that had been truncated by the wrong "
+            "flag. Run this once early when a binary's disassembly looks suspiciously cut short "
+            "right after a call. "
+            "mode=\"fix_mips_soft_float\" (WRITES to the analysis database, no target/value needed, "
+            "32-bit MIPS binaries only): fixes Ghidra's own MIPS32 model, which assumes HARD-float "
+            "o32 (float/double parameters and returns in $f12/$f14/$f0) -- a soft-float o32 binary "
+            "(a real, common embedded/MIPS toolchain configuration, not every MIPS target) passes "
+            "float/double through the SAME integer registers/stack as any other same-size value, so "
+            "every float-typed function's actual arguments/return get read from the wrong place "
+            "without this fix. Reports \"applicable\": false with no database change at all on "
+            "anything that isn't genuinely 32-bit MIPS. The `dry_run` parameter (default true) "
+            "reports every function/function-pointer-type that WOULD be reassigned, with zero "
+            "writes -- call again with dry_run=false once you've reviewed that list to actually "
+            "install the soft-float calling convention and reassign them; any failure during the "
+            "real pass rolls back completely, leaving nothing partially applied. "
+            "The FIRST call against a given (unmodified) binary runs a full analysis and can take "
+            "several minutes on a large/complex target; every later call against the SAME "
+            "unchanged binary reuses that analysis and is fast. Any WRITE mode's effect persists "
+            "for the lifetime of that binary's own Ghidra project (every later call against the "
+            "same unmodified file sees it), but is lost if the binary itself changes (a different "
+            "mtime starts a fresh project)."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local binary to analyze."},
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "info", "functions", "decompile_function", "disassemble_function", "xrefs_to", "cfg",
+                        "pcode_def_use", "value_flow", "inspect_native_data_type", "set_address_name",
+                        "annotate_native_function", "fix_no_return_flags", "fix_mips_soft_float",
+                    ],
+                    "description": "Which analysis (or write) to run.",
+                },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Function name/address, or a data type name -- required for every mode except "
+                        "info/functions/fix_no_return_flags/fix_mips_soft_float. Ignored otherwise."
+                    ),
+                },
+                "value": {
+                    "type": "string",
+                    "description": (
+                        "The new name (set_address_name) or comment text (annotate_native_function) to "
+                        "write. Required for those two modes, ignored otherwise."
+                    ),
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "Only read by mode=\"fix_mips_soft_float\" (ignored otherwise). Defaults to true: "
+                        "reports the candidate functions/types with zero database writes. Pass false to "
+                        "actually install the soft-float prototype and reassign them."
+                    ),
+                },
+            },
+            "required": ["file_path", "mode"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="js_bundle_graph",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python (stdlib-only Source Map v3 VLQ decoding) -- no subprocess at all
+        build_command=None,
+        native_function=run_js_bundle_graph,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Reconstructs a bundled JS file's ORIGINAL per-file source from its source map "
+            "(Source Map v3, decoded here directly -- no js_bundle_scan duplication, this is "
+            "reconstruction, not secret/endpoint scanning, run both for full coverage). Recovers "
+            "each original source file's real content (when the map embeds sourcesContent -- "
+            "commonly the FULL unminified original, exactly where a real secret or an "
+            "undocumented API route is actually readable, unlike the minified bundle itself), "
+            "plus a regex-based structural overview per file (imports/requires, exports, "
+            "function/class declarations -- not a full AST parse, a fast dependency-free "
+            "approximation). Looks for the map at an explicit map_path, a sibling \"<bundle>.map\" "
+            "file, or an inline base64 sourceMappingURL comment, in that order."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "bundle_path": {"type": "string", "description": "Path to the local bundled JS file."},
+                "map_path": {"type": "string", "description": "Optional explicit path to the .map file, if it isn't a sibling of bundle_path or inlined in it."},
+            },
+            "required": ["bundle_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="electron_surface",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python (stdlib-only ASAR/fuse parsing) -- no subprocess at all
+        build_command=None,
+        native_function=run_electron_surface,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Static Electron app surface mapping -- no app is launched. app_path can be a .asar "
+            "archive (unpacked in-memory via a real ASAR Pickle-header parser, no external asar "
+            "tool needed) or an already-extracted app directory. Reports: package.json's main "
+            "entrypoint, native .node addons, and every ipcMain.handle/handleOnce/on/once, "
+            "ipcRenderer.invoke/send/sendSync/on, contextBridge.exposeInMainWorld/"
+            "exposeInIsolatedWorld call found across the JS (plus webPreferences/nodeIntegration/"
+            "contextIsolation/sandbox/preload settings, and bare \"domain:action\"-shaped string "
+            "literals app-specific wrappers often hide real channel names behind). With "
+            "electron_binary_path also given (the main Electron executable, or on macOS the "
+            "Electron Framework binary inside the .app bundle), also reads Electron Fuses -- "
+            "compile-time toggles for whether RunAsNode/--inspect/embedded-ASAR-integrity are "
+            "honored at runtime; absent fuses means UNKNOWN state, never assumed disabled. For "
+            "LIVE renderer-side observation of an already-running app through ASRA's own browser "
+            "session instead of static files, see the companion runtime probe this module exposes "
+            "(window.require/window.process.versions.electron/exposed contextBridge globals) -- "
+            "run it via browser_evaluate against an open page, not a separate call here."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "app_path": {"type": "string", "description": "Path to a local .asar archive, or an already-extracted Electron app directory."},
+                "electron_binary_path": {"type": "string", "description": "Optional: path to the main Electron executable (or the Electron Framework binary on macOS) to also read its Electron Fuses from."},
+            },
+            "required": ["app_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="bundle_runtime_graph",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python synthesis over electron_surface + js_bundle_graph -- no subprocess at all
+        build_command=None,
+        native_function=run_bundle_runtime_graph,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Synthesizes electron_surface's own ASAR/IPC/contextBridge scan into a per-file graph: "
+            "which runtime context each file's code most likely runs in (main process, preload "
+            "bridge, renderer -- pattern-based, each node carries its own reasoning basis, never "
+            "claimed as ground truth), plus every endpoint-shaped string (absolute http(s)/ws(s) "
+            "URL, relative \"*api*\" path) referenced from that file's own text. app_path is the "
+            "same shape as electron_surface (.asar archive or an already-extracted app directory). "
+            "In directory mode, a large .js file is additionally expanded via js_bundle_graph's own "
+            "source-map reconstruction, attaching each original source's structure and endpoints as "
+            "children of that bundle's node -- this expansion is NOT attempted against a packed "
+            ".asar directly (extract it to a directory first if that's needed)."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "app_path": {"type": "string", "description": "Path to a local .asar archive, or an already-extracted Electron app directory."},
+                "electron_binary_path": {"type": "string", "description": "Optional: passed through to electron_surface to also read Electron Fuses (not otherwise used by this tool's own graph)."},
+            },
+            "required": ["app_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="pwntools_analysis",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python (pwntools, already a project dependency) -- no subprocess at all
+        build_command=None,
+        native_function=run_pwntools_analysis,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Pwntools' own crash/exploit-primitive analysis -- post-mortem/offline, complements "
+            "gdb's own live breakpoint debugging rather than duplicating it. "
+            "mode=\"cyclic_pattern\": generates a De Bruijn-based input pattern (default "
+            "length=200) for feeding a target to trigger a crash with recognizable control data. "
+            "mode=\"cyclic_offset\": given a value captured from a real crash (e.g. a corrupted "
+            "return address), finds its exact byte offset into that pattern -- the standard "
+            "technique for locating the overflow offset. mode=\"parse_corefile\": structured "
+            "facts from a real core dump file (signal, program counter, stack pointer, fault "
+            "address, a short raw stack dump, the crashed binary's own path) -- generates one via "
+            "e.g. `gdb --batch -ex run -ex \"generate-core-file <path>\" -ex quit <binary>` "
+            "(the gdb tool, run_args to actually trigger the crash) or a fuzzer's own saved crash."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["cyclic_pattern", "cyclic_offset", "parse_corefile"],
+                    "description": "Which analysis to run.",
+                },
+                "length": {
+                    "type": "integer",
+                    "description": "cyclic_pattern only: pattern length in bytes (default 200).",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "cyclic_offset only: the captured value (e.g. a corrupted return address) to locate, as a hex string (\"0x6161616c\") or plain decimal.",
+                },
+                "n": {
+                    "type": "integer",
+                    "description": "cyclic_offset only: the value's width in bytes (default: the target architecture's own pointer size, 8 for a typical 64-bit binary). Set explicitly if the captured value is a different width.",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "parse_corefile only: path to a real core dump file.",
+                },
+            },
+            "required": ["mode"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="unblob",
+        category="re",
+        tool_tier=1,
+        executable="unblob",
+        build_command=None,
+        native_function=run_unblob,
+        # See agent/tools/builders/unblob.py's own module docstring for why this is tier-1: its
+        # own exit code is not a reliable success signal (confirmed live), and the real
+        # structured result is a --report JSON file the generic tier-2 pipeline can't read.
+        availability_check=unblob_available,
+        requires_allowed_target=False,
+        installed_by_default=False,
+        heavy=True,
+        description=(
+            "unblob's own firmware/container extractor -- complements binwalk (byte-signature "
+            "carving) rather than replacing it: chains more handlers (7z/squashfs/cpio/gzip/ubi/"
+            "jefferson/...) and recurses automatically into whatever it extracts. Returns which "
+            "container formats it identified (handler name, byte offsets) and the real path to "
+            "every extracted file on disk -- pass one of those paths to radare2/binwalk/strings/"
+            "a custom script next."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local firmware image/blob/archive to extract."},
+            },
+            "required": ["file_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="sigrok_cli",
+        category="re",
+        tool_tier=2,
+        executable="sigrok-cli",
+        build_command=build_sigrok_cli_command,
+        requires_allowed_target=False,
+        installed_by_default=False,
+        heavy=True,
+        description=(
+            "sigrok-cli -- logic-signal (digital/analog) capture and analysis via a connected USB "
+            "logic analyzer. mode=\"scan\" (default): lists detected devices -- always reports at "
+            "least a built-in \"demo\" pattern-generator driver even with no real hardware "
+            "attached, so its presence alone never proves a real device is connected; check for "
+            "anything beyond \"demo\" for that. mode=\"capture\": captures from `driver` (a name "
+            "mode=\"scan\" reported) for `time_ms` or `samples` (default ~1s if neither is given), "
+            "optionally restricted to specific `channels\" (e.g. \"D0,D1\"). Capturing anything "
+            "meaningful beyond the demo driver requires real, physically connected hardware."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["scan", "capture"],
+                    "description": "Which operation to run.",
+                },
+                "driver": {
+                    "type": "string",
+                    "description": "mode=\"capture\" only (required): the driver name a prior mode=\"scan\" call reported (e.g. \"demo\").",
+                },
+                "channels": {
+                    "type": "string",
+                    "description": "mode=\"capture\" only: restrict capture to specific channels, comma-separated (e.g. \"D0,D1\"). Omit to capture every channel the driver offers.",
+                },
+                "time_ms": {
+                    "type": "integer",
+                    "description": "mode=\"capture\" only: capture duration in milliseconds. Mutually exclusive with 'samples'. Defaults to a short capture if neither is given.",
+                },
+                "samples": {
+                    "type": "integer",
+                    "description": "mode=\"capture\" only: number of samples to acquire instead of a time duration. Mutually exclusive with 'time_ms'.",
+                },
+            },
+            "required": [],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="adb",
+        category="re",
+        tool_tier=2,
+        executable="adb",
+        build_command=build_adb_command,
+        requires_allowed_target=False,
+        installed_by_default=False,
+        heavy=True,
+        description=(
+            "adb -- Android live-device/emulator access. mode=\"devices\" (default): lists "
+            "connected devices/emulators (a real, valid EMPTY list when none are connected -- not "
+            "an error). mode=\"shell\": runs one remote shell `command` on the device and returns "
+            "its output. mode=\"install\": installs a local APK (`apk_path`); set `replace=true` "
+            "to overwrite an already-installed app (never implied). mode=\"pull\": copies "
+            "`remote_path` off the device to an optional `local_path`. mode=\"logcat\": dumps the "
+            "device's current log buffer and exits (never streams live), optionally restricted by "
+            "`filter` (e.g. \"*:E\" for errors only). Every mode but \"devices\" needs a real "
+            "connected device or running emulator to do anything meaningful."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["devices", "shell", "install", "pull", "logcat"],
+                    "description": "Which operation to run.",
+                },
+                "command": {"type": "string", "description": "mode=\"shell\" only (required): the remote shell command to run on the device."},
+                "apk_path": {"type": "string", "description": "mode=\"install\" only (required): local path to the .apk file to install."},
+                "replace": {"type": "boolean", "description": "mode=\"install\" only: overwrite an already-installed copy of this app. Default false."},
+                "remote_path": {"type": "string", "description": "mode=\"pull\" only (required): the on-device file/directory path to copy."},
+                "local_path": {"type": "string", "description": "mode=\"pull\" only: where to save it locally. Defaults to the current directory if omitted."},
+                "filter": {"type": "string", "description": "mode=\"logcat\" only: a logcat filter expression (e.g. \"*:E\" for errors only). Omit for the full buffer."},
+            },
+            "required": [],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="go_buildinfo",
+        category="re",
+        tool_tier=1,
+        executable="",  # go toolchain is optional -- see agent/tools/builders/go_buildinfo.py's
+        # own module docstring for the pure-Python fallback used when it's absent
+        build_command=None,
+        native_function=run_go_buildinfo,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Reads a Go binary's own embedded build/module metadata -- module path, dependency "
+            "list (with versions and checksums), and build settings (GOOS/GOARCH, CGO_ENABLED, "
+            "VCS revision, ...), straight from what the Go compiler recorded. mode=\"buildinfo\" "
+            "(default): uses `go version -m` when a 'go' toolchain is available, otherwise falls "
+            "back to locating the same information as a plain-text block the binary carries "
+            "embedded in itself (Go 1.18+) -- works either way, but the toolchain-backed read is "
+            "authoritative while the fallback is a heuristic byte scan (flagged as such in the "
+            "result). mode=\"nm_symbols\": the binary's own symbol table via `go tool nm` -- "
+            "requires a 'go' toolchain, no fallback (a symbol table is a real binary section, not "
+            "a findable text blob). Use this before decompiling a Go binary: the dependency list "
+            "alone often tells you which third-party libraries' own known behavior/vulnerabilities "
+            "are relevant, without reading a single function."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local Go binary to inspect."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["buildinfo", "nm_symbols"],
+                    "description": "Which operation to run. Defaults to \"buildinfo\".",
+                },
+            },
+            "required": ["file_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="wasm_analyze",
+        category="re",
+        tool_tier=1,
+        executable="",  # four independent WABT binaries, one per mode -- see
+        # agent/tools/builders/wasm.py's own module docstring for why this is tier-1, not tier-2
+        build_command=None,
+        native_function=run_wasm_analyze,
+        # Real bug caught by the operator reading the Tools page's own "Heavy arsenal" count:
+        # WABT is provisioned by setup_tools_heavy.sh's own install_wabt() (not the base
+        # setup_tools.sh), so this is exactly a tier-1 tool "whose real dependency is an external
+        # binary the Python code doesn't itself carry" (registry.py's own availability_check
+        # docstring) -- the same shape as ghidra/unblob, not an ordinary always-present tier-1
+        # tool. installed_by_default=True + no availability_check previously made this silently
+        # claim "always installed" even with WABT genuinely absent, and heavy=False (the default)
+        # made it invisible to the Tools page's heavy-arsenal count entirely.
+        availability_check=wasm_analyze_available,
+        requires_allowed_target=False,
+        installed_by_default=False,
+        heavy=True,
+        description=(
+            "Static analysis for a compiled WebAssembly (.wasm) module, via WABT (wasm-validate/"
+            "wasm-objdump/wasm2wat). mode=\"validate\" (cheapest -- is this even a well-formed wasm "
+            "module at all; run this first). mode=\"info\" (default): full section inventory -- "
+            "imports/exports/functions/memory/tables/globals by name and signature, no "
+            "disassembly -- the cheap-inventory step, often enough on its own to answer \"what does "
+            "this module do\" (an unusual host-function import, or its export list, can settle it "
+            "outright). mode=\"disassemble\": per-function WASM instruction listing. "
+            "mode=\"decompile_wat\": the whole module re-encoded as readable WebAssembly Text "
+            "format (WAT) -- a lossless, structured textual form of the exact same module, the "
+            "closest equivalent to \"decompiled\" that a stack-machine bytecode like WASM has. "
+            "Requires WABT to be installed (the \"Install (heavy)\" button, or `brew install "
+            "wabt` on macOS) -- returns status=\"tool_unavailable\" with a clear message "
+            "otherwise."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local .wasm file to inspect."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["validate", "info", "disassemble", "decompile_wat"],
+                    "description": "Which operation to run. Defaults to \"info\".",
+                },
+            },
+            "required": ["file_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="strace_run",
         category="re",
         # tier-1 native_function, not a build_command()-based tier-2 tool -- a via_wine=true call
@@ -3895,6 +4431,9 @@ register_tool(
         # carry -- availability reflects whether it's actually importable, not a bare which() on the
         # python interpreter (which is always present). Same pattern the browser tools use.
         availability_check=qiling_available,
+        # qiling_runner.py's own wrapper always exits 0 even on a real internal failure -- see
+        # ToolSpec.parsed_error_override's own docstring for the confirmed incident this closes.
+        parsed_error_override=qiling_parsed_error_override,
         description=(
             "Cross-platform dynamic triage of a binary by full CPU emulation (Qiling Framework, on "
             "Unicorn) -- runs a Windows PE (.exe/.dll), Linux ELF, or macOS Mach-O under an emulated "
@@ -4207,6 +4746,42 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="binary_semantic_diff",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python shelling directly to radare2/Ghidra, not a plain subprocess tool
+        build_command=None,
+        native_function=run_binary_semantic_diff,
+        availability_check=binary_semantic_diff_available,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Semantic cross-version diff of two local binaries (e.g. a pre-patch and post-patch "
+            "build, or two versions of a library) -- NOT a byte-level diff like radiff2, a "
+            "structural one: functions/symbols added, removed, or changed, plus import changes. "
+            "Diffs cheap inventory first (radare2 symbols/imports, no decompilation): a same-named "
+            "function whose size changed is reported 'changed by size'; same name+size is reported "
+            "'same size' but genuinely ambiguous on cheap data alone. mode deep=true (default) then "
+            "resolves exactly that ambiguous case with Ghidra: decompiles each common function in "
+            "both files and compares a normalized content digest of the pseudocode -- bounded to a "
+            "handful of functions per call (BINARY_DIFF_MAX_DEEP_FUNCTIONS), prioritizing the ones "
+            "cheap data could not already resolve. Degrades gracefully (cheap diff only) if Ghidra "
+            "isn't available, or if deep=false is passed explicitly."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_a": {"type": "string", "description": "Path to the first (e.g. older/pre-patch) local binary."},
+                "file_b": {"type": "string", "description": "Path to the second (e.g. newer/patched) local binary."},
+                "deep": {"type": "boolean", "description": "Default true: also resolve ambiguous same-size common functions via a Ghidra decompile+content-digest comparison. Set false to only run the cheap inventory diff."},
+            },
+            "required": ["file_a", "file_b"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="frida_trace",
         category="re",
         tool_tier=2,
@@ -4278,6 +4853,7 @@ register_tool(
                 "interface": {"type": "string", "description": "Network interface to capture on, e.g. \"eth0\", \"lo\". Default \"any\" captures every interface at once."},
                 "duration_seconds": {"type": "integer", "description": "How long to capture, in seconds. Capped by TSHARK_CAPTURE_MAX_SECONDS regardless of what's requested here."},
                 "bpf_filter": {"type": "string", "description": "Optional BPF capture filter (tshark/tcpdump syntax), e.g. \"tcp port 443\", \"host 10.0.0.5\", \"udp\"."},
+                "raw_payload": {"type": "boolean", "description": "If true, also include the full TCP/UDP segment payload as hex. Use this for a target's own custom binary protocol (e.g. a game's netcode) that tshark has no dissector for -- the default fields only decode known protocols (HTTP/DNS/TLS) and otherwise show bare IP/port metadata with the real bytes invisible."},
             },
             "required": [],
         },
@@ -4306,6 +4882,7 @@ register_tool(
             "properties": {
                 "pcap_path": {"type": "string", "description": "Path to the local .pcap/.pcapng file to read."},
                 "display_filter": {"type": "string", "description": "Optional Wireshark display filter syntax, e.g. \"http.request\", \"dns\", \"ip.addr == 10.0.0.5\"."},
+                "raw_payload": {"type": "boolean", "description": "If true, also include the full TCP/UDP segment payload as hex. Use this for a target's own custom binary protocol (e.g. a game's netcode) that tshark has no dissector for -- the default fields only decode known protocols (HTTP/DNS/TLS) and otherwise show bare IP/port metadata with the real bytes invisible."},
             },
             "required": ["pcap_path"],
         },
@@ -4396,11 +4973,11 @@ register_tool(
         native_function=memscan_attach,
         requires_allowed_target=False,
         installed_by_default=True,
-        description="Attaches to an already-running LOCAL process (by pid -- see frida_ps to find one) for live memory scanning, the classic \"Cheat Engine\" technique: search a running process's memory for a value, narrow across repeated scans as it visibly changes, then patch it to confirm you found the real address -- not a decoy/cached copy. Useful both to study how a value is stored (anti-cheat/licensing research), to verify a decompiled guess against real runtime state, and to find a decrypted string (a license/verdict message an obfuscator only decrypts at runtime) directly in the process's own live memory. Returns a scan_id -- pass it to memscan_scan/memscan_list/memscan_write/memscan_detach. Only a directly-scanned address is found (no pointer-chain/static-offset resolution), and nothing here survives a target restart.",
+        description="Attaches to an already-running LOCAL process (by pid -- see frida_ps to find one) for live memory scanning, the classic \"Cheat Engine\" technique: search a running process's memory for a value, narrow across repeated scans as it visibly changes, then patch it to confirm you found the real address -- not a decoy/cached copy. Useful both to study how a value is stored (anti-cheat/licensing research), to verify a decompiled guess against real runtime state, and to find a decrypted string (a license/verdict message an obfuscator only decrypts at runtime) directly in the process's own live memory. Returns a scan_id -- pass it to memscan_scan/memscan_list/memscan_write/memscan_detach. Only a directly-scanned address is found (no pointer-chain/static-offset resolution), and nothing here survives a target restart. platform=\"windows\" reaches a REAL Windows process (e.g. a native Windows game) via the desktop app's own bridge instead of this Linux/WSL2-only default -- requires ASRA to be running via the desktop app on Windows; returns a clear error otherwise.",
         parameters_schema={
             "type": "object",
             "properties": {
-                "pid": {"type": "integer", "description": "Process ID of the already-running local target (see frida_ps)."},
+                "pid": {"type": "integer", "description": "Process ID of the already-running target (see frida_ps for the Linux-side default, or memscan_attach itself isn't how you'd list Windows pids today -- ask the operator, or check whatever already surfaced the pid)."},
                 "scan_data_type": {
                     "type": "string",
                     "enum": sorted(VALUE_TYPES),
@@ -4411,6 +4988,11 @@ register_tool(
                         "memscan_scan mode=\"exact\". \"bytearray\" searches for a raw byte pattern "
                         "(hex pairs, \"??\" as a per-byte wildcard, e.g. \"FF ?? EE\")."
                     ),
+                },
+                "platform": {
+                    "type": "string",
+                    "enum": ["linux", "windows"],
+                    "description": "Which backend to use. \"linux\" (default) attaches via scanmem to a Linux/WSL2 process. \"windows\" attaches via the desktop app's own live-memory bridge to a REAL Windows process (e.g. a native Windows game client) -- only works when ASRA is running through the desktop app on Windows.",
                 },
             },
             "required": ["pid"],
@@ -4445,6 +5027,11 @@ register_tool(
                         "omit it entirely for those modes on a string/bytearray session. Unused for mode=\"unknown\"."
                     ),
                 },
+                "platform": {
+                    "type": "string",
+                    "enum": ["linux", "windows"],
+                    "description": "Must match the platform the scan_id's own memscan_attach call used.",
+                },
             },
             "required": ["scan_id", "mode"],
         },
@@ -4464,7 +5051,10 @@ register_tool(
         description="Lists the current candidate matches for a memscan_attach session (refreshed to their real, current live value first) -- address, region, value, type, and the list_index memscan_write needs. Capped at 50 entries with an honest total_count/truncated flag if there are more; keep narrowing with memscan_scan first to bring the count down to something worth reading one by one.",
         parameters_schema={
             "type": "object",
-            "properties": {"scan_id": {"type": "string", "description": "The scan_id returned by memscan_attach."}},
+            "properties": {
+                "scan_id": {"type": "string", "description": "The scan_id returned by memscan_attach."},
+                "platform": {"type": "string", "enum": ["linux", "windows"], "description": "Must match the platform the scan_id's own memscan_attach call used."},
+            },
             "required": ["scan_id"],
         },
     )
@@ -4487,6 +5077,7 @@ register_tool(
                 "scan_id": {"type": "string", "description": "The scan_id returned by memscan_attach."},
                 "list_index": {"type": "integer", "description": "The index (from memscan_list's own output) of the match to overwrite."},
                 "value": {"type": "number", "description": "The new value to write."},
+                "platform": {"type": "string", "enum": ["linux", "windows"], "description": "Must match the platform the scan_id's own memscan_attach call used."},
             },
             "required": ["scan_id", "list_index", "value"],
         },
@@ -4503,11 +5094,56 @@ register_tool(
         native_function=memscan_detach,
         requires_allowed_target=False,
         installed_by_default=True,
-        description="Detaches a memscan_attach session and stops the underlying scanmem process. Call this once you're done with a target rather than leaving it attached for the rest of the conversation.",
+        description="Detaches a memscan_attach session and stops the underlying scanmem process (or, for platform=\"windows\", closes the process handle held by the desktop app's bridge). Call this once you're done with a target rather than leaving it attached for the rest of the conversation.",
         parameters_schema={
             "type": "object",
-            "properties": {"scan_id": {"type": "string", "description": "The scan_id returned by memscan_attach."}},
+            "properties": {
+                "scan_id": {"type": "string", "description": "The scan_id returned by memscan_attach."},
+                "platform": {"type": "string", "enum": ["linux", "windows"], "description": "Must match the platform the scan_id's own memscan_attach call used."},
+            },
             "required": ["scan_id"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="native_binary_metadata",
+        category="re",
+        tool_tier=1,
+        executable="",  # pure Python (magic-byte header parsing / a hand-rolled minimal ELF section reader) -- no subprocess at all
+        build_command=None,
+        native_function=run_native_binary_metadata,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Detects/extracts build-toolchain-specific metadata embedded in a native binary that "
+            "jadx/radare2/Ghidra don't otherwise surface. mode=\"hermes\": confirms whether a file "
+            "is React Native's Hermes JS bytecode (magic-byte header) and its bytecode format "
+            "version -- detection only, no decompiler installed, so pseudocode is not available. "
+            "mode=\"flutter\": confirms whether a file is a Flutter/Dart AOT snapshot (e.g. "
+            "libapp.so) and reads its embedded engine snapshot-hash -- detection only, same reason. "
+            "mode=\"rust_cargo_auditable\": for a Rust binary built with `cargo auditable build`, "
+            "extracts its real embedded dependency list (name/version/kind) directly from the "
+            "binary's own `.dep-v0` ELF section -- full extraction, not detection-only, needs no "
+            "external tool. mode=\"dotnet_nativeaot\": for a .NET binary published with "
+            "`PublishAot=true` (no managed IL for ilspycmd to decompile), finds and parses its "
+            "embedded \"RTR\" (ReadyToRun) directory -- real format/version plus every section's "
+            "type/flags/start/end, directly from the binary's own bytes, no external tool needed. "
+            "Does not resolve MethodTable/type-name/virtual-dispatch data, only the directory's own "
+            "section inventory."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["hermes", "flutter", "rust_cargo_auditable", "dotnet_nativeaot"],
+                    "description": "Which native binary format to check for/extract.",
+                },
+                "file_path": {"type": "string", "description": "Path to the local binary file to inspect."},
+            },
+            "required": ["mode", "file_path"],
         },
     )
 )

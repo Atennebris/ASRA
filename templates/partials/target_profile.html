@@ -2,8 +2,11 @@
    established via agent/core.py's record_target_profile (language, compiler, obfuscator,
    platform, version, ...), kept in view here and fed to every later chat turn via
    agent/chat.py's _session_snapshot so the model never has to re-derive an already-confirmed
-   fact. `facts` is session["target_profile"] as-is: a list of {"label", "value"}, in the order
-   each fact was first recorded (an update-in-place edit keeps its original position). #}
+   fact. `facts` is session["target_profile"] as-is: a list of {"label", "value", "source",
+   "corrected_from_operator_claim"?}, in the order each fact was first recorded (an update-in-place
+   edit keeps its original position). target_profile_source_badge() (templates/macros/ui.html)
+   flags an operator-stated, not-yet-tool-confirmed entry, or one that was later corrected. #}
+{% from "macros/ui.html" import target_profile_source_badge %}
 {% if not facts %}
   <div class="flex flex-col items-center justify-center text-center h-full py-12 px-6">
     <svg class="w-7 h-7 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -20,7 +23,10 @@
   <dl class="space-y-2">
     {% for fact in facts %}
       <div class="rounded-lg border border-default bg-elevated px-3 py-2">
-        <dt class="text-[10.5px] font-semibold uppercase tracking-wider text-secondary">{{ fact.label }}</dt>
+        <dt class="flex items-center justify-between gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-secondary">
+          <span>{{ fact.label }}</span>
+          {{ target_profile_source_badge(fact) }}
+        </dt>
         <dd class="text-[12.5px] text-primary mt-0.5 break-words">{{ fact.value }}</dd>
       </div>
     {% endfor %}

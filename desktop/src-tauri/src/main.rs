@@ -14,6 +14,9 @@
 // per-launch token) or hands back the URL (web -- opened in a browser only on the
 // explicit "Open" click, never automatically). Closing the window stops a shell-started
 // backend cleanly (SIGINT).
+#[cfg(windows)]
+mod mem_bridge;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -24,7 +27,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 
@@ -92,6 +95,8 @@ struct StartConfig {
     default_mode: String,
     run_as_root: bool,
     intro_enabled: bool,
+    // Only consulted when the intro is off: dragon progress bar (true) or nothing at all (false).
+    loader_enabled: bool,
     intro_sound_enabled: bool,
     // Distinguishes "wsl.exe isn't on this machine at all" from "wsl.exe works but zero distros
     // are registered" -- list_wsl_distros() alone collapses both into an empty `distros`, which is
@@ -486,14 +491,15 @@ fn parse_env_settings(text: &str) -> Vec<EnvSetting> {
         } else if let Some(eq) = trimmed.find('=') {
             let key = trimmed[..eq].trim();
             // ASRA_RUN_AS_ROOT is surfaced as the top-level "Run as root" toggle, so it is
-            // excluded from the Advanced list to avoid showing it twice. ASRA_INTRO_ENABLED and
-            // ASRA_INTRO_SOUND_ENABLED are excluded the same way -- they're surfaced in the WEB
-            // app's own Settings -> Customization -> Visual instead (their own toggles need live
-            // description text this generic list can't give them), not as a second, redundant raw
-            // row here.
+            // excluded from the Advanced list to avoid showing it twice. The launch-screen keys
+            // (ASRA_INTRO_ENABLED, ASRA_LAUNCH_LOADER_ENABLED, ASRA_INTRO_SOUND_ENABLED) are
+            // excluded the same way -- they're surfaced in the WEB app's own Settings ->
+            // Customization -> Visual instead (their own picker needs live description text this
+            // generic list can't give them), not as a second, redundant raw row here.
             if is_valid_env_key(key)
                 && key != "ASRA_RUN_AS_ROOT"
                 && key != "ASRA_INTRO_ENABLED"
+                && key != "ASRA_LAUNCH_LOADER_ENABLED"
                 && key != "ASRA_INTRO_SOUND_ENABLED"
             {
                 let value = unquote(&trimmed[eq + 1..]);
@@ -786,8 +792,7 @@ fn spawn_backend(
     // the Python backend (agent/desktop_update.py) know whether it's running under the desktop
     // shell at all, and which GitHub Release asset would match THIS binary if a newer one exists --
     // std::env::consts::OS, not sys.platform on the Python side, since under this Windows/WSL2
-    // launch path the backend's own sys.platform is always "linux" (see CLAUDE.md's runtime-
-    // architecture rule), which would resolve to the wrong release asset if read from there instead.
+    // launch path the backend's own sys.platform is always "linux", which would resolve to the wrong release asset if read from there instead.
     let token_prefix = if ui_token.is_empty() {
         String::new()
     } else {
@@ -1129,7 +1134,9 @@ fn get_start_config() -> StartConfig {
         default_mode: "desktop".to_string(),
         run_as_root: env_flag(&env_text, "ASRA_RUN_AS_ROOT"),
         intro_enabled: env_flag_default(&env_text, "ASRA_INTRO_ENABLED", true),
-        intro_sound_enabled: env_flag_default(&env_text, "ASRA_INTRO_SOUND_ENABLED", true),
+        loader_enabled: env_flag_default(&env_text, "ASRA_LAUNCH_LOADER_ENABLED", true),
+        // Off by default: the intro's soundtrack does not work yet (Settings shows it locked).
+        intro_sound_enabled: env_flag_default(&env_text, "ASRA_INTRO_SOUND_ENABLED", false),
         wsl_installed,
         wsl_default_distro: default_wsl_install_distro(&env_text),
         distros,
@@ -1502,6 +1509,10 @@ fn download_and_extract_repo(target: &Path) -> Result<(), String> {
 // timing if that file's sequence length changes again.
 const MIN_INTRO_DISPLAY: Duration = Duration::from_millis(8100);
 
+// How long launch_backend waits after telling the start screen "backend-ready" so the dragon progress
+// bar can finish filling (dragonLoader.finish in dist/index.html runs it in about 0.8s).
+const DRAGON_FINISH_DURATION: Duration = Duration::from_millis(1000);
+
 #[tauri::command]
 async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, String> {
     let launch_start = Instant::now();
@@ -1530,6 +1541,19 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
         .unwrap_or_default();
     let new_env = rewrite_env(&original, &args.updates);
     std::fs::write(repo.join(".env"), &new_env).map_err(|e| format!("could not write .env: {e}"))?;
+
+    // Which launch screen the start screen is showing (Settings' "Launch screen" picker) decides
+    // whether the intro-length floor below applies, so it is worth one line in the desktop log.
+    let intro_enabled = env_flag_default(&new_env, "ASRA_INTRO_ENABLED", true);
+    let dragon_enabled = !intro_enabled && env_flag_default(&new_env, "ASRA_LAUNCH_LOADER_ENABLED", true);
+    let launch_screen = if intro_enabled {
+        "animated intro"
+    } else if dragon_enabled {
+        "dragon progress bar"
+    } else {
+        "nothing"
+    };
+    append_desktop_log_line(&new_env, &format!("launch screen: {launch_screen}"));
 
     // With DEBUG on, open the familiar tail console (Windows). Linux/macOS run.sh does its own.
     #[cfg(windows)]
@@ -1695,7 +1719,7 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
         }
     }
 
-    if env_flag_default(&new_env, "ASRA_INTRO_ENABLED", true) {
+    if intro_enabled {
         let remaining = MIN_INTRO_DISPLAY.saturating_sub(launch_start.elapsed());
         if !remaining.is_zero() {
             append_desktop_log_line(
@@ -1706,6 +1730,19 @@ async fn launch_backend(app: AppHandle, args: LaunchArgs) -> Result<String, Stri
                 .await
                 .map_err(|e| format!("intro min-display wait failed: {e}"))?;
         }
+    }
+
+    // The dragon progress bar only reads as a progress bar if it is FULL when the window moves on.
+    // Its length is an estimate while the backend starts (there is no real percentage), so tell the
+    // start screen the backend is ready and give the dragon time to run the rest of the way before
+    // navigating -- otherwise a quick start (or an adopted, already-running backend) swaps the
+    // window while the bar is still short. The wait must stay a little longer than the finishing
+    // run in dist/index.html (dragonLoader.finish).
+    if dragon_enabled {
+        let _ = app.emit("backend-ready", ());
+        tauri::async_runtime::spawn_blocking(move || std::thread::sleep(DRAGON_FINISH_DURATION))
+            .await
+            .map_err(|e| format!("loader finish wait failed: {e}"))?;
     }
 
     if args.mode == "web" {
@@ -2145,6 +2182,22 @@ fn main() {
             }
         })
         .setup(|app| {
+            // Windows live-memory bridge: starts once per launch, independent of whether/when the
+            // operator ever clicks Start -- see mem_bridge.rs's own module doc comment for why
+            // this lives here (a plain background TCP listener, not a Tauri command) and its
+            // trust model. Linux/macOS builds of this shell don't need it at all: the Python
+            // agent on those platforms already runs natively (no WSL2 involved), so
+            // memscan_manager.py's existing scanmem backend already reaches a live local process
+            // directly with no bridge required.
+            #[cfg(windows)]
+            {
+                let repo = repo_dir();
+                let env_text = std::fs::read_to_string(repo.join(".env"))
+                    .or_else(|_| std::fs::read_to_string(repo.join(".env.example")))
+                    .unwrap_or_default();
+                mem_bridge::start(resolve_app_dir(&env_text));
+            }
+
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("")
                 .inner_size(1200.0, 820.0)
@@ -2228,4 +2281,34 @@ fn main() {
             stop_backend(&app_handle.state::<OwnedBackend>());
         }
     });
+}
+
+#[cfg(test)]
+mod launch_screen_defaults {
+    use super::*;
+
+    // The animated intro is what every user sees unless they changed it in Settings, so a missing
+    // key (fresh machine, or a .env written before the key existed) must read as "on".
+    #[test]
+    fn missing_keys_mean_the_intro_is_on_and_the_loader_is_available() {
+        assert!(env_flag_default("", "ASRA_INTRO_ENABLED", true));
+        assert!(env_flag_default("PORT=8000\n", "ASRA_INTRO_ENABLED", true));
+        assert!(env_flag_default("", "ASRA_LAUNCH_LOADER_ENABLED", true));
+    }
+
+    #[test]
+    fn an_explicit_off_is_respected_even_when_quoted() {
+        assert!(!env_flag_default("ASRA_INTRO_ENABLED='false'\n", "ASRA_INTRO_ENABLED", true));
+        assert!(!env_flag_default("ASRA_INTRO_ENABLED=false\n", "ASRA_INTRO_ENABLED", true));
+    }
+
+    // With no .env the shell reads .env.example (get_start_config), so what that file ships is the
+    // real default for a new user.
+    #[test]
+    fn the_shipped_example_env_starts_with_the_intro_on_and_its_sound_off() {
+        let example = include_str!("../../../.env.example");
+        assert!(env_flag_default(example, "ASRA_INTRO_ENABLED", false));
+        assert!(env_flag_default(example, "ASRA_LAUNCH_LOADER_ENABLED", false));
+        assert!(!env_flag_default(example, "ASRA_INTRO_SOUND_ENABLED", true));
+    }
 }

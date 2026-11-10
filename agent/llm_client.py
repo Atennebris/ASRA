@@ -17,6 +17,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -199,6 +200,46 @@ class LLMResponse:
     # Feeds agent/core.py's per-provider usage/cost tracking (compute_llm_usage_summary); nothing in
     # this module's own request/response handling reads it back.
     usage: dict | None = None
+    # Which provider/model actually answered and how long that one request took, stamped by
+    # stamp_response_origin at the two choke points every real call goes through (core's
+    # _llm_complete, chat's _complete_or_stop) -- never by a concrete provider, so a reserve-chain
+    # failover mid-run reports the step that really served the reply, not the one first configured.
+    # Surfaced next to each tool-call log row so an operator can tell a slow provider apart from a
+    # slow tool without cross-reading debug.log. None on a response nobody stamped (tests, embeds).
+    provider_id: str | None = None
+    model: str | None = None
+    elapsed_seconds: float | None = None
+
+
+def stamp_response_origin(response: LLMResponse, llm: object, started_monotonic: float) -> LLMResponse:
+    """Returns `response` with provider_id/model/elapsed_seconds filled in from `llm` (anything with
+    provider_id/model attributes -- a bare test double without them just leaves those None) and the
+    wall-clock time since `started_monotonic` (a time.monotonic() reading taken right before the call).
+    Includes the in-provider retry/backoff wait on purpose: that is the real time the operator waited
+    for this answer, which is what "response time" has to mean here."""
+    elapsed = time.monotonic() - started_monotonic
+    if not dataclasses.is_dataclass(response):
+        # A duck-typed reply (a test double, a third-party provider shim) can't be stamped --
+        # leave it untouched; its rows just render without the origin label.
+        return response
+    stamped = dataclasses.replace(
+        response,
+        provider_id=getattr(llm, "provider_id", None),
+        model=getattr(llm, "model", None),
+        elapsed_seconds=round(elapsed, 2),
+    )
+    logger.debug("llm_client: answered by %s/%s in %.2fs", stamped.provider_id, stamped.model, elapsed)
+    return stamped
+
+
+def describe_response_origin(response: LLMResponse) -> dict | None:
+    """The persisted, JSON-safe form of a response's origin ({"provider", "model", "elapsed_s"}) for
+    session.json log entries / chat tool-call segments; None when the response was never stamped, so
+    callers can store it unconditionally and the UI simply skips the label."""
+    provider_id, model = getattr(response, "provider_id", None), getattr(response, "model", None)
+    if provider_id is None and model is None:
+        return None
+    return {"provider": provider_id, "model": model, "elapsed_s": getattr(response, "elapsed_seconds", None)}
 
 
 class LLMProvider(Protocol):

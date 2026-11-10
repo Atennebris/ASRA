@@ -44,6 +44,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agent.tools import win_memscan_bridge
 from agent.tools.builders.validators import validate_safe_value
 from agent.utils.logger import get_logger
 
@@ -502,12 +503,20 @@ def shutdown_all() -> None:
 # --- native_function wrappers, registered as ToolSpecs (agent/tools/__init__.py) -----------------
 # Each pulls _session_id from params (server-injected, hidden from the model's schema -- see
 # agent/core.py's own "injected" dict, same pattern afl_fuzz_start/record_target_profile use).
+#
+# platform="windows" (default "linux") routes to win_memscan_bridge.py instead of this module's
+# own scanmem-backed attach/scan/list_matches/write/detach -- one model-facing tool surface for
+# both backends (DRY: the agent learns one workflow, not two near-identical tool-name sets) rather
+# than a parallel set of win_memscan_* tools. The two backends intentionally share this exact
+# function-signature shape so the dispatch below is a one-line branch, not a redesign.
 
 def memscan_attach(params: dict) -> dict:
     session_id = params.get("_session_id")
     if not session_id:
         return {"status": "error", "error": "memscan_attach requires session context"}
     scan_data_type = str(params.get("scan_data_type") or "int32").strip()
+    if str(params.get("platform") or "linux") == "windows":
+        return win_memscan_bridge.attach(session_id, params.get("pid"), scan_data_type)
     return attach(session_id, params.get("pid"), scan_data_type)
 
 
@@ -517,6 +526,8 @@ def memscan_scan(params: dict) -> dict:
         return {"status": "error", "error": "memscan_scan requires session context"}
     scan_id = str(params.get("scan_id") or "").strip()
     mode = str(params.get("mode") or "").strip()
+    if str(params.get("platform") or "linux") == "windows":
+        return win_memscan_bridge.scan(session_id, scan_id, mode, params.get("value"))
     return scan(session_id, scan_id, mode, params.get("value"))
 
 
@@ -525,6 +536,8 @@ def memscan_list(params: dict) -> dict:
     if not session_id:
         return {"status": "error", "error": "memscan_list requires session context"}
     scan_id = str(params.get("scan_id") or "").strip()
+    if str(params.get("platform") or "linux") == "windows":
+        return win_memscan_bridge.list_matches(session_id, scan_id)
     return list_matches(session_id, scan_id)
 
 
@@ -533,6 +546,8 @@ def memscan_write(params: dict) -> dict:
     if not session_id:
         return {"status": "error", "error": "memscan_write requires session context"}
     scan_id = str(params.get("scan_id") or "").strip()
+    if str(params.get("platform") or "linux") == "windows":
+        return win_memscan_bridge.write(session_id, scan_id, params.get("list_index"), params.get("value"))
     return write(session_id, scan_id, params.get("list_index"), params.get("value"))
 
 
@@ -541,4 +556,6 @@ def memscan_detach(params: dict) -> dict:
     if not session_id:
         return {"status": "error", "error": "memscan_detach requires session context"}
     scan_id = str(params.get("scan_id") or "").strip()
+    if str(params.get("platform") or "linux") == "windows":
+        return win_memscan_bridge.detach(session_id, scan_id)
     return detach(session_id, scan_id)

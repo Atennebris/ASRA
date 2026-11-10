@@ -36,62 +36,64 @@
         </p>
       {% endif %}
     </div>
-    <div class="flex items-center gap-2 flex-wrap shrink-0">
-      {# Opens the Library drawer (partials/library_sources.html) -- upload a source, analyze it
-         with an already-configured LLM provider, extracted techniques land below as unreviewed. #}
-      <button type="button" onclick="window.asraToggleLibraryPanel(true)"
-              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v10m0 0l-3-3m3 3l3-3M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Library
-      </button>
-      <button type="button" onclick="document.getElementById('playbook-add').showModal()"
-              class="inline-flex items-center gap-1.5 rounded-md bg-accent hover:bg-accent-hover text-white px-3 py-1.5 text-[12px] font-medium transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
-        Add technique
-      </button>
-      <a href="/api/playbook/export"
-         class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Export
-      </a>
-      <button type="button" onclick="document.getElementById('playbook-import').showModal()"
-              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Import
-      </button>
-      {% if total %}
-        {# Real, direct operator ask: rename off "Remove duplicates" and stop irreversibly
-           auto-merging on click -- the old button only ever offered a static hx-confirm warning
-           text, never an actual look at which entries would be folded together, before an
-           unrecoverable merge ran. "Check duplicates" opens a real preview (playbook-duplicates
-           dialog below) listing every group found, with a "Keep this one" choice PER group --
-           the operator picks which copy survives, not "whichever dedupe_all_techniques itself
-           would have picked" -- and merges happen one deliberate group at a time from inside it.
-           agent/tools/playbook_store.py's own dedupe_all_techniques (blind auto-merge-keep-newest)
-           still exists underneath and is what a group's own history summary is built from, just
-           never invoked directly from this button anymore. #}
-        <button type="button" hx-get="/api/playbook/duplicates" hx-target="#playbook-duplicates-content" hx-swap="innerHTML"
-                hx-on::after-request="document.getElementById('playbook-duplicates').showModal()"
-                class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 8h13v13H8z"/></svg>
-          Check duplicates
-        </button>
-      {% endif %}
-      {% if seeded %}
-        <span class="inline-flex items-center gap-1.5 rounded-md border border-severity-low/40 bg-severity-low/10 px-3 py-1.5 text-[12px] text-severity-low" title="The built-in starter pack is already in your playbook — nothing to do.">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Seed pack imported
-        </span>
-      {% else %}
-        <button type="button" hx-post="/api/playbook/seed" hx-target="#playbook-list" hx-swap="innerHTML"
-                hx-confirm="Add the built-in starter pack — 5 well-known, public WAF/CDN-bypass technique templates — to your playbook? They're generic leads to prime an empty playbook, and this is optional."
-                class="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 hover:bg-accent/20 px-3 py-1.5 text-[12px] text-accent transition-colors">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l2.2 5 5.3.4-4 3.5 1.2 5.2L12 16l-4.7 2.6 1.2-5.2-4-3.5 5.3-.4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Seed pack
-        </button>
-      {% endif %}
-    </div>
     {% include "macros/header_light.html" %}
+  </div>
+
+  {# Page actions live in their own toolbar below the banner, not on the decorative header bar. #}
+  <div class="flex items-center justify-end gap-2 flex-wrap mb-4">
+    {# Opens the Library drawer (partials/library_sources.html) -- upload a source, analyze it
+       with an already-configured LLM provider, extracted techniques land below as unreviewed. #}
+    <button type="button" onclick="window.asraToggleLibraryPanel(true)"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v10m0 0l-3-3m3 3l3-3M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Library
+    </button>
+    <button type="button" onclick="document.getElementById('playbook-add').showModal()"
+            class="inline-flex items-center gap-1.5 rounded-md bg-accent hover:bg-accent-hover text-white px-3 py-1.5 text-[12px] font-medium transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
+      Add technique
+    </button>
+    <a href="/api/playbook/export"
+       class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Export
+    </a>
+    <button type="button" onclick="document.getElementById('playbook-import').showModal()"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Import
+    </button>
+    {% if total %}
+      {# Real, direct operator ask: rename off "Remove duplicates" and stop irreversibly
+         auto-merging on click -- the old button only ever offered a static hx-confirm warning
+         text, never an actual look at which entries would be folded together, before an
+         unrecoverable merge ran. "Check duplicates" opens a real preview (playbook-duplicates
+         dialog below) listing every group found, with a "Keep this one" choice PER group --
+         the operator picks which copy survives, not "whichever dedupe_all_techniques itself
+         would have picked" -- and merges happen one deliberate group at a time from inside it.
+         agent/tools/playbook_store.py's own dedupe_all_techniques (blind auto-merge-keep-newest)
+         still exists underneath and is what a group's own history summary is built from, just
+         never invoked directly from this button anymore. #}
+      <button type="button" hx-get="/api/playbook/duplicates" hx-target="#playbook-duplicates-content" hx-swap="innerHTML"
+              hx-on::after-request="document.getElementById('playbook-duplicates').showModal()"
+              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 8h13v13H8z"/></svg>
+        Check duplicates
+      </button>
+    {% endif %}
+    {% if seeded %}
+      <span class="inline-flex items-center gap-1.5 rounded-md border border-severity-low/40 bg-severity-low/10 px-3 py-1.5 text-[12px] text-severity-low" title="The built-in starter pack is already in your playbook — nothing to do.">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Seed pack imported
+      </span>
+    {% else %}
+      <button type="button" hx-post="/api/playbook/seed" hx-target="#playbook-list" hx-swap="innerHTML"
+              hx-confirm="Add the built-in starter pack — 5 well-known, public WAF/CDN-bypass technique templates — to your playbook? They're generic leads to prime an empty playbook, and this is optional."
+              class="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 hover:bg-accent/20 px-3 py-1.5 text-[12px] text-accent transition-colors">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l2.2 5 5.3.4-4 3.5 1.2 5.2L12 16l-4.7 2.6 1.2-5.2-4-3.5 5.3-.4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Seed pack
+      </button>
+    {% endif %}
   </div>
 
   {# One form so every control (search text + the three dropdowns) submits together on either

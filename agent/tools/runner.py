@@ -9,6 +9,7 @@ import time
 
 from agent.tools.allowed_targets import is_target_allowed
 from agent.tools.cache import cache_get, cache_set
+from agent.tools.custom_tools_root import resolve_via_custom_root
 from agent.tools.registry import ToolSpec, categories_of
 from agent.tools.tool_api_keys import redact_secrets_in_command
 from agent.utils.debug import current_subagent_label, truncate_for_log
@@ -121,6 +122,11 @@ _DEFAULT_EXPLOIT_TIMEOUT_SECONDS = 180
 
 
 def _timeout_for(spec: ToolSpec) -> int:
+    # A per-tool override (ToolSpec.timeout_env_var) wins outright, before the generic scan/
+    # exploit-category logic below -- see that field's own docstring for why (a tool whose real
+    # duration doesn't fit either generic bucket, e.g. nuclei's own NUCLEI_TIMEOUT_SECONDS).
+    if spec.timeout_env_var:
+        return int(os.getenv(spec.timeout_env_var, str(spec.timeout_default_seconds or _DEFAULT_TOOL_TIMEOUT_SECONDS)))
     # A tool registered in more than one category (categories_of) is exploit-class timeout if
     # EITHER of its categories is -- a read-only verification tool shared with Analyze (e.g.
     # http_request) still deserves Exploit's own timeout budget when called from that phase.
@@ -135,7 +141,13 @@ def _resolve_executable(spec: ToolSpec) -> str | None:
     override = os.getenv(f"{spec.name.upper()}_PATH")
     if override:
         return override if shutil.which(override) or os.path.isfile(override) else None
-    return shutil.which(spec.executable)
+    found_on_path = shutil.which(spec.executable)
+    if found_on_path:
+        return found_on_path
+    # Last resort: an operator-registered root holding a whole pre-existing tool collection
+    # (TOOLS_CUSTOM_ROOT, Settings -> Tools) that was never installed through setup_tools.sh at
+    # all -- never overrides the two checks above, only fills in what neither found.
+    return resolve_via_custom_root(spec.executable)
 
 
 def tool_is_installed(spec: ToolSpec) -> bool:

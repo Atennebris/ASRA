@@ -76,6 +76,7 @@ from agent.llm_client import (
     _extract_prompt_tool_calls,
     _inject_tool_instructions,
 )
+from agent.opencode_cli import OpencodeCliUnavailable, diagnose_opencode_cli
 from agent.utils.debug import truncate_for_log
 from agent.utils.lazy_openai import openai
 from agent.utils.logger import get_logger
@@ -89,7 +90,7 @@ OPENCODE_LOCAL_DEFAULT_MODEL = "big-pickle"
 _AGENT_NAME = "asra-ask"
 # How long to wait for `opencode serve` to come up before giving up -- operator-tunable (a slow
 # machine, or the CLI's own first-ever cold start on this install, can genuinely need longer than
-# the default; CLAUDE.md -- anything that can vary, timeouts included, belongs in config/env, not
+# the default; anything that can vary, timeouts included, belongs in config/env, not
 # baked in).
 _DEFAULT_READY_TIMEOUT_SECONDS = 20
 _PERMISSION_POLL_INTERVAL_SECONDS = 0.4
@@ -148,31 +149,17 @@ def _find_free_port() -> int:
 
 
 def _resolve_opencode_binary() -> str:
-    binary = shutil.which("opencode")
-    if not binary:
-        raise ValueError(
-            "The opencode CLI is not installed (or not on this process's PATH). Install it "
-            "(`npm install -g opencode-ai`, or see https://opencode.ai) in this machine's own "
-            "shell -- under this project's WSL2 launch path (see CLAUDE.md), that means installed "
-            "*inside* WSL2, not just on the Windows side -- then try this provider again."
-        )
-    # Confirmed real incident: WSL2 appends the Windows PATH to the Linux one by default, so
-    # shutil.which("opencode") can resolve a Windows-side npm global install exposed under
-    # /mnt/c/... instead of a native Linux binary. Launching THAT from here goes through the
-    # WSL/Windows process-interop layer on every single call, which is slow enough (observed:
-    # routinely exceeding this provider's own 20s readiness timeout) that the server never gets
-    # detected as ready and this code just restarts it forever on a new port -- and `process.kill()`
-    # on the WSL-side interop stub may not actually stop the real Windows-hosted process, leaking
-    # live opencode servers. Refuse outright rather than silently eating the cost on every call.
-    if binary.startswith("/mnt/"):
-        raise ValueError(
-            f"The opencode CLI found on PATH ({binary}) is the Windows-side install exposed "
-            "through WSL2's PATH interop, not a native Linux binary -- running it from here is slow "
-            "enough to make this provider unreliable (and process cleanup on failure may not fully "
-            "stop it). Install opencode *inside* WSL2 instead: open a WSL2 shell (not PowerShell/cmd) "
-            "and run `npm install -g opencode-ai`, then try this provider again."
-        )
-    return binary
+    # Confirmed real incident behind refusing a Windows-side copy (see agent/opencode_cli.py):
+    # WSL2 appends the Windows PATH, so a plain `which` can resolve /mnt/c/.../opencode. Launching
+    # THAT goes through WSL's process interop on every call -- slow enough (observed: routinely past
+    # this provider's own 20s readiness timeout) that the server never looks ready and this code
+    # restarted it forever on new ports, while `process.kill()` on the interop stub may not stop
+    # the real Windows process, leaking live opencode servers. The diagnosis explains WHICH
+    # situation the operator is in (Windows-only vs missing everywhere) instead of one generic text.
+    status = diagnose_opencode_cli()
+    if not status.usable:
+        raise OpencodeCliUnavailable(status)
+    return status.native_path
 
 
 class _PermissionDenier(threading.Thread):
@@ -214,7 +201,7 @@ class _LogDrain(threading.Thread):
     reads from fills its OS buffer once `--print-logs` writes enough output, at which point the
     opencode process blocks on its own next write and the whole server hangs. Keeps only the last
     _SERVER_LOG_TAIL_LINES for a startup-failure error message; everything else is logged at debug
-    level (so DEBUG=true still surfaces it in this project's own debug log, per CLAUDE.md's debug-
+    level (so DEBUG=true still surfaces it in this project's own debug log, per the project's debug-
     module rule) and then discarded.
     """
 
@@ -317,13 +304,18 @@ def _get_shared_server() -> _SharedServer:
     with _shared_server_lock:
         if _shared_server is not None and _shared_server.is_alive():
             return _shared_server
+        # Before the cooldown on purpose: a missing/Windows-only CLI is a cheap, instantly
+        # re-checkable condition (no process to spawn), so it must never be masked by -- or feed --
+        # the spawn-failure cooldown below, or the operator would wait out up to 15s after clicking
+        # "Install opencode" for a provider that is already fixed.
+        _resolve_opencode_binary()
         cooldown = _failure_cooldown_seconds()
         elapsed = time.monotonic() - _last_failure_at
         if _last_failure_at and elapsed < cooldown:
             # Confirmed real incident: Settings page load, the model dropdown, "Test", and "Save"
             # each independently reach this function -- without this cooldown, a server that just
             # failed to start got re-spawned from scratch by the very next one of these, every
-            # ~20s, forever, with no backoff (see module docstring / CLAUDE.md known-bug-patterns).
+            # ~20s, forever, with no backoff (see module docstring).
             raise ValueError(
                 f"{_last_failure_message}\n(retrying again in {cooldown - elapsed:.0f}s -- "
                 "repeated immediate retries were suppressed)"

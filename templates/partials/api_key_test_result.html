@@ -1,3 +1,13 @@
 {# Result of a Settings API-key Test button (main.py's /api/settings/test-api-key) -- a real
-   template like llm_test_status.html, so autoescape covers the message text automatically. #}
-<span class="{{ 'text-severity-low' if ok else 'text-severity-high' }}">{{ message }}</span>
+   template like llm_test_status.html, so autoescape covers the message text automatically.
+   `action` == "install_opencode" (the opencode-local card's Test, main.py's test_opencode_local)
+   adds the one-click fix next to the failure message; the Settings page reloads once it succeeds
+   (reload_after_install) so the card's own "CLI found" badge never lags the real state. The outer
+   span is the swap host the button replaces with the live install panel. #}
+<span {% if action == "install_opencode" %}data-opencode-fix-host class="inline-flex items-center gap-2 flex-wrap"{% endif %}>
+  <span class="{{ 'text-severity-low' if ok else 'text-severity-high' }}">{{ message }}</span>
+  {% if action == "install_opencode" %}
+    {% set reload_after_install = true %}
+    {% include "partials/opencode_install_button.html" %}
+  {% endif %}
+</span>

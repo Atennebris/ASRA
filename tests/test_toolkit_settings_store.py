@@ -10,7 +10,10 @@ from agent.tools import toolkit_settings_store
 
 # Built from BOOL_KEYS itself, not a hardcoded literal dict -- stays correct automatically as more
 # toolkit capabilities get their own toggle.
-_DEFAULTS = dict.fromkeys(toolkit_settings_store.BOOL_KEYS, False)
+_DEFAULTS = dict.fromkeys(toolkit_settings_store.BOOL_KEYS, True)
+# What save_toolkit_agent_settings writes for any key the caller leaves out -- an explicit save is
+# "exactly what I passed", unlike a missing FILE, which falls back to the (all-on) defaults above.
+_ALL_OFF = dict.fromkeys(toolkit_settings_store.BOOL_KEYS, False)
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -39,16 +42,16 @@ def test_load_toolkit_agent_settings_treats_a_non_object_json_as_defaults(tmp_pa
 def test_load_toolkit_agent_settings_backfills_a_missing_key_with_its_default(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     toolkit_settings_store.TOOLKIT_AGENT_SETTINGS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    toolkit_settings_store.TOOLKIT_AGENT_SETTINGS_STORE_PATH.write_text(json.dumps({"toolkit_proxy_enabled": True}), encoding="utf-8")
+    toolkit_settings_store.TOOLKIT_AGENT_SETTINGS_STORE_PATH.write_text(json.dumps({"toolkit_proxy_enabled": False}), encoding="utf-8")
 
     expected = dict(_DEFAULTS)
-    expected["toolkit_proxy_enabled"] = True
+    expected["toolkit_proxy_enabled"] = False  # a saved choice wins over the default; the rest backfill to it
     assert toolkit_settings_store.load_toolkit_agent_settings() == expected
 
 
 def test_save_toolkit_agent_settings_persists_all_values(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
-    given = dict(_DEFAULTS)
+    given = dict(_ALL_OFF)
     given.update({"toolkit_proxy_enabled": True, "toolkit_repeater_enabled": True, "toolkit_comparer_enabled": True})
     saved = toolkit_settings_store.save_toolkit_agent_settings(given)
 
@@ -59,7 +62,7 @@ def test_save_toolkit_agent_settings_persists_all_values(tmp_path, monkeypatch):
 def test_save_toolkit_agent_settings_defaults_missing_keys_to_false(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     saved = toolkit_settings_store.save_toolkit_agent_settings({"toolkit_proxy_enabled": True})
-    expected = dict(_DEFAULTS)
+    expected = dict(_ALL_OFF)
     expected["toolkit_proxy_enabled"] = True
     assert saved == expected
 
@@ -82,6 +85,6 @@ def test_save_toolkit_agent_settings_overwrites_a_previous_save(tmp_path, monkey
     _isolate(tmp_path, monkeypatch)
     toolkit_settings_store.save_toolkit_agent_settings(dict.fromkeys(toolkit_settings_store.BOOL_KEYS, True))
 
-    toolkit_settings_store.save_toolkit_agent_settings(dict.fromkeys(toolkit_settings_store.BOOL_KEYS, False))
+    toolkit_settings_store.save_toolkit_agent_settings(dict(_ALL_OFF))
 
-    assert toolkit_settings_store.load_toolkit_agent_settings() == _DEFAULTS
+    assert toolkit_settings_store.load_toolkit_agent_settings() == _ALL_OFF

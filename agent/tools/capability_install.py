@@ -63,6 +63,13 @@ def has_sudo_password() -> bool:
     return bool(os.getenv(_SUDO_PASSWORD_ENV))
 
 
+def get_sudo_password() -> str:
+    """The saved value itself, for the one caller that must carry it to another machine on the
+    owner's explicit request (agent/settings_transfer.py's opt-in sensitive export). Everything else
+    should keep using has_sudo_password() and never see the secret."""
+    return os.getenv(_SUDO_PASSWORD_ENV) or ""
+
+
 def save_sudo_password(password: str) -> None:
     """Same write-then-verify-read-back pattern agent/llm_client.py's save_provider_api_key already
     uses for provider keys -- writes into .env, mirrors into this process's own os.environ so it

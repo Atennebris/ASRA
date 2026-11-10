@@ -77,6 +77,9 @@ def _list_tool_availability_uncached() -> list[dict]:
             # like qiling, or the browser tools' Playwright download) rather than a plain binary on
             # PATH -- lets the UI say "Not installed" instead of a misleading "Not found on PATH".
             "checks_dependency": spec.availability_check is not None,
+            # Provisioned by setup_tools_heavy.sh rather than the base setup_tools.sh -- see
+            # ToolSpec.heavy's own docstring. Always False for a tier-1 tool (that field's default).
+            "heavy": spec.heavy,
         }
         for spec in TOOL_REGISTRY
     ]

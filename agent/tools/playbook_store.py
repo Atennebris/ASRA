@@ -182,10 +182,12 @@ def extract_cves(*texts: str) -> list[str]:
 
 
 def refresh_threat_intel() -> int:
-    """Enriches every technique that names CVEs with live KEV/EPSS signals and STAMPS the result onto
-    the entry (kev: bool, epss_max: float) so scoring + the addendum can read it without any network
-    at search time. Network happens only here (the explicit refresh action), behind threat_intel's
-    own TTL cache. Returns how many techniques were updated."""
+    """Enriches every technique that names CVEs with live KEV/EPSS signals, CVE metadata
+    (description/CVSS, from the CVE Program's own cvelistV5 repo) and public-PoC-repo availability
+    (poc-in-github, best-effort third signal) -- STAMPS the result onto the entry so scoring + the
+    addendum + the UI can read it without any network at search/render time. Network happens only
+    here (the explicit refresh action), behind each signal's own TTL cache in
+    agent/tools/threat_intel.py. Returns how many techniques were updated."""
     from agent.tools import threat_intel
     if not threat_intel.threat_intel_enabled():
         return 0
@@ -194,6 +196,8 @@ def refresh_threat_intel() -> int:
     if not all_cves:
         return 0
     enriched = threat_intel.enrich_cves(all_cves)
+    metadata = threat_intel.cve_metadata(all_cves)
+    poc = threat_intel.poc_availability(all_cves)
     updated = 0
     for entries in store.values():
         for entry in entries:
@@ -203,9 +207,36 @@ def refresh_threat_intel() -> int:
             kev = any(enriched.get(c, {}).get("kev") for c in cves)
             epss_values = [enriched.get(c, {}).get("epss") for c in cves if enriched.get(c, {}).get("epss") is not None]
             epss_max = max(epss_values) if epss_values else None
-            if entry.get("kev") != kev or entry.get("epss_max") != epss_max:
+
+            # A technique naming several CVEs (rare) gets exactly one description/CVSS/PoC set --
+            # the first CVE that actually has real data, not a silent per-CVE overwrite.
+            description = cvss_score = cvss_vector = None
+            for c in cves:
+                meta = metadata.get(c)
+                if meta and meta.get("description"):
+                    description, cvss_score, cvss_vector = meta["description"], meta.get("cvss_score"), meta.get("cvss_vector")
+                    break
+            poc_repos: list = []
+            for c in cves:
+                if poc.get(c):
+                    poc_repos = poc[c]
+                    break
+
+            changed = (
+                entry.get("kev") != kev
+                or entry.get("epss_max") != epss_max
+                or (description is not None and entry.get("cve_description") != description)
+                or (poc_repos and entry.get("poc_repos") != poc_repos)
+            )
+            if changed:
                 entry["kev"] = kev
                 entry["epss_max"] = epss_max
+                if description is not None:
+                    entry["cve_description"] = description
+                    entry["cve_cvss_score"] = cvss_score
+                    entry["cve_cvss_vector"] = cvss_vector
+                if poc_repos:
+                    entry["poc_repos"] = poc_repos
                 updated += 1
     if updated:
         _write_playbook_store(store)
@@ -623,11 +654,15 @@ def update_technique(technique_id: str, updates: dict, tech_keywords: list[str] 
             found_entry[field] = updates[field]
 
     if cves is not None:
-        # Editing CVEs clears any stamped KEV/EPSS so a stale flag from the old CVE set can't linger
-        # until the next refresh-intel.
+        # Editing CVEs clears any stamped KEV/EPSS/CVE-metadata/PoC so a stale flag from the old
+        # CVE set can't linger until the next refresh-intel.
         found_entry["cves"] = extract_cves(*cves)
         found_entry.pop("kev", None)
         found_entry.pop("epss_max", None)
+        found_entry.pop("cve_description", None)
+        found_entry.pop("cve_cvss_score", None)
+        found_entry.pop("cve_cvss_vector", None)
+        found_entry.pop("poc_repos", None)
 
     if tech_keywords is not None or waf_vendors is not None:
         new_tech = tech_keywords if tech_keywords is not None else (found_entry.get("tech_keywords") or [])

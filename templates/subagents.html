@@ -267,27 +267,23 @@
 {% endmacro %}
 
 {% block content %}
-  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
-     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
-     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
-     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
-     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
-     confirmed visual bug that fix caused. #}
-  <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
-    <h1 class="text-[13px] font-semibold text-primary">Subagents</h1>
-    <div class="flex items-center gap-2 flex-wrap shrink-0">
-      <a href="/api/subagents/export"
-         class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Export
-      </a>
-      <button type="button" onclick="document.getElementById('subagent-import').showModal()"
-              class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Import
-      </button>
-    </div>
-    {% include "macros/header_light.html" %}
+  {# The standard page_header() like every other page (Settings/Tools/Toolkit/Dorks/Terminal): the
+     title bar carries ONLY the title and the header light. Export/Import used to live inside it,
+     which put two action buttons on the decorative banner right under the lamp -- they are
+     page actions, so they sit in their own toolbar row just below the header instead. #}
+  {{ page_header("Subagents") }}
+
+  <div class="flex items-center justify-end gap-2 mb-4">
+    <a href="/api/subagents/export"
+       class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Export
+    </a>
+    <button type="button" onclick="document.getElementById('subagent-import').showModal()"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Import
+    </button>
   </div>
 
   {% if error %}

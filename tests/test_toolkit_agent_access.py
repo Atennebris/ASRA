@@ -50,6 +50,7 @@ def _enable(**overrides) -> None:
 
 def test_extras_are_empty_when_every_toggle_is_off(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
+    _enable()  # defaults are all-on; this test is about the explicit all-off state
     assert _toolkit_tool_extras() == []
 
 
@@ -194,6 +195,7 @@ def test_chain_phase_offers_the_enabled_toolkit_tool(tmp_path, monkeypatch):
 
 def test_toolkit_tool_absent_from_every_phase_when_all_toggles_off(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
+    _enable()
     llm = _CapturingLLM(LLMResponse(content="done", tool_calls=[]))
     session = {"session_id": "usr_recon_toolkit_off_test", "logs": [], "findings": []}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
@@ -270,7 +272,8 @@ async def _delegate_and_await_completion(session: dict, subagent_name: str) -> N
 
 def test_subagent_never_gets_a_toolkit_tool_the_operator_has_not_enabled(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
-    _profile_with_tools("Recon Bot", ["decode_value", "diff_requests"])  # neither toggle enabled
+    _enable()  # neither toggle enabled
+    _profile_with_tools("Recon Bot", ["decode_value", "diff_requests"])
 
     llm = _CapturingLLM(LLMResponse(content=None, tool_calls=[ToolCallRequest(id="c1", name="report_subagent_result", arguments={"summary": "done"})]))
     monkeypatch.setattr("agent.core.get_provider", lambda provider, model: llm)

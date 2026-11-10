@@ -32,6 +32,7 @@ def test_get_settings_renders_the_native_toolkit_access_section(tmp_path, monkey
 
 def test_toolkit_agent_settings_post_toggles_one_field_on(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
+    toolkit_settings_store.save_toolkit_agent_settings({})  # start from everything off (defaults are on)
     client = TestClient(main.app)
 
     resp = client.post("/api/toolkit-agent-settings/toolkit_decoder_enabled", data={"enabled": "on"})

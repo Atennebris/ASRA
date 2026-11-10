@@ -439,4 +439,56 @@ def test_sweep_idle_sessions_drops_the_empty_session_entry_entirely():
 
     memscan._sweep_idle_sessions()
 
+
+# --- platform="windows" dispatch -- routes to win_memscan_bridge.py instead of this module's own
+# scanmem-backed functions, without a model-facing second set of tool names. Mocked at the bridge
+# module boundary (never a real TCP call), mirroring this file's own _FakeSession approach for the
+# Linux path above -- same reasoning, different backend.
+
+def test_memscan_attach_routes_to_the_windows_bridge_when_requested(monkeypatch):
+    calls = {}
+
+    def fake_attach(session_id, pid, scan_data_type):
+        calls["args"] = (session_id, pid, scan_data_type)
+        return {"status": "ok", "scan_id": "win1"}
+
+    monkeypatch.setattr(memscan.win_memscan_bridge, "attach", fake_attach)
+    result = memscan.memscan_attach({"_session_id": "sess1", "pid": 4242, "scan_data_type": "int32", "platform": "windows"})
+
+    assert result == {"status": "ok", "scan_id": "win1"}
+    assert calls["args"] == ("sess1", 4242, "int32")
+
+
+def test_memscan_attach_still_uses_scanmem_when_platform_is_omitted(monkeypatch):
+    called = {"bridge": False}
+    monkeypatch.setattr(memscan.win_memscan_bridge, "attach", lambda *a, **k: called.__setitem__("bridge", True))
+    result = memscan.memscan_attach({"_session_id": "sess1", "pid": 999999, "scan_data_type": "int32"})
+
+    assert called["bridge"] is False
+    assert result["status"] == "error"  # a real attach() call against a nonexistent pid
+
+
+@pytest.mark.parametrize(
+    "wrapper_name,bridge_fn_name,params,bridge_args",
+    [
+        ("memscan_scan", "scan", {"scan_id": "win1", "mode": "exact", "value": 7}, ("sess1", "win1", "exact", 7)),
+        ("memscan_list", "list_matches", {"scan_id": "win1"}, ("sess1", "win1")),
+        ("memscan_write", "write", {"scan_id": "win1", "list_index": 0, "value": 9}, ("sess1", "win1", 0, 9)),
+        ("memscan_detach", "detach", {"scan_id": "win1"}, ("sess1", "win1")),
+    ],
+)
+def test_memscan_wrappers_route_to_the_windows_bridge_when_requested(monkeypatch, wrapper_name, bridge_fn_name, params, bridge_args):
+    calls = {}
+
+    def fake(*args):
+        calls["args"] = args
+        return {"status": "ok"}
+
+    monkeypatch.setattr(memscan.win_memscan_bridge, bridge_fn_name, fake)
+    wrapper = getattr(memscan, wrapper_name)
+    result = wrapper({"_session_id": "sess1", "platform": "windows", **params})
+
+    assert result == {"status": "ok"}
+    assert calls["args"] == bridge_args
+
     assert "sess1" not in memscan._SESSIONS

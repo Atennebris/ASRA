@@ -10,7 +10,8 @@
 <style>
   :root { color-scheme: dark; --bg:#0a0e14; --panel:#0f141c; --panel2:#131a24;
           --line:#1f2731; --fg:#c9d1d9; --muted:#8b949e; --accent:#e5484d;
-          --intro-void:#05070c; --intro-core:#fff4ea; }
+          --intro-void:#05070c; --intro-core:#fff4ea;
+          --danger:#ff5c5f; --danger-solid:#c4262b; --danger-bg:rgba(229,72,77,0.1); }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
@@ -147,50 +148,45 @@
         border-radius: 7px; padding: 8px 14px; font: inherit; font-size: 12px; cursor: pointer; }
   .web .btn-open { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
 
-  /* Loader overlay */
+  /* Web mode keeps the server running after the launcher hands over the URL, so the launcher is
+     where it has to be stoppable from. Destructive, so: an outlined red button first, then an
+     in-page warning with the consequences before anything is stopped (window.confirm is not
+     reliable in the webview). Shown/hidden with .show, not the hidden attribute: a display rule
+     here would silently win over [hidden]. */
+  .web-stop { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .web .btn-stop { border-color: var(--danger); color: var(--danger); background: transparent; font-weight: 600; }
+  .web .btn-stop:hover { background: var(--danger-bg); }
+  .web .btn-stop.solid { background: var(--danger-solid); border-color: var(--danger-solid); color: #fff; }
+  .web .btn-stop.solid:hover { background: var(--danger); border-color: var(--danger); }
+  .web .btn-stop:disabled, .web .web-stop button:disabled { opacity: 0.5; cursor: default; }
+  .stop-confirm { display: none; margin-top: 12px; padding: 12px 14px; border-radius: 8px;
+        border: 1px solid var(--danger); background: var(--danger-bg); }
+  .stop-confirm.show { display: block; }
+  .stop-confirm .stop-title { font-size: 13px; font-weight: 700; color: var(--danger); margin-bottom: 6px; }
+  .stop-confirm .stop-text { font-size: 11.5px; color: var(--fg); line-height: 1.6; margin-bottom: 12px; }
+  .stop-status { display: none; margin-top: 10px; font-size: 11.5px; line-height: 1.6; color: var(--muted); }
+  .stop-status.show { display: block; }
+  .stop-status.err { color: var(--danger); }
+
+  /* Dragon loader overlay -- what Start shows when Settings -> Customization -> Visual's "Launch
+     screen" is set to the dragon progress bar instead of the animated intro (ASRA_INTRO_ENABLED=false,
+     agent/intro_settings.py). The creature itself is drawn on #dragon-canvas by the engine in the
+     script below; this CSS only lays out the canvas and the text under it. */
   .overlay { position: fixed; inset: 0; z-index: 50; display: none;
-    flex-direction: column; align-items: center; justify-content: center; gap: 20px;
-    background: rgba(10,14,20,0.9); backdrop-filter: blur(4px); }
+    flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    background: rgba(10,14,20,0.94); backdrop-filter: blur(4px); }
   .overlay.show { display: flex; }
-  .loader-ring { width: 66px; height: 66px; border-radius: 50%;
-    background: conic-gradient(from 0deg, rgba(229,72,77,0) 0 25%, var(--accent) 90%, var(--accent) 100%);
-    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 6px));
-            mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 6px));
-    animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  .loader-dragon { display: block; width: min(760px, 94vw); height: 200px; }
   .loader-msg { font-size: 14px; letter-spacing: 0.03em; }
+  .loader-elapsed { font-size: 11px; color: var(--muted); letter-spacing: 0.08em;
+                    font-variant-numeric: tabular-nums; min-height: 1.2em; }
   .loader-sub { font-size: 11.5px; color: var(--muted); max-width: 26rem; text-align: center;
-                line-height: 1.6; margin-top: -8px; }
-  /* Real, confirmed misses on earlier attempts: a smooth gradient streak on a wavy line read as "a
-     crooked line," a chain of plain square dots read as "cubes," and a THIN, dim, clip-path-swept
-     version of this same spiked-ridge idea read as "an ugly arrow with sticks" -- the clip-path
-     sweep trick was fragile (silently never painted anything visible) and, more fundamentally, too
-     small/low-contrast to read as a creature at all against the dim base color. Fixed both: no more
-     clip-path -- the whole silhouette (spikes + spine + head) is drawn directly in the accent color
-     with a real glow, full-time, at roughly double the previous scale. Spikes are still generated
-     from the spine <path>'s own real geometry at runtime (getPointAtLength/tangent, see the script
-     below), not hand-guessed coordinates, so they sit flush against the curve. Motion is a gentle
-     continuous undulation (the whole shape breathing/swimming in place) plus a slow glow pulse --
-     simple, robust, alive-looking, nothing that depends on SVG clip-path compositing working right. */
-  .loader-dragon { width: 280px; height: 120px; overflow: visible;
-    filter: drop-shadow(0 0 5px var(--accent)) drop-shadow(0 0 12px rgba(229,72,77,0.5));
-    animation: dragonPulse 2.4s ease-in-out infinite; }
-  .loader-dragon .spine { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; opacity: .8; }
-  .loader-dragon .spike { fill: var(--accent); }
-  .loader-dragon .head { fill: var(--accent); }
-  .loader-dragon .eye { fill: var(--bg); }
-  .loader-dragon .swim { animation: dragonSwim 3.6s ease-in-out infinite; transform-origin: 140px 60px; }
-  @keyframes dragonPulse { 0%, 100% { opacity: .75; } 50% { opacity: 1; } }
-  @keyframes dragonSwim {
-    0%   { transform: translateY(0px) rotate(0deg); }
-    50%  { transform: translateY(-3px) rotate(-1.5deg); }
-    100% { transform: translateY(0px) rotate(0deg); }
-  }
+                line-height: 1.6; }
 
   /* ---- Launch intro (Settings -> Customization -> Visual's "Play launch intro" switch,
-     agent/intro_settings.py) -- an alternative to the loader overlay above, never a replacement:
-     #overlay (ring/message/dragon, all untouched above) is exactly what still shows when this is
-     turned off. Both sit hidden (display:none) until start() below picks exactly one.
+     agent/intro_settings.py) -- an alternative to the dragon loader overlay above, never a
+     replacement: #overlay is exactly what shows when this is turned off. Both sit hidden
+     (display:none) until start() below picks exactly one.
 
      Concept: a warp-space background (thin warm streaks drifting outward from a central vanishing
      point -- moving forward through depth) sets the stage; the handle ATENNEBRIS ("from the
@@ -535,19 +531,26 @@
       <button id="open" class="btn-open">Open in browser</button>
       <button id="copy">Copy</button>
     </div>
+    <div class="web-stop">
+      <button type="button" id="web-stop" class="btn-stop">Stop server</button>
+      <div class="stop-confirm" id="web-stop-confirm" role="alertdialog" aria-labelledby="web-stop-title">
+        <div class="stop-title" id="web-stop-title">Stop the ASRA server?</div>
+        <div class="stop-text">This shuts down the server this launcher started. A scan that is still running is interrupted, and every browser tab with ASRA open stops working until you click Start again. Saved projects and findings stay on disk.</div>
+        <div class="web-actions">
+          <button type="button" id="web-stop-confirm-btn" class="btn-stop solid">Stop server</button>
+          <button type="button" id="web-stop-cancel">Cancel</button>
+        </div>
+      </div>
+      <div class="stop-status" id="web-stop-status" role="status"></div>
+    </div>
   </div>
 </div>
 
-<div class="overlay" id="overlay">
-  <div class="loader-ring"></div>
+<div class="overlay" id="overlay" role="status">
+  <canvas class="loader-dragon" id="dragon-canvas" aria-hidden="true"></canvas>
   <div class="loader-msg" id="loader-msg">Starting backend…</div>
+  <div class="loader-elapsed" id="loader-elapsed" aria-hidden="true"></div>
   <div class="loader-sub">Waiting for the server to be ready. A first launch can take a couple of minutes while the environment is built.</div>
-  <svg class="loader-dragon" viewBox="0 0 280 100" width="280" height="100" aria-hidden="true">
-    <g class="swim">
-      <path id="dragonSpine" class="spine" d="M 14,60 C 55,80 95,15 150,32 C 195,46 230,8 262,40" />
-      <g id="dragonSilhouette"></g>
-    </g>
-  </svg>
 </div>
 
 <!-- Launch intro (Settings -> Customization -> Visual's "Play launch intro" switch) -- start()
@@ -579,65 +582,335 @@
 </div>
 
 <script>
-  // Builds the dragon's spiked ridge + head from the #dragonSpine path's own real geometry
-  // (getPointAtLength/tangent sampling), not hand-guessed coordinates -- see the .loader-dragon
-  // CSS comment above for why. Runs once; the whole <g class="swim"> then undulates as one rigid
-  // unit (pure CSS, see @keyframes dragonSwim) -- simpler and far more robust than the earlier
-  // clip-path sweep attempt, which silently never painted anything visible.
+  // Dragon loader engine: a progress bar where the dragon itself is the gauge. The whole dragon
+  // exists as a faint "ghost" vessel spanning the bar; the real, lit dragon grows inside it --
+  // tail fixed at the left edge, head leading, body length = progress -- so how much is done reads
+  // at a glance with no separate track line to draw. The backend has no measurable startup progress
+  // (a warm launch is seconds, a first-time environment build can be many minutes), so the length is
+  // an honest estimate, not a fake percentage: it climbs quickly at first, then keeps creeping ever
+  // more slowly and never reaches the end on its own -- only the real handoff (the shell navigating
+  // away) means "done". An elapsed-time readout under it shows the launch is alive however long it
+  // takes. Canvas 2D with a little hand-rolled physics (no external lib, no WebGL), safe on a
+  // pre-backend screen. Exposes window.dragonLoader.{start,stop}.
   (function () {
-    var svgNS = "http://www.w3.org/2000/svg";
-    var spine = document.getElementById("dragonSpine");
-    var silhouette = document.getElementById("dragonSilhouette");
-    if (!spine || !silhouette || typeof spine.getTotalLength !== "function") return;
+    var canvas = document.getElementById("dragon-canvas");
+    var elapsedEl = document.getElementById("loader-elapsed");
+    var ctx = canvas && canvas.getContext && canvas.getContext("2d");
+    if (!ctx) { window.dragonLoader = { start: function () {}, finish: function () {}, stop: function () {} }; return; }
 
-    function addPolygon(points, cls, target) {
-      var el = document.createElementNS(svgNS, "polygon");
-      el.setAttribute("points", points);
-      if (cls) el.setAttribute("class", cls);
-      target.appendChild(el);
+    // Progress model
+    var PROGRESS_CEILING = 0.96;   // while waiting the bar never claims "done" by itself
+    var DEFAULT_HALF_MS = 4000;    // elapsed time at which the bar reaches half of the ceiling...
+    var MIN_HALF_MS = 1500, MAX_HALF_MS = 20000;  // ...or half of the last launch's real duration
+    var HISTORY_KEY = "asra.launch.ms";
+    var SMOOTHING_PER_SEC = 2.5;   // how fast the drawn length chases the estimate
+    var FINISH_SMOOTHING_PER_SEC = 7;  // the closing run once the backend is ready (~0.8s to full)
+    // Shape: a travelling wave anchored at the tail, thickest through the body
+    var BODY_MIN_LEN = 96, HEAD_LEN = 32, EDGE_PAD = 28, MAX_DPR = 2;
+    var WAVE_LEN = 140, WAVE_AMP = 15, WAVE_PERIOD_MS = 2000, TAIL_CALM_LEN = 70;
+    var TAIL_HW = 0.5, MAX_HW = 8.5, HW_RAMP_LEN = 150, SAMPLE_STEP = 3;
+    var PULSE_PERIOD_MS = 2600, PULSE_WIDTH = 110;
+    // Particles (one shared pool, capped)
+    var MAX_PARTICLES = 110, FLAME_RATE_PER_SEC = 48, EMBER_RATE_PER_SEC = 7;
+    // One warm light temperature: everything is a step along ember -> accent, never a second hue
+    var EMBER = [255, 184, 108], CORE = [255, 244, 234], FALLBACK_ACCENT = [229, 72, 77];
+
+    var running = false, finishing = false, rafId = 0, startedAt = 0, lastFrame = 0, lastSecond = -1, shown = 0;
+    var halfMs = DEFAULT_HALF_MS;
+    var W = 0, H = 0, cy = 0, tailX = 0, fullLen = 0;
+    var accent = FALLBACK_ACCENT, reduceMotion = false, particles = [], flameBudget = 0, emberBudget = 0;
+
+    function rgba(c, a) { return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")"; }
+    function mix(a, b, k) { return [0, 1, 2].map(function (i) { return Math.round(a[i] + (b[i] - a[i]) * k); }); }
+    function lerp(a, b, t) { return a + (b - a) * t; }
+    function smooth01(t) { t = Math.min(1, Math.max(0, t)); return t * t * (3 - 2 * t); }
+
+    function readAccent() {
+      var hex = (getComputedStyle(document.documentElement).getPropertyValue("--accent") || "").trim();
+      var m = /^#([0-9a-f]{6})$/i.exec(hex);
+      return m ? [0, 2, 4].map(function (i) { return parseInt(m[1].substr(i, 2), 16); }) : FALLBACK_ACCENT;
     }
 
-    var len = spine.getTotalLength();
-    var SPIKE_COUNT = 15, MIN_H = 5, MAX_H = 17, BASE_W = 6.5;
-    for (var i = 1; i < SPIKE_COUNT; i++) {
-      var t = i / SPIKE_COUNT;
-      var d = t * len;
-      var p = spine.getPointAtLength(d);
-      var ahead = spine.getPointAtLength(Math.min(d + 1.5, len));
-      var dx = ahead.x - p.x, dy = ahead.y - p.y;
-      var mag = Math.sqrt(dx * dx + dy * dy) || 1;
-      var ux = dx / mag, uy = dy / mag;   // unit tangent (along the spine)
-      var nx = -uy, ny = ux;              // unit normal (perpendicular, "up" off the spine)
-      var taper = Math.sin(Math.PI * t);  // 0 at both ends, 1 at mid-body -- tallest spikes in the middle
-      var h = MIN_H + taper * (MAX_H - MIN_H);
-      var half = BASE_W / 2;
-      var bx1 = (p.x + ux * half).toFixed(1), by1 = (p.y + uy * half).toFixed(1);
-      var bx2 = (p.x - ux * half).toFixed(1), by2 = (p.y - uy * half).toFixed(1);
-      var tipx = (p.x + nx * h).toFixed(1), tipy = (p.y + ny * h).toFixed(1);
-      var pts = bx1 + "," + by1 + " " + tipx + "," + tipy + " " + bx2 + "," + by2;
-      addPolygon(pts, "spike", silhouette);
+    // Smooth value noise: drives flame turbulence and ember sway so neither moves in straight lines.
+    function hash(ix, iy) {
+      var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263);
+      h = Math.imul(h ^ (h >>> 13), 1274126177);
+      return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+    }
+    function noise(x, y) {
+      var ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+      var u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+      return lerp(lerp(hash(ix, iy), hash(ix + 1, iy), u), lerp(hash(ix, iy + 1), hash(ix + 1, iy + 1), u), v);
     }
 
-    // Head: a small wedge continuing straight out from the spine's own leading tangent, plus an eye.
-    var end = spine.getPointAtLength(len);
-    var justBefore = spine.getPointAtLength(Math.max(len - 2, 0));
-    var hx = end.x - justBefore.x, hy = end.y - justBefore.y;
-    var hmag = Math.sqrt(hx * hx + hy * hy) || 1;
-    var hux = hx / hmag, huy = hy / hmag;
-    var hnx = -huy, hny = hux;
-    var HEAD_LEN = 21, HEAD_WIDE = 8.5;
-    var tipX = (end.x + hux * HEAD_LEN).toFixed(1), tipY = (end.y + huy * HEAD_LEN).toFixed(1);
-    var b1x = (end.x + hnx * HEAD_WIDE).toFixed(1), b1y = (end.y + hny * HEAD_WIDE).toFixed(1);
-    var b2x = (end.x - hnx * HEAD_WIDE).toFixed(1), b2y = (end.y - hny * HEAD_WIDE).toFixed(1);
-    var headPts = b1x + "," + b1y + " " + tipX + "," + tipY + " " + b2x + "," + b2y;
-    addPolygon(headPts, "head", silhouette);
+    function measure() {
+      var rect = canvas.getBoundingClientRect();
+      var dpr = Math.min(MAX_DPR, window.devicePixelRatio || 1);
+      W = rect.width; H = rect.height; cy = H / 2;
+      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      tailX = EDGE_PAD;
+      fullLen = Math.max(BODY_MIN_LEN + 40, W - EDGE_PAD * 2 - HEAD_LEN);
+    }
 
-    var eye = document.createElementNS(svgNS, "circle");
-    eye.setAttribute("cx", (end.x + hux * 6.5).toFixed(1));
-    eye.setAttribute("cy", (end.y + huy * 6.5).toFixed(1));
-    eye.setAttribute("r", "1.6");
-    eye.setAttribute("class", "eye");
-    silhouette.appendChild(eye);
+    // Eased estimate in [0, PROGRESS_CEILING): hyperbolic, so it still visibly creeps after minutes.
+    function estimate(ms) { return PROGRESS_CEILING * ms / (ms + halfMs); }
+
+    // Pace the crawl to how long the previous launch really took, so the dragon is roughly where the
+    // backend is instead of a fixed guess. Falls back to the default on a first run or no storage.
+    function loadHalfMs() {
+      try {
+        var last = parseFloat(window.localStorage.getItem(HISTORY_KEY));
+        if (last > 0) return Math.min(MAX_HALF_MS, Math.max(MIN_HALF_MS, last / 2));
+      } catch (e) { /* storage unavailable: use the default */ }
+      return DEFAULT_HALF_MS;
+    }
+
+    // Height of the spine at distance s from the tail. Defined from the TAIL so the live body is
+    // exactly a prefix of the ghost: the wave travels toward the tail (reads as forward flight) and
+    // is calm at the tail tip.
+    function spineY(s, phase) {
+      return cy + WAVE_AMP * smooth01(s / TAIL_CALM_LEN) * Math.sin(2 * Math.PI * s / WAVE_LEN + phase);
+    }
+    function halfWidth(s) {
+      return TAIL_HW + (MAX_HW - TAIL_HW) * Math.pow(Math.min(1, s / HW_RAMP_LEN), 0.8);
+    }
+
+    // Points from tail (index 0) to head (last), each with its tangent and an up-facing normal.
+    function sampleBody(len, phase) {
+      var n = Math.max(12, Math.ceil(len / SAMPLE_STEP)), pts = [];
+      for (var i = 0; i <= n; i++) {
+        var s = len * i / n;
+        pts.push({ s: s, x: tailX + s, y: spineY(s, phase), hw: halfWidth(s) });
+      }
+      for (var j = 0; j <= n; j++) {
+        var a = pts[Math.max(0, j - 1)], b = pts[Math.min(n, j + 1)];
+        var tx = b.x - a.x, ty = b.y - a.y, mag = Math.sqrt(tx * tx + ty * ty) || 1;
+        var p = pts[j];
+        p.tx = tx / mag; p.ty = ty / mag;
+        p.nx = p.ty; p.ny = -p.tx; // rotated tangent; tx > 0 always, so this always points up the screen
+      }
+      return pts;
+    }
+
+    function pathBody(pts) {
+      ctx.beginPath();
+      pts.forEach(function (p, i) {
+        var x = p.x + p.nx * p.hw, y = p.y + p.ny * p.hw;
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      });
+      for (var i = pts.length - 1; i >= 0; i--) { var q = pts[i]; ctx.lineTo(q.x - q.nx * q.hw, q.y - q.ny * q.hw); }
+      ctx.closePath();
+    }
+
+    // The empty vessel the dragon grows into: the same shape, unlit.
+    function drawGhost(pts, nowMs) {
+      pathBody(pts);
+      ctx.fillStyle = rgba(accent, 0.05); ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = rgba(accent, 0.2); ctx.stroke();
+      var head = pts[pts.length - 1];
+      drawHead(head, nowMs, 0.2);
+    }
+
+    function drawSpines(pts) {
+      var step = Math.max(3, Math.round(14 / SAMPLE_STEP));
+      ctx.fillStyle = rgba(mix(accent, EMBER, 0.35), 0.9);
+      for (var i = 4; i < pts.length - 3; i += step) {
+        var p = pts[i], h = p.hw * 1.05 + 3, half = 3 * Math.min(1, p.hw / MAX_HW + 0.3);
+        ctx.beginPath();
+        ctx.moveTo(p.x + p.tx * half + p.nx * p.hw * 0.7, p.y + p.ty * half + p.ny * p.hw * 0.7);
+        ctx.lineTo(p.x - p.tx * h * 0.7 + p.nx * (p.hw + h), p.y - p.ty * h * 0.7 + p.ny * (p.hw + h));
+        ctx.lineTo(p.x - p.tx * half + p.nx * p.hw * 0.7, p.y - p.ty * half + p.ny * p.hw * 0.7);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+
+    function drawBody(pts, nowMs) {
+      var head = pts[pts.length - 1];
+      var grad = ctx.createLinearGradient(tailX, 0, head.x, 0);
+      grad.addColorStop(0, rgba(accent, 0.3));
+      grad.addColorStop(0.5, rgba(accent, 0.85));
+      grad.addColorStop(1, rgba(mix(accent, EMBER, 0.3), 1));
+      ctx.save();
+      ctx.shadowColor = rgba(accent, 0.65); ctx.shadowBlur = 16;
+      ctx.fillStyle = grad;
+      pathBody(pts); ctx.fill();
+      ctx.restore();
+
+      ctx.save();                       // a pulse of heat travelling tail -> head, clipped to the body
+      pathBody(pts); ctx.clip();
+      if (!reduceMotion) {
+        var span = head.x - tailX + PULSE_WIDTH * 2;
+        var px = tailX - PULSE_WIDTH + span * ((nowMs % PULSE_PERIOD_MS) / PULSE_PERIOD_MS);
+        var pulse = ctx.createLinearGradient(px - PULSE_WIDTH, 0, px + PULSE_WIDTH, 0);
+        pulse.addColorStop(0, rgba(CORE, 0)); pulse.addColorStop(0.5, rgba(CORE, 0.32)); pulse.addColorStop(1, rgba(CORE, 0));
+        ctx.fillStyle = pulse; ctx.fillRect(px - PULSE_WIDTH, 0, PULSE_WIDTH * 2, H);
+      }
+      ctx.lineWidth = 1; ctx.strokeStyle = "rgba(255,235,220,0.2)";   // scale chevrons
+      for (var j = 4; j < pts.length - 3; j += 2) {
+        var c = pts[j], w = c.hw * 0.85;
+        ctx.beginPath();
+        ctx.moveTo(c.x + c.nx * w, c.y + c.ny * w);
+        ctx.lineTo(c.x + c.tx * w * 0.5, c.y + c.ty * w * 0.5);
+        ctx.lineTo(c.x - c.nx * w, c.y - c.ny * w);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.strokeStyle = "rgba(255,225,200,0.45)"; ctx.lineWidth = 1.2;  // dorsal highlight
+      ctx.beginPath();
+      pts.forEach(function (p, i) {
+        var x = p.x + p.nx * p.hw * 0.55, y = p.y + p.ny * p.hw * 0.55;
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    function drawHead(head, nowMs, alpha) {
+      var angle = Math.atan2(head.ty, head.tx);
+      var gape = reduceMotion ? 0.14 : 0.14 + 0.1 * Math.sin(nowMs * 0.006);
+      var whisker = reduceMotion ? 0 : 3 * Math.sin(nowMs * 0.005);
+      var skin = rgba(mix(accent, EMBER, 0.25), 1), horn = rgba(mix(accent, [255, 235, 220], 0.45), 1);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(head.x, head.y); ctx.rotate(angle);
+      ctx.fillStyle = horn;                                  // swept-back horns
+      ctx.beginPath(); ctx.moveTo(1, -7); ctx.quadraticCurveTo(-6, -17, -22, -18); ctx.quadraticCurveTo(-9, -11, -5, -5); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(6, -8); ctx.quadraticCurveTo(2, -14, -8, -22); ctx.quadraticCurveTo(0, -11, 0, -6); ctx.closePath(); ctx.fill();
+      ctx.save();                                            // lower jaw, hinged near the neck
+      ctx.translate(-4, 3); ctx.rotate(gape);
+      ctx.fillStyle = skin;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(26, -1); ctx.lineTo(28, 2); ctx.lineTo(14, 5.5); ctx.lineTo(-2, 5); ctx.closePath(); ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = skin;                                  // skull and upper jaw
+      ctx.beginPath(); ctx.moveTo(-8, -7); ctx.bezierCurveTo(0, -10.5, 10, -9.5, 18, -6.5);
+      ctx.lineTo(28, -4.5); ctx.quadraticCurveTo(31, -2, 28, 0.5); ctx.lineTo(16, 1.5); ctx.lineTo(-8, 3.5); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "rgba(255,248,240,0.9)";               // fangs
+      ctx.beginPath(); ctx.moveTo(21, 1); ctx.lineTo(23.5, 1); ctx.lineTo(22.2, 5); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(14, 1.8); ctx.lineTo(16.2, 1.6); ctx.lineTo(15.3, 4.6); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = rgba(mix(accent, EMBER, 0.5), 0.85); ctx.lineWidth = 1.1; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(23, -2); ctx.quadraticCurveTo(8, -15 + whisker, -14, -8); ctx.quadraticCurveTo(-24, -4, -34, -12 + whisker); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(23, -1); ctx.quadraticCurveTo(10, -9 - whisker, -10, -2); ctx.quadraticCurveTo(-20, 3, -30, -3 - whisker); ctx.stroke();
+      ctx.save();                                            // eye
+      ctx.shadowColor = rgba(EMBER, 1); ctx.shadowBlur = 9; ctx.fillStyle = rgba(CORE, 1);
+      ctx.beginPath(); ctx.ellipse(10, -3.6, 2.7, 1.7, -0.25, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = "rgba(10,14,20,0.75)"; ctx.beginPath(); ctx.arc(25, -2.6, 0.9, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    function spawnFlames(head, dt) {
+      flameBudget += FLAME_RATE_PER_SEC * dt;
+      var dx = head.tx, dy = head.ty;
+      while (flameBudget >= 1 && particles.length < MAX_PARTICLES) {
+        flameBudget -= 1;
+        var speed = 70 + Math.random() * 90, spread = (Math.random() - 0.5) * 0.5;
+        particles.push({ kind: "flame", x: head.x + dx * 30, y: head.y + dy * 30 + 2,
+          vx: (dx * Math.cos(spread) - dy * Math.sin(spread)) * speed,
+          vy: (dy * Math.cos(spread) + dx * Math.sin(spread)) * speed,
+          age: 0, life: 0.5 + Math.random() * 0.45, r: 1.4 + Math.random() * 1.9 });
+      }
+      flameBudget = Math.min(flameBudget, 1);
+    }
+
+    function spawnEmbers(pts, dt) {
+      emberBudget += EMBER_RATE_PER_SEC * dt;
+      while (emberBudget >= 1 && particles.length < MAX_PARTICLES) {
+        emberBudget -= 1;
+        var p = pts[Math.floor((0.15 + Math.random() * 0.8) * (pts.length - 1))];
+        particles.push({ kind: "ember", x: p.x + p.nx * p.hw, y: p.y + p.ny * p.hw,
+          vx: -4 - Math.random() * 6, vy: -(14 + Math.random() * 18),
+          age: 0, life: 1.1 + Math.random() * 0.9, r: 0.7 + Math.random() * 0.9 });
+      }
+      emberBudget = Math.min(emberBudget, 1);
+    }
+
+    function stepParticles(dt, nowMs) {
+      particles = particles.filter(function (q) { return (q.age += dt) < q.life; });
+      particles.forEach(function (q) {
+        var t = nowMs * 0.001;
+        var turbulence = (noise(q.x * 0.035 + t, q.y * 0.035) - 0.5) * (q.kind === "flame" ? 260 : 60);
+        q.vy += (q.kind === "flame" ? -45 : -6) * dt + turbulence * dt * 0.6;   // buoyancy + a swirling field
+        q.vx *= 1 - (q.kind === "flame" ? 1.5 : 0.4) * dt;
+        q.x += q.vx * dt; q.y += q.vy * dt;
+      });
+    }
+
+    function drawParticles() {
+      ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.lineCap = "round";
+      particles.forEach(function (q) {
+        var k = q.age / q.life, radius = q.r * (1 - 0.45 * k);
+        if (q.kind === "flame") {
+          // A short streak along the velocity (motion blur) reads as a flame tongue; plain circles
+          // read as bubbles. Hottest only at the mouth, then ember, then accent as it cools.
+          var color = k < 0.2 ? mix(mix(CORE, EMBER, 0.45), EMBER, k / 0.2) : mix(EMBER, accent, Math.min(1, (k - 0.2) / 0.6));
+          ctx.strokeStyle = rgba(color, 0.55 * Math.pow(1 - k, 1.2));
+          ctx.lineWidth = radius * 1.6;
+          ctx.beginPath(); ctx.moveTo(q.x - q.vx * 0.06, q.y - q.vy * 0.06); ctx.lineTo(q.x, q.y); ctx.stroke();
+        } else {
+          ctx.fillStyle = rgba(mix(EMBER, accent, k), 0.9 * (1 - k));
+          ctx.beginPath(); ctx.arc(q.x, q.y, radius, 0, Math.PI * 2); ctx.fill();
+        }
+      });
+      ctx.restore();
+    }
+
+    function frame(now) {
+      if (!running) return;
+      var dt = Math.min(0.1, (now - lastFrame) / 1000); lastFrame = now;
+      var ms = now - startedAt;
+      var target = finishing ? 1 : estimate(ms);
+      shown += (target - shown) * Math.min(1, dt * (finishing ? FINISH_SMOOTHING_PER_SEC : SMOOTHING_PER_SEC));
+      var len = BODY_MIN_LEN + shown * (fullLen - BODY_MIN_LEN);
+      var phase = reduceMotion ? 0.9 : 2 * Math.PI * ms / WAVE_PERIOD_MS;
+      ctx.clearRect(0, 0, W, H);
+      drawGhost(sampleBody(fullLen, phase), ms);
+      var body = sampleBody(len, phase);
+      drawSpines(body);
+      drawBody(body, ms);
+      drawHead(body[body.length - 1], ms, 1);
+      if (!reduceMotion) {
+        spawnFlames(body[body.length - 1], dt);
+        spawnEmbers(body, dt);
+        stepParticles(dt, ms);
+        drawParticles();
+      }
+      var sec = Math.floor(ms / 1000);
+      if (sec !== lastSecond && elapsedEl) {
+        lastSecond = sec;
+        elapsedEl.textContent = Math.floor(sec / 60) + ":" + ("0" + (sec % 60)).slice(-2);
+      }
+      rafId = requestAnimationFrame(frame);
+    }
+
+    window.addEventListener("resize", function () { if (running) measure(); });
+    // A hidden window stops delivering frames; without this the first frame back would integrate
+    // the whole hidden interval as one step.
+    document.addEventListener("visibilitychange", function () { if (running) lastFrame = performance.now(); });
+
+    window.dragonLoader = {
+      // Must be called AFTER #overlay is shown: the canvas is measured from its real laid-out size.
+      start: function () {
+        if (running) return;
+        reduceMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+        accent = readAccent();
+        measure();
+        shown = 0; particles = []; flameBudget = 0; emberBudget = 0; lastSecond = -1;
+        finishing = false; halfMs = loadHalfMs();
+        startedAt = lastFrame = performance.now();
+        running = true;
+        rafId = requestAnimationFrame(frame);
+      },
+      // The backend is ready: run the rest of the way to the end (the shell waits for this before
+      // moving the window on) and remember how long this launch took to pace the next one.
+      finish: function () {
+        if (!running || finishing) return;
+        finishing = true;
+        try { window.localStorage.setItem(HISTORY_KEY, String(Math.round(performance.now() - startedAt))); }
+        catch (e) { /* storage unavailable: nothing to remember */ }
+      },
+      stop: function () { running = false; cancelAnimationFrame(rafId); }
+    };
   })();
 </script>
 
@@ -1142,13 +1415,29 @@
     var $ = function (id) { return document.getElementById(id); };
     var cfg = null;
     var origValues = {};
+    // launch_backend (main.rs) emits this once the backend answers, then waits a moment before
+    // navigating so the dragon progress bar can fill up completely first.
+    var tauriEvent = window.__TAURI__ && window.__TAURI__.event;
+    if (tauriEvent) tauriEvent.listen("backend-ready", function () {
+      if (window.dragonLoader) window.dragonLoader.finish();
+    });
+    var START_LABEL = $("start").textContent;
+
+    // Start is disabled while a launch is running; with the "nothing" launch screen it is also the
+    // only sign that the click registered, so its label changes too.
+    function setStartBusy(busy) {
+      $("start").disabled = busy;
+      $("start").textContent = busy && cfg && !cfg.intro_enabled && cfg.loader_enabled === false
+        ? "Starting…" : START_LABEL;
+    }
 
     function showError(msg) {
       $("overlay").classList.remove("show");
+      if (window.dragonLoader) window.dragonLoader.stop();
       $("intro").classList.remove("show");
       if (window.introAudio) window.introAudio.stop();
       var e = $("error"); e.textContent = "Error: " + msg; e.classList.add("show");
-      $("start").disabled = false;
+      setStartBusy(false);
     }
 
     function boolFrom(v) {
@@ -1415,13 +1704,15 @@
       $("web").classList.remove("show");
       var mode = (document.querySelector('input[name=mode]:checked') || {}).value || "desktop";
       var distroEl = $("distro");
-      $("start").disabled = true;
+      setStartBusy(true);
       var msg = mode === "web" ? "Starting the server…" : "Starting backend…";
-      // Settings -> Customization -> Visual's "Play launch intro" switch (agent/intro_settings.py,
-      // read here via cfg.intro_enabled -- get_start_config() already re-reads .env fresh on every
-      // launch). On: the animated intro (#intro; the shatter geometry is built for the CURRENT window
-      // size right when shown, not at page load, in case the operator resized before clicking Start).
-      // Off: the plain loader untouched above -- exactly what always showed here before this existed.
+      // Settings -> Customization -> Visual's "Launch screen" picker (agent/intro_settings.py, read
+      // here via cfg.intro_enabled / cfg.loader_enabled -- get_start_config() already re-reads .env
+      // fresh on every launch). Intro: the animated intro (#intro; the shatter geometry is built
+      // for the CURRENT window size right when shown, not at page load, in case the operator
+      // resized before clicking Start). Dragon: the progress bar (#overlay; its engine is
+      // window.dragonLoader above). Nothing: neither is shown, setStartBusy() above is the only
+      // feedback.
       if (cfg && cfg.intro_enabled) {
         $("intro-msg").textContent = msg;
         $("intro").classList.add("show");
@@ -1433,9 +1724,10 @@
         // Called from right here, inside this click handler, so AudioContext creation is always
         // inside a real user gesture.
         if (cfg.intro_sound_enabled && window.introAudio) window.introAudio.start();
-      } else {
+      } else if (!cfg || cfg.loader_enabled !== false) {
         $("loader-msg").textContent = msg;
         $("overlay").classList.add("show");
+        if (window.dragonLoader) window.dragonLoader.start();
       }
       try {
         var startUpdates = collectChanges();
@@ -1448,11 +1740,13 @@
         }});
         if (mode === "web") {
           $("overlay").classList.remove("show");
+          if (window.dragonLoader) window.dragonLoader.stop();
           $("intro").classList.remove("show");
           if (window.introAudio) window.introAudio.stop();
           $("web-url").textContent = res;
+          setStopStep("idle");
           $("web").classList.add("show");
-          $("start").disabled = false;
+          setStartBusy(false);
         }
         // desktop: the shell navigates this window to the live UI itself.
       } catch (e) { showError(String(e)); }
@@ -1487,6 +1781,46 @@
         status.textContent = String(e);
       } finally {
         btn.disabled = false;
+      }
+    });
+
+    // Web mode's "Stop server": two steps on purpose (warning first, stop second). Reuses
+    // force_restart_agent (main.rs): it stops the backend this shell owns -- which also ends that
+    // backend's watchdog, so nothing restarts it behind the operator's back -- then clears any
+    // leftover process in the targeted WSL distro and waits for the port to free up.
+    function setStopStep(step) {
+      $("web-stop").style.display = step === "idle" ? "" : "none";
+      $("web-stop-confirm").classList.toggle("show", step === "confirm");
+      var status = $("web-stop-status");
+      status.classList.toggle("show", step === "stopping" || step === "error");
+      status.classList.toggle("err", step === "error");
+    }
+
+    $("web-stop").addEventListener("click", function () {
+      setStopStep("confirm");
+      $("web-stop-cancel").focus(); // the safe choice is the default one
+    });
+    $("web-stop-cancel").addEventListener("click", function () { setStopStep("idle"); });
+    $("web-stop-confirm-btn").addEventListener("click", async function () {
+      if (!invoke) return;
+      var status = $("web-stop-status");
+      setStopStep("stopping");
+      status.textContent = "Stopping the server…";
+      try {
+        var distroEl = $("distro");
+        var res = await invoke("force_restart_agent", {
+          distro: distroEl ? distroEl.value : "",
+          asRoot: $("root").checked
+        });
+        $("web").classList.remove("show");
+        setStopStep("idle");
+        var done = $("force-restart-status");
+        done.className = "force-restart-status show ok";
+        done.textContent = res;
+        setStartBusy(false);
+      } catch (e) {
+        setStopStep("error");
+        status.textContent = String(e);
       }
     });
 

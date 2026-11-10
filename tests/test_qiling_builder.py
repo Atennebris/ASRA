@@ -111,3 +111,46 @@ def test_resolve_rootfs_uses_base_when_no_subdir(tmp_path):
     base.mkdir()
     target = _write(tmp_path, "app.bin", b"\x7fELF" + b"\x00" * 60)  # unknown machine
     assert qiling_runner._resolve_rootfs(target, str(base)) == str(base)
+
+
+def test_windows_rootfs_incomplete_flags_a_bare_skeleton_dir(tmp_path):
+    # setup_tools.sh's rootfs clone creates the x8664_windows FOLDER for every arch, but the real
+    # Windows DLLs/registry inside it are a separate, manual, licensing-constrained step -- a bare
+    # skeleton dir must not be mistaken for a usable rootfs.
+    windows_dir = tmp_path / "x8664_windows"
+    windows_dir.mkdir()
+    hint = qiling_runner._windows_rootfs_incomplete(str(windows_dir))
+    assert hint is not None
+    assert "registry" in hint.lower()
+    assert "System32" in hint
+
+
+def test_windows_rootfs_incomplete_allows_a_populated_windows_rootfs(tmp_path):
+    windows_dir = tmp_path / "x8664_windows"
+    (windows_dir / "Windows" / "registry").mkdir(parents=True)
+    assert qiling_runner._windows_rootfs_incomplete(str(windows_dir)) is None
+
+
+def test_windows_rootfs_incomplete_ignores_non_windows_rootfs(tmp_path):
+    linux_dir = tmp_path / "x8664_linux"
+    linux_dir.mkdir()
+    assert qiling_runner._windows_rootfs_incomplete(str(linux_dir)) is None
+
+
+def test_run_gives_a_clear_windows_dll_hint_instead_of_a_raw_qiling_traceback(tmp_path):
+    base = tmp_path / "rootfs"
+    (base / "x8664_windows").mkdir(parents=True)  # the clone's bare skeleton, no real DLLs
+    target = _write(tmp_path, "app.exe", _pe(0x8664))
+
+    result = qiling_runner._run({"file_path": target, "rootfs": str(base)})
+
+    assert result["status"] == "error"
+    assert "registry" in result["error"].lower()
+
+
+def test_qiling_parsed_error_override_flags_a_failed_payload():
+    assert qiling.qiling_parsed_error_override({"status": "error", "error": "boom"}) == "boom"
+
+
+def test_qiling_parsed_error_override_leaves_a_successful_payload_alone():
+    assert qiling.qiling_parsed_error_override({"status": "ok", "os": "windows"}) is None

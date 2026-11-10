@@ -15,6 +15,9 @@ pytest==9.1.1
 ruff==0.15.22
 fpdf2==2.8.7
 python-docx==1.2.0
+# Optional passphrase encryption of exported API keys (agent/settings_transfer.py, Settings -> General ->
+# Transfer settings). Already pulled in transitively by other packages here; listed so it doesn't depend on that.
+cryptography>=42
 # >=12 floor, not just a bare "mitmproxy" like most deps above -- confirmed live: resolving the
 # WHOLE requirements.txt together (not mitmproxy alone), pip's resolver backtracks all the way to
 # ancient mitmproxy==6.0.2 to satisfy some other package's constraint chain, pulling in
@@ -35,11 +38,18 @@ playwright==1.61.0
 # it separately, `pip install --no-deps slither-analyzer==0.11.6`, right after this file. Real,
 # confirmed incident this fixes: slither-analyzer 0.11.6 declares eth-abi>=5.0.1; mythril (pinned
 # below) declares eth-abi<5.0.0,>=4.0.0 -- genuinely irreconcilable in one pip resolve
-# (ResolutionImpossible, confirmed live), even though slither-analyzer's OWN actual runtime code
-# works fine against the older eth-abi 4.2.1 mythril's own install already pulls in (confirmed live:
-# `slither --version` and a real `myth analyze` pass both succeed side by side in the exact same
-# venv) -- its declared floor is stricter than what it actually needs. --no-deps is what lets both
-# tools share that one already-proven-working eth-abi instead of pip refusing to install either.
+# (ResolutionImpossible, confirmed live). --no-deps is what avoids that resolve entirely.
+# Real, confirmed incident THIS fixes (found later, 2026-11-09): --no-deps on its own leaves
+# slither-analyzer with NONE of its own real dependencies installed either -- it never actually ran
+# at all (`ModuleNotFoundError: No module named 'crytic_compile'` the first time it was actually
+# used, not at install time). run.sh now installs the real dependency set (crytic-compile, eth-abi,
+# web3, ...) as its own separate follow-up `pip install` step, right after the two --no-deps
+# installs -- see that file's own comment for why resolving THAT separately (not merged into this
+# file's own resolve) avoids the same backtracking problem --no-deps exists to avoid. Confirmed
+# live end-to-end against a real vulnerable contract afterward: slither correctly flagged a real
+# reentrancy bug through this exact dependency set (eth-abi 6.x, not mythril's own older declared
+# floor -- its floor is stricter than what it actually needs, same situation this file already
+# documents for mythril below).
 pyevmasm==0.2.3
 semgrep==1.173.0
 # Manages per-project Solidity compiler versions -- slither shells out to whichever solc version a
@@ -60,12 +70,17 @@ solc-select==1.2.0
 # version that satisfies mythril's stale floor -- confirmed live, each one either never converges
 # (a real, several-minutes-plus hang with zero output under run.sh's own former `pip -q`,
 # indistinguishable from a genuinely frozen install) or hits a hard ResolutionImpossible/build
-# failure. mythril's own actual runtime code works fine against the NEWER versions of these
-# packages the rest of this file already needs (confirmed live: `myth analyze -c <bytecode>`
-# succeeds end-to-end in the exact same venv jinja2/slither-analyzer/etc. are installed into) --
-# its declared floors are stricter than what it actually needs, same situation as slither-analyzer's
-# own eth-abi floor above. --no-deps is what lets mythril share the SAME already-proven-working
-# package set instead of pip trying (and failing) to downgrade half of them on its behalf.
+# failure. --no-deps avoids that resolve entirely for mythril's OWN install.
+# Real, confirmed incident THIS fixes (found later, 2026-11-09): same gap as slither-analyzer above
+# -- --no-deps alone left mythril with NONE of its own real dependencies installed, so it crashed
+# the first time it actually ran (`ModuleNotFoundError: No module named 'eth_abi'`), not at install
+# time. run.sh's own follow-up `pip install` step (see that file) installs mythril's real
+# dependencies too, resolved together with slither-analyzer's own (they overlap substantially --
+# eth-abi, eth-typing, ...), confirmed live end-to-end: a real `myth analyze` pass against a real
+# vulnerable contract correctly reported a real finding (SWC-107) through the NEWER package
+# versions pip's own resolver actually picked (eth-abi 6.x, not mythril's own declared `<5.0.0`
+# floor) -- its declared floors are stricter than what it actually needs, confirmed by it actually
+# working, not assumed.
 # mythril's own transitive dependency chain (py-evm's `eth` package) still does a bare
 # `import pkg_resources` at import time -- confirmed live: setuptools>=81 dropped pkg_resources
 # entirely, so mythril crashes with "ModuleNotFoundError: No module named 'pkg_resources'" the

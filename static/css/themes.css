@@ -2611,8 +2611,16 @@ select, option {
    :has() is already relied on elsewhere in this app (Settings' own CSS-only radio tabs) for the
    same "no JS, no per-template edit" reasoning. Scoped to :has(> .header-light-fixture) specifically
    so this never touches an unrelated .relative element elsewhere in the app that has nothing to do
-   with this fixture. */
-.relative:has(> .header-light-fixture) > *:not(.header-light):not(.header-light-fixture) {
+   with this fixture.
+   Real, confirmed regression of this very rule (measured live with Playwright on a session page,
+   where the title bar carries BOTH the lamp and the mascot mount): at its original specificity it
+   also forced position:relative onto the mascot's own `.asra-mascot` box, which must stay
+   position:absolute so it can patrol the bar. The mascot became a third in-flow flex item, so the
+   bar's justify-between spread title | status badge | mascot apart and the "live" badge jumped to
+   the middle of the header while the mascot was pushed off-screen. Wrapped in :where() so this
+   rule has zero specificity: it still gives a plain static child its position/z-index, but any
+   element that sets its own position (absolute mascot, a sticky child) always wins. */
+:where(.relative:has(> .header-light-fixture) > *:not(.header-light):not(.header-light-fixture)) {
   position: relative;
   z-index: 1;
 }
@@ -2954,6 +2962,15 @@ dialog:not([open]) {
    Restate the hide rule here in the author origin, scoped to this one element like the dialog rule
    above, rather than a blanket `[hidden]` override that could have wider, unaudited side effects. */
 #asra-confirm-checkbox-row[hidden] {
+  display: none !important;
+}
+
+/* Same root cause again, third element: the sidebar clock row (base.html #asra-clock-row) carries
+   Tailwind's `flex`, so the `hidden` attribute set by Settings -> Customization's "Show clock"
+   toggle (live, and server-side on load) never hid it -- the clock stayed on screen with the
+   toggle off. Measured live: computed display stayed `flex` with hidden=true. */
+#asra-clock-row[hidden],
+#asra-clock-line[hidden] {
   display: none !important;
 }
 

@@ -174,3 +174,6 @@ windows-pty-bridge/bin/
 
 # Tauri build-generated ACL schemas (regenerated on every build)
 desktop/src-tauri/gen/
+
+# Stray timing marker left by ad-hoc session scripts
+t0.txt

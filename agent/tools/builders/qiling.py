@@ -67,3 +67,17 @@ def parse_qiling_output(stdout: str) -> dict:
         return json.loads(payload)
     except json.JSONDecodeError:
         return {"raw_output": stdout.strip()}
+
+
+def qiling_parsed_error_override(parsed: dict) -> str | None:
+    """ToolSpec.parsed_error_override for qiling_emulate -- qiling_runner.py's own main() always
+    exits 0, even when _run() caught a real failure (missing rootfs, qiling not importable, the
+    target's own load error), specifically so that failure reads as a clean tool result instead of
+    the wrapper script itself crashing. That leaves run_tool()'s exit-code-based status with nothing
+    to see, and the real failure visible only inside this parsed payload. Confirmed real incident:
+    a Windows PE target against an incomplete rootfs (no Windows/registry dir) came back
+    {"status": "ok", ...} at the top level while `parsed` plainly said {"status": "error", ...} --
+    the chat UI showed a successful tool call for a run that never actually emulated anything."""
+    if parsed.get("status") != "error":
+        return None
+    return str(parsed.get("error") or "qiling_emulate reported a failure with no error message.")

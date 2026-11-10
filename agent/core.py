@@ -63,10 +63,12 @@ from agent.llm_client import (
     ProviderConfig,
     ToolCallRequest,
     current_backoff_accumulator,
+    describe_response_origin,
     get_fallback_chain,
     get_fallback_chain_enabled,
     get_next_chain_step,
     get_provider,
+    stamp_response_origin,
 )
 from agent.providers.models_dev import get_model_cost
 from agent.settings import get_secondary_verification_provider, load_llm_settings
@@ -97,6 +99,7 @@ from agent.tools.subagent_store import get_enabled_profiles, get_profile_by_name
 from agent.tools.builders.apktool import parse_apktool_output
 from agent.tools.builders.binwalk import parse_binwalk_output
 from agent.tools.builders.qiling import parse_qiling_output
+from agent.tools.builders.adb import parse_adb_output
 from agent.tools.builders.dalfox import parse_dalfox_output
 from agent.tools.builders.validators import validate_scope_entry
 from agent.tools.builders.discovered import get_tool_help
@@ -114,6 +117,7 @@ from agent.tools.builders.osv_scanner import parse_osv_scanner_output
 from agent.tools.builders.radare2 import parse_radare2_output
 from agent.tools.builders.radiff2 import parse_radiff2_output
 from agent.tools.builders.semgrep import parse_semgrep_output
+from agent.tools.builders.sigrok_cli import parse_sigrok_cli_output
 from agent.tools.builders.slither import parse_slither_output
 from agent.tools.builders.sqlmap import parse_sqlmap_output
 from agent.tools.builders.subfinder import parse_subfinder_output
@@ -133,6 +137,7 @@ from agent.tools import playbook_store, tool_memory_store
 # composition root that populates TOOL_REGISTRY) — spelled out explicitly rather than relied on
 # implicitly, since it's easy to miss that package-init side effect on a later refactor.
 import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
+from agent.tools.custom_tool_runtime import build_dynamic_toolspecs
 from agent.tools.registry import ToolSpec, categories_of, get_tool, get_tools_by_category, register_tool
 from agent.tools.runner import _loggable_params, current_subprocess_registry, run_tool
 from agent.tools.tool_api_keys import get_tool_api_key
@@ -311,7 +316,17 @@ _OUTPUT_PARSERS: dict[str, Callable[[str], object]] = {
     "frida_ps": parse_frida_ps_output,
     "tshark_capture": parse_tshark_capture_output,
     "tshark_read_pcap": parse_tshark_read_pcap_output,
+    "sigrok_cli": parse_sigrok_cli_output,
+    "adb": parse_adb_output,
 }
+
+# Parsers registered above whose shape also depends on the model's OWN arguments, not just stdout
+# -- specifically radare2's "offset" param (pagination: a result list bigger than
+# radare2.py's own _MAX_LIST_ENTRIES cap needs the model to be able to ask for the NEXT page, which
+# means the parser needs to see what offset was requested). Everything else in _OUTPUT_PARSERS
+# above still gets the plain single-argument call -- this is a narrow opt-in, not a signature
+# change for the ~25 other registered parsers.
+_PAGINATED_OUTPUT_PARSERS = {"radare2"}
 
 # Same registration shape as _OUTPUT_PARSERS above, for the opposite case: a tool-specific failure
 # whose raw stderr/stdout gives the model nothing actionable to work with (confirmed live: nuclei's
@@ -998,6 +1013,32 @@ def _toolkit_tool_extras() -> list[ToolSpec]:
     return [spec for spec in (get_tool(name) for name in names) if spec is not None]
 
 
+def _custom_tool_extras(category: str | None = None) -> list[ToolSpec]:
+    """Operator-registered "(custom)" tools (Settings -> Tools -> Custom tools,
+    agent/tools/custom_tool_runtime.py) that are currently enabled -- appended to every phase's/
+    subagent's own tool_specs, same unconditional-extras pattern _toolkit_tool_extras() just above
+    already establishes, not a second mechanism. These are never part of the static TOOL_REGISTRY
+    at all (minted fresh on every call, since enabling/disabling one must take effect on the very
+    next tool-set assembly, not after a restart) -- so unlike an ordinary registered tool, nothing
+    about get_tools_by_category()/get_tool() ever finds one on its own; every call site that
+    should offer them has to append this explicitly, which is exactly what every call site below
+    now does.
+
+    Unlike the toolkit's own fixed 7 names, a custom tool's own category decides which phase(s)
+    see it (recon/scan/exploit/post_exploit/re, or every ordinary one at once if the operator
+    picked "custom" when unsure which bucket fits -- see custom_tool_runtime.py's own
+    _category_for). category=None (used for a subagent's own flat, profile-driven toolset, which
+    has no per-category assembly to filter against at all) returns every enabled custom tool
+    unconditionally; a phase that DOES assemble by category passes its own category string so an
+    "re"-only custom tool doesn't leak into an ordinary web-pentest phase, matching how
+    get_tools_by_category itself already scopes everything else.
+    """
+    specs = build_dynamic_toolspecs()
+    if category is None:
+        return specs
+    return [spec for spec in specs if category in categories_of(spec)]
+
+
 def _build_subagent_system_prompt(profile: dict) -> str:
     parts = [
         f"You are '{profile['name']}', a specialized subagent working inside ASRA, an autonomous "
@@ -1152,6 +1193,11 @@ async def _delegate_to_subagent_impl(arguments: dict) -> dict:
     report_tool = get_tool("report_subagent_result")
     if report_tool is not None:
         tool_specs.append(report_tool)
+    # Every enabled "(custom)" tool, unconditionally -- a subagent's own toolset has no
+    # per-category assembly to filter against (unlike a phase's get_tools_by_category calls
+    # below), so this never finds one on its own without this explicit append either (see
+    # _custom_tool_extras' own docstring for why that's never automatic).
+    tool_specs += _custom_tool_extras()
 
     llm = _initial_llm_for_subagent(session_id, profile)
     task_id = uuid.uuid4().hex[:12]
@@ -1510,7 +1556,7 @@ async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict]
     _log_agent_debug(ctx, "llm call %d", ctx.iteration_count)
     call_started = time.monotonic()
     try:
-        response = await asyncio.to_thread(ctx.llm.complete, messages, tools, stop_check=stop_check)
+        response = stamp_response_origin(await asyncio.to_thread(ctx.llm.complete, messages, tools, stop_check=stop_check), ctx.llm, call_started)
         _record_llm_usage_event(ctx.session, ctx.llm.provider_id, ctx.llm.model, time.monotonic() - call_started, response.usage)
         return response
     except LLMCallAborted:
@@ -1586,7 +1632,7 @@ async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict]
             fallback_started = time.monotonic()
             try:
                 try:
-                    response = await asyncio.to_thread(ctx.llm.complete, messages, tools, stop_check=stop_check)
+                    response = stamp_response_origin(await asyncio.to_thread(ctx.llm.complete, messages, tools, stop_check=stop_check), ctx.llm, fallback_started)
                     _record_llm_usage_event(ctx.session, ctx.llm.provider_id, ctx.llm.model, time.monotonic() - fallback_started, response.usage)
                     return response
                 except LLMCallAborted:
@@ -1601,7 +1647,7 @@ async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict]
                 claimed.discard(fallback_step)
 
 
-def _apply_output_parser(spec: ToolSpec, result: dict) -> dict:
+def _apply_output_parser(spec: ToolSpec, result: dict, arguments: dict | None = None) -> dict:
     if result.get("status") == "ok":
         degraded_hint_fn = _DEGRADED_OK_HINTS.get(spec.name)
         note = degraded_hint_fn(result) if degraded_hint_fn is not None else None
@@ -1610,7 +1656,10 @@ def _apply_output_parser(spec: ToolSpec, result: dict) -> dict:
         parser = _OUTPUT_PARSERS.get(spec.name)
         if parser is None:
             return {**result, **note_update} if note_update else result
-        parsed = parser(result["stdout"])
+        if spec.name in _PAGINATED_OUTPUT_PARSERS:
+            parsed = parser(result["stdout"], arguments or {})
+        else:
+            parsed = parser(result["stdout"])
         # Real, confirmed incident this fixes (ffuf against a large wordlist): raw stdout can run
         # to hundreds of KB, and it sits BEFORE "parsed" in this dict — the final
         # json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT] truncation (this module's own message-append
@@ -1622,6 +1671,15 @@ def _apply_output_parser(spec: ToolSpec, result: dict) -> dict:
         # budget instead of being silently squeezed out by whatever ran ahead of it.
         stdout = result["stdout"]
         capped_stdout = stdout if len(stdout) <= 2000 else stdout[:2000] + f"... [{len(stdout)} chars total, see 'parsed' for the structured result]"
+        # A tool whose own wrapper subprocess always exits 0 even on a real internal failure (see
+        # ToolSpec.parsed_error_override's own docstring -- qiling_emulate is the confirmed case)
+        # only ever reports that failure inside the parsed payload itself, never through the exit
+        # code this function's caller already classified as "ok". Checked here, not earlier, because
+        # this is the first point both the exit-code status AND the parsed payload exist together.
+        if spec.parsed_error_override is not None:
+            override_error = spec.parsed_error_override(parsed)
+            if override_error is not None:
+                return {**result, "status": "failed", "error": override_error, "stdout": capped_stdout, "parsed": parsed, **note_update}
         return {**result, "stdout": capped_stdout, "parsed": parsed, **note_update}
 
     permanent_hint_fn = _PERMANENT_ERROR_HINTS.get(spec.name)
@@ -1757,7 +1815,7 @@ async def _repair_terminal_tool_reply(
     result = await execute_tool(spec, call.arguments) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, call.arguments)
     duration_ms = (time.monotonic() - dispatch_started) * 1000
     trace.append({"tool": call.name, "arguments": call.arguments, "result": result})
-    _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result))
+    _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result), describe_response_origin(response))
     if result.get("status") != "ok":
         return None
     return {k: v for k, v in result.items() if k not in _TOOL_RETRY_BOOKKEEPING_KEYS}
@@ -1895,7 +1953,7 @@ def _cited_unresolved_subagent_task(call_arguments: dict, unresolved_task_ids: s
 
 def _append_log(
     ctx: RunContext, phase: str, thought: str | None, command: str | None, status: str, error: str | None,
-    duration_ms: float | None = None, output: str | None = None,
+    duration_ms: float | None = None, output: str | None = None, llm: dict | None = None,
 ) -> None:
     ctx.session["logs"].append(
         {
@@ -1925,6 +1983,10 @@ def _append_log(
             # "at" timestamps by hand — that gap also includes the next LLM turn's own thinking
             # time, so it was never more than an approximation.
             "duration_ms": round(duration_ms) if duration_ms is not None else None,
+            # {"provider", "model", "elapsed_s"} of the LLM request that PRODUCED this step
+            # (llm_client.describe_response_origin) -- distinct from duration_ms above, which times
+            # only the tool dispatch. None for a synthetic record with no model reply behind it.
+            "llm": llm,
             # Set only while ctx is a delegated subagent's own RunContext (see RunContext's
             # docstring) — None for every main-phase entry. Lets the UI group a subagent's own
             # steps by which delegation produced them instead of a flat, wall-clock-interleaved
@@ -2125,7 +2187,44 @@ async def _dispatch_browser_tool_impl(
         # DOM being ready is all a snapshot/interaction actually needs; "load"/"networkidle" are
         # still available as an explicit choice (see this tool's own parameters_schema) for the
         # rarer case that genuinely needs every subresource finished.
-        return await manager.navigate(session_id, arguments.get("target", ""), arguments.get("wait_until", "domcontentloaded"), out_of_scope_entries, arguments.get("identity"))
+        target = arguments.get("target", "")
+        requested_wait_until = arguments.get("wait_until", "domcontentloaded")
+        wait_until = requested_wait_until
+        host = _extract_target_host({"target": target})
+        # Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): the model chose
+        # wait_until="networkidle" against an analytics-heavy marketing page (continuous Snapchat/
+        # GA4/Quantcount/Contentsquare/Queue-it beacons -- the network genuinely never goes idle) and
+        # hit the same 45s Playwright timeout 3 separate times across one session, each time
+        # self-correcting back to "domcontentloaded" and succeeding immediately. The self-correction
+        # always worked, it just never got REMEMBERED between calls the way host_health/
+        # _dead_host_blocked already remember a dead host -- _track_tool_memory below deliberately
+        # only covers tier=2 "scan" tools, not this tier-1 browser helper, so the exact same ~45s +
+        # a wasted LLM retry round-trip repeated against the exact same host. Same "derive it in
+        # code, don't rely on the model to remember" discipline, just scoped to this one tool: once
+        # networkidle has genuinely timed out against a host THIS session, silently downgrade any
+        # further networkidle request against that same host instead of repeating a known-doomed
+        # wait.
+        if requested_wait_until == "networkidle" and host:
+            session = arguments.get("_session") or {}
+            unreliable_hosts = (session.get("recon_result") or {}).get("networkidle_unreliable_hosts") or []
+            if host in unreliable_hosts:
+                logger.debug(
+                    "core: browser_navigate host=%s already timed out once on wait_until=networkidle "
+                    "this session -- downgrading to domcontentloaded instead of repeating a known-doomed wait",
+                    host,
+                )
+                wait_until = "domcontentloaded"
+        result = await manager.navigate(session_id, target, wait_until, out_of_scope_entries, arguments.get("identity"))
+        if wait_until == "networkidle" and host and session_id and isinstance(result, dict) and result.get("status") != "ok":
+            error_text = str(result.get("error") or "")
+            if "Timeout" in error_text and "exceeded" in error_text:
+                def _mark_networkidle_unreliable(s: dict) -> None:
+                    hosts = s.setdefault("recon_result", {}).setdefault("networkidle_unreliable_hosts", [])
+                    if host not in hosts:
+                        hosts.append(host)
+
+                _reload_merge_save(session_id, _mark_networkidle_unreliable)
+        return result
     if name == "browser_snapshot":
         return await manager.snapshot(session_id, out_of_scope_entries)
     if name == "browser_click":
@@ -3095,7 +3194,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
             _log_agent_debug(ctx, "tool=msf_module_search cache hit for query=%r", msf_search_query)
             return cached
 
-    result = _apply_output_parser(spec, await _dispatch_tool_interruptible(ctx, spec, arguments))
+    result = _apply_output_parser(spec, await _dispatch_tool_interruptible(ctx, spec, arguments), arguments)
     # Callers that key bookkeeping (dns_map, technologies, os_guesses) off the tool's target/domain
     # argument must use the arguments actually run, not the pre-retry ones passed in — a corrected
     # retry below can send a different domain/target than the one that failed.
@@ -3253,7 +3352,29 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
     # running) whenever the original failure was a timeout AND the "corrected" arguments came back
     # unchanged; any other retryable status (a real "error" with actual stderr to react to) or any
     # real argument change still goes through the normal retry dispatch below.
-    if result.get("status") == "timeout" and retry_arguments == arguments:
+    #
+    # Real, confirmed incident this ALSO fixes (Live-Nation-HackerOne-usr_0f5c71): the plain
+    # `retry_arguments == arguments` comparison above missed the exact case it exists for when the
+    # model tacks on a field that isn't one of this tool's own real parameters at all (nuclei has no
+    # "extra_headers" param -- build_nuclei_command never reads it, only the server-injected
+    # "_extra_headers"). The correction prompt above truthfully tells the model nuclei's real
+    # parameter names (schema_hint), so a well-behaved correction correctly drops that make-believe
+    # field -- which made the dicts compare unequal even though the ACTUAL command that would be
+    # dispatched is byte-identical (confirmed live: both attempts' logged argv matched exactly, down
+    # to the injected -H header). The guard never fired, and nuclei re-ran the identical doomed scan
+    # against the same target/tags, burning a second full TOOL_TIMEOUT_SECONDS for nothing -- twice
+    # in one real session (www.royalarena.dk and www.ticketmaster.com, ~40 real minutes total with
+    # zero nuclei results). Comparing only the keys that are actually part of this tool's own
+    # parameters_schema (schema_properties, already computed above for the correction hint) ignores
+    # any such make-believe field on either side, so a cosmetic difference like this can no longer
+    # defeat a guard built specifically to catch "nothing that could affect the real command actually
+    # changed, don't re-run it." Falls back to comparing the full dicts for a schema-less discovered
+    # tool (schema_properties empty, e.g. httpx/whatweb) -- filtering by an empty schema would
+    # wrongly treat every such tool's retry as "unchanged", which is not this fix's job.
+    def _schema_relevant_only(args: dict) -> dict:
+        return {k: v for k, v in args.items() if k in schema_properties} if schema_properties else args
+
+    if result.get("status") == "timeout" and _schema_relevant_only(retry_arguments) == _schema_relevant_only(arguments):
         _log_agent_debug(
             ctx, "tool=%s retry arguments identical to the ones that just timed out — skipping a "
             "second, guaranteed-identical timeout wait instead of re-dispatching", spec.name,
@@ -3268,7 +3389,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         _track_tool_memory(ctx, failed_result)
         return failed_result
 
-    retry_result = _apply_output_parser(spec, await _dispatch_tool_interruptible(ctx, spec, retry_arguments))
+    retry_result = _apply_output_parser(spec, await _dispatch_tool_interruptible(ctx, spec, retry_arguments), retry_arguments)
     if retry_result.get("status") in _RETRYABLE_STATUSES:
         original_retry_status = retry_result.get("status")
         _log_agent_debug(ctx, "tool=%s retry failed again, marking step failed", spec.name)
@@ -3928,7 +4049,7 @@ async def _run_llm_tool_loop_impl(
                     reason = f"model replied as text instead of calling {terminal_tool!r}, and the text didn't parse as JSON either"
                 else:
                     reason = None
-                _append_log(ctx, phase, response.content, None, "error" if (refused_again or parsed is None) else "success", reason)
+                _append_log(ctx, phase, response.content, None, "error" if (refused_again or parsed is None) else "success", reason, llm=describe_response_origin(response))
                 return parsed, trace
             if not expect_json_final:
                 # Real output already landed via record_target/record_finding tool calls — this
@@ -3940,7 +4061,7 @@ async def _run_llm_tool_loop_impl(
                     "real, completed recon/analysis pass"
                     if refused_again else None
                 )
-                _append_log(ctx, phase, response.content, None, "error" if refused_again else "success", reason)
+                _append_log(ctx, phase, response.content, None, "error" if refused_again else "success", reason, llm=describe_response_origin(response))
                 return None, trace
             parsed = _parse_json_response(response.content)
             if parsed is None:
@@ -3949,6 +4070,7 @@ async def _run_llm_tool_loop_impl(
                 ctx, phase, response.content, None,
                 "success" if parsed is not None else "error",
                 None if parsed is not None else "could not parse a final JSON response from the model",
+                llm=describe_response_origin(response),
             )
             return parsed, trace
 
@@ -4075,7 +4197,7 @@ async def _run_llm_tool_loop_impl(
             # to each of its several tool calls -- attach it once, to the first entry of the batch,
             # instead of copying the identical thought onto every entry (pure session.json bloat and
             # log-review noise: a 4-call turn used to store the same paragraph 4 times).
-            _append_log(ctx, phase, response.content if call_index == 0 else None, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result))
+            _append_log(ctx, phase, response.content if call_index == 0 else None, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result), describe_response_origin(response))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
 
             if progress_stall_threshold is not None:
@@ -4179,7 +4301,7 @@ async def _run_llm_tool_loop_impl(
             logger.debug("core: session=%s %s phase: safeguard-stop summary call itself failed (%s)", ctx.session_id, phase, exc)
             summary_text = ""
         if summary_text:
-            _append_log(ctx, phase, summary_text, None, "success", None)
+            _append_log(ctx, phase, summary_text, None, "success", None, llm=describe_response_origin(summary_response))
         return None, trace
 
     logger.debug("core: session=%s %s phase stopped: %s — forcing a final answer", ctx.session_id, phase, stop_reason)
@@ -4193,7 +4315,7 @@ async def _run_llm_tool_loop_impl(
             result = await execute_tool(spec, call.arguments) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, call.arguments)
             duration_ms = (time.monotonic() - dispatch_started) * 1000
             trace.append({"tool": call.name, "arguments": call.arguments, "result": result})
-            _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result))
+            _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result), describe_response_origin(response))
             if result.get("status") == "ok":
                 return {k: v for k, v in result.items() if k not in _TOOL_RETRY_BOOKKEEPING_KEYS}, trace
         parsed = _parse_json_response(response.content)
@@ -4284,7 +4406,7 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
     _mark_phase_started(ctx.session, "recon")
     await _maybe_refresh_program_check(ctx)
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tools = get_tools_by_category("recon") + subagent_tools + _toolkit_tool_extras()
+    tools = get_tools_by_category("recon") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("recon")
     # Two independent ways to turn subdomain enumeration on: a per-entry "*.example.com" marker
     # in the scope itself, or the New Project form's "Enumerate subdomains" checkbox (a
     # project-wide equivalent that doesn't need typing "*." on every entry — off by default,
@@ -5998,7 +6120,7 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     _mark_phase_started(ctx.session, "analyze")
     await _maybe_refresh_program_check(ctx)
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tools = get_tools_by_category("scan") + subagent_tools + _toolkit_tool_extras()
+    tools = get_tools_by_category("scan") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan")
     # See _run_recon's identical block for why update_plan (category="post_exploit") has to be
     # appended explicitly rather than picked up by get_tools_by_category — plan_phase="analyze" on
     # the _run_llm_tool_loop call below is what actually reorders tools, fresh every turn.
@@ -6516,7 +6638,7 @@ async def _run_reverify(ctx: RunContext) -> None:
     # get_tools_by_category(...) call queries) specifically so it can't leak into either of those —
     # it only ever reaches the model through this explicit list.
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tool_specs = get_tools_by_category("scan") + [get_tool("record_reverification_result")] + subagent_tools + _toolkit_tool_extras()
+    tool_specs = get_tools_by_category("scan") + [get_tool("record_reverification_result")] + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs.append(update_plan_spec)
@@ -6730,6 +6852,7 @@ async def _run_skeptical_verification(ctx: RunContext) -> None:
     base = (
         get_tools_by_category("recon") + get_tools_by_category("scan") + get_tools_by_category("exploit")
         + _toolkit_tool_extras()
+        + _custom_tool_extras("recon") + _custom_tool_extras("scan") + _custom_tool_extras("exploit")
     )
     tool_specs = list({spec.name: spec for spec in base}.values())
     record_result_spec = get_tool("record_skeptical_verification_result")
@@ -7823,6 +7946,22 @@ def re_record_target_profile(params: dict) -> dict:
     Reserved pane next to Findings (templates/partials/target_profile.html) and to every future
     chat turn via _session_snapshot's own "target_profile" field (agent/chat.py) -- the whole point
     is that once a fact lands here, the model never has to re-derive or re-ask for it again.
+
+    `source` ("tool", the default, or "operator") is a real, deliberate distinction -- NOT a
+    gate that blocks recording either way. Real gap this closes: RE_CHAT_PROMPT used to tell the
+    model that an operator-stated fact should be "treated as settled," with no way to tell, later,
+    whether a given entry was something the model actually confirmed with a tool or just something
+    the operator said in chat (which could be wrong -- a guess stated with full confidence reads
+    identically to a fact once recorded). Recording an operator's own claim immediately, without
+    spending a dedicated tool call to re-confirm it first, is still the right call (wasting the
+    operator's time re-proving something they already know defeats the whole point of them telling
+    you) -- `source="operator"` just keeps that provenance visible instead of silently erasing it,
+    so a LATER tool call that happens to touch the same fact (not a dedicated re-check, just
+    whatever it was already doing) can correct it if it turns out wrong. When a "tool"-sourced call
+    overwrites an existing "operator"-sourced value with a genuinely DIFFERENT value, the prior
+    operator claim is kept in `corrected_from_operator_claim` rather than silently discarded --
+    same "never silently lose the prior value on a correction" principle CHAT_PROMPT's own
+    correct_finding already follows for findings.
     """
     session_id = params.get("_session_id")
     session = params.get("_session")
@@ -7834,14 +7973,25 @@ def re_record_target_profile(params: dict) -> dict:
         return {"status": "error", "error": "label is required"}
     if not value:
         return {"status": "error", "error": "value is required"}
+    source = (params.get("source") or "tool").strip().lower()
+    if source not in ("tool", "operator"):
+        source = "tool"
     profile = session.setdefault("target_profile", [])
     existing = next((fact for fact in profile if str(fact.get("label", "")).lower() == label.lower()), None)
+    recorded = {"label": label, "value": value, "source": source}
     if existing is not None:
-        existing["value"] = value
+        if (
+            source == "tool"
+            and existing.get("source") == "operator"
+            and existing.get("value") != value
+        ):
+            recorded["corrected_from_operator_claim"] = existing["value"]
+        existing.clear()
+        existing.update(recorded)
     else:
-        profile.append({"label": label, "value": value})
+        profile.append(recorded)
     save_session(session_id, session)
-    return {"status": "ok", "recorded": {"label": label, "value": value}}
+    return {"status": "ok", "recorded": recorded}
 
 
 register_tool(
@@ -7860,14 +8010,26 @@ register_tool(
             "view without re-deriving it every turn. One fact per call; calling again with a label "
             "that already exists updates its value instead of duplicating it. Call this the moment "
             "you actually establish something concrete (e.g. from real runtime strings, a compiler "
-            "signature, a header) -- not a guess. Shown to the operator alongside Findings and kept "
-            "in view for every later turn of this same session."
+            "signature, a header) -- not a guess, use source=\"tool\" (the default) for this case. "
+            "If the operator told you the fact directly in chat instead, record it right away with "
+            "source=\"operator\" -- don't spend a dedicated tool call re-confirming something the "
+            "operator already knows, that just wastes their time; it's still recorded and built on "
+            "immediately. It isn't unfalsifiable, though: if a LATER tool call (run for some other "
+            "reason) happens to reveal the real value differs, call this again with source=\"tool\" "
+            "and the corrected value -- the prior operator claim is kept alongside the correction, "
+            "never silently dropped. Shown to the operator alongside Findings and kept in view for "
+            "every later turn of this same session."
         ),
         parameters_schema={
             "type": "object",
             "properties": {
                 "label": {"type": "string", "description": "Short fact name, e.g. \"Language\", \"Compiler\", \"Obfuscator\", \"Platform\", \"Architecture\", \"Packer\""},
                 "value": {"type": "string", "description": "The fact itself, e.g. \"Go (not Rust) -- confirmed via runtime strings\""},
+                "source": {
+                    "type": "string",
+                    "enum": ["tool", "operator"],
+                    "description": "\"tool\" (default) if YOU established this via a real tool call; \"operator\" if the operator told you directly in chat and you haven't independently verified it yet.",
+                },
             },
             "required": ["label", "value"],
         },
@@ -7925,6 +8087,21 @@ def _playbook_task_addendum(session: dict, finding: dict | None = None, track_in
     retrieval goes HYBRID (semantic + keyword), so a technique whose wording differs from this
     target's but whose meaning matches still surfaces. No provider / no embeddings -> keyword-only,
     exactly as before.
+
+    Real, confirmed gap this closes for Reverse Engineering sessions specifically: agent/chat.py's
+    own system-prompt assembly already called this every single RE chat turn, but the finding=None
+    branch below only ever read session["recon_result"]["technologies"] -- a web-pentest-only
+    fingerprint shape (whatweb/wappalyzer-style tech tokens per host) that an RE session never
+    populates at all. The result was a silent no-op on every single RE turn: the call happened,
+    tech_keywords always came back empty, and the function returned "" before ever reaching
+    playbook_store -- confirmed live, a real technique recorded from an earlier RE session on a
+    similarly-shaped target sat in the store the whole time and was never once surfaced to a later
+    session working the same kind of binary. Fixed by falling back to session["target_profile"]
+    (language/packer/platform/architecture -- the RE-mode equivalent of a tech fingerprint, set by
+    record_target_profile) plus the target's own filename when that's still empty too. run_re_triage
+    is newly wired to call this function too (its own first turn, before Step 1 has even run, so
+    target_profile is still empty and only the filename fallback has anything to go on) -- it never
+    called any playbook function at all before this.
     """
     if not _playbook_enabled():
         return ""
@@ -7936,6 +8113,13 @@ def _playbook_task_addendum(session: dict, finding: dict | None = None, track_in
             technologies.extend(tokens)
         tech_keywords = frozenset(_technology_keywords(" ".join(technologies)))
         waf_vendors = _waf_vendors_from_protections(session)
+        if not tech_keywords and session.get("mode") == "reverse_engineering":
+            profile_text = " ".join(
+                f"{fact.get('label', '')} {fact.get('value', '')}"
+                for fact in (session.get("target_profile") or [])
+            )
+            target_name = os.path.basename(str(session.get("target") or "").rstrip("/\\"))
+            tech_keywords = frozenset(_technology_keywords(f"{profile_text} {target_name}"))
     if not tech_keywords:
         return ""
 
@@ -8393,9 +8577,9 @@ async def _run_exploit_for_finding(
     tool_specs = exploit_tools
     if deep_dive:
         exploit_names = {spec.name for spec in exploit_tools}
-        tool_specs = exploit_tools + [spec for spec in get_tools_by_category("scan") if spec.name not in exploit_names]
+        tool_specs = exploit_tools + [spec for spec in get_tools_by_category("scan") if spec.name not in exploit_names] + _custom_tool_extras("scan")
         task += DEEP_DIVE_ADDENDUM
-    tool_specs = tool_specs + subagent_tools + _toolkit_tool_extras()
+    tool_specs = tool_specs + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs = tool_specs + [update_plan_spec]
@@ -9678,6 +9862,7 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
         extra_spec = get_tool(extra_name)
         if extra_spec is not None:
             tools.append(extra_spec)
+    tools += _custom_tool_extras("re")
 
     session_context_token = current_session_id.set(session_id)
     stopped = False
@@ -9718,6 +9903,16 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
         task += _custom_instructions_task_addendum(session)
         task += _scope_rules_task_addendum(session)
         task += _goal_task_addendum(session)
+        # Code-level, guaranteed playbook lookup before the model's own first turn -- real,
+        # confirmed gap this closes: query_playbook/playbook_strategy were always available as
+        # ordinary tools, but calling them was entirely the model's own judgment call, the exact
+        # "the tool exists, the model just never reached for it" pattern already found and fixed
+        # for record_technique's own trigger (RE_TRIAGE_PROMPT's "easy-to-miss trigger" paragraph).
+        # _playbook_task_addendum itself now understands an RE session with no web-style
+        # recon_result["technologies"] (see its own updated docstring/branch) and falls back to
+        # target_profile/the target's own filename -- the only RE-aware fingerprint available this
+        # early, before Step 1 has even run.
+        task += _playbook_task_addendum(session, llm=ctx.llm)
 
         system_prompt = RE_TRIAGE_PROMPT + _re_experience_level_addendum(session)
         await _run_llm_tool_loop(
@@ -9836,6 +10031,7 @@ async def run_re_reverify(session_id: str, finding_titles: list[str] | None = No
     job_check_tool = get_tool("background_job_check")
     if job_check_tool is not None:
         tools = [*tools, job_check_tool]
+    tools += _custom_tool_extras("re")
 
     session_context_token = current_session_id.set(session_id)
     stopped = False
@@ -9981,7 +10177,10 @@ def _hypothesis_verification_tool_specs() -> list[ToolSpec]:
     Exploit's own resolve_hypothesis (agent/core.py's _run_exploit tool-list assembly) and Chain's
     own record_finding/record_chain_result assembly just below.
     """
-    base = get_tools_by_category("recon") + get_tools_by_category("scan") + get_tools_by_category("exploit")
+    base = (
+        get_tools_by_category("recon") + get_tools_by_category("scan") + get_tools_by_category("exploit")
+        + _custom_tool_extras("recon") + _custom_tool_extras("scan") + _custom_tool_extras("exploit")
+    )
     deduped = list({spec.name: spec for spec in base}.values())
     for name in ("record_finding", "record_hypothesis", "resolve_hypothesis"):
         spec = get_tool(name)
@@ -10656,7 +10855,7 @@ async def _run_chain_pass(ctx: RunContext, hop_index: int) -> dict | None:
     record_chain_result_spec = get_tool("record_chain_result")
     if record_chain_result_spec is not None:
         tool_specs.append(record_chain_result_spec)
-    tool_specs += subagent_tools + _toolkit_tool_extras()
+    tool_specs += subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs.append(update_plan_spec)

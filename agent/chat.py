@@ -49,6 +49,7 @@ import itertools
 import json
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -58,6 +59,7 @@ from agent.core import (
     _apply_corrected_qualification,
     _apply_corrected_title,
     _BROWSER_TOOL_NAMES,
+    _custom_tool_extras,
     _embed_playbook_entries,
     _embed_playbook_query,
     _playbook_fingerprint_key,
@@ -74,7 +76,8 @@ from agent.core import (
     get_instruction_queue,
     RunContext,
 )
-from agent.llm_client import LLMCallAborted, LLMProvider, ToolCallRequest, get_provider
+from agent.llm_client import LLMCallAborted, LLMProvider, ToolCallRequest, describe_response_origin, get_provider, stamp_response_origin
+from agent.opencode_cli import OpencodeCliUnavailable
 from agent.prompts import CHAT_COMPACTION_PROMPT, CHAT_PROMPT, INTERACTIVE_CHAT_PROMPT, PLAYBOOK_STRATEGY_PROMPT, RE_CHAT_PROMPT, STANDALONE_CHAT_PROMPT
 from agent.tools import chat_settings_store, playbook_store
 from agent.tools.allowed_targets import authorize_all_targets_for_context, deauthorize_all_targets_for_context
@@ -1058,6 +1061,10 @@ def _chat_tool_specs(mode: str = "agent", allowed_subagent_ids: list[str] | None
         job_check_spec = get_tool("background_job_check")
         if job_check_spec is not None:
             specs.append(job_check_spec)
+        # Same "never found automatically" gap as every other get_tools_by_category("re") call
+        # site (agent/core.py's _custom_tool_extras own docstring) -- an enabled "(custom)" RE tool
+        # reaches chat's own Reverse Engineering mode only through this explicit append too.
+        specs.extend(_custom_tool_extras("re"))
     return specs
 
 
@@ -1226,6 +1233,16 @@ def _append_segment_and_save(session_id: str, thread_id: str, segment: dict) -> 
     save_session(session_id, session)
 
 
+def _tool_finish_fields(started_monotonic: float) -> dict:
+    """finished_at + duration_ms for a tool_call segment's done-update: the real moment its result
+    landed and how long the tool itself ran. The Logs view shows finished_at as the row's time (not
+    the reply's creation time, which a slow tool outlives by minutes) and duration_ms next to it."""
+    return {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "duration_ms": round((time.monotonic() - started_monotonic) * 1000),
+    }
+
+
 def _update_last_tool_call_segment_and_save(session_id: str, thread_id: str, call_id: str, **fields) -> None:
     found = _reload_active_message(session_id, thread_id)
     if found is None:
@@ -1278,13 +1295,15 @@ async def _complete_or_stop(ctx: RunContext, thread_id: str, messages: list[dict
     if stop_event.is_set():
         raise ChatStopRequested()
     stop_check = lambda: stop_event.is_set()  # noqa: E731
-    call_task = asyncio.ensure_future(asyncio.to_thread(ctx.llm.complete, messages, tools, stop_check=stop_check))
+    llm = ctx.llm
+    call_started = time.monotonic()
+    call_task = asyncio.ensure_future(asyncio.to_thread(llm.complete, messages, tools, stop_check=stop_check))
     stop_task = asyncio.ensure_future(stop_event.wait())
     try:
         done, _pending = await asyncio.wait({call_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if call_task in done:
             try:
-                return call_task.result()
+                return stamp_response_origin(call_task.result(), llm, call_started)
             except LLMCallAborted:
                 raise ChatStopRequested()
         _abandoned_llm_calls.add(call_task)
@@ -1437,8 +1456,16 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                 # Computed once here, not in the template -- chat_messages.html just reads this
                 # field directly, no Jinja-side tool-name-dispatch logic needed.
                 "arg_summary": _chat_tool_arg_summary(call.name, call.arguments),
+                # Which provider/model produced THIS tool call and how long that request took --
+                # every tool call of one multi-call reply shares the same value (one request).
+                "llm": describe_response_origin(response),
+                # When the tool actually started (the message's own "at" is the reply's creation
+                # time, shared by every call in it -- minutes before a slow tool finishes), so the
+                # UI can show a live "running Xm Ys" timer and, once done, the real finish time.
+                "started_at": datetime.now(timezone.utc).isoformat(),
                 "output": None, "error": False, "done": False,
             })
+            tool_started = time.monotonic()
             try:
                 if call.name == "record_technique":
                     # The reward it produces is collected, NOT delivered here -- appending a reward
@@ -1516,14 +1543,14 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                 # would render as an empty, misleadingly red "failed" card for what was actually a
                 # deliberate abandon, not a real tool failure.
                 if isinstance(exc, ChatStopRequested):
-                    _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output="Stopped by the operator.", error=False, done=True)
+                    _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output="Stopped by the operator.", error=False, done=True, **_tool_finish_fields(tool_started))
                 else:
-                    _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=str(exc), error=True, done=True)
+                    _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=str(exc), error=True, done=True, **_tool_finish_fields(tool_started))
                 raise
             logger.debug("chat: session=%s tool call %s -> status=%s", ctx.session_id, call.name, result.get("status"))
             is_error = result.get("status") in ("error", "failed")
             output_text = result.get("confirmation") or json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]
-            _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=output_text, error=is_error, done=True)
+            _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=output_text, error=is_error, done=True, **_tool_finish_fields(tool_started))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
 
         # Real, confirmed operator complaint this fixes: append_pending_chat_message's own
@@ -1673,6 +1700,34 @@ def append_pending_chat_message(
     return session, True
 
 
+def save_chat_picker(session_id: str, provider: str | None, model: str | None, free_only: bool | None = None) -> bool:
+    """Remembers the operator's provider/model pick the moment they change it, not only when they
+    next send a message. Real, confirmed operator complaint this fixes: the picker's value was only
+    ever persisted by append_pending_chat_message (on Send), so picking a provider and then
+    refreshing the page (F5), or leaving and coming back, snapped it back to whatever was last
+    SENT with -- whichever provider they had deliberately moved away from.
+
+    Same two things a send persists: this thread's own provider/model, and chat_settings_store's
+    last_provider/last_model (what a brand-new thread starts from). Returns False for an unknown
+    session. Skips the session write entirely when nothing changed -- the picker fires this on
+    every change event, and a no-op rewrite of a session file a running background turn is also
+    saving is pure risk for no benefit.
+    """
+    session = load_session(session_id)
+    if session is None:
+        return False
+    thread = _get_active_thread(session)
+    new_provider, new_model = provider or None, model or None
+    if thread.get("provider") != new_provider or thread.get("model") != new_model:
+        thread["provider"], thread["model"] = new_provider, new_model
+        save_session(session_id, session)
+    existing_free_only = chat_settings_store.load_chat_settings()["last_free_only"]
+    chat_settings_store.save_last_chat_llm(new_provider, new_model, existing_free_only if free_only is None else free_only)
+    logger.debug("chat: session=%s thread=%s picker saved provider=%r model=%r free_only=%r",
+                 session_id, thread["id"], new_provider, new_model, free_only)
+    return True
+
+
 def cancel_queued_chat_message(session_id: str, thread_id: str, message_id: str) -> dict | None:
     """Removes one not-yet-dispatched queued message (chat_messages.html's own "x" on a queued
     bubble) — the operator changed their mind before it was actually sent. Returns None (main.py's
@@ -1789,6 +1844,10 @@ def _format_llm_error(exc: Exception, provider: str | None, model: str | None) -
             f"Couldn't reach this provider ({provider_label}) — a network/connection issue, "
             "not an ASRA bug. Try again in a moment."
         )
+    if isinstance(exc, OpencodeCliUnavailable):
+        # Already a complete, specific explanation of what is installed where and how to fix it --
+        # a generic "Something went wrong —" prefix in front of it only buries that.
+        return str(exc)
     return f"Something went wrong — {exc}"
 
 

@@ -15,18 +15,14 @@ so they don't belong under a name that says "chat panel's own". Same on-disk con
 error) -- app-level state (spans every session/project), not tied to one session's own schema, same
 category as chat_settings.json/subagent_profiles.json/llm_settings.json.
 
-All seven default False -- unlike chat's own web_fetch/browser (on by default, safe read-only
-research), send_raw_request/intruder_run/racer_run can send arbitrary attacker-chosen
-method/headers/body to the real target (all three registered with requires_allowed_target=True,
-gated by the same "authorize exploitation" allowlist real exploit tools use -- intruder_run/
-racer_run potentially many times over, one real request per payload/race attempt),
-list_captured_traffic/diff_requests read this session's own captured traffic verbatim (real
-headers/cookies/tokens from a live target) straight into the model's context, and
-sequencer_analyze's own mode="live" fires real repeated requests too (gated the same way, just
-checked manually inside its native_function -- see toolkit_agent_tools.py's
-_sequencer_analyze_native for why) -- opt-in for the model, matching the "manual UI always works
-regardless of agent access" independence these toggles are meant to preserve, rather than on
-unless turned off.
+All seven default True (a fresh install gets the full toolkit; an operator who wants any of them
+out of the agent's reach turns it off in Settings, and a saved choice always wins over this
+default). That is safe because none of them opens an unguarded path: send_raw_request/intruder_run/
+racer_run (and sequencer_analyze's own live mode) are registered with requires_allowed_target=True
+and sit behind the very same "authorize exploitation" allowlist sqlmap/Metasploit already require,
+decode_value is a pure local text transform, and list_captured_traffic/diff_requests only read
+traffic this session already captured -- the same target output (nmap/HTTP responses) that every
+other tool already feeds the model. The manual toolkit UI always works regardless of these toggles.
 """
 from __future__ import annotations
 
@@ -46,7 +42,7 @@ BOOL_KEYS = (
     "toolkit_comparer_enabled", "toolkit_intruder_enabled", "toolkit_sequencer_enabled",
     "toolkit_racer_enabled",
 )
-_DEFAULT_SETTINGS = dict.fromkeys(BOOL_KEYS, False)
+_DEFAULT_SETTINGS = dict.fromkeys(BOOL_KEYS, True)
 
 
 def load_toolkit_agent_settings() -> dict:

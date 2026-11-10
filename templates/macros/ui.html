@@ -227,6 +227,24 @@
     {{ label }}</span>
 {% endmacro %}
 
+{# Target Profile card badge (templates/partials/target_profile.html) -- shown ONLY for an
+   operator-stated fact (agent/core.py's record_target_profile, source="operator") that no tool
+   call has independently confirmed yet, so the operator can tell at a glance which facts came
+   from their own chat message versus a real tool result. Deliberately renders nothing for the
+   default source="tool" case -- that's the expected, unremarkable case, badging every single
+   entry would just be visual noise for no new information. #}
+{% macro target_profile_source_badge(fact) %}
+  {% if fact.source == "operator" %}
+    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium border text-severity-unknown border-severity-unknown/40 bg-severity-unknown/10" title="Stated by the operator in chat -- not yet independently confirmed by a tool">
+      <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      From operator</span>
+  {% elif fact.corrected_from_operator_claim %}
+    <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10" title="The operator originally said {{ fact.corrected_from_operator_claim }} -- a later tool result corrected it">
+      <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 3v5h5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Corrected</span>
+  {% endif %}
+{% endmacro %}
+
 {# One masked field in the Recon tab's Credentials card (an Identity A/B/etc. row) -- starts as a
    fixed bullet mask with an eye button; the button's first click fetches the real value via htmx
    (main.py's reveal_identity_field route), every click after that just flips shown/masked
@@ -294,6 +312,32 @@
       </button>
     {% endif %}
   </span>
+{% endmacro %}
+
+{# "provider/model · LLM 3.2s" -- which LLM produced a log row / tool call and how long THAT model
+   request took (agent/llm_client.py's describe_response_origin, persisted as `llm` on log entries
+   and chat tool_call segments). The "LLM" prefix is deliberate: it is the model's answer time, not
+   the tool's own run time (tool_timing below) -- a 10-minute tool row used to read "20.9s" and look
+   like the whole row's time. While `running` the seconds are withheld (only the model name shows),
+   so a row never claims a time before its own result exists. Shared by every tool-activity row.
+   Truncates instead of wrapping: the row's own command preview is the primary content. #}
+{% macro llm_origin(llm, running=false) %}
+  {% if llm %}
+    {% set model_label = [llm.provider, llm.model] | select | join("/") %}
+    <span class="font-mono text-secondary/60 shrink min-w-0 max-w-[40%] truncate whitespace-nowrap"
+          title="LLM: {{ model_label }}{% if llm.elapsed_s is not none %} &mdash; answered in {{ '%.2f' | format(llm.elapsed_s) }}s{% endif %}">{{ model_label }}{% if not running and llm.elapsed_s is not none %} &middot; LLM {{ '%.1f' | format(llm.elapsed_s) }}s{% endif %}</span>
+  {% endif %}
+{% endmacro %}
+
+{# The tool's OWN time: a live "running 3m 12s" ticker while it is in flight (static/js/
+   live_elapsed.js rewrites the text every second from data-asra-elapsed-since), the final run time
+   once done. Nothing for a row with no timing data (older sessions). #}
+{% macro tool_timing(done, duration_ms, started_at) %}
+  {% if not done %}
+    {% if started_at %}<span class="font-mono text-severity-medium shrink-0 whitespace-nowrap" title="Time since this tool started" data-asra-elapsed-since="{{ started_at }}">running&hellip;</span>{% endif %}
+  {% elif duration_ms is number %}
+    <span class="font-mono text-secondary/70 shrink-0 whitespace-nowrap" title="Tool run time">{{ duration_ms | human_duration }}</span>
+  {% endif %}
 {% endmacro %}
 
 {# Condensed, deduplicated tool history for a finding/hypothesis card -- NOT a raw dump of every

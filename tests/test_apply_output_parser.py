@@ -1,4 +1,4 @@
-"""agent/core.py's _apply_output_parser: two real, confirmed gaps found during a log-review audit.
+"""agent/core.py's _apply_output_parser: real, confirmed gaps found during log-review audits.
 
 1. A successfully parsed tool result kept its full, raw stdout in the dict ALONGSIDE the new
    "parsed" field -- for a tool whose raw stdout can run to hundreds of KB (ffuf against a large
@@ -9,6 +9,12 @@
 2. WhatWeb can hit its own internal per-URL timeout mid-scan and still exit 0 -- confirmed live
    (test-2-again2-usr_2f4db1): stderr carried "ERROR Opening: ... - execution expired" while
    status stayed "ok", reading as a clean, information-free "nothing detected" result.
+3. qiling_emulate's own wrapper subprocess always exits 0 even on a real internal failure (missing
+   rootfs, a Windows PE target with no real DLLs, qiling not importable), so a run that never
+   actually emulated anything came back {"status": "ok", ...} -- confirmed live
+   (Supratest_RE_a-usr_ff40fb): a real crackme session's qiling_emulate call reported a plain
+   successful tool call (green dot in the chat UI) for a Qiling loader failure the model only
+   noticed by reading the raw JSON text itself.
 """
 import json
 
@@ -62,3 +68,26 @@ def test_apply_output_parser_does_not_flag_a_clean_whatweb_result():
     result = _apply_output_parser(spec, raw_result)
 
     assert "note" not in result
+
+
+def test_apply_output_parser_downgrades_a_qiling_run_that_only_failed_inside_its_own_payload():
+    spec = get_tool("qiling_emulate")
+    payload = json.dumps({"status": "error", "error": "Qiling failed to load the target: QlErrorFileNotFound: ..."})
+    raw_result = {"status": "ok", "exit_code": 0, "stdout": f"===QILING_RESULT===\n{payload}", "stderr": ""}
+
+    result = _apply_output_parser(spec, raw_result)
+
+    assert result["status"] == "failed"
+    assert "Qiling failed to load the target" in result["error"]
+    assert result["parsed"]["status"] == "error"  # the raw payload is still there to inspect
+
+
+def test_apply_output_parser_leaves_a_genuinely_successful_qiling_run_as_ok():
+    spec = get_tool("qiling_emulate")
+    payload = json.dumps({"status": "ok", "os": "WINDOWS", "instructions_executed": 42})
+    raw_result = {"status": "ok", "exit_code": 0, "stdout": f"===QILING_RESULT===\n{payload}", "stderr": ""}
+
+    result = _apply_output_parser(spec, raw_result)
+
+    assert result["status"] == "ok"
+    assert "error" not in result

@@ -225,13 +225,13 @@ def test_find_free_port_returns_a_usable_port():
 
 
 def test_resolve_opencode_binary_raises_actionable_error_when_missing(monkeypatch):
-    monkeypatch.setattr("agent.opencode_local_provider.shutil.which", lambda name: None)
-    with pytest.raises(ValueError, match="opencode CLI is not installed"):
+    monkeypatch.setattr("agent.opencode_cli.shutil.which", lambda name, path=None: None)
+    with pytest.raises(ValueError, match="opencode is not installed"):
         _resolve_opencode_binary()
 
 
 def test_resolve_opencode_binary_returns_the_resolved_path(monkeypatch):
-    monkeypatch.setattr("agent.opencode_local_provider.shutil.which", lambda name: "/usr/local/bin/opencode")
+    monkeypatch.setattr("agent.opencode_cli.shutil.which", lambda name, path=None: "/usr/local/bin/opencode")
     assert _resolve_opencode_binary() == "/usr/local/bin/opencode"
 
 

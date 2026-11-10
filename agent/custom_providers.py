@@ -120,6 +120,27 @@ def update_custom_provider(provider_id: str, **fields) -> dict | None:
     return None
 
 
+def upsert_custom_provider(entry: dict) -> None:
+    """Create-or-update by the entry's own id -- used when moving settings between machines
+    (agent/settings_transfer.py), where the id must survive unchanged: the main provider choice, the
+    Reserve chain, subagent profiles and chat's last pick all reference a custom provider by that id,
+    and create_custom_provider() would mint a fresh one and orphan every such reference. An update
+    leaves the stored api_key alone unless the entry carries one."""
+    providers = load_custom_providers()
+    for existing in providers:
+        if existing["id"] == entry["id"]:
+            existing.update({k: v for k, v in entry.items() if k in existing and k != "created_at"})
+            break
+    else:
+        providers.append({
+            "id": entry["id"], "name": entry["name"], "type": entry.get("type", "universal"),
+            "base_url": entry["base_url"], "api_key": entry.get("api_key", ""), "model": entry.get("model", ""),
+            "enabled": entry.get("enabled", True), "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    _write_custom_providers(providers)
+    logger.debug("custom_providers: upserted id=%s name=%s", entry["id"], entry["name"])
+
+
 def delete_custom_provider(provider_id: str) -> bool:
     providers = load_custom_providers()
     remaining = [p for p in providers if p["id"] != provider_id]

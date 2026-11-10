@@ -48,7 +48,15 @@
       .chat-tab.drag-over-left { box-shadow: inset 2px 0 0 var(--accent); }
       .chat-tab.drag-over-right { box-shadow: inset -2px 0 0 var(--accent); }
 
+      /* Same box model as Terminal's .terminal-tab (terminal_panel.html): one flex row with an even
+         6px gap, status dot FIRST, then label, color swatch, close -- the dot used to sit right
+         after the label, directly beside the color swatch, which read as an ugly doubled "dot dot". */
+      #chat-thread-tabs { display: flex; align-items: stretch; background: var(--surface-elevated); scrollbar-width: none; }
+      #chat-thread-tabs::-webkit-scrollbar { display: none; }
       .chat-tab {
+        position: relative; display: flex; align-items: center; gap: 6px;
+        padding: 0 6px 0 10px; height: 34px; font-size: 11.5px; flex-shrink: 0;
+        border-right: 1px solid var(--border); white-space: nowrap; cursor: pointer; user-select: none;
         color: var(--chat-tab-fg, var(--text-secondary));
         background-color: var(--chat-tab-color-dim, transparent);
         transition: background-color .12s ease, color .12s ease;
@@ -61,7 +69,7 @@
         color: var(--chat-tab-fg, var(--text-primary));
         background-color: var(--chat-tab-color, var(--surface-elevated));
       }
-      .chat-tab-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: currentColor; opacity: .45; margin-left: 0.5rem; }
+      .chat-tab-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: currentColor; opacity: .45; }
       .chat-tab:not(.chat-tab-active) .chat-tab-dot { visibility: hidden; }
       .chat-tab-dot.is-live {
         background: rgb(var(--status-online)); opacity: 1;
@@ -73,15 +81,17 @@
       }
       @media (prefers-reduced-motion: reduce) { .chat-tab-dot.is-live { animation: none; } }
 
+      .chat-tab-label { overflow: hidden; text-overflow: ellipsis; max-width: 11rem; }
       .chat-tab-label[contenteditable="true"] { outline: none; max-width: none; border-bottom: 1px dashed var(--accent); }
 
-      .chat-tab-color-btn {
+      .chat-tab-color-btn, .chat-tab-close {
         display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-        width: 16px; height: 16px; border-radius: 4px; color: inherit;
+        width: 16px; height: 16px; border-radius: 4px; color: inherit; line-height: 1;
         opacity: 0; transition: opacity .12s ease, background-color .12s ease;
       }
-      .chat-tab:hover .chat-tab-color-btn, .chat-tab-active .chat-tab-color-btn { opacity: .8; }
-      .chat-tab-color-btn:hover { opacity: 1; background: rgb(127 127 127 / 0.25); }
+      .chat-tab:hover .chat-tab-color-btn, .chat-tab:hover .chat-tab-close,
+      .chat-tab-active .chat-tab-color-btn, .chat-tab-active .chat-tab-close { opacity: .8; }
+      .chat-tab-color-btn:hover, .chat-tab-close:hover { opacity: 1; background: rgb(127 127 127 / 0.25); }
       .chat-tab-color-btn > span { width: 8px; height: 8px; border-radius: 999px; background: var(--chat-tab-color, currentColor); }
 
       /* Small, self-contained popover chrome for #chat-color-picker below -- the Quick Chat page
@@ -296,6 +306,33 @@
         } catch (err) {
           console.error("chat free-only toggle refresh failed (picker still fully usable):", err);
         }
+
+        // Persist the pick the moment the operator makes it (POST .../chat/picker), not only on
+        // Send -- otherwise a page refresh snaps the pickers back to whatever was last SENT with.
+        // Only USER-initiated changes persist: the model list is also re-fetched on page load for a
+        // provider that needs a live probe, and that automatic swap must never overwrite a saved
+        // model with the list's default. A provider change waits for its model list to arrive
+        // (afterSwap below) so the provider and the model it landed on are saved together.
+        var form = document.getElementById("chat-form");
+        var providerPicked = false;
+        function persistPicker() {
+          if (!form) return;
+          var body = new URLSearchParams();
+          body.set("provider", providerSelect ? providerSelect.value : "");
+          body.set("model", modelSelect.value);
+          body.set("free_only", hiddenField.value);
+          fetch(form.getAttribute("hx-post").replace(/\/chat$/, "/chat/picker"), { method: "POST", body: body })
+            .catch(function (err) { console.error("chat picker save failed (pick still applies to this page):", err); });
+        }
+        if (providerSelect) providerSelect.addEventListener("change", function () { providerPicked = true; });
+        modelSelect.addEventListener("change", persistPicker);
+        toggle.addEventListener("change", persistPicker);
+        document.addEventListener("htmx:afterSwap", function (event) {
+          if (providerPicked && event.detail && event.detail.target === modelSelect) {
+            providerPicked = false;
+            persistPicker();
+          }
+        });
       })();
     </script>
     <div class="flex gap-2">
@@ -371,13 +408,23 @@
     // callback only ever sees the DOM AFTER it already changed, too late to know where the
     // operator was scrolled to beforehand).
     var chatWasAtBottom = true;
-    (function () {
-      var messages = document.getElementById("chat-messages");
-      if (!messages) return;
-      messages.addEventListener("scroll", function () {
-        chatWasAtBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40;
-      });
-    })();
+    // Capture-phase listener on the STABLE #chat-stream, not a direct listener on #chat-messages
+    // itself -- #chat-messages gets replaced (a whole new element, not patched in place) on plenty
+    // of real swaps, as the summary-click fix just below already has to account for. A listener
+    // attached directly to one specific #chat-messages node goes dead the moment that exact node is
+    // replaced, silently freezing chatWasAtBottom at whatever it last was -- confirmed real bug: if
+    // that frozen value happened to be `false` (the operator had scrolled up to read something, or
+    // to click an older suggested-actions card -- see that block's own comment), syncChatState()
+    // below permanently stops correcting scroll position, so the NEXT replacement's brand new node
+    // (default scrollTop 0, i.e. the very top of the whole thread) never gets scrolled back down --
+    // the reported "every click teleports to the top of the chat" symptom. 'scroll' doesn't bubble,
+    // but a capturing listener on an ancestor still sees it fire on the way down to its real target,
+    // so this keeps working no matter how many times the descendant node underneath gets swapped.
+    chatStream.addEventListener("scroll", function (event) {
+      var messages = event.target;
+      if (!messages || messages.id !== "chat-messages") return;
+      chatWasAtBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40;
+    }, true);
 
     function syncChatState() {
       var messages = document.getElementById("chat-messages");
@@ -582,7 +629,20 @@
     // (not form.submit()) so hx-on::before-request/hx-disabled-elt on #chat-form still run exactly
     // as if the operator had typed this and hit Send themselves -- htmx has no separate JS API of
     // its own for "submit this form", it hooks the native submit event.
-    window.asraUseSuggestedStep = function (text) {
+    window.asraUseSuggestedStep = function (text, buttonEl) {
+      // Real, confirmed operator complaint this closes: chat_messages.html's own is_last_message
+      // lock (see that block's comment) only takes effect once the NEXT message has actually landed
+      // -- a slow reply left a window where the operator could click the same, or a different,
+      // option in this exact card several times, firing one separate turn per click. Disabling
+      // every button in THIS card synchronously, on click, same "instant feedback, never wait on
+      // the network" discipline as markTabActiveOptimistically() elsewhere in this file, closes
+      // that narrower race; the server-derived lock is what makes it survive a reload.
+      if (buttonEl) {
+        var card = buttonEl.closest(".suggested-actions-card");
+        if (card) {
+          card.querySelectorAll("button").forEach(function (btn) { btn.disabled = true; });
+        }
+      }
       setChatCollapsed(false);
       closeSlashMenu();
       input.value = text;
@@ -1059,18 +1119,11 @@
       // textContent/innerHTML, so it can't disturb the dblclick-to-rename detection below.
       function markTabActiveOptimistically(clickedTabEl) {
         var prevActive = tabsContainer.querySelector(".chat-tab.chat-tab-active");
-        if (prevActive && prevActive !== clickedTabEl) {
-          prevActive.classList.remove("chat-tab-active");
-          var prevLabel = prevActive.querySelector(".chat-tab-label");
-          if (prevLabel) { prevLabel.classList.remove("text-primary"); prevLabel.classList.add("text-secondary", "hover:text-primary"); }
-          var prevClose = prevActive.querySelector("form[hx-post*='delete-thread'] button");
-          if (prevClose) { prevClose.classList.remove("opacity-80"); prevClose.classList.add("opacity-0", "group-hover:opacity-80"); }
-        }
+        // Label colour, close-button visibility and the status dot are all driven by the single
+        // .chat-tab-active class in CSS (same as Terminal's tabs), so flipping that class IS the
+        // whole instant highlight -- nothing per-element to keep in step by hand.
+        if (prevActive && prevActive !== clickedTabEl) prevActive.classList.remove("chat-tab-active");
         clickedTabEl.classList.add("chat-tab-active");
-        var label = clickedTabEl.querySelector(".chat-tab-label");
-        if (label) { label.classList.remove("text-secondary", "hover:text-primary"); label.classList.add("text-primary"); }
-        var closeBtn = clickedTabEl.querySelector("form[hx-post*='delete-thread'] button");
-        if (closeBtn) { closeBtn.classList.remove("opacity-0", "group-hover:opacity-80"); closeBtn.classList.add("opacity-80"); }
         var titleEl = document.getElementById("chat-panel-title");
         if (titleEl) {
           var newLabel = clickedTabEl.querySelector(".chat-tab-label");

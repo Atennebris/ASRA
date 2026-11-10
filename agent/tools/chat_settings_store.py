@@ -7,15 +7,16 @@ pair, atomic tmp-file + os.replace, empty/corrupt file treated as "nothing store
 an error) -- app-level state (spans every session/project), not tied to one session's own schema,
 same category as subagent_profiles.json/llm_settings.json.
 
-web_fetch/browser/dork_engine default True: the point of adding these capabilities is turning them
-on; an operator who doesn't want chat touching the network at all has an easy Settings toggle to
-turn any of them back off. dork_engine specifically is a read-mostly recon capability (builds a
-search-engine dork/OSINT lookup, agent/tools/dork_engine.py) already available to the main agent's
-own recon phase unconditionally (category="recon") -- this toggle only controls whether CHAT's own
-curated tool set additionally offers it, same as web_fetch/browser.
-subagents_enabled defaults False -- delegation spawns real background work sharing the same
-SUBAGENT_MAX_CONCURRENT_TASKS concurrency slots the main agent's own phases use, a bigger
-behavioral change than "chat can read a page", so it's opt-in rather than on-by-default.
+web_fetch/browser/dork_engine/subagents default True: the point of adding these capabilities is
+turning them on; an operator who doesn't want chat touching the network, or delegating at all, has
+an easy Settings toggle to turn any of them back off, and a saved choice always wins over the
+default. dork_engine specifically is a read-mostly recon capability (builds a search-engine
+dork/OSINT lookup, agent/tools/dork_engine.py) already available to the main agent's own recon
+phase unconditionally (category="recon") -- this toggle only controls whether CHAT's own curated
+tool set additionally offers it, same as web_fetch/browser. subagents is also safe on by default:
+delegation only appears when the operator has actually configured an enabled subagent profile (no
+profile = nothing to delegate to), and every delegated run goes through the same scope/allowlist
+checks as the main agent.
 
 last_provider/last_model default None (nobody's picked anything in chat yet, so a brand-new thread
 falls back to "same as main agent" exactly like before this pair existed). Real, confirmed operator
@@ -52,7 +53,7 @@ _BOOL_KEYS = ("web_fetch_enabled", "browser_enabled", "subagents_enabled", "dork
 _DEFAULT_SETTINGS = {
     "web_fetch_enabled": True,
     "browser_enabled": True,
-    "subagents_enabled": False,
+    "subagents_enabled": True,
     "dork_engine_enabled": True,
     "last_provider": None,
     "last_model": None,

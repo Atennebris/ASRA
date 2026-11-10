@@ -1,0 +1,57 @@
+{# Live panel for the "Install opencode" button (main.py's /api/tools/opencode/install/* routes,
+   agent/opencode_install.py). Replaces the failure message that held
+   the button (data-opencode-fix-host), then polls its own status route only WHILE running -- same
+   "the 'on' state only exists in the DOM while it should" discipline as arsenal_install.html.
+   `opencode` is the live OpencodeCliStatus, so a finished install is VERIFIED against the same
+   check the provider itself makes (a native copy is on PATH), not just trusted from the exit code. #}
+{% if blocked %}
+  <div data-opencode-fix-host class="border border-severity-high/40 rounded-lg p-3 my-1">
+    <p class="text-[11px] text-severity-high mb-1">Install did not start</p>
+    <p class="text-[11px] text-secondary mb-2">{{ blocked_message }}</p>
+    {% if blocked_command %}
+      <pre class="text-[11px] font-mono text-primary bg-elevated rounded p-2 overflow-x-auto whitespace-pre-wrap">{{ blocked_command }}</pre>
+      <p class="text-[10.5px] text-secondary mt-1">Run it inside WSL, from ASRA's own folder.</p>
+    {% endif %}
+  </div>
+{% else %}
+  {% set running = status.state == "running" %}
+  <div id="opencode-install-view" data-opencode-fix-host
+       {% if running %}hx-get="/api/tools/opencode/install/status{{ '?reload=true' if reload_page else '' }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+       class="border border-default rounded-lg p-3 my-1 bg-surface">
+    <div class="flex items-center gap-2 mb-1.5">
+      {% if running %}
+        <span class="w-2 h-2 rounded-full bg-severity-medium shrink-0 animate-pulse"></span>
+        <p class="text-[12px] font-semibold text-primary">Installing opencode&hellip;</p>
+      {% elif status.succeeded and opencode.usable %}
+        <span class="w-2 h-2 rounded-full bg-status-online shrink-0"></span>
+        <p class="text-[12px] font-semibold text-status-online">opencode installed{% if opencode.native_path %} ({{ opencode.native_path }}){% endif %}.</p>
+      {% elif status.succeeded %}
+        <span class="w-2 h-2 rounded-full bg-severity-high shrink-0"></span>
+        <p class="text-[12px] font-semibold text-severity-high">The installer finished, but there is still no usable opencode on PATH.</p>
+      {% elif status.returncode is not none %}
+        <span class="w-2 h-2 rounded-full bg-severity-high shrink-0"></span>
+        <p class="text-[12px] font-semibold text-severity-high">Install failed (exit code {{ status.returncode }}).</p>
+      {% else %}
+        <span class="w-2 h-2 rounded-full bg-severity-medium shrink-0"></span>
+        <p class="text-[12px] font-semibold text-primary">Install state unknown (the server restarted during the install).</p>
+      {% endif %}
+    </div>
+    {% if status.command %}
+      <p class="text-[10.5px] text-secondary mb-1.5">{{ status.command }}</p>
+    {% endif %}
+    <pre class="text-[11px] font-mono text-secondary bg-elevated rounded p-2 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">{{ status.log or "Waiting for output..." }}</pre>
+
+    {% if not running %}
+      {% if status.succeeded and opencode.usable %}
+        <p class="text-[11px] text-secondary mt-2">{% if reload_page %}Refreshing the page so everything shows the new state&hellip;{% else %}Press Test again to verify the provider end to end.{% endif %}</p>
+        {% if reload_page %}<script>setTimeout(function () { window.location.reload(); }, 1200);</script>{% endif %}
+      {% else %}
+        <div class="mt-2">
+          {% set install_label = opencode.install_label %}
+          {% set reload_after_install = reload_page %}
+          {% include "partials/opencode_install_button.html" %}
+        </div>
+      {% endif %}
+    {% endif %}
+  </div>
+{% endif %}

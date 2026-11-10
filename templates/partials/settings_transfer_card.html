@@ -1,0 +1,24 @@
+{% from "macros/ui.html" import section_label %}
+{# Settings -> General -> "Transfer settings". Deliberately a card in the tab body, not buttons on the
+   page_header banner: the banner is decorative and action buttons never sit on it. The dialogs these
+   open live in settings_transfer_dialogs.html, hoisted outside the tab sections (a dialog nested in a
+   hidden section[data-settings-tab] would never show). #}
+<div id="settings-transfer-card" class="bg-surface border border-default rounded-xl p-5">
+  {{ section_label("Transfer settings") }}
+  <p class="text-[12px] text-secondary mb-3">
+    Move your own ASRA settings to another machine of yours with one pasteable code or a file.
+    Machine-specific things (file paths, installed tool locations, projects, sign-in tokens) are never included.
+  </p>
+  <div class="flex flex-wrap items-center gap-2">
+    <button type="button" data-transfer-open="export"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Export settings
+    </button>
+    <button type="button" data-transfer-open="import"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Import settings
+    </button>
+  </div>
+</div>

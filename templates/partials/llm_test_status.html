@@ -18,10 +18,11 @@
 {% set running = status.running %}
 <span id="{{ target_id }}"
       {% if running %}hx-get="/api/settings/test-llm/status?target_id={{ target_id | urlencode }}" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}
+      {% if status.action == "install_opencode" %}data-opencode-fix-host{% endif %}
       class="inline-flex items-center gap-2 flex-wrap">
   {% if running %}
     <span class="text-secondary">
-      Testing&hellip;{% if status.attempt and status.total_attempts %} (attempt {{ status.attempt }}/{{ status.total_attempts }}{% if status.wait_seconds %}, next retry in ~{{ status.wait_seconds | int }}s{% endif %}){% endif %}
+      Testing{% if status.provider and status.model %} <span class="font-mono">{{ status.provider }}/{{ status.model }}</span>{% endif %}&hellip;{% if status.attempt and status.total_attempts %} (attempt {{ status.attempt }}/{{ status.total_attempts }}{% if status.wait_seconds %}, next retry in ~{{ status.wait_seconds | int }}s{% endif %}){% endif %}
     </span>
     <button type="button" hx-post="/api/settings/test-llm/cancel?target_id={{ target_id | urlencode }}" hx-target="#{{ target_id }}" hx-swap="outerHTML"
             class="text-[11px] text-secondary hover:text-severity-high underline shrink-0">Cancel</button>
@@ -31,5 +32,13 @@
     <span class="text-secondary">{{ status.message }}</span>
   {% elif status.state == "error" %}
     <span class="text-severity-high">{{ status.message }}</span>
+    {% if status.action == "install_opencode" %}
+      {# The failure came from agent/opencode_cli.py, which knows its own one-click fix -- the
+         Settings page reloads once it succeeds (reload_after_install) so the opencode card's own
+         "CLI found" badge and the Add Provider dropdown never keep showing the old state. #}
+      {% set install_label = status.action_label %}
+      {% set reload_after_install = true %}
+      {% include "partials/opencode_install_button.html" %}
+    {% endif %}
   {% endif %}
 </span>

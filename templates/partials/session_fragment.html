@@ -4,7 +4,7 @@
    Swapped in via hx-swap="morph" (Idiomorph, base.html), not innerHTML — stable id attributes
    on repeated elements (log entries, finding cards) below are what let it match "this node
    already exists, leave it alone" instead of destroying/recreating everything on every update. #}
-{% from "macros/ui.html" import button, badge, scenario_badge, bounty_badge, exploited_badge, false_positive_badge, possible_duplicate_badge, unconfirmed_target_badge, carried_over_badge, pending_reverify_badge, status_badge, section_label, empty_state, plan_status_icon, hypothesis_status_badge, disclosure_summary, toggle_switch, chat_ref, tool_timeline_list, copy_button, target_type_badges, credential_source_badge, masked_identity_field %}
+{% from "macros/ui.html" import button, badge, scenario_badge, bounty_badge, exploited_badge, false_positive_badge, possible_duplicate_badge, unconfirmed_target_badge, carried_over_badge, pending_reverify_badge, status_badge, section_label, empty_state, plan_status_icon, hypothesis_status_badge, disclosure_summary, toggle_switch, chat_ref, tool_timeline_list, copy_button, target_type_badges, credential_source_badge, masked_identity_field, llm_origin %}
 {% from "macros/tech_icons.html" import tech_icon %}
 
 {# Shared by the main Logs list, the Analyze/Exploit tab logs, and the Subagent log section
@@ -22,9 +22,12 @@
            duration (agent/core.py's _run_llm_tool_loop timing around the actual dispatch), not
            the approximate "gap between two consecutive log timestamps" a human previously had to
            eyeball by hand to tell a slow tool (ffuf/nikto) apart from something actually stuck. #}
-        <span class="text-[11px] text-secondary shrink-0">{{ "%.1fs"|format(entry.duration_ms / 1000) if entry.duration_ms >= 1000 else (entry.duration_ms ~ "ms") }}</span>
+        <span class="text-[11px] text-secondary shrink-0" title="Tool run time">{{ entry.duration_ms | human_duration }}</span>
       {% endif %}
       <span class="text-[11px] text-secondary shrink-0">{{ entry.status }}</span>
+      {# Which provider/model produced this step and how long that LLM request took -- distinct from
+         the tool-dispatch duration above (agent/core.py's _append_log "llm" field). #}
+      {{ llm_origin(entry.llm) }}
       {# entry.at (agent/core.py's _append_log) already existed on disk with nothing rendering it
          here -- Interactive/RE mode's own activity log (interactive_log.html) already shows this
          same field with this same human_dt filter, this just brings the main Logs/Analyze/Exploit/

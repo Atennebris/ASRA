@@ -1,0 +1,29 @@
+{# TOOLS_CUSTOM_ROOT -- Settings -> Tools -> "Custom tools path" (agent/tools/custom_tools_root.py).
+   One shared field, backed by one real <input>/endpoint pair: a future second installer section
+   (a "heavy"/extended arsenal) includes this exact same partial rather than duplicating its own
+   copy with separate state -- see that module's own docstring on why TOOLS_CUSTOM_ROOT is a single
+   value, not one per installer. #}
+<div class="bg-elevated border border-default rounded-lg p-4 mb-6" id="custom-tools-root-block">
+  <div class="flex items-center gap-2 mb-1.5">
+    <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-status-online' if custom_tools_root else 'bg-secondary/40' }}"></span>
+    <span class="text-[13px] font-semibold text-primary">Custom tools path</span>
+  </div>
+  <p class="text-[11px] text-secondary mb-3 max-w-[46rem]">
+    Already have a set of tools installed somewhere on disk -- not through "Install" above? Point
+    ASRA at the root folder (flat, or an install base with its own
+    <code class="font-mono">bin/</code> subfolder) and it's checked as a last-resort fallback
+    whenever a tool isn't found on PATH. Type a Windows-style path (like
+    <code class="font-mono">C:\path\to\tools</code>) or its Linux/WSL2 form
+    (<code class="font-mono">/mnt/c/path/to/tools</code>) directly -- either works, it's
+    translated automatically.
+  </p>
+  <p class="text-[11px] text-secondary mb-3">
+    {% if custom_tools_root %}Currently saved: <code class="font-mono text-primary">{{ custom_tools_root }}</code>{% else %}No custom tools path saved -- this fallback is inactive.{% endif %}
+  </p>
+  <form hx-post="/api/tools/custom-root/test" hx-target="#custom-tools-root-result" hx-swap="innerHTML" class="flex items-center gap-2">
+    <input type="text" name="path" value="{{ custom_tools_root or '' }}" placeholder="e.g. C:\path\to\tools or /path/to/tools"
+           class="flex-1 min-w-0 bg-surface border border-default rounded px-2.5 py-1.5 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+    <button type="submit" class="h-7 px-2.5 text-[11px] font-medium rounded bg-surface border border-default text-secondary hover:text-primary hover:bg-overlay transition-colors shrink-0">Test path</button>
+  </form>
+  <div id="custom-tools-root-result" class="empty:hidden mt-3"></div>
+</div>

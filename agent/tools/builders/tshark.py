@@ -19,6 +19,12 @@ Live capture needs raw-socket capability -- setup_tools.sh's install_tshark gran
 cap_net_raw,cap_net_admin on dumpcap (the actual capture helper tshark shells out to internally)
 once at install time via setcap, specifically so an ordinary (non-root) run of this tool works
 exactly like every other tier-2 tool here, no per-call sudo prompt.
+
+raw_payload=True adds the full TCP/UDP segment payload (hex) to both tools' output -- the default
+field set only decodes protocols tshark itself has a dissector for (HTTP/DNS/TLS); a target with its
+own custom binary protocol (a game's own netcode, a proprietary control channel) otherwise shows up
+as bare IP/port metadata with the actual bytes invisible. Opt-in, not default, since on ordinary
+HTTP/TLS traffic this column is near-always empty/redundant with the already-decoded fields above.
 """
 from __future__ import annotations
 
@@ -42,19 +48,30 @@ _FIELD_NAMES = (
     "tls.handshake.extensions_server_name",
 )
 
+# Opt-in only (raw_payload=True) -- a custom, non-HTTP game/app protocol has no dissector to name a
+# useful field for, so the model can't ask for "the interesting bytes" by name the way it can for
+# http.host/dns.qry.name above. tcp.payload/udp.payload are Wireshark's own full-segment-payload hex
+# fields (the entire L4 payload, not just whatever a partial dissector left undissected) -- handing
+# the model these raw bytes lets it recognize magic numbers/fixed headers/diff two captures itself
+# with tools it already has (pwntools_analysis, hex comparison), instead of ASRA needing a bespoke
+# dissector per game. Kept out of the default field set: on ordinary HTTP/TLS traffic these columns
+# are almost always empty or redundant with the already-decoded http.*/tls.* fields, pure noise.
+_RAW_PAYLOAD_FIELD_NAMES = ("tcp.payload", "udp.payload")
+
 _DEFAULT_CAPTURE_SECONDS = 20
 _MAX_CAPTURE_SECONDS_ENV = "TSHARK_CAPTURE_MAX_SECONDS"
 _DEFAULT_MAX_CAPTURE_SECONDS = 120
 
 
-def _field_output_args() -> list[str]:
+def _field_output_args(raw_payload: bool = False) -> list[str]:
     # occurrence=f: a field repeated within one packet (rare, e.g. more than one dns.qry.name in an
     # unusual query) keeps only the first instead of tshark's own default of joining all of them
     # with a comma inside the same tab-separated column -- keeps the table's own column count
     # honest (one value per column, never a surprise embedded comma-list) for _parse_field_table
     # below.
     args = ["-T", "fields", "-E", "header=y", "-E", "separator=/t", "-E", "occurrence=f"]
-    for field in _FIELD_NAMES:
+    fields = _FIELD_NAMES + _RAW_PAYLOAD_FIELD_NAMES if raw_payload else _FIELD_NAMES
+    for field in fields:
         args += ["-e", field]
     return args
 
@@ -86,7 +103,7 @@ def build_tshark_capture_command(params: dict) -> list[str]:
     bpf_filter = params.get("bpf_filter")
     if bpf_filter:
         command += ["-f", validate_safe_value(str(bpf_filter))]
-    command += _field_output_args()
+    command += _field_output_args(raw_payload=bool(params.get("raw_payload")))
     return command
 
 
@@ -96,7 +113,7 @@ def build_tshark_read_pcap_command(params: dict) -> list[str]:
     display_filter = params.get("display_filter")
     if display_filter:
         command += ["-Y", validate_safe_value(str(display_filter))]
-    command += _field_output_args()
+    command += _field_output_args(raw_payload=bool(params.get("raw_payload")))
     return command
 
 

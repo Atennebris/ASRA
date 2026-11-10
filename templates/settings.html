@@ -288,6 +288,20 @@
           if (r.checked) history.replaceState(null, "", "#" + r.id.replace("settings-tab-", ""));
         });
       });
+      // Every remaining plain (non-htmx) POST form on this page ends in a redirect back to /settings,
+      // which used to land on the first tab no matter where the operator was. The redirect inherits
+      // the fragment of the URL it was requested from, so carrying the current "#tab" on the form's
+      // own action URL brings them back to the same tab -- one shim for every form here, instead of
+      // each one needing its own save-without-reload rewrite.
+      document.addEventListener("submit", function (event) {
+        var form = event.target;
+        if (!(form instanceof HTMLFormElement) || !location.hash) return;
+        if ((form.getAttribute("method") || "").toLowerCase() !== "post" || form.hasAttribute("hx-post")) return;
+        try {
+          var url = new URL(form.action, location.href);
+          if (url.origin === location.origin) { url.hash = location.hash; form.action = url.toString(); }
+        } catch (err) { /* keep the original action -- worst case is the old "back to the first tab" */ }
+      }, true);
       if (anchorId) {
         var target = document.getElementById(anchorId);
         // Real, confirmed bug this fixes: a single rAF here ran BEFORE session_state.js's own
@@ -827,10 +841,12 @@
                 {% elif opencode_cli_found %}
                   <span class="inline-flex items-center gap-1.5 text-[11px] text-severity-low shrink-0"><span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span>opencode CLI found</span>
                 {% else %}
-                  <span class="inline-flex items-center gap-1.5 text-[11px] text-severity-high shrink-0"><span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span>opencode CLI not found</span>
+                  <span class="inline-flex items-center gap-1.5 text-[11px] text-severity-high shrink-0"><span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span>{{ "opencode found on Windows only" if opencode_cli_status.state == "windows_only" else "opencode CLI not found" }}</span>
                 {% endif %}
               </div>
-              <p id="opencode-local-test-status" class="text-[11px] text-secondary mt-0.5">{% if not opencode_cli_found %}Install it from the Tools tab's "Dependencies" row, or run setup_tools.sh.{% endif %}</p>
+              {# The inner span is the swap host the install button replaces with its live panel --
+                 never the <p> itself, which is the Test button's own hx-target and must survive. #}
+              <p id="opencode-local-test-status" class="text-[11px] text-secondary mt-0.5">{% if not opencode_cli_found %}<span data-opencode-fix-host class="inline-flex items-center gap-2 flex-wrap">{{ opencode_cli_status.explanation() }}{% if opencode_cli_status.auto_install %}{% set install_label = opencode_cli_status.install_label %}{% set reload_after_install = true %}{% include "partials/opencode_install_button.html" %}{% endif %}</span>{% endif %}</p>
             </div>
             <div class="shrink-0 flex items-center gap-1">
               <button type="button" hx-post="/api/settings/providers/{{ opencode_local_provider_id }}/test"
@@ -1098,11 +1114,15 @@
         {% if wordlists %}
           <div class="grid sm:grid-cols-2 gap-x-6 gap-y-3">
             {% for role in assignable_roles %}
-              <form method="post" action="/api/settings/wordlists/assign" class="flex items-end gap-2">
+              {# Saves in place (htmx, no reload): a full-page submit here used to reload Settings and
+                 throw the operator back to the first tab on every pick. method/action stay as the
+                 no-JS fallback. #}
+              <form method="post" action="/api/settings/wordlists/assign" hx-post="/api/settings/wordlists/assign"
+                    hx-trigger="change" hx-swap="none" class="flex items-end gap-2">
                 <input type="hidden" name="role" value="{{ role }}">
                 <label class="flex-1 min-w-0 block">
                   <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">{{ role.replace("_", " ") | title }}</span>
-                  <select name="path" onchange="this.form.requestSubmit()"
+                  <select name="path"
                           class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
                     <option value="">(tool default)</option>
                     {% for wl in wordlists %}
@@ -1430,6 +1450,8 @@
           </label>
         </div>
       </div>
+
+      {% include "partials/settings_transfer_card.html" %}
     </section>
 
     {# Settings -> Customization -- every cosmetic/presentation control in one place (theme, clock
@@ -1590,36 +1612,53 @@
         </div>
       </div>
 
-      {# Desktop shell's own launch intro (desktop/src-tauri/dist/index.html) -- real, explicit
-         operator request for a way to turn it off if it doesn't land, without losing the plain
-         "Starting backend..." loader that shows instead (that loader was never touched -- it's
-         still exactly what plays when this switch is off). Persisted straight to .env
-         (agent/intro_settings.py), not this app's usual on-disk JSON store, because the Rust
-         desktop shell reads it directly from .env on the NEXT launch, before this backend even
-         exists -- see that module's own docstring. Web-mode operators (no desktop shell at all)
-         still get the toggle here since Settings is shared, it just has nothing to affect for them. #}
+      {# Desktop shell's own launch screen (desktop/src-tauri/dist/index.html) -- the animated
+         intro (default), a dragon progress bar for operators who find the intro too much, or
+         nothing at all. All three cover the same wait while the backend starts, so this is one
+         choice of three, backed by two .env flags (intro on/off, loader on/off) that the Rust shell
+         reads separately. Persisted straight to .env (agent/intro_settings.py), not this
+         app's usual on-disk JSON store, because the Rust desktop shell reads it directly from .env
+         on the NEXT launch, before this backend even exists -- see that module's own docstring.
+         Web-mode operators (no desktop shell at all) still get the picker here since Settings is
+         shared, it just has nothing to affect for them. Applies on the next launch by nature --
+         there is no live element to restyle in this session. #}
       <div class="bg-surface border border-default rounded-xl p-5">
-        {{ section_label("Launch intro") }}
-        <p class="text-[12px] text-secondary mb-3">The desktop app's own animated intro, played once while the backend starts up. Off shows the plain loading screen instead. Takes effect on your next launch, not this session.</p>
-        <label class="flex items-start gap-3 cursor-pointer">
-          {{ toggle_switch("enabled", checked=intro_enabled, extra_attrs='hx-post="/api/settings/intro" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
-          <span>
-            <span class="block text-sm font-medium text-primary">Play launch intro</span>
-            <span class="block text-[11px] text-secondary mt-0.5">On by default. Only matters for the desktop app -- there's nothing to start up in a browser tab.</span>
-          </span>
-        </label>
-        {# Sibling toggle for the intro's own sound (ambient warp-space drone + the three glass-
-           impact hits) -- synthesized client-side inside dist/index.html itself, same "no shipped
-           audio files" convention as agent/sound_settings.py's event sounds. Independent of the
-           visuals toggle above so an operator can keep the animation but mute the audio (or vice
-           versa); has nothing to play when the intro itself is off. #}
-        <label class="flex items-start gap-3 cursor-pointer mt-4 pt-4 border-t border-default">
-          {{ toggle_switch("enabled", checked=intro_sound_enabled, extra_attrs='hx-post="/api/settings/intro-sound" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
-          <span>
-            <span class="block text-sm font-medium text-primary">Play intro sound</span>
-            <span class="block text-[11px] text-secondary mt-0.5">Ambient drone plus the glass-impact hits, synthesized on the fly -- no audio files. Only plays while the intro above is also on.</span>
-          </span>
-        </label>
+        {{ section_label("Launch screen") }}
+        <p class="text-[12px] text-secondary mb-3">What the desktop app shows while the backend starts up. Takes effect on your next launch, not this session. Only matters for the desktop app -- there's nothing to start up in a browser tab.</p>
+        <div id="launch-screen-choice" class="grid grid-cols-1 sm:grid-cols-3 gap-3" role="radiogroup" aria-label="Launch screen">
+          {% for value, name, desc in [
+            ("intro", "Animated intro", "Cinematic title sequence. The default."),
+            ("dragon", "Dragon progress bar", "A dragon flies along a bar while the backend starts. Quiet and lightweight."),
+            ("none", "Nothing", "No intro and no loader. Start just shows \"Starting…\" until the app opens."),
+          ] %}
+            <label data-launch-screen-option="{{ value }}"
+                   class="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-default bg-elevated cursor-pointer hover:border-accent/50 transition-colors">
+              <input type="radio" name="style" value="{{ value }}" class="sr-only peer"
+                     {{ "checked" if value == launch_screen else "" }}
+                     hx-post="/api/settings/intro" hx-trigger="change" hx-swap="none" hx-disabled-elt="this">
+              <svg class="w-6 h-6 shrink-0 mt-0.5 text-secondary peer-checked:text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                {% if value == "intro" %}
+                  <rect x="3" y="5" width="18" height="14" rx="2"/>
+                  <path d="M10 9.5v5l4.5-2.5z" fill="currentColor" stroke="none"/>
+                {% elif value == "none" %}
+                  <circle cx="12" cy="12" r="8"/>
+                  <path d="M6.5 6.5l11 11" stroke-linecap="round"/>
+                {% else %}
+                  <path d="M2 15c2.5-5 4.5-5 7 0s4.5 5 7 0" stroke-linecap="round"/>
+                  <path d="M17.5 15l4.5-2.5v5z" fill="currentColor" stroke="none"/>
+                {% endif %}
+              </svg>
+              <span class="flex-1 min-w-0">
+                <span class="block text-sm text-primary font-medium">{{ name }}</span>
+                <span class="block text-[11px] text-secondary">{{ desc }}</span>
+              </span>
+              <svg class="w-5 h-5 shrink-0 text-accent opacity-0 peer-checked:opacity-100 transition-opacity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.15" stroke="none"/>
+                <path d="M8 12.5l2.5 2.5L16 9" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </label>
+          {% endfor %}
+        </div>
       </div>
 
       {# Settings -> Timezone -- agent/timezone_settings.py's own on-disk store. Every timestamp
@@ -1677,7 +1716,7 @@
            operator request -- the corner should show only the time unless asked for more). #}
         <div class="mt-4 pt-4 border-t border-default space-y-3">
           <label class="flex items-start gap-3 cursor-pointer">
-            {{ toggle_switch("enabled", checked=clock_show_time, onchange="var r=document.getElementById('asra-clock-row'); if(r){r.hidden=!this.checked;}", extra_attrs='hx-post="/api/settings/clock-display/show_clock" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+            {{ toggle_switch("enabled", checked=clock_show_time, onchange="asraClockSetVisible('asra-clock-line', this.checked)", extra_attrs='hx-post="/api/settings/clock-display/show_clock" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Show clock</span>
               <span class="block text-[11px] text-secondary mt-0.5">The live time in the sidebar footer, on every page.</span>
@@ -1695,7 +1734,7 @@
             </span>
           </label>
           <label class="flex items-start gap-3 cursor-pointer">
-            {{ toggle_switch("enabled", checked=clock_show_date, onchange="var d=document.getElementById('asra-clock-date'); if(d){d.hidden=!this.checked;}", extra_attrs='hx-post="/api/settings/clock-display/show_date" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+            {{ toggle_switch("enabled", checked=clock_show_date, onchange="asraClockSetVisible('asra-clock-date', this.checked)", extra_attrs='hx-post="/api/settings/clock-display/show_date" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Show date</span>
               <span class="block text-[11px] text-secondary mt-0.5">Today's date underneath the time, in this same display zone. Off by default.</span>
@@ -2239,6 +2278,22 @@
           {% endfor %}
         </div>
       </div>
+
+      {# The animated launch intro's own soundtrack (ambient drone + glass-impact hits) belongs with
+         the other sounds, not in Settings -> Launch screen. Not working yet, so it is shipped off
+         and locked: disabled + unchecked regardless of any saved value, no htmx wiring. Once the
+         sound actually plays, back it with a saved value + route again (ASRA_INTRO_SOUND_ENABLED,
+         which the desktop shell already reads and defaults to off). #}
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Launch intro sound") }}
+        <label class="flex items-start gap-3 cursor-not-allowed opacity-60" aria-disabled="true">
+          {{ toggle_switch("enabled", checked=false, disabled=true) }}
+          <span>
+            <span class="block text-sm font-medium text-secondary">Play intro sound</span>
+            <span class="block text-[11px] text-secondary mt-0.5">Ambient drone plus glass-impact hits for the animated launch intro. Not available yet -- coming soon.</span>
+          </span>
+        </label>
+      </div>
       </div>
     </section>
 
@@ -2255,6 +2310,7 @@
   {# Every dialog this page can open, hoisted here as siblings of #settings-panels -- never nested
      inside a section[data-settings-tab] (see the long comment at the top of this file / the
      matching CSS comment in themes.css for why). #}
+  {% include "partials/settings_transfer_dialogs.html" %}
   {% for provider_id in cloud_provider_ids %}{{ provider_dialog(provider_id) }}{% endfor %}
   {% for provider_id in local_provider_ids %}{{ provider_dialog(provider_id) }}{% endfor %}
   {% for p in custom_providers %}{{ custom_provider_edit_dialog(p) }}{% endfor %}
@@ -2273,12 +2329,12 @@
         {% if opencode_cli_found %}
           <span class="w-1.5 h-1.5 rounded-full bg-status-online shrink-0"></span><span class="text-[11px] text-secondary">opencode CLI found on this machine</span>
         {% else %}
-          <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span><span class="text-[11px] text-severity-high">opencode CLI not found</span>
+          <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span><span class="text-[11px] text-severity-high">{{ "opencode found on Windows only" if opencode_cli_status.state == "windows_only" else "opencode CLI not found" }}</span>
         {% endif %}
       </div>
       <p class="text-[11px] text-secondary">Nothing to configure here -- no API key, no base URL, no model to type. This provider spawns the opencode CLI as a local server on this machine and talks to it directly; its own model list is read live once it's running.</p>
       {% if not opencode_cli_found %}
-        <p class="text-[11px] text-secondary">Install it from the Tools tab's "Dependencies" row, or run setup_tools.sh.</p>
+        <p class="text-[11px] text-secondary">{{ opencode_cli_status.explanation() }}</p>
       {% endif %}
     </div>
   </dialog>
@@ -2329,18 +2385,16 @@
             {% for pid in cloud_provider_ids + local_provider_ids %}
               <option value="{{ pid }}">{{ provider_display_names[pid] }}</option>
             {% endfor %}
-            {# opencode-local -- disabled client-side when the CLI isn't actually on PATH right
-               now (opencode_cli_found, main.py's _llm_settings_context), so the operator sees WHY
-               before even submitting, not just after a server-side rejection. The server (POST
-               /api/settings/providers/custom, add_custom_provider_route) re-checks the same thing
-               before actually adding it either way -- never trust a disabled attribute alone. #}
+            {# opencode-local -- always addable; when the CLI isn't installed yet the label says so,
+               and the provider's own card (once added) carries the one-click install button. Never
+               disabled: that would block the only road to that button for a first-time operator. #}
             {# Defaults to selected when the CLI is actually usable -- real, explicit operator
                request: this is the provider most operators reach for first here (free, no key, no
                sign-in), so it shouldn't need to be hunted for near the bottom of a long built-in
                list every time. Never defaults selected while disabled (CLI not found) -- a
                disabled option landing pre-selected would show a grayed-out choice with no way to
                submit it, worse than just falling back to the list's normal first option. #}
-            <option value="{{ opencode_local_provider_id }}" {% if not opencode_cli_found %}disabled{% else %}selected{% endif %}>{{ opencode_local_display_name }}{% if not opencode_cli_found %} — opencode CLI not installed{% endif %}</option>
+            <option value="{{ opencode_local_provider_id }}" {% if opencode_cli_found %}selected{% endif %}>{{ opencode_local_display_name }}{% if not opencode_cli_found %} — opencode CLI not installed yet (one click after adding){% endif %}</option>
           </optgroup>
           <optgroup label="Custom">
             {% for type_id, preset in custom_provider_type_presets.items() %}

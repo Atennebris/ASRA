@@ -53,6 +53,21 @@
     </div>
   {% endif %}
 
+  {# The "heavy" arsenal (setup_tools_heavy.sh) -- entirely separate accounting from everything
+     above (agent/tools/arsenal.py's own comment on why), shown only once at least one heavy tool
+     is actually registered -- a permanent "0/0" row with nothing behind it yet would be noise,
+     not signal. #}
+  {% if summary.heavy_total %}
+    <div class="flex items-center gap-3 mb-3 pt-3 border-t border-default">
+      <span class="text-[11px] text-secondary w-40 shrink-0">Heavy arsenal (Ghidra, &hellip;)</span>
+      <div class="flex-1 h-1.5 rounded-full bg-elevated overflow-hidden">
+        <div class="h-full rounded-full {{ 'bg-status-online' if summary.heavy_percent == 100 else ('bg-severity-medium' if summary.heavy_installed > 0 else 'bg-severity-high') }}"
+             style="width: {{ summary.heavy_percent if summary.heavy_percent > 0 else 4 }}%"></div>
+      </div>
+      <span class="text-[11px] w-24 text-right shrink-0 text-secondary">{{ summary.heavy_installed }}/{{ summary.heavy_total }} ({{ summary.heavy_percent }}%)</span>
+    </div>
+  {% endif %}
+
   {% if summary.dependencies %}
     {# Separate from everything above on purpose -- these aren't recon/exploit tools (never
        counted in verdict/percent/modes), just other things setup_tools.sh also provisions.
@@ -61,11 +76,15 @@
       <p class="text-[11px] text-secondary uppercase tracking-wider mb-2">Dependencies (not tools)</p>
       <div class="space-y-1">
         {% for dep in summary.dependencies %}
-          <div class="flex items-center gap-2 text-[11px]">
+          <div data-opencode-fix-host class="flex items-center gap-2 flex-wrap text-[11px]">
             <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-status-online' if dep.installed else 'bg-severity-high' }}"></span>
             <span class="font-mono text-primary">{{ dep.label }}</span>
             <span class="{{ 'text-severity-low' if dep.installed else 'text-severity-high' }}">{{ "installed" if dep.installed else "not installed" }}</span>
             <span class="text-secondary">— {{ dep.note }}</span>
+            {% if not dep.installed and dep.name == "opencode" and dep.auto_install %}
+              {% set install_label = dep.install_label %}
+              {% include "partials/opencode_install_button.html" %}
+            {% endif %}
           </div>
         {% endfor %}
       </div>

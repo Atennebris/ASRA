@@ -1,14 +1,17 @@
-{# Confirm/warning step for the Tools page "Install" button -- rendered into #arsenal-output.
-   Nothing is installed until the operator confirms here. preflight (agent/tools/arsenal_install.py's
-   can_autostart) decides whether a real install button is even shown: on a platform/sudo situation
-   where the automatic run cannot work, this shows the honest reason + the exact manual command
-   instead of a button that would only fail after the click. #}
+{# Confirm/warning step for the Tools page "Install"/"Install (heavy)" buttons -- rendered into
+   #arsenal-output. Nothing is installed until the operator confirms here. preflight
+   (agent/tools/arsenal_install.py's can_autostart/heavy_can_autostart) decides whether a real
+   install button is even shown: on a platform/sudo situation where the automatic run cannot work,
+   this shows the honest reason + the exact manual command instead of a button that would only
+   fail after the click. `heavy` (bool, passed by the route) switches the script/copy/endpoints
+   between the fast base arsenal and the heavy one -- one real template, not two near-duplicates. #}
 <div class="bg-surface border border-severity-medium/40 rounded-lg p-4">
-  <p class="text-[13px] font-semibold text-primary mb-2">Install the external arsenal</p>
+  <p class="text-[13px] font-semibold text-primary mb-2">Install the {{ "heavy/extended" if heavy else "external" }} arsenal</p>
 
-  {# On-disk footprint, shown prominently as its own badge, never buried in prose. When the arsenal
-     is already (mostly) installed we show the REAL size measured on this machine; on a fresh machine
-     nothing is there to measure yet, so we fall back to a rough estimate and label it as such. #}
+  {# On-disk footprint, shown prominently as its own badge, never buried in prose. The base arsenal
+     shows the REAL size measured on this machine once it's (mostly) installed; the heavy one has
+     no equivalent measurement (its install locations are too varied/operator-configurable, e.g.
+     GHIDRA_INSTALL_DIR, see arsenal_install.py's own comment) so it's always the estimate. #}
   <div class="flex flex-wrap items-center gap-2 mb-3 rounded border border-severity-medium/40 bg-severity-medium/10 px-3 py-2">
     {% if measured_gb %}
       <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Arsenal on disk (measured here)</span>
@@ -22,21 +25,31 @@
   </div>
 
   <p class="text-[11px] text-secondary leading-relaxed max-w-[46rem] mb-3">
-    Runs the local <code class="font-mono text-primary">setup_tools.sh</code> from this repository.
-    It installs the external tools (nmap, nuclei, sqlmap, metasploit, radare2, wine, apktool and
-    others) via the system package manager and downloads from their official sources. Already-installed
-    tools are skipped, so on a mostly-provisioned machine the actual new download is far smaller than
-    the total above. It runs for several minutes; a restart of the agent (and sometimes the system)
-    may be needed afterwards.
+    {% if heavy %}
+      Runs the local <code class="font-mono text-primary">setup_tools_heavy.sh</code> from this
+      repository. Installs substantially larger/slower tools kept out of the fast base install:
+      Ghidra (+ the JDK it needs), pwntools/pwndbg/pyelftools/unicorn, sigrok-cli, unblob, adb, and
+      WABT. Already-installed tools are skipped. Expect several minutes at minimum (Ghidra alone is
+      a sizeable download); a restart of the agent may be needed afterwards.
+    {% else %}
+      Runs the local <code class="font-mono text-primary">setup_tools.sh</code> from this repository.
+      It installs the external tools (nmap, nuclei, sqlmap, metasploit, radare2, wine, apktool and
+      others) via the system package manager and downloads from their official sources. Already-installed
+      tools are skipped, so on a mostly-provisioned machine the actual new download is far smaller than
+      the total above. It runs for several minutes; a restart of the agent (and sometimes the system)
+      may be needed afterwards.
+    {% endif %}
   </p>
 
   {% if preflight.ok %}
-    <form hx-post="/api/tools/arsenal/install/start" hx-target="#arsenal-output" hx-swap="innerHTML">
-      <label class="flex items-start gap-2 text-[11px] text-secondary mb-3 cursor-pointer select-none">
-        <input type="checkbox" name="include_wordlists" value="true" class="mt-0.5">
-        <span>Also the large wordlists (rockyou.txt + SecLists, ~60&ndash;70 MB more) &mdash; needed
-          to brute-force genuinely weak passwords, not just default credentials.</span>
-      </label>
+    <form hx-post="{{ '/api/tools/arsenal/heavy-install/start' if heavy else '/api/tools/arsenal/install/start' }}" hx-target="#arsenal-output" hx-swap="innerHTML">
+      {% if not heavy %}
+        <label class="flex items-start gap-2 text-[11px] text-secondary mb-3 cursor-pointer select-none">
+          <input type="checkbox" name="include_wordlists" value="true" class="mt-0.5">
+          <span>Also the large wordlists (rockyou.txt + SecLists, ~60&ndash;70 MB more) &mdash; needed
+            to brute-force genuinely weak passwords, not just default credentials.</span>
+        </label>
+      {% endif %}
       <p class="text-[10.5px] text-secondary mb-3">
         Launch method: <span class="text-primary font-mono">{{ preflight.command }}</span>
         {% if preflight.reason == "root" %}(already root){% elif preflight.reason == "sudo" %}(via sudo){% endif %}

@@ -26,7 +26,15 @@
             class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-4 text-[12px]">
       Install
     </button>
-    <span class="text-[11px] text-secondary">Check whether the external arsenal is installed, and add what's missing in one click.</span>
+    {# "Heavy"/extended arsenal -- substantially larger/slower tools deliberately kept out of the
+       fast base install above (Ghidra, pwntools/pwndbg, sigrok-cli, unblob, adb, WABT -- see
+       setup_tools_heavy.sh's own header comment). Same confirm-step/output/auto-scroll mechanism,
+       reused via the `heavy` flag on arsenal_confirm.html/arsenal_install.html, not a second one. #}
+    <button type="button" hx-get="/api/tools/arsenal/heavy-install/confirm" hx-target="#arsenal-output" hx-swap="innerHTML"
+            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-4 text-[12px]">
+      Install (heavy)
+    </button>
+    <span class="text-[11px] text-secondary">Check whether the external arsenal is installed, and add what's missing in one click. "Heavy" is a separate, larger, slower set of RE tools (Ghidra, &hellip;) kept out of the fast base install.</span>
   </div>
   <div id="arsenal-output" class="empty:hidden mt-3"></div>
 </div>
@@ -60,6 +68,9 @@
     });
   })();
 </script>
+
+{% include "partials/custom_tools_root.html" %}
+{% include "partials/custom_tools_list.html" %}
 
 {# Optional nuclei template packs (agent/tools/nuclei_template_packs.py) -- nothing enabled by
    default; nuclei already keeps its own official template set up to date on every run on its

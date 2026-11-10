@@ -1,8 +1,10 @@
-{# Live install view for the Tools page -- rendered into #arsenal-output by the start route, then
-   re-fetched by its own polling trigger while the background setup_tools.sh run is in flight
-   (agent/tools/arsenal_install.py). The root element self-polls only WHILE running: once the
-   process exits, the returned fragment drops the hx-trigger, so polling stops on its own -- same
-   "the 'on' state only exists in the DOM while it should" discipline the toolkit live-view uses. #}
+{# Live install view for the Tools page -- rendered into #arsenal-output by either start route,
+   then re-fetched by its own polling trigger while the background setup_tools.sh/
+   setup_tools_heavy.sh run is in flight (agent/tools/arsenal_install.py). The root element
+   self-polls only WHILE running: once the process exits, the returned fragment drops the
+   hx-trigger, so polling stops on its own -- same "the 'on' state only exists in the DOM while it
+   should" discipline the toolkit live-view uses. `heavy` (bool, passed by the route) switches the
+   poll endpoint/copy -- one real template, not two near-duplicates. #}
 {% if blocked %}
   <div class="bg-surface border border-severity-high/40 rounded-lg p-4">
     <p class="text-[11px] text-severity-high mb-1.5">Install did not start</p>
@@ -14,12 +16,12 @@
 {% else %}
   {% set running = status.state == "running" %}
   <div id="arsenal-install-view"
-       {% if running %}hx-get="/api/tools/arsenal/install/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
+       {% if running %}hx-get="{{ '/api/tools/arsenal/heavy-install/status' if heavy else '/api/tools/arsenal/install/status' }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}
        class="bg-surface border border-default rounded-lg p-4">
     <div class="flex items-center gap-2 mb-2">
       {% if running %}
         <span class="w-2 h-2 rounded-full bg-severity-medium shrink-0 animate-pulse"></span>
-        <p class="text-[13px] font-semibold text-primary">Installing the arsenal&hellip;</p>
+        <p class="text-[13px] font-semibold text-primary">Installing the {{ "heavy arsenal" if heavy else "arsenal" }}&hellip;</p>
       {% elif status.succeeded %}
         <span class="w-2 h-2 rounded-full bg-status-online shrink-0"></span>
         <p class="text-[13px] font-semibold text-status-online">Install finished.</p>

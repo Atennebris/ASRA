@@ -47,6 +47,21 @@
     }
   }
 
+  // The row (#asra-clock-row) holds the time line and the date; each has its own Settings toggle,
+  // and the row is only hidden when neither is showing -- turning the clock off must not take the
+  // date with it.
+  window.asraClockSetVisible = function (id, visible) {
+    var part = document.getElementById(id);
+    var row = document.getElementById("asra-clock-row");
+    if (part) part.hidden = !visible;
+    if (row) {
+      var line = document.getElementById("asra-clock-line");
+      var date = document.getElementById("asra-clock-date");
+      row.hidden = !!(line && line.hidden) && !!(date && date.hidden);
+    }
+    tick(); // a date switched on should show today's date now, not on the next second
+  };
+
   tick();
   setInterval(tick, 1000);
 })();

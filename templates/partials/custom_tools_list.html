@@ -1,0 +1,59 @@
+{# Settings -> Tools -> "Custom tools" -- every operator-registered binary ASRA's own registry
+   doesn't know about (agent/tools/custom_tools_store.py). The toggle persists via htmx
+   (hx-trigger="change", hx-swap="none") and is a native checkbox under toggle_switch's own
+   peer-checked CSS -- the visual flip is instant and needs no JS, same "Live visual feedback"
+   discipline every other Settings toggle in this app already follows. #}
+<div class="bg-elevated border border-default rounded-lg p-4 mb-6" id="custom-tools-list">
+  <p class="text-[13px] font-semibold text-primary mb-1">Custom tools</p>
+  <p class="text-[11px] text-secondary mb-3 max-w-[46rem]">
+    Binaries you've registered yourself, discovered via "Test path" above (or added directly) --
+    ASRA's own registry has no builder for these at all. Each ENABLED one becomes a real, named
+    tool the agent and its subagents can call, using whichever flags its own usage text below
+    documents. Runs sandboxed (the same process/filesystem isolation custom-script tools already
+    get), since this project has no track record with an arbitrary added binary the way it does
+    with its own built-in tools.
+  </p>
+  {% if not custom_tools %}
+    <p class="text-[11px] text-secondary italic">No custom tools registered yet.</p>
+  {% else %}
+    <div class="space-y-2">
+      {% for tool in custom_tools %}
+        <div class="px-3 py-2.5 rounded-lg border border-default bg-surface">
+          <div class="flex items-center gap-3">
+            <label class="relative inline-flex items-center cursor-pointer shrink-0">
+              {{ toggle_switch("enabled", checked=tool.enabled, extra_attrs='hx-post="/api/tools/custom-tools/' ~ tool.id ~ '/toggle" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+            </label>
+            <div class="min-w-0 flex-1">
+              <span class="text-[13px] font-medium text-primary font-mono">{{ tool.name }}</span>
+              <span class="text-[10px] text-secondary">(custom)</span>
+              <p class="text-[11px] text-secondary truncate font-mono" title="{{ tool.path }}">{{ tool.path }}</p>
+            </div>
+            <form method="post" action="/api/tools/custom-tools/{{ tool.id }}/delete" class="shrink-0"
+                  onsubmit="return asraConfirmSubmit(event, {title: 'Remove this custom tool?', message: 'Removes &quot;' + {{ tool.name | tojson }} + '&quot; from the registry -- the agent and its subagents will no longer be able to call it. The binary itself on disk is untouched.', confirmLabel: 'Remove'});">
+              <button type="submit" class="h-7 px-2.5 text-[11px] font-medium rounded bg-surface border border-default text-secondary hover:text-primary hover:bg-overlay transition-colors">Remove</button>
+            </form>
+          </div>
+          <form method="post" action="/api/tools/custom-tools/{{ tool.id }}/update" class="mt-2 space-y-2">
+            <textarea name="description" rows="2" placeholder="What this tool does and how to call it -- shown to the model as its tool description."
+                      class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ tool.description }}</textarea>
+            <div class="flex items-center gap-3 flex-wrap">
+              <label class="text-[11px] text-secondary">
+                Category
+                <select name="category" class="ml-1 bg-surface border border-default rounded px-2 py-1 text-[11px] text-primary">
+                  {% for cat in custom_tool_categories %}
+                    <option value="{{ cat }}" {{ "selected" if cat == tool.category else "" }}>{{ cat }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="flex items-center gap-1.5 text-[11px] text-secondary cursor-pointer select-none">
+                <input type="checkbox" name="requires_target" value="true" {{ "checked" if tool.requires_target else "" }}>
+                Requires a live target (allowlist-gated)
+              </label>
+              <button type="submit" class="h-7 px-2.5 text-[11px] font-medium rounded bg-surface border border-default text-secondary hover:text-primary hover:bg-overlay transition-colors ml-auto">Save</button>
+            </div>
+          </form>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>

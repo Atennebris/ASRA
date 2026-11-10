@@ -79,6 +79,30 @@ def _resolve_rootfs(file_path: str, base: str) -> str:
     return base
 
 
+def _windows_rootfs_incomplete(rootfs: str) -> str | None:
+    """setup_tools.sh's install_qiling clones the qilingframework/rootfs repo, but that free clone
+    ships Linux ELF content only -- Windows PE emulation additionally needs REAL Windows system
+    DLLs the operator must copy in manually (Qiling can't redistribute them: Windows is
+    proprietary). A `*_windows` rootfs dir existing (the git clone creates the skeleton folder for
+    every arch) is therefore not the same as it being USABLE. Without this check, that gap surfaces
+    only as a cryptic QlErrorFileNotFound several frames deep inside Qiling's own loader -- this
+    catches it first with a message that actually says what's missing and why. Returns None for
+    anything that isn't an incomplete *_windows rootfs (a real ELF/macOS rootfs, or a Windows one
+    the operator already populated)."""
+    if not os.path.basename(os.path.normpath(rootfs)).endswith("_windows"):
+        return None
+    if os.path.isdir(os.path.join(rootfs, "Windows", "registry")):
+        return None
+    return (
+        f"Qiling rootfs at {rootfs!r} has no Windows/registry directory. The free rootfs clone "
+        "(setup_tools.sh's Install button, or qilingframework/rootfs on GitHub) ships Linux ELF "
+        "content out of the box, but Windows PE emulation additionally needs REAL Windows system "
+        "DLLs copied in manually -- Qiling can't redistribute them for licensing reasons. Copy "
+        f"them from a real Windows install into {os.path.join(rootfs, 'Windows', 'System32')!r} "
+        "(see qilingframework/rootfs's own setup notes for exactly which files)."
+    )
+
+
 def _emit(result: dict) -> None:
     # Sentinel first so the parser can skip any output qiling wrote to stdout before this point.
     sys.stdout.flush()
@@ -104,6 +128,10 @@ def _run(params: dict) -> dict:
                          "(see github.com/qilingframework/rootfs).",
                 "rootfs_tried": base}
     rootfs = _resolve_rootfs(file_path, base)
+
+    windows_hint = _windows_rootfs_incomplete(rootfs)
+    if windows_hint:
+        return {"status": "error", "error": windows_hint, "rootfs": rootfs}
 
     try:
         from qiling import Qiling  # noqa: PLC0415 -- optional heavy dep, imported only when used

@@ -32,7 +32,7 @@ def test_a_tier1_native_tool_is_always_reported_installed(monkeypatch):
     monkeypatch.setattr(inv, "TOOL_REGISTRY", [fake_spec])
 
     entries = list_tool_availability()
-    assert entries == [{"name": "fake_native_tool", "categories": ("scan",), "tier": 1, "installed": True, "description": "", "checks_dependency": False}]
+    assert entries == [{"name": "fake_native_tool", "categories": ("scan",), "tier": 1, "installed": True, "description": "", "checks_dependency": False, "heavy": False}]
 
 
 def test_a_tier2_tool_reports_installed_false_when_its_real_binary_is_missing(monkeypatch):

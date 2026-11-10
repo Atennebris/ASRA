@@ -20,6 +20,7 @@
    chat_panel.html), no separate manual Send needed. #}
 {% from "macros/project_icons.html" import project_icon %}
 {% from "macros/nav.html" import nav_icon %}
+{% from "macros/ui.html" import llm_origin, tool_timing %}
 {% set chat_messages = thread.get("messages", []) %}
 {# The agent's identity mark, reused for every asra-side row and the "thinking" bubble -- this
    project's own icon/color (picked at project creation, sessions/store.py) rather than a fixed
@@ -51,6 +52,12 @@
     <div class="text-[11px] text-center text-secondary italic">{{ flash }}</div>
   {% endif %}
   {% for msg in chat_messages %}
+    {# is_last_message/next_msg -- whether ANOTHER message already exists after this one, and
+       which, used below to lock a stale "suggested_actions" menu (see that block's own comment for
+       the real, confirmed "clicking an old card still works" bug this derives the fix from, instead
+       of a separate persisted "used" flag that would need its own write path and could drift). #}
+    {% set is_last_message = loop.last %}
+    {% set next_msg = chat_messages[loop.index] if not loop.last else None %}
     {% if msg.role == "system" %}
       {# A persisted compaction note (_run_compaction, agent/chat.py) -- a durable, centered marker
          on the scrollback (hairline rules either side) so it reads as a break in the conversation,
@@ -130,20 +137,30 @@
             {% endif %}
             <div class="max-w-full px-3.5 py-2 text-sm text-left break-words chat-markdown shadow-sm border {% if seg.error %}bg-severity-high/10 text-primary border-severity-high/40 rounded-2xl{% elif is_user %}bg-accent/15 text-primary border-default rounded-2xl rounded-br-md{% else %}bg-elevated text-primary border-default rounded-2xl rounded-bl-md{% endif %}">{{ seg.content | render_chat_markdown }}</div>
           {% elif seg.type == "tool_call" %}
-            <details class="w-full rounded-xl border text-[11px] overflow-hidden {{ 'border-severity-high/40' if seg.error else 'border-default' }} bg-elevated">
+            {# A tool call still "not done" while the thread itself is NOT pending is an orphan (the
+               turn ended/crashed/was stopped before its result landed) -- never a live spinner, which
+               would claim work is happening when nothing is. Each state gets its OWN indicator id so
+               idiomorph REPLACES the node on a state change instead of patching a spinner in place
+               (a card the operator had expanded mid-run kept its spinner after the tool failed). #}
+            {% set tool_live = (not seg.done) and thread.get("pending") %}
+            <details id="chat-tool-{{ seg.id }}" class="w-full rounded-xl border text-[11px] overflow-hidden {{ 'border-severity-high/40' if seg.error else 'border-default' }} bg-elevated">
               <summary class="flex items-center gap-2 px-3 py-2 cursor-pointer list-none hover:bg-overlay transition-colors">
-                {% if not seg.done %}
-                  <span class="asra-spinner shrink-0"></span>
+                {% if tool_live %}
+                  <span id="chat-tool-ind-{{ seg.id }}-running" class="asra-spinner shrink-0"></span>
+                {% elif not seg.done %}
+                  <span id="chat-tool-ind-{{ seg.id }}-orphan" class="w-1.5 h-1.5 rounded-full shrink-0 bg-secondary/50" title="Interrupted -- no result was recorded"></span>
                 {% elif seg.error %}
-                  <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-high" title="Failed"></span>
+                  <span id="chat-tool-ind-{{ seg.id }}-failed" class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-high" title="Failed"></span>
                 {% else %}
-                  <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-low" title="Done"></span>
+                  <span id="chat-tool-ind-{{ seg.id }}-done" class="w-1.5 h-1.5 rounded-full shrink-0 bg-severity-low" title="Done"></span>
                 {% endif %}
                 <span class="font-mono font-semibold text-secondary shrink-0">{{ seg.name }}</span>
-                {% if seg.arg_summary %}<span class="font-mono text-secondary/70 truncate flex-1 min-w-0">{{ seg.arg_summary }}</span>{% endif %}
+                {% if seg.arg_summary %}<span class="font-mono text-secondary/70 truncate flex-1 min-w-0">{{ seg.arg_summary }}</span>{% else %}<span class="flex-1"></span>{% endif %}
+                {{ llm_origin(seg.llm, running=not seg.done) }}
+                {{ tool_timing(seg.done or not tool_live, seg.duration_ms, seg.started_at if tool_live else none) }}
               </summary>
               <div class="border-t border-default px-3 py-2">
-                <pre class="whitespace-pre-wrap break-words text-[10px] font-mono text-secondary max-h-40 overflow-y-auto asra-scroll">{{ seg.output or "(running…)" }}</pre>
+                <pre class="whitespace-pre-wrap break-words text-[10px] font-mono text-secondary max-h-40 overflow-y-auto asra-scroll">{{ seg.output or ("(running…)" if tool_live else "(no output recorded)") }}</pre>
               </div>
             </details>
           {% elif seg.type == "suggested_actions" and seg.actions %}
@@ -157,9 +174,38 @@
                background + border, distinct from bg-elevated) plus a small label give it its own
                visual identity; each pill's own border/shadow (not just a hover state) reads as
                "raised, clickable" even before the cursor gets there. Clicking sends immediately
-               (asraUseSuggestedStep, chat_panel.html) -- see this file's header comment for why. #}
+               (asraUseSuggestedStep, chat_panel.html) -- see this file's header comment for why.
+
+               Locking once the turn has moved on -- a real, confirmed operator complaint: this menu
+               had no notion of "already acted on", so a card from several messages back stayed
+               exactly as clickable as a brand new one at the bottom of the thread, letting the
+               operator fire off the same (or a different) option as several separate messages long
+               after that turn was answered. `is_last_message` (set once per outer message, above)
+               is this segment's own message's real position in the thread, not a separate stored
+               flag -- the moment ANY later message exists, the menu that offered it is necessarily
+               from a finished turn and renders locked on every future render, page reload included,
+               with nothing extra to persist or keep in sync. `chosen_action`, when the very next
+               message is the operator's own text matching one of these options, shows which one was
+               actually picked instead of just going uniformly inert with no trace of the choice.
+               The click-time disable in asraUseSuggestedStep (chat_panel.html) closes the narrower
+               race where the operator clicks again before that next message has landed yet. #}
             {% set lead_in = loop.previtem if (loop.previtem and loop.previtem.type == "text" and loop.previtem.content and not loop.previtem.error and not loop.previtem.suspected_fake_tool_call) else None %}
-            <div class="w-full rounded-xl border border-accent/25 bg-accent/5 p-2.5 space-y-2">
+            {% set is_locked = not is_last_message %}
+            {# A plain {% set %} inside the {% for %} below would be scoped to that loop body only
+               and vanish again once it ends -- a real Jinja2 gotcha, confirmed live (it silently
+               rendered "No longer active" for every locked card instead of "Selected", because the
+               assignment never actually escaped the loop). A namespace object is the one construct
+               whose attributes survive past the end of a for loop. #}
+            {% set ns = namespace(chosen_action=None) %}
+            {% if is_locked and next_msg and next_msg.role == "user" %}
+              {% for next_seg in next_msg.get("segments", []) %}
+                {% if next_seg.type == "text" and next_seg.content in seg.actions %}
+                  {% set ns.chosen_action = next_seg.content %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {% set chosen_action = ns.chosen_action %}
+            <div class="suggested-actions-card w-full rounded-xl border p-2.5 space-y-2 {{ 'border-default bg-elevated/60' if is_locked else 'border-accent/25 bg-accent/5' }}">
               {% if lead_in %}
                 {# The model's own lead-in sentence before offering these buttons (e.g. "click one of
                    the options below") -- merged into this same card, muted (text-secondary, not the
@@ -168,16 +214,18 @@
                    own right, a real, confirmed operator complaint this closes. #}
                 <p class="text-[12px] text-secondary leading-snug break-words chat-markdown">{{ lead_in.content | render_chat_markdown }}</p>
               {% endif %}
-              <p class="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-accent/80">
+              <p class="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide {{ 'text-secondary/70' if is_locked else 'text-accent/80' }}">
                 <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
-                Suggested next steps
+                {{ "Selected" if chosen_action else ("No longer active" if is_locked else "Suggested next steps") }}
               </p>
               <div class="flex flex-wrap gap-1.5">
                 {% for action in seg.actions %}
-                  <button type="button" onclick='asraUseSuggestedStep({{ action | tojson }})'
-                          class="px-3 py-1.5 text-[11px] font-medium rounded-full border border-accent/40 bg-surface text-primary shadow-sm hover:border-accent hover:bg-accent/15 hover:text-accent transition-colors">
+                  {% set is_chosen = action == chosen_action %}
+                  <button type="button" {{ "disabled" if is_locked else "" }}
+                          onclick='asraUseSuggestedStep({{ action | tojson }}, this)'
+                          class="px-3 py-1.5 text-[11px] font-medium rounded-full border shadow-sm transition-colors {% if is_chosen %}border-accent bg-accent/15 text-accent cursor-default{% elif is_locked %}border-default bg-surface/50 text-secondary/50 cursor-not-allowed{% else %}border-accent/40 bg-surface text-primary hover:border-accent hover:bg-accent/15 hover:text-accent{% endif %}">
                     {{ action }}
                   </button>
                 {% endfor %}

@@ -1,32 +1,39 @@
-"""Tools page -> "Install" button: runs the project's own setup_tools.sh (the full Tier-2 arsenal
-provisioner) as a tracked BACKGROUND process, streaming its output to a log file the UI tails live.
+"""Tools page -> "Install" / "Install (heavy)" buttons: runs the project's own setup_tools.sh (the
+fast, base Tier-2 arsenal) or setup_tools_heavy.sh (larger/slower tools deliberately kept out of
+the fast base install: Ghidra, pwntools/pwndbg, sigrok-cli, unblob, adb, WABT) as a tracked
+BACKGROUND process, streaming its output to a log file the UI tails live. One real implementation,
+parameterized by (script_path, log_name, state) and called twice -- see _start_install/
+_install_status below -- rather than a second module repeating the same sudo/Popen/tail code
+(the project's "no hardcoding"/DRY rules).
 
 Why a background Popen + log file instead of capability_install.py's blocking subprocess.run:
 capability_install installs ONE package (seconds), so a blocking call with a 300s cap is fine.
-setup_tools.sh provisions the whole arsenal (nmap/nuclei/metasploit/radare2/wine/... + optional
-wordlists) and genuinely runs for many minutes -- blocking a FastAPI worker that long is not an
+Either script here provisions a whole arsenal and genuinely runs for minutes (the heavy one,
+downloading/unpacking Ghidra, considerably longer) -- blocking a FastAPI worker that long is not an
 option, and the operator needs to watch progress, not stare at a spinner. So: start it detached,
 write combined stdout+stderr to a log in the global app dir, and let the panel poll a "tail the
 log" endpoint.
 
 Privilege handling mirrors capability_install.py exactly, one deliberate simplification: rather
 than let the script's own many internal sudo calls each need a password (a web request has no TTY
-to answer them on), the WHOLE script is run under one `sudo -S bash setup_tools.sh` with the saved
+to answer them on), the WHOLE script is run under one `sudo -S bash <script>` with the saved
 password piped once -- so `id -u` inside the script is already 0 and its own SUDO variable resolves
 to empty, no further prompts. Three cases, same order of preference as capability_install:
-  1. already root -> `bash setup_tools.sh`, no sudo at all.
+  1. already root -> `bash <script>`, no sudo at all.
   2. SUDO_PASSWORD set -> `sudo -S bash ...`, password piped to stdin once.
   3. passwordless sudo -> `sudo -n bash ...`.
   4. none of the above -> return status="manual" with the exact command to run in a real terminal.
 
-Linux/WSL2 only, same explicit scoping setup_tools.sh itself uses ("not for macOS"): under ASRA's
+Linux/WSL2 only, same explicit scoping both scripts themselves use ("not for macOS"): under ASRA's
 supported Windows launch path the server already runs inside WSL2 (sys.platform == "linux"), so
 this drives the same Linux script it always would. A native-Windows/macOS process cannot run it and
 gets status="unsupported" instead of a broken half-run.
 
-The Popen handle lives in memory only -- a server restart mid-install loses the ability to poll/stop
-it, but the log file persists so the last output is still shown; the install itself keeps running
-under its own process group regardless.
+Each installer's Popen handle lives in memory only, in its OWN state dict (_STATE / _HEAVY_STATE --
+two separate installs can be tracked independently, e.g. one finished while the other is still
+running) -- a server restart mid-install loses the ability to poll/stop it, but the log file
+persists so the last output is still shown; the install itself keeps running under its own process
+group regardless.
 """
 from __future__ import annotations
 
@@ -44,7 +51,8 @@ from projects.paths import resolve_global_app_dir
 
 logger = get_logger("TOOLS")
 
-_SCRIPT_PATH = Path(__file__).resolve().parent.parent.parent / "setup_tools.sh"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_SCRIPT_PATH = _REPO_ROOT / "setup_tools.sh"
 _LOG_NAME = "arsenal-install.log"
 _LOG_TAIL_LINES = int(os.getenv("ARSENAL_INSTALL_LOG_TAIL_LINES", "400"))
 # Descriptive, shown in the confirm warning -- an estimate that legitimately varies by distro and
@@ -52,19 +60,32 @@ _LOG_TAIL_LINES = int(os.getenv("ARSENAL_INSTALL_LOG_TAIL_LINES", "400"))
 _APPROX_GB = os.getenv("ARSENAL_INSTALL_APPROX_GB", "6-8")
 _SUDO_PASSWORD_ENV = "SUDO_PASSWORD"
 
+_HEAVY_SCRIPT_PATH = _REPO_ROOT / "setup_tools_heavy.sh"
+_HEAVY_LOG_NAME = "arsenal-heavy-install.log"
+# Noticeably bigger than the base arsenal's own 6-8 GB estimate above (Ghidra + a JDK alone are a
+# large chunk of that) -- a real number, not measured (unlike the base arsenal's own
+# measure_arsenal_size_gb: the heavy tools' install locations are too varied/operator-configurable,
+# e.g. GHIDRA_INSTALL_DIR, to make a `du`-based measurement meaningful the same way).
+_HEAVY_APPROX_GB = os.getenv("ARSENAL_HEAVY_INSTALL_APPROX_GB", "15-25")
+
 # In-memory only (a live Popen handle is neither JSON-serializable nor meaningful past this
-# process's lifetime) -- same reasoning as background_jobs._RUNNING_PROCESSES.
-_STATE: dict = {
-    "proc": None,      # subprocess.Popen | None
-    "log_path": None,  # Path | None
-    "started_at": None,
-    "command": None,   # human-readable command string
-    "wordlists": False,
-}
+# process's lifetime) -- same reasoning as background_jobs._RUNNING_PROCESSES. Two independent
+# dicts, one per installer, so a normal-arsenal install and a heavy-arsenal install can each be
+# tracked/polled on their own without one clobbering the other's state.
+def _fresh_state() -> dict:
+    return {"proc": None, "log_path": None, "started_at": None, "command": None, "wordlists": False}
+
+
+_STATE: dict = _fresh_state()
+_HEAVY_STATE: dict = _fresh_state()
 
 
 def approx_download_size_gb() -> str:
     return _APPROX_GB
+
+
+def approx_heavy_download_size_gb() -> str:
+    return _HEAVY_APPROX_GB
 
 
 # The standard locations setup_tools.sh actually provisions into -- measured to report a REAL
@@ -115,11 +136,11 @@ def measure_arsenal_size_gb() -> str | None:
     return result
 
 
-def _log_path() -> Path:
-    return resolve_global_app_dir() / _LOG_NAME
+def _log_path(log_name: str) -> Path:
+    return resolve_global_app_dir() / log_name
 
 
-# setup_tools.sh colorizes its output with tput (SGR color codes + charset-designator resets like
+# Both scripts colorize their output with tput (SGR color codes + charset-designator resets like
 # ESC(B). Those escape sequences render as garbage boxes in the plain-text <pre> the UI shows them
 # in, so strip them before display -- covers CSI sequences (\x1b[...m and friends), charset
 # designators (\x1b(B), and other single-char C1 escapes.
@@ -138,8 +159,8 @@ def _tail(path: Path, lines: int) -> str:
         return ""
 
 
-def _is_running() -> bool:
-    proc = _STATE.get("proc")
+def _is_running(state: dict) -> bool:
+    proc = state.get("proc")
     return proc is not None and proc.poll() is None
 
 
@@ -157,11 +178,11 @@ def _passwordless_sudo_available() -> bool:
         return False
 
 
-def _resolve_command() -> tuple[list[str] | None, str | None, str]:
+def _resolve_command(script_path: Path = _SCRIPT_PATH) -> tuple[list[str] | None, str | None, str]:
     """(argv, stdin_password, display_command). argv is None when no automatic path exists.
     display_command is always the plain, copy-pasteable command for the manual fallback."""
-    display = f"bash {_SCRIPT_PATH.name}"
-    script = str(_SCRIPT_PATH)
+    display = f"bash {script_path.name}"
+    script = str(script_path)
     if os.geteuid() == 0:
         return ["bash", script], None, display
     if has_sudo_password():
@@ -171,7 +192,7 @@ def _resolve_command() -> tuple[list[str] | None, str | None, str]:
     return None, None, f"sudo {display}"
 
 
-def can_autostart() -> dict:
+def can_autostart(script_path: Path = _SCRIPT_PATH) -> dict:
     """Cheap pre-flight for the confirm panel -- can the button actually run this here, and by which
     path, WITHOUT starting anything. Lets the UI show the honest situation up front instead of only
     discovering it after a click."""
@@ -179,12 +200,12 @@ def can_autostart() -> dict:
         return {"ok": False, "reason": "unsupported",
                 "message": "Automatic arsenal install only works on Linux/WSL2 "
                            f"(here sys.platform={sys.platform!r})."}
-    if not _SCRIPT_PATH.is_file():
+    if not script_path.is_file():
         return {"ok": False, "reason": "no_script",
-                "message": f"setup_tools.sh not found at {_SCRIPT_PATH}."}
+                "message": f"{script_path.name} not found at {script_path}."}
     if not shutil.which("bash"):
         return {"ok": False, "reason": "no_bash", "message": "bash not found on PATH."}
-    argv, _, display = _resolve_command()
+    argv, _, display = _resolve_command(script_path)
     if argv is None:
         return {"ok": False, "reason": "manual", "command": display,
                 "message": "sudo needs a password and a web request has no terminal to enter it on. "
@@ -192,27 +213,34 @@ def can_autostart() -> dict:
     return {"ok": True, "reason": "root" if argv[0] == "bash" else "sudo", "command": display}
 
 
-def start_arsenal_install(*, include_wordlists: bool = False) -> dict:
-    """Starts setup_tools.sh in the background. include_wordlists passes the script's own
-    INSTALL_LARGE_WORDLISTS=true opt-in (rockyou.txt + a couple of SecLists lists, an extra
-    ~60-70MB the script otherwise skips). Returns status="running" without starting a second copy
-    if one is already in flight."""
-    if _is_running():
-        logger.debug("arsenal_install: start requested but an install is already running")
-        return {"status": "running", **arsenal_install_status()}
+def heavy_can_autostart() -> dict:
+    return can_autostart(_HEAVY_SCRIPT_PATH)
 
-    preflight = can_autostart()
+
+def _start_install(script_path: Path, log_name: str, state: dict, *, include_wordlists: bool = False) -> dict:
+    """The one real implementation behind start_arsenal_install/start_heavy_arsenal_install.
+    include_wordlists only ever matters for the base script (setup_tools.sh's own
+    INSTALL_LARGE_WORDLISTS=true opt-in); the heavy wrapper below never passes it. Returns
+    status="running" without starting a second copy of THIS installer if one is already in flight
+    -- the other installer's own state is untouched either way, so a normal and a heavy install can
+    run side by side (their own scripts still serialize on apt's own lock if genuinely concurrent,
+    exactly as they would run by hand in two terminals)."""
+    if _is_running(state):
+        logger.debug("arsenal_install: start requested for %s but an install is already running", script_path.name)
+        return {"status": "running", **_install_status(script_path, log_name, state)}
+
+    preflight = can_autostart(script_path)
     if not preflight["ok"]:
-        logger.debug("arsenal_install: cannot autostart (%s)", preflight["reason"])
+        logger.debug("arsenal_install: cannot autostart %s (%s)", script_path.name, preflight["reason"])
         return {"status": preflight["reason"], "message": preflight["message"],
                 "command": preflight.get("command")}
 
-    argv, stdin_password, display = _resolve_command()
+    argv, stdin_password, display = _resolve_command(script_path)
     env = dict(os.environ)
     if include_wordlists:
         env["INSTALL_LARGE_WORDLISTS"] = "true"
 
-    log_path = _log_path()
+    log_path = _log_path(log_name)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     header = (f"# ASRA arsenal install started {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
               f"# command: {display}\n"
@@ -223,7 +251,7 @@ def start_arsenal_install(*, include_wordlists: bool = False) -> dict:
                  " ".join(argv), include_wordlists, log_path)
     log_handle = log_path.open("a", encoding="utf-8")
     proc = subprocess.Popen(
-        argv, cwd=str(_SCRIPT_PATH.parent), env=env,
+        argv, cwd=str(script_path.parent), env=env,
         stdin=subprocess.PIPE if stdin_password is not None else subprocess.DEVNULL,
         stdout=log_handle, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,  # own process group -- a server restart never orphans it into ours
@@ -232,35 +260,51 @@ def start_arsenal_install(*, include_wordlists: bool = False) -> dict:
         proc.stdin.write(stdin_password + "\n")
         proc.stdin.close()
 
-    _STATE.update({"proc": proc, "log_path": log_path, "started_at": time.time(),
-                   "command": display, "wordlists": include_wordlists})
-    logger.debug("arsenal_install: started pid=%s", proc.pid)
-    return {"status": "started", **arsenal_install_status()}
+    state.update({"proc": proc, "log_path": log_path, "started_at": time.time(),
+                  "command": display, "wordlists": include_wordlists})
+    logger.debug("arsenal_install: started pid=%s for %s", proc.pid, script_path.name)
+    return {"status": "started", **_install_status(script_path, log_name, state)}
 
 
-def arsenal_install_status() -> dict:
+def _install_status(script_path: Path, log_name: str, state: dict) -> dict:
     """Current state + a tail of the log for the polling panel. Works even after a restart lost the
     Popen handle: falls back to whatever the persisted log file still holds."""
-    proc = _STATE.get("proc")
-    log_path = _STATE.get("log_path") or _log_path()
-    running = _is_running()
+    proc = state.get("proc")
+    log_path = state.get("log_path") or _log_path(log_name)
+    running = _is_running(state)
     returncode = None if running or proc is None else proc.poll()
 
     if proc is not None:
-        state = "running" if running else "finished"
+        install_state = "running" if running else "finished"
     elif log_path.is_file():
-        state = "unknown"  # a prior process's log survives, but not its handle (server restarted)
+        install_state = "unknown"  # a prior process's log survives, but not its handle (server restarted)
     else:
-        state = "idle"
+        install_state = "idle"
 
     return {
-        "state": state,
+        "state": install_state,
         "running": running,
         "returncode": returncode,
         "succeeded": returncode == 0 if returncode is not None else None,
-        "command": _STATE.get("command"),
-        "wordlists": _STATE.get("wordlists", False),
-        "started_at": _STATE.get("started_at"),
+        "command": state.get("command"),
+        "wordlists": state.get("wordlists", False),
+        "started_at": state.get("started_at"),
         "log": _tail(log_path, _LOG_TAIL_LINES),
         "log_path": str(log_path),
     }
+
+
+def start_arsenal_install(*, include_wordlists: bool = False) -> dict:
+    return _start_install(_SCRIPT_PATH, _LOG_NAME, _STATE, include_wordlists=include_wordlists)
+
+
+def arsenal_install_status() -> dict:
+    return _install_status(_SCRIPT_PATH, _LOG_NAME, _STATE)
+
+
+def start_heavy_arsenal_install() -> dict:
+    return _start_install(_HEAVY_SCRIPT_PATH, _HEAVY_LOG_NAME, _HEAVY_STATE)
+
+
+def heavy_arsenal_install_status() -> dict:
+    return _install_status(_HEAVY_SCRIPT_PATH, _HEAVY_LOG_NAME, _HEAVY_STATE)

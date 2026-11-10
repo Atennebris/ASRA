@@ -1,24 +1,20 @@
 {% extends "base.html" %}
 {% from "macros/nav.html" import nav_icon %}
+{% from "macros/ui.html" import page_header %}
 {% block title %}ASRA &mdash; Projects{% endblock %}
 {% block content %}
   {# Same asraOpenDialog('new-project-modal') the sidebar's own "New project" nav item already
      uses (base.html) -- a second, on-page entry point so starting a project doesn't always
      require going back to the sidebar first, without duplicating the dialog itself. #}
-  {# relative anchors the decorative header light below to this WHOLE bar -- same shape
-     page_header() itself uses (Settings/Tools/Toolkit/Dorks/Terminal/Chat settings), Settings ->
-     Customization -> Header light, hidden entirely when that toggle is off. Anchoring it to just the h1
-     (a previous attempt) shrink-wrapped the light's own box down to the title text's width, which
-     put the lamp fixture on TOP of the text instead of hanging clear of it to the right -- real,
-     confirmed visual bug that fix caused. #}
-  <div class="relative flex items-center justify-between py-3.5 border-b border-default mb-4">
-    <h1 class="text-[13px] font-semibold text-primary">Projects</h1>
-    <button type="button" onclick="asraOpenDialog('new-project-modal')"
-            class="inline-flex items-center justify-center gap-1.5 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-8 px-3 text-[13px] shrink-0">
-      {{ nav_icon("plus") }}
-      New project
-    </button>
-    {% include "macros/header_light.html" %}
+  {# The standard page_header(): title + header light only. "New project" is a page action, so it
+     sits in its own toolbar row just below the banner instead of on top of the decorative bar. #}
+  {{ page_header("Projects") }}
+  <div class="flex items-center justify-end mb-4">
+      <button type="button" onclick="asraOpenDialog('new-project-modal')"
+              class="inline-flex items-center justify-center gap-1.5 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-8 px-3 text-[13px] shrink-0">
+        {{ nav_icon("plus") }}
+        New project
+      </button>
   </div>
 
   {# Polls itself every 5s (same interval as the sidebar's active-session widget, base.html) and

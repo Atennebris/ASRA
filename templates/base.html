@@ -1,4 +1,4 @@
-{# Shared layout (4.2.1) — every page extends this, exports <head> setup exactly once. #}
+{% if static_url is not defined %}{% macro static_url(path) %}{{ path }}{% endmacro %}{% endif %}{# Transitional guard: a backend process started before static_url() existed hot-reloads this template but lacks the Python global (main.py's own comment on that failure mode), and would 500 on every page. Falls back to the plain, unversioned URL. Safe to delete once no such process can still be running. #}{# Shared layout (4.2.1) — every page extends this, exports <head> setup exactly once. #}
 {# A literal (non-Jinja) HTML comment used to sit here, ahead of <!DOCTYPE html> -- harmless for a
    normal browser load, but real, confirmed incident: htmx's own "is this response a full HTML
    document" detection (what makes hx-select/hx-target work correctly on a boosted #sidebar link,
@@ -21,7 +21,7 @@
      quite aggressively and don't reliably notice just because this tag's href text changed to a
      real file on a later deploy. A change in the URL itself forces a genuine re-fetch instead of
      relying on a hard refresh/cache-clear to notice. Bump this number again if the icon changes. #}
-  <link rel="icon" type="image/png" href="/static/favicon.png?v=1">
+  <link rel="icon" type="image/png" href="{{ static_url('/static/favicon.png') }}">
 
   <!-- Anti-FOUC (4.2.6): must run synchronously, before Tailwind/CSS, so the page never paints
        the wrong theme for a frame. Default "dark" is a deliberate choice, not prefers-color-scheme. -->
@@ -29,6 +29,12 @@
     (function () {
       var theme = localStorage.getItem("asra-theme") || "dark";
       document.documentElement.dataset.theme = theme;
+      // Remembered UI zoom (static/js/ui_zoom.js) -- applied here, before first paint, for the same
+      // no-flash reason as the theme above.
+      try {
+        var zoom = parseFloat(localStorage.getItem("asra-ui-zoom"));
+        if (zoom > 0 && zoom !== 1) document.documentElement.style.zoom = String(zoom);
+      } catch (e) { /* storage blocked: stays at 100% */ }
     })();
   </script>
 
@@ -89,20 +95,15 @@
     }, { passive: true });
   </script>
 
-  {# ?v=4 -- same cache-bust reasoning as the favicon above: StaticFiles serves this with no
+  {# Every css/js URL in this file goes through static_url(), which appends the file's own
+     modification time as ?v= (agent/utils/static_url.py). StaticFiles serves these with no
      Cache-Control header at all, so browsers fall back to heuristic freshness on Last-Modified and
-     can keep serving a stale copy across ordinary reloads during active development (confirmed
-     live: a newly-added theme rendered as a plain white/unstyled page until a hard refresh, purely
-     because the browser hadn't re-fetched the edited file). Bump this number whenever themes.css
-     changes so every browser is forced to re-fetch, not just whoever remembers to hard-refresh.
-     Real incident this rule itself caught: the native toolkit's own Site Map/Repeater/Decoder/
-     Comparer sub-tab visibility rules (.toolkit-subtabs, [data-toolkit-subtab], added across
-     several later changes) never bumped this number past 9 despite themes.css changing repeatedly
-     in the meantime -- a browser tab that had cached themes.css BEFORE those rules landed kept
-     serving that stale copy indefinitely, so every sub-tab panel rendered simultaneously
-     (no display:none at all) instead of only the selected one, on that one still-cached tab, even
-     though the rules were correct and present in the real file on disk the whole time. #}
-  <link rel="stylesheet" href="/static/css/themes.css?v=62">
+     keep serving a stale copy of an edited file across ordinary reloads -- confirmed live more
+     than once: a newly-added theme rendered as a plain white/unstyled page, the native toolkit's
+     sub-tab rules never reached a tab that had cached an older themes.css, and a hidden-clock fix
+     "did not work" in the desktop window because a hand-bumped ?v=N was not bumped. Never write a
+     literal ?v=N here again (tests/test_static_url.py fails on it). #}
+  <link rel="stylesheet" href="{{ static_url('/static/css/themes.css') }}">
 
   {# Instant "this sidebar link was just clicked" acknowledgment (tab/nav switching must
      be visually instant, never gated on the full-page reload that follows) -- classList-only toggle,
@@ -124,7 +125,7 @@
      navigation round-trip to unpkg.com/cdn.tailwindcss.com (the dominant cost of a full-page
      transition here), and the app keeps working with no internet at all -- a flaky connection used
      to stall or blank every page while it waited on those CDN fetches. #}
-  <script src="/static/vendor/tailwind.js?v=1"></script>
+  <script src="{{ static_url('/static/vendor/tailwind.js') }}"></script>
   <script>
     tailwind.config = {
       theme: {
@@ -193,8 +194,8 @@
     };
   </script>
 
-  <script src="/static/vendor/htmx.min.js?v=1"></script>
-  <script src="/static/vendor/sse.js?v=1"></script>
+  <script src="{{ static_url('/static/vendor/htmx.min.js') }}"></script>
+  <script src="{{ static_url('/static/vendor/sse.js') }}"></script>
   {# Idiomorph (htmx morph extension) — the session log/findings SSE swap uses hx-swap="morph"
      instead of innerHTML: a real DOM diff that only touches nodes that actually changed, instead
      of destroying and recreating the whole fragment on every update. innerHTML was the root
@@ -203,7 +204,7 @@
      were symptoms of the same thing (nothing about an unrelated new log entry should touch DOM
      nodes for entries that didn't change), so morph fixes the actual cause instead of adding a
      third manual save/restore workaround on top of the first two. #}
-  <script src="/static/vendor/idiomorph-ext.min.js?v=1"></script>
+  <script src="{{ static_url('/static/vendor/idiomorph-ext.min.js') }}"></script>
   <script>
     // Real, confirmed bug (not a guess): idiomorph's syncNodeFrom removes any attribute the live
     // DOM node has that the incoming server-rendered node lacks. A finding-detail <dialog> is
@@ -408,7 +409,7 @@
      <script> tags already execute in), since that file reads window.ASRA_DEBUG synchronously at the
      top of its own IIFE. #}
   <script>window.ASRA_DEBUG = {{ "true" if debug_enabled else "false" }};</script>
-  <script src="/static/js/debug_events.js?v=3"></script>
+  <script src="{{ static_url('/static/js/debug_events.js') }}"></script>
   {# Settings -> Customization -> Sounds' current state, on every page (not just settings.html) -- static/js/
      sound_events.js's own event watchers (new finding, session done, approval needed, chat reply)
      have to fire from session.html/session pages, not just the Settings screen that edits this.
@@ -420,7 +421,7 @@
      -- static/js/free_models_filter.js has to filter every model <select> it finds on whatever
      page it's on, same page-wide-global reasoning as ASRA_SOUND_SETTINGS right above. #}
   <script>window.ASRA_FREE_MODELS_ONLY = {{ get_free_models_only() | tojson }};</script>
-  <script src="/static/js/free_models_filter.js?v=2"></script>
+  <script src="{{ static_url('/static/js/free_models_filter.js') }}"></script>
   {# Page-wide (any `select[data-custom-select]`, any page) progressive-enhancement replacement for
      a native <select>'s own OS-rendered popup -- see static/js/custom_select.js's own top comment
      for why this exists (a native <select> popup silently refusing to open inside an open <dialog>
@@ -428,36 +429,40 @@
      after free_models_filter.js, not before -- this file's own panel-building logic reads that
      filter's option.hidden/disabled writes, so the filter's hide/show pass (also wired to
      htmx:afterSwap) needs to already be registered first. #}
-  <script src="/static/js/custom_select.js?v=2"></script>
+  <script src="{{ static_url('/static/js/custom_select.js') }}"></script>
   {# window.asraCopyCard/asraCopyLogs, used by every finding/hypothesis/credential/chain card's own
      Copy button (macros/ui.html's copy_button()) on ANY page, Agent mode included -- must be
      loaded here (page-wide), not inside session.html's own Interactive/RE-only conditional block,
      which is where these functions used to live and the exact reason Agent-mode copy buttons were
      silently broken (window.asraCopyCard never existed for that branch at all). #}
-  <script src="/static/js/copy_card.js?v=1"></script>
+  <script src="{{ static_url('/static/js/copy_card.js') }}"></script>
+  {# Ctrl +/-/0 and Ctrl+wheel whole-UI zoom, and the live "running Xm Ys" ticker on in-flight tool
+     rows -- both page-wide (the chat panel and the Logs views live on several different pages). #}
+  <script src="{{ static_url('/static/js/ui_zoom.js') }}"></script>
+  <script src="{{ static_url('/static/js/live_elapsed.js') }}"></script>
   {# window.asraToggleIdentityField, used by the Recon tab's Credentials card (identity fields
      masked by default, an eye button reveals them) -- same page-wide-load posture as
      copy_card.js right above, for the identical reason (session_fragment.html is Agent mode's own
      partial, not loaded from session.html's Interactive/RE-only branch). #}
-  <script src="/static/js/identity_reveal.js?v=1"></script>
+  <script src="{{ static_url('/static/js/identity_reveal.js') }}"></script>
   {# window.asraOpenExternal + a page-wide target="_blank" click interceptor -- desktop shell only
      (window.__TAURI__ presence-gated, no-op in a real browser). Loaded page-wide, not just on
      /playbook, since the same "target=_blank does nothing inside the desktop webview" gap showed
      up in Settings' Codex/Copilot OAuth links too, not only the Library panel's own source links. #}
-  <script src="/static/js/external_links.js?v=2"></script>
+  <script src="{{ static_url('/static/js/external_links.js') }}"></script>
   <script src="/static/js/desktop_update.js"></script>
   {# Preserves the Library panel's own scroll position across any #library-sources swap (delete,
      analyze, stop, self-poll) -- see the file's own top comment for the real bug this fixes. #}
-  <script src="/static/js/library_scroll.js?v=1"></script>
+  <script src="{{ static_url('/static/js/library_scroll.js') }}"></script>
   {# Depends on window.asraDebugEvent (debug_events.js right above) and localStorage's
      asra-mascot-skin (Settings -> Customization -> Mascot, settings.html) -- purely decorative, mounts
      nothing on pages with no [data-mascot-mount] element (only session.html has one). #}
-  <script src="/static/js/mascot.js?v=6"></script>
+  <script src="{{ static_url('/static/js/mascot.js') }}"></script>
   {# Header light -- Settings -> Customization -> Header light. Depends on localStorage only (asra-
      header-light-*), same client-only convention as mascot.js right above; needs no
      window.asraDebugEvent hook of its own since debug_events.js's generic click/change delegates
      already cover this element (a plain clickable span + settings.html's plain inputs). #}
-  <script src="/static/js/header_light.js?v=9"></script>
+  <script src="{{ static_url('/static/js/header_light.js') }}"></script>
   {# ?v=2 -- same cache-bust reasoning as themes.css/favicon.png above (this file's own head
      comments): StaticFiles serves every static file with no Cache-Control header, so a browser
      can keep serving an old cached copy of this script across ordinary reloads even after a real
@@ -471,22 +476,23 @@
      with nothing in the confirm dialog to catch it.
      v=7: added the optional opts.checkboxLabel opt-out checkbox (fallback chain's per-row Remove
      on Settings) -- see the dialog markup's own comment in base.html. #}
-  <script src="/static/js/confirm_dialog.js?v=7"></script>
+  <script src="{{ static_url('/static/js/confirm_dialog.js') }}"></script>
   {# v2: the tooltip now re-parents into the currently open subagent Edit dialog (and switches to
      position:absolute while doing so) instead of always living fixed-positioned in <body> -- a
      real, confirmed bug where it rendered invisibly behind the dialog's own content. Same
      cache-busting discipline as confirm_dialog.js above -- bump again next time this file changes. #}
-  <script src="/static/js/tool_tooltip.js?v=3"></script>
-  <script src="/static/js/summary_filter.js?v=1"></script>
+  <script src="{{ static_url('/static/js/tool_tooltip.js') }}"></script>
+  <script src="{{ static_url('/static/js/summary_filter.js') }}"></script>
   {# window.asraTogglePrivacy for macros/ui.html's privacy_toggle_button (Dashboard/Fleet/Projects/
      Recent projects) -- see that macro's own comment for the full design. #}
-  <script src="/static/js/privacy_toggle.js?v=1"></script>
+  <script src="{{ static_url('/static/js/privacy_toggle.js') }}"></script>
   {# v2: default source/metric changed from Findings (empty on any 0-finding session) to Activity
      (always populated) -- same cache-busting discipline as confirm_dialog.js's own comment above.
      Bump the number again the next time diagram_builder.js actually changes. #}
-  <script src="/static/js/diagram_builder.js?v=3"></script>
-  <script src="/static/js/live_duration.js?v=1"></script>
-  <script src="/static/js/header_clock.js?v=2"></script>
+  <script src="{{ static_url('/static/js/diagram_builder.js') }}"></script>
+  <script src="{{ static_url('/static/js/live_duration.js') }}"></script>
+  <script src="{{ static_url('/static/js/header_clock.js') }}"></script>
+  <script src="{{ static_url('/static/js/public_ip.js') }}"></script>
   {# Settings -> Appearance's "Neo"/"Mr. Robot" themes only -- every other theme is pure CSS
      (static/css/themes.css), these two get a real per-frame canvas/typewriter treatment. Loaded
      unconditionally (theme is a client-side-only choice, localStorage, never known at Jinja render
@@ -494,12 +500,12 @@
      itself checks document.documentElement's current data-theme and a MutationObserver reacts to
      Settings' own live theme-switch (applyTheme() in settings.html), so switching themes there
      shows the new effect immediately without a reload. #}
-  <script src="/static/js/theme_effects.js?v=2"></script>
-  <script src="/static/js/findings_tab_count.js?v=1"></script>
+  <script src="{{ static_url('/static/js/theme_effects.js') }}"></script>
+  <script src="{{ static_url('/static/js/findings_tab_count.js') }}"></script>
   {# Depends on window.asraDebugEvent (debug_events.js above) -- loaded after it, same discipline
      as hypotheses_paste_guard.js's own comment further down. Bump the number next time this file
      changes. #}
-  <script src="/static/js/live_view_input.js?v=1"></script>
+  <script src="{{ static_url('/static/js/live_view_input.js') }}"></script>
   {# Shared window.asraSessionState store (localStorage, namespaced per session) -- must load
      before recon_filter.js/findings_filter.js below, both of which call straight into it to
      persist their own active filter tile across a reload. See the file's own top comment.
@@ -525,11 +531,11 @@
      BEFORE the operator started scrolling. restoreScrollPositions() now takes a mode: "force" for
      a real load/tab-switch, "gentle" for afterSwap -- gentle only rescues a container idiomorph
      just reset to 0, never touches one the operator is genuinely mid-scroll on. #}
-  <script src="/static/js/session_state.js?v=6"></script>
+  <script src="{{ static_url('/static/js/session_state.js') }}"></script>
   {# Depends on window.asraOnDomReady (session_state.js right above) -- must load after it, same
      discipline as recon_filter.js/findings_filter.js below. See the file's own top comment for the
      whole sound-notification system. #}
-  <script src="/static/js/sound_events.js?v=4"></script>
+  <script src="{{ static_url('/static/js/sound_events.js') }}"></script>
   {# v=5/v=6: the restored filter used to get silently wiped moments after it was applied --
      confirmed live: main.py's stream_session sends at least one render the instant its SSE
      connection opens, even for an already-completed session (see this file's own Idiomorph comment
@@ -538,8 +544,8 @@
      told Idiomorph the client-added "hidden" class on each row was supposed to survive. Now
      re-applied on every "htmx:afterSwap" instead of only once at restore time, so it survives
      however many of these land, not just the first. #}
-  <script src="/static/js/recon_filter.js?v=5"></script>
-  <script src="/static/js/findings_filter.js?v=6"></script>
+  <script src="{{ static_url('/static/js/recon_filter.js') }}"></script>
+  <script src="{{ static_url('/static/js/findings_filter.js') }}"></script>
   {# Persists which session tab (Plan/Recon/.../Findings) the operator switches to, so a later
      reload can restore it -- the actual restore-on-load half lives inline in macros/ui.html's
      tab_bar() macro instead (has to run synchronously to avoid a visible flash on a large page,
@@ -547,16 +553,16 @@
      v=3: also re-runs session_state.js's own <main> scroll restore ("force" mode) right after a
      tab switch, since <main> is shared across every tab and doesn't reset its own scrollTop just
      because the tab underneath it changed. #}
-  <script src="/static/js/session_tab_memory.js?v=3"></script>
+  <script src="{{ static_url('/static/js/session_tab_memory.js') }}"></script>
   {# Real, confirmed incident this guards against: pasting the program's whole rules/policy page
      into the New Project form's "Hypotheses to check" field splits it line-by-line into a pile of
      junk hypotheses (main.py's start_scan) that the end-of-session gate can never legitimately
      resolve. Loaded after confirm_dialog.js/debug_events.js above -- depends on both. #}
-  <script src="/static/js/hypotheses_paste_guard.js?v=1"></script>
+  <script src="{{ static_url('/static/js/hypotheses_paste_guard.js') }}"></script>
   {# Settings -> Tool API Keys: fills a saved tool-key field with a solid masked value so it
      always looks saved (server never re-renders the real secret). Progressive enhancement --
      attribute-driven, covers every current/future tool row with no per-tool code. #}
-  <script src="/static/js/tool_api_key_field.js?v=1"></script>
+  <script src="{{ static_url('/static/js/tool_api_key_field.js') }}"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="font-mono bg-base text-primary min-h-screen">
@@ -568,7 +574,7 @@
   <div id="asra-progress" class="asra-progress" aria-hidden="true"></div>
   {# Loaded here at the very top of <body> (not with the other scripts in <head>) so #asra-progress
      already exists when it runs and it can start the bar as early as possible in the page's life. #}
-  <script src="/static/js/progress_bar.js?v=3"></script>
+  <script src="{{ static_url('/static/js/progress_bar.js') }}"></script>
   {# Dashboard shell (sidebar + content), not the old top-nav bar — see macros/nav.html for the
      link list this renders (single source, not repeated per nav item here and in mobile markup).
      Sidebar is a fixed 224px on every viewport down to the narrowest phone (no responsive
@@ -784,6 +790,34 @@
         Settings
       </a>
 
+      {# "My IP" block (real operator request: a bug bounty program may ask for the tester's own IP,
+         and googling a 2ip-style site / typing terminal commands is slow and leaks it to a third
+         party page). HIDDEN by default on purpose: the address is NOT in this server-rendered HTML
+         and is not fetched at page load -- static/js/public_ip.js fetches GET /api/public-ip only on
+         an eye-button click (so a VPN switched on a minute ago shows its own exit IP on the next
+         reveal, no polling), and wipes the text from the DOM again on manual hide, on the
+         auto-hide timer (data-autohide-seconds, env PUBLIC_IP_AUTOHIDE_SECONDS) and whenever the
+         tab becomes hidden. Masked placeholders keep the row height stable. text-secondary +
+         currentColor keeps the icon/labels theme-aware with no hardcoded colors. #}
+      <div id="asra-public-ip" data-autohide-seconds="{{ public_ip_autohide_seconds() }}"
+           class="px-3 pt-2 pb-1 shrink-0 flex items-start justify-center gap-1.5 text-[10px] text-secondary">
+        <div class="min-w-0 flex flex-col gap-0.5">
+          <span class="flex items-baseline gap-1.5">
+            <span class="w-6 shrink-0 opacity-70">IPv4</span>
+            <span id="asra-public-ip-v4" data-masked="&bull;&bull;&bull;.&bull;&bull;&bull;.&bull;&bull;&bull;.&bull;&bull;&bull;" class="font-mono tabular-nums break-all">&bull;&bull;&bull;.&bull;&bull;&bull;.&bull;&bull;&bull;.&bull;&bull;&bull;</span>
+          </span>
+          <span class="flex items-baseline gap-1.5">
+            <span class="w-6 shrink-0 opacity-70">IPv6</span>
+            <span id="asra-public-ip-v6" data-masked="&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;" class="font-mono tabular-nums break-all">&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;:&bull;&bull;&bull;&bull;</span>
+          </span>
+        </div>
+        <button type="button" id="asra-public-ip-toggle" aria-pressed="false" aria-label="Show IP address" title="Show IP address"
+                class="shrink-0 p-0.5 rounded text-secondary hover:bg-elevated hover:text-primary transition-colors">
+          <svg data-icon="show" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="3"/></svg>
+          <svg data-icon="hide" hidden class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 3l18 18M10.6 5.2A10.4 10.4 0 0112 5c6.5 0 10 7 10 7a17 17 0 01-3.2 4.1M6.6 6.7C3.7 8.6 2 12 2 12s3.5 7 10 7c1.7 0 3.2-.4 4.5-1M9.9 9.9a3 3 0 004.2 4.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+
       {# Corner clock, own row so it stays visible on every page (this sidebar footer is the one
          part of the shell that's never swapped by htmx) -- ticks client-side (static/js/
          header_clock.js), server only ever renders the operator's saved Settings -> Customization
@@ -813,9 +847,11 @@
          sitting at the flex start. #}
       <a id="asra-clock-row" href="/settings#customization/settings-timezone-section" title="{{ load_display_timezone() }}"
          class="px-3 py-2 border-t border-default flex flex-col items-center justify-center gap-0.5 shrink-0 hover:bg-elevated transition-colors"
-         {% if not load_clock_show_time() %}hidden{% endif %}>
-        <span class="flex items-center justify-center gap-2">
-          <span id="asra-clock" data-tz="{{ load_display_timezone() }}" data-style="{{ load_clock_style() }}" class="clock-style-{{ load_clock_style() }} text-[11px] font-medium text-primary tabular-nums">--:--</span>
+         {% if not (load_clock_show_time() or load_clock_show_date()) %}hidden{% endif %}>
+        {# The time line and the date are shown independently (Settings -> Timezone's "Show clock" and
+           "Show date"); the row itself only disappears when BOTH are off (asraClockSyncRow). #}
+        <span id="asra-clock-line" class="flex items-center justify-center gap-2" {% if not load_clock_show_time() %}hidden{% endif %}>
+          <span id="asra-clock"data-tz="{{ load_display_timezone() }}" data-style="{{ load_clock_style() }}" class="clock-style-{{ load_clock_style() }} text-[11px] font-medium text-primary tabular-nums">--:--</span>
           <span id="asra-clock-zone" class="text-[10px] text-secondary truncate" {% if not load_clock_show_zone_label() %}hidden{% endif %}>{{ load_display_timezone() }}</span>
         </span>
         <span id="asra-clock-date" class="text-[10px] text-secondary truncate" {% if not load_clock_show_date() %}hidden{% endif %}>--</span>

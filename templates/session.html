@@ -391,7 +391,7 @@
          SUPPOSED to update on every tick) via a MutationObserver, not a page-load-once read --
          see that script's own comment. #}
       <script src="/static/vendor/cytoscape.min.js"></script>
-      <script src="/static/js/attack_surface_graph.js?v=34"></script>
+      <script src="{{ static_url('/static/js/attack_surface_graph.js') }}"></script>
       {# Map tab's Geopolitical Map sub-tab -- same "load outside the morphed subtree, read the
          in-subtree JSON blob via a MutationObserver instead of a page-load-once read" posture as
          cytoscape/attack_surface_graph.js right above. jsvectormap (MIT license, map data derived
@@ -410,8 +410,8 @@
          edit here, same versioned-static-asset discipline every other script/link tag in this file
          already follows (see attack_surface_graph.js/geo_map.js's own ?v= tags right around this
          one). #}
-      <script src="/static/vendor/jsvectormap-world.js?v=1"></script>
-      <script src="/static/js/geo_map.js?v=3"></script>
+      <script src="{{ static_url('/static/vendor/jsvectormap-world.js') }}"></script>
+      <script src="{{ static_url('/static/js/geo_map.js') }}"></script>
     </div>
 
     <div class="session-chat-column w-full">

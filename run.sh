@@ -189,6 +189,29 @@ if [ "$CURRENT_HASH" != "$INSTALLED_HASH" ]; then
   # has no per-line way to express "resolve everything else normally, but --no-deps just this one".
   "$VENV_DIR/bin/pip" install --no-deps slither-analyzer==0.11.6
   "$VENV_DIR/bin/pip" install --no-deps mythril==0.24.8
+  # Real, confirmed incident the two --no-deps installs above leave unfixed on their own: neither
+  # slither-analyzer nor mythril ever actually WORKED with only the --no-deps install -- `--no-deps`
+  # means pip installs ONLY the named package, never any of its own real dependencies, so both
+  # tools crashed outright (`ModuleNotFoundError: crytic_compile` / `eth_abi`) the first time either
+  # was actually run, confirmed live. This installs their real dependencies as a SEPARATE follow-up
+  # step (same reasoning as the two lines above it) -- doing this as part of the main
+  # requirements.txt resolve is what caused the original ResolutionImpossible/backtracking-hang
+  # problem; resolving just these packages against what's ALREADY installed, in their own pip call,
+  # does not hit that same problem (confirmed live: completes in well under a minute, no backtracking
+  # hang). Deliberately not --no-deps itself -- these packages' OWN further dependencies (e.g. web3's
+  # own chain) need to resolve normally. No version pins here (unlike slither-analyzer/mythril
+  # themselves above) -- confirmed live that pip's own current resolution (eth-abi 6.x, not the
+  # older 4.x mythril nominally declares) works correctly end-to-end for both tools' real output;
+  # pip's own dependency-conflict warnings for mythril's stricter declared floors are expected and
+  # harmless, same "declared floor is stricter than what's actually needed" situation documented in
+  # requirements.txt's own comments next to these two tools.
+  "$VENV_DIR/bin/pip" install \
+    crytic-compile eth-abi eth-typing eth-utils web3 prettytable \
+    asn1crypto blake2b-py coincurve coloredlogs configparser coverage \
+    eth-account eth-keyfile eth-rlp ethereum-input-decoder hexbytes \
+    matplotlib mock mypy-extensions numpy persistent pre-commit \
+    py_ecc py-evm py-flags py-solc py-solc-x pytest-cov pytest_mock \
+    rlp scikit-learn transaction z3-solver
   echo "$CURRENT_HASH" > "$INSTALLED_HASH_FILE"
 else
   echo "Dependencies already installed and up to date — skipping install."

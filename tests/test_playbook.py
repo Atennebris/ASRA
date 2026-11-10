@@ -558,6 +558,50 @@ def test_addendum_analyze_phase_shape_reads_recon_technologies(tmp_path, monkeyp
     assert "Known WAF bypass technique" in addendum
 
 
+def test_addendum_re_session_falls_back_to_target_profile(tmp_path, monkeypatch):
+    """Real, confirmed gap: an RE session's recon_result never carries "technologies" (that's a
+    web-pentest-only shape), so the finding=None branch above always returned "" for every single
+    RE chat turn before this fallback existed -- a real technique recorded from an earlier RE
+    session sat in the store and was never once surfaced to a later one. target_profile (language/
+    packer/platform, set by record_target_profile) is the RE-mode equivalent fingerprint."""
+    _isolate_store(tmp_path, monkeypatch)
+    key = json.dumps({"tech": sorted(["garble", "golang", "pe32"]), "waf": []}, sort_keys=True)
+    playbook_store.record_technique(key, {"id": "re1", "technique": "Known garble-obfuscation unwrap trick", "times_confirmed": 2, "last_seen": "t1", "source_session_ids": ["s1"]})
+    session = _session(
+        "usr_re1", mode="reverse_engineering",
+        target_profile=[{"label": "Language", "value": "Go", "source": "tool"}, {"label": "Obfuscator", "value": "garble", "source": "tool"}],
+    )
+
+    addendum = _playbook_task_addendum(session, finding=None)
+
+    assert "Known garble-obfuscation unwrap trick" in addendum
+
+
+def test_addendum_re_session_with_no_profile_yet_falls_back_to_target_filename(tmp_path, monkeypatch):
+    """run_re_triage's own first turn: target_profile is still empty (Step 1 hasn't run yet) -- the
+    target's own filename is the only RE-aware fingerprint available this early."""
+    _isolate_store(tmp_path, monkeypatch)
+    key = json.dumps({"tech": sorted(["apk", "crackme"]), "waf": []}, sort_keys=True)
+    playbook_store.record_technique(key, {"id": "re2", "technique": "Known apk crackme trick", "times_confirmed": 1, "last_seen": "t1", "source_session_ids": ["s1"]})
+    session = _session("usr_re2", mode="reverse_engineering", target="/data/apk_crackme.apk", target_profile=[])
+
+    addendum = _playbook_task_addendum(session, finding=None)
+
+    assert "Known apk crackme trick" in addendum
+
+
+def test_addendum_non_re_session_with_no_tech_data_still_empty(tmp_path, monkeypatch):
+    """Regression guard: an ordinary Agent/Interactive session with no recon_result tech data yet
+    must still return "" -- the RE fallback above is scoped to mode == "reverse_engineering" only,
+    never applied to a web-pentest session just because recon hasn't found a technology yet."""
+    _isolate_store(tmp_path, monkeypatch)
+    key = json.dumps({"tech": sorted(["wordpress"]), "waf": []}, sort_keys=True)
+    playbook_store.record_technique(key, {"id": "a9", "technique": "Known WAF bypass technique", "times_confirmed": 1, "last_seen": "t1", "source_session_ids": ["s1"]})
+    session = _session("usr_add5", target="wordpress-site.example.com")
+
+    assert _playbook_task_addendum(session, finding=None) == ""
+
+
 # --- _run_playbook_distillation_pass ---
 
 

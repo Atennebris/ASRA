@@ -327,6 +327,42 @@ def test_retry_skips_a_second_dispatch_when_timeout_correction_repeats_identical
     assert "identical" in result["error"]
 
 
+def test_retry_skips_a_second_dispatch_when_only_a_non_schema_field_differs():
+    """Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): nuclei timed out
+    (TOOL_TIMEOUT_SECONDS=600) with the model's own call carrying a made-up field ("extra_headers")
+    that isn't one of nuclei's real parameters at all (only "target"/"tags") -- the correction
+    prompt truthfully tells the model nuclei's real parameter names, so a well-behaved correction
+    correctly drops that make-believe field. That made the two dicts compare unequal at the plain
+    `retry_arguments == arguments` check even though the ACTUAL command built from either one is
+    identical, so the identical-timeout guard never fired and nuclei re-ran the same doomed scan,
+    burning a second full timeout for nothing -- twice in one real session. Restricting the
+    comparison to the tool's own declared parameters_schema keys must still catch this."""
+    calls = []
+
+    def native_function(args: dict) -> dict:
+        calls.append(dict(args))
+        return {"status": "timeout"}
+
+    # The correction drops "extra_headers" (not a real nuclei-shaped parameter) while leaving
+    # target/tags untouched -- exactly what a schema-informed correction is supposed to do.
+    llm = _ScriptedCorrectionLLM(json.dumps({"arguments": {"target": "http://example.com", "tags": "cve"}}))
+    session = {"session_id": "usr_non_schema_field_retry_test", "logs": []}
+    ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+    spec = ToolSpec(
+        name="slow_scan_test_tool", category="scan", tool_tier=1, executable="", build_command=None,
+        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
+        parameters_schema={"type": "object", "properties": {"target": {"type": "string"}, "tags": {"type": "string"}}},
+    )
+
+    result = _run(_run_tool_with_retry(
+        ctx, spec, {"target": "http://example.com", "tags": "cve", "extra_headers": '["X-Foo: bar"]'},
+    ))
+
+    assert len(calls) == 1  # the retry was never actually re-dispatched
+    assert result["status"] == "failed"
+    assert result["retried"] is True
+
+
 def test_retry_still_dispatches_when_timeout_correction_gives_different_arguments():
     """Regression guard for the fix above: a corrected retry with genuinely different arguments
     must still run normally after a timeout -- only a byte-identical correction is skipped."""

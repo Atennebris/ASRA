@@ -20,6 +20,21 @@ def test_hint_fires_for_a_bare_ip_handshake_failure():
     assert "SNI" in hint
 
 
+def test_hint_warns_against_a_wildcard_dns_workaround():
+    """Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): a free-tier model
+    retried the bare-IP failure with target="<ip>.nip.io" (a wildcard-DNS trick) instead of a real
+    hostname -- that still sends the literal "<ip>.nip.io" string as SNI, not a hostname the origin
+    actually recognizes, so the handshake failed identically. The hint should rule this out by name."""
+    result = {
+        "status": "error",
+        "error": "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1000)",
+        "target": "104.21.65.240",
+    }
+    hint = interpret_ssl_cert_info_failure(result)
+    assert hint is not None
+    assert "nip.io" in hint
+
+
 def test_hint_is_none_for_a_real_hostname_target():
     result = {
         "status": "error",

@@ -17,8 +17,7 @@ another, and a single global percentage would hide that.
 """
 from __future__ import annotations
 
-import shutil
-
+from agent.opencode_cli import diagnose_opencode_cli
 from agent.tools.tool_inventory import list_tool_availability
 
 # Tier-2 == external subprocess binary (setup_tools.sh's job); Tier-1 == native Python, always
@@ -50,21 +49,24 @@ def _percent(installed: int, total: int) -> int:
 
 
 def _dependencies() -> list[dict]:
-    """Things setup_tools.sh also provisions that are NOT recon/exploit tools -- today just the
-    opencode CLI (agent/opencode_local_provider.py's "opencode (local server)" LLM provider).
+    """Dependencies that are NOT recon/exploit tools -- today just the opencode CLI (agent/opencode_local_provider.py's "opencode (local server)" LLM provider).
     Deliberately separate from external/native/modes/verdict above, never folded into any of
     those counts: this answers "does one particular, optional LLM provider work", not "can the
     agent run its own tools" -- counting it in would make a fresh install missing only this one
-    optional dependency read as a degraded tool arsenal, which it isn't. The same Install button
-    (setup_tools.sh's own install_opencode_cli) still provisions it -- this list exists purely so
-    its status is actually visible somewhere, not to give it its own separate install path.
+    optional dependency read as a degraded tool arsenal, which it isn't. It has its own one-click
+    installer (agent/opencode_install.py), surfaced as a button on this row.
     """
+    opencode = diagnose_opencode_cli()
+    # "installed" means USABLE here (a native copy), not merely "something named opencode is on
+    # PATH" -- a Windows-side copy visible through WSL2's PATH interop is reported for what it is.
     return [
         {
             "name": "opencode",
             "label": "opencode CLI",
-            "installed": shutil.which("opencode") is not None,
-            "note": "Dependency for the \"opencode (local server)\" LLM provider (Settings -> AI Provider & Model) — not a recon/exploit tool.",
+            "installed": opencode.usable,
+            "note": opencode.explanation() or "Dependency for the \"opencode (local server)\" LLM provider (Settings -> AI Provider & Model) — not a recon/exploit tool.",
+            "install_label": opencode.install_label,
+            "auto_install": opencode.auto_install,
         },
     ]
 
@@ -83,11 +85,31 @@ def summarize_arsenal() -> dict:
                             _dependencies' own docstring); never affects verdict/percent above.
     """
     inventory = list_tool_availability()
-    external = [e for e in inventory if e["tier"] == _EXTERNAL_TIER]
-    native = [e for e in inventory if e["tier"] != _EXTERNAL_TIER]
+    # heavy tools (ToolSpec.heavy=True -- provisioned by setup_tools_heavy.sh, not setup_tools.sh)
+    # are split out BEFORE everything below: they must never count toward the base arsenal's own
+    # verdict/percent/modes/missing/present, or a heavy tool the operator never installs (by
+    # design, via its own separate "Install (heavy)" button) would make the ordinary "Check
+    # arsenal" verdict read as perpetually degraded for something setup_tools.sh was never
+    # responsible for provisioning in the first place.
+    #
+    # Real, operator-caught bug this comment used to describe wrong: this filter used to ALSO
+    # require tier == _EXTERNAL_TIER (2) for a tool to count as "heavy" -- but Ghidra/unblob are
+    # BOTH heavy=True AND tool_tier=1 (native_function dispatch for architectural reasons -- a
+    # socket protocol / a --report file the generic tier-2 pipeline can't read -- not because
+    # they're "always present" the way an ordinary tier-1 Python helper is). The old filter
+    # silently excluded them from heavy_total/heavy_installed entirely, so the Tools page's own
+    # "Heavy arsenal (Ghidra, ...)" block could read "100%" while Ghidra itself was never even
+    # checked -- confirmed live: only sigrok_cli/adb (the tier=2 heavy tools) were ever counted.
+    # heavy is now keyed on the heavy flag ALONE, independent of tier; native (below) excludes
+    # anything heavy so a heavy tier-1 tool isn't ALSO double-counted as "native, always present".
+    heavy = [e for e in inventory if e.get("heavy", False)]
+    external = [e for e in inventory if e["tier"] == _EXTERNAL_TIER and not e.get("heavy", False)]
+    native = [e for e in inventory if e["tier"] != _EXTERNAL_TIER and not e.get("heavy", False)]
 
     external_installed = [e for e in external if e["installed"]]
     external_missing = [e for e in external if not e["installed"]]
+    heavy_installed = [e for e in heavy if e["installed"]]
+    heavy_missing = [e for e in heavy if not e["installed"]]
 
     modes: list[dict] = []
     for key in ("web", "re", "toolkit"):
@@ -123,4 +145,14 @@ def summarize_arsenal() -> dict:
         "missing": sorted(e["name"] for e in external_missing),
         "present": sorted(e["name"] for e in external_installed),
         "dependencies": _dependencies(),
+        # The "heavy" arsenal (tools provisioned by setup_tools_heavy.sh instead of the fast base
+        # setup_tools.sh), entirely separate from everything above: 0/0 until a tool that actually
+        # needs the heavy installer (Ghidra, ...) registers heavy=True on its own ToolSpec -- the
+        # Tools page only shows this block once heavy_total > 0, so a fresh install with no heavy
+        # tools registered yet shows nothing extra here, not a confusing permanent "0/0" row.
+        "heavy_total": len(heavy),
+        "heavy_installed": len(heavy_installed),
+        "heavy_percent": _percent(len(heavy_installed), len(heavy)),
+        "heavy_missing": sorted(e["name"] for e in heavy_missing),
+        "heavy_present": sorted(e["name"] for e in heavy_installed),
     }

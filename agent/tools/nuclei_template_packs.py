@@ -1,7 +1,18 @@
-"""Optional, opt-in nuclei template packs beyond the official set nuclei already keeps up to date
-on its own (confirmed live: nuclei checks/updates its own default `~/nuclei-templates` on every
-run unless `-duc` is passed, which agent/tools/builders/nuclei.py never does -- there is no gap to
-fix there).
+"""Optional, opt-in nuclei template packs beyond the official set.
+
+Correction to this module's own earlier claim here (kept visible rather than silently rewritten,
+since the wrong conclusion once shipped): this used to assert nuclei's own per-run "is a newer
+official template set available" check was harmless and needed no `-duc` guard. A real, confirmed
+incident (Live-Nation-HackerOne-usr_0f5c71) disproved that: a live timed scan against an approved
+target (ginandjuice.shop) did not finish within 1800s, and a short diagnostic (-stats) run showed
+it never got past "[INF] Your current nuclei-templates vX are outdated. Latest is vY" -- zero scan
+progress the entire window. Syncing the official set into this project's own WSL2/drvfs-mounted
+Windows template path (many small files) was the real bottleneck, not the scan itself.
+`agent/tools/builders/nuclei.py`'s `build_nuclei_command` now always passes `-duc`, so a real scan
+never blocks on this check again. The official set still gets refreshed, just never implicitly
+mid-scan: installing/reinstalling any pack below (`install_pack`) already runs a real
+`nuclei -update-templates`, which syncs the official set too as a side effect, same deliberate
+operator-triggered background job this module always used for custom packs.
 
 What this covers instead: third-party GitHub repos of extra templates (a WordPress-CVE-focused
 pack, an experimental exploit-class pack, ...) an operator may want on top of the official set.

@@ -85,6 +85,36 @@ def test_build_tshark_read_pcap_command_applies_a_display_filter():
     assert command[command.index("-Y") + 1] == "http.request"
 
 
+def test_build_tshark_capture_command_omits_raw_payload_fields_by_default():
+    command = build_tshark_capture_command({})
+    assert command.count("-e") == 13
+    assert "tcp.payload" not in command
+    assert "udp.payload" not in command
+
+
+def test_build_tshark_capture_command_adds_raw_payload_fields_when_requested():
+    command = build_tshark_capture_command({"raw_payload": True})
+    assert "tcp.payload" in command
+    assert "udp.payload" in command
+    assert command.count("-e") == 15
+
+
+def test_build_tshark_read_pcap_command_adds_raw_payload_fields_when_requested():
+    command = build_tshark_read_pcap_command({"pcap_path": "/tmp/capture.pcap", "raw_payload": True})
+    assert "tcp.payload" in command
+    assert "udp.payload" in command
+
+
+def test_parse_field_table_surfaces_raw_payload_hex_when_present():
+    raw_shaped_output = (
+        _REAL_SHAPED_FIELD_OUTPUT.splitlines()[0] + "\ttcp.payload\tudp.payload\n"
+        "0.000000\teth:ip:tcp:data\t10.0.0.5\t203.0.113.9\t51514\t27015\t\t\t\t\t\t\t\tdeadbeef0102\t\n"
+    )
+    parsed = parse_tshark_capture_output(raw_shaped_output)
+    assert parsed["packets"][0]["tcp.payload"] == "deadbeef0102"
+    assert "udp.payload" not in parsed["packets"][0]  # blank column omitted, same as any other field
+
+
 def test_parse_field_table_extracts_one_dict_per_packet_omitting_blank_columns():
     parsed = parse_tshark_capture_output(_REAL_SHAPED_FIELD_OUTPUT)
     assert parsed["packet_count"] == 2
