@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from agent.tools import sandbox
 
 
@@ -103,7 +105,10 @@ def test_falls_back_to_unsandboxed_when_bwrap_is_missing(monkeypatch, tmp_path):
         raise AssertionError("_run_sandboxed_linux must not be called when bwrap is missing")
 
     monkeypatch.setattr(sandbox, "_run_sandboxed_linux", _fail_if_called)
-    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: called.setdefault("fallback", True))
+    # The unsandboxed tail now goes through run_with_process_group_timeout (process-group cleanup
+    # + an explicit WINEPREFIX/Xvfb setup -- see run_sandboxed's own comment for the real incident
+    # this closes), not a bare subprocess.run -- that's what actually runs the command now.
+    monkeypatch.setattr(sandbox, "run_with_process_group_timeout", lambda *a, **k: called.setdefault("fallback", True))
 
     sandbox.run_sandboxed(["echo", "hi"], tmp_path, 10)
 
@@ -117,8 +122,13 @@ def test_falls_back_to_unsandboxed_on_an_unhandled_platform(monkeypatch, tmp_pat
     bypassing run.bat/WSL2 entirely -- not a case with its own sandbox implementation, same honest
     unsandboxed-with-a-log-line fallback as any other unhandled platform."""
     monkeypatch.setattr(sandbox.sys, "platform", "win32")
+    # Also stubbed here, not just subprocess -- the unsandboxed tail now calls
+    # start_offscreen_display() too, whose own shutil.which("Xvfb") otherwise hits a real stdlib
+    # win32-only code path (_winapi) that doesn't exist on this (real Linux) test runner once
+    # sys.platform is faked to "win32" -- unrelated to what this test is actually checking.
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: None)
     called = {}
-    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: called.setdefault("fallback", True))
+    monkeypatch.setattr(sandbox, "run_with_process_group_timeout", lambda *a, **k: called.setdefault("fallback", True))
 
     sandbox.run_sandboxed(["echo", "hi"], tmp_path, 10)
 
@@ -157,6 +167,35 @@ def test_run_sandboxed_linux_strips_display_and_wayland_display_from_env(monkeyp
 
     assert "DISPLAY" not in captured["env"]
     assert "WAYLAND_DISPLAY" not in captured["env"]
+
+
+def test_run_sandboxed_linux_pins_writable_home_and_dotnet_state_under_scratch(monkeypatch, tmp_path):
+    """The .NET SDK fix: $HOME inside `--ro-bind / /` is read-only, so dotnet/csc/nuget's own
+    $HOME-relative writes ($HOME/.dotnet sentinel, $HOME/.nuget restore) die with "Read-only file
+    system". HOME (and the dotnet/nuget state dirs) must be pinned at the one writable bind the
+    sandbox grants, same treatment TMPDIR/WINEPREFIX already get."""
+    monkeypatch.setattr(sandbox.os, "environ", {"HOME": "/root", "PATH": "/usr/bin"})
+    monkeypatch.setattr(sandbox, "start_offscreen_display", lambda: (None, None))
+    # Keep the sensitive-path masking off the simulated read-only /root (an inaccessible path on the
+    # test runner) -- this test is only about the env dict, not the bind masking.
+    monkeypatch.setattr(sandbox, "resolve_global_app_dir", lambda: tmp_path / "app")
+    captured = {}
+
+    def _fake_run(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", _fake_run)
+
+    sandbox._run_sandboxed_linux(["dotnet", "build"], tmp_path, 10)
+
+    scratch = str(tmp_path.resolve())
+    env = captured["env"]
+    assert env["HOME"] == scratch  # no longer the read-only ambient /root
+    assert env["DOTNET_CLI_HOME"] == scratch
+    assert env["NUGET_PACKAGES"].startswith(scratch)
+    assert env["DOTNET_CLI_TELEMETRY_OPTOUT"] == "1"
+    assert env["DOTNET_NOLOGO"] == "1"
 
 
 def test_run_sandboxed_linux_sets_display_from_the_started_xvfb(monkeypatch, tmp_path):
@@ -362,3 +401,139 @@ def test_macos_branch_invokes_sandbox_exec_with_the_profile_and_real_command(mon
     assert argv[1] == "-p"
     assert "(version 1)" in argv[2]
     assert argv[3:] == ["python3", "script.py", "arg1"]
+
+
+# --- wine_prefix_dir: a WINEPREFIX wine will actually accept, never under a Windows-mounted drive
+# (see its own docstring for the real incident this fixes: CM-usr_b416f2) ---
+
+
+def test_wine_prefix_dir_is_stable_and_creates_the_directory():
+    path_1 = sandbox.wine_prefix_dir("/mnt/c/Users/user/Desktop/crackme/crackme.exe")
+    path_2 = sandbox.wine_prefix_dir("/mnt/c/Users/user/Desktop/crackme/crackme.exe")
+
+    assert path_1 == path_2
+    assert path_1.is_dir()
+    # The whole point is sidestepping drvfs's ownership check on a /mnt/c/... path -- the prefix
+    # itself must never land back under one.
+    assert "/mnt/" not in str(path_1)
+
+
+def test_wine_prefix_dir_differs_for_different_keys():
+    assert sandbox.wine_prefix_dir("target-a") != sandbox.wine_prefix_dir("target-b")
+
+
+# --- run_with_process_group_timeout: kills the WHOLE process group on timeout, not just the one
+# direct child (see its own docstring for the real incident: a `wine`-spawned wineserver surviving
+# a bare SIGKILL and holding a mutex that hung every subsequent attempt identically) ---
+
+
+def test_run_with_process_group_timeout_returns_completed_process_on_success():
+    result = sandbox.run_with_process_group_timeout(
+        [sys.executable, "-c", "print('ok')"], timeout_seconds=10,
+    )
+    assert result.returncode == 0
+    assert "ok" in result.stdout
+
+
+def test_run_with_process_group_timeout_kills_group_and_returns_partial_output_on_timeout(monkeypatch):
+    killed = {}
+
+    class _FakeProc:
+        pid = 4321
+        args = ["sleep", "100"]
+
+        def __init__(self):
+            self._calls = 0
+
+        def communicate(self, timeout=None):
+            self._calls += 1
+            if self._calls == 1:
+                raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout)
+            return ("partial-out", "partial-err")  # the drain after the kill
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(sandbox.os, "killpg", lambda pid, sig: killed.setdefault("killpg", (pid, sig)))
+
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        sandbox.run_with_process_group_timeout(["sleep", "100"], timeout_seconds=1)
+
+    assert killed["killpg"] == (4321, sandbox.signal.SIGKILL)
+    # Partial output drained from the killed group and attached to the exception, not discarded.
+    assert excinfo.value.stdout == "partial-out"
+    assert excinfo.value.stderr == "partial-err"
+
+
+def test_run_with_process_group_timeout_without_stop_check_does_not_poll(monkeypatch):
+    """Default (stop_check=None) stays a single blocking communicate(timeout=...), no polling loop
+    -- behavior byte-identical to before stop_check existed."""
+    calls = {"n": 0}
+
+    class _FakeProc:
+        pid = 1
+        args = ["echo"]
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            calls["n"] += 1
+            return ("ok", "")
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    result = sandbox.run_with_process_group_timeout(["echo"], timeout_seconds=5)
+
+    assert result.stdout == "ok"
+    assert calls["n"] == 1
+
+
+def test_run_with_process_group_timeout_honors_stop_check_and_kills_the_group(monkeypatch):
+    """A stop_check that flips to True mid-run must kill the whole group promptly (not wait out the
+    full timeout) -- the shared-symbol contract Agent A threads a live-session stop callback through."""
+    monkeypatch.setattr(sandbox, "_STOP_CHECK_POLL_INTERVAL_SECONDS", 0.01)
+    killed = {}
+    stop_calls = {"n": 0}
+
+    def _stop_check():
+        stop_calls["n"] += 1
+        return stop_calls["n"] >= 2  # not stopped on the first poll, stopped on the second
+
+    class _FakeProc:
+        pid = 777
+        args = ["sleep", "100"]
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout)  # a per-slice poll
+            return ("partial", "")  # the drain after the kill
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(sandbox.os, "killpg", lambda pid, sig: killed.setdefault("killpg", (pid, sig)))
+
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        sandbox.run_with_process_group_timeout(["sleep", "100"], timeout_seconds=100, stop_check=_stop_check)
+
+    assert killed["killpg"] == (777, sandbox.signal.SIGKILL)
+    assert stop_calls["n"] >= 2
+    assert excinfo.value.stdout == "partial"
+
+
+# --- run_sandboxed's unsandboxed fallback: same WINEPREFIX/Xvfb protection as _run_sandboxed_linux
+# (real, confirmed incident this fixes -- this branch had neither before, see run_sandboxed's own
+# comment) ---
+
+
+def test_unsandboxed_fallback_sets_wineprefix_and_strips_display(monkeypatch, tmp_path):
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: None)  # no bwrap, no Xvfb either
+    monkeypatch.setattr(sandbox.os, "environ", {"DISPLAY": ":0", "PATH": "/usr/bin"})
+    captured = {}
+
+    def _fake_run_with_timeout(command, *, cwd=None, env=None, timeout_seconds=None):
+        captured["env"] = env
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(sandbox, "run_with_process_group_timeout", _fake_run_with_timeout)
+
+    sandbox.run_sandboxed(["wine", "target.exe"], tmp_path, 10)
+
+    assert "DISPLAY" not in captured["env"]
+    assert "WINEPREFIX" in captured["env"]

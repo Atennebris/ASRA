@@ -33,7 +33,8 @@ from agent.custom_providers import (
     is_custom_provider_id,
     load_custom_providers,
 )
-from agent.providers.models_dev import get_model_capabilities, list_models, validate_model_known
+from agent.providers.models_dev import get_model_capabilities, is_model_free, list_models, validate_model_known
+from agent import reliability_settings
 from agent.settings import is_provider_enabled, load_llm_settings
 from agent.utils.crash_diagnostics import log_memory_snapshot
 from agent.utils.debug import current_session_id, truncate_for_log
@@ -161,6 +162,17 @@ _DEFAULT_LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS = 2
 # close to an hour on a single retryable 429 before Ctrl+C surfaced anything). Capped here so a
 # server-dictated wait can never exceed what's still a reasonable, visible retry cadence.
 _DEFAULT_MAX_RETRY_AFTER_SECONDS = 30
+# Sampling temperature for tool-call turns only (env-overridable via LLM_TOOL_CALL_TEMPERATURE).
+# Deliberately low: weak/small models emit far less malformed tool-call JSON when sampling variance
+# is reduced at the source, rather than relying only on after-the-fact parsing/retries to recover a
+# noisy default (~0.7+). Plain-text turns keep the provider's own default untouched.
+_DEFAULT_TOOL_CALL_TEMPERATURE = 0.2
+# A "weak model" profile is computed once per provider instance from real capability signals (not a
+# regex over the model name), so the agent can shrink its prompt/tool menu for a small/local model
+# that would otherwise choke on the full, strong-model-sized input. Context-window threshold below
+# which a model counts as weak; env-overridable. The manual override (WEAK_MODEL_MODE: auto|on|off)
+# lets an operator force the profile for a custom local checkpoint the catalog doesn't list at all.
+_DEFAULT_WEAK_CONTEXT_LIMIT_THRESHOLD = 16384
 # A backoff wait is the one place a retry loop blocks for many seconds with no real work
 # happening -- real incident: an operator's Stop click during a 429 backoff sat completely
 # ignored until every remaining retry attempt (and its own wait) had run its course, because
@@ -1341,19 +1353,126 @@ def _create_completion_with_backoff(create_call, stop_check=None):
     return _call_with_backoff(request_fn, stop_check=stop_check)
 
 
-def _tool_instructions_text(tools: list[dict]) -> str:
+def _tool_call_temperature() -> float:
+    """Resolve LLM_TOOL_CALL_TEMPERATURE, falling back to the low default on an unset/malformed
+    value rather than crashing the call -- see _DEFAULT_TOOL_CALL_TEMPERATURE for why it's low."""
+    raw = reliability_settings.raw_setting("LLM_TOOL_CALL_TEMPERATURE")
+    if raw is None or not raw.strip():
+        return _DEFAULT_TOOL_CALL_TEMPERATURE
+    try:
+        return float(raw)
+    except ValueError:
+        logger.debug(
+            "llm_client: invalid LLM_TOOL_CALL_TEMPERATURE=%r, using default %.2f",
+            raw, _DEFAULT_TOOL_CALL_TEMPERATURE,
+        )
+        return _DEFAULT_TOOL_CALL_TEMPERATURE
+
+
+def _is_temperature_rejection(exc: openai.BadRequestError) -> bool:
+    """A 400 that names the temperature parameter: some OpenAI-compatible endpoints reject an
+    explicit temperature outright. Matched on the error text so the caller can drop just that one
+    param and retry, instead of mistaking it for a native-tool-calling rejection."""
+    return "temperature" in str(exc).lower()
+
+
+def _structured_output_enabled() -> bool:
+    """LLM_STRUCTURED_OUTPUT opt-in flag, off by default. When on, prompt-mode forces a single
+    json_object response using the flat envelope protocol, cutting malformed tool-call JSON from
+    weak/local models at generation time instead of repairing it afterwards. Only prompt mode is
+    affected; a provider that rejects the param degrades back to the plain tag format on its own."""
+    return (reliability_settings.raw_setting("LLM_STRUCTURED_OUTPUT") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_response_format_rejection(exc: openai.BadRequestError) -> bool:
+    """A 400 that points at response_format / JSON mode being unsupported, so the caller can drop
+    structured output and fall back to the plain <tool_call> tag format. Dropping it is always safe
+    (the tag format is today's behavior), so a broad match here only ever costs an unneeded
+    downgrade, never a crash."""
+    text = str(exc).lower()
+    return "response_format" in text or "json" in text
+
+
+def _weak_model_mode() -> str:
+    """WEAK_MODEL_MODE: 'auto' (default, decide from real signals), 'on'/'off' (force). Any other
+    value degrades to 'auto' rather than raising -- a misconfigured env var must not break startup."""
+    mode = (reliability_settings.raw_setting("WEAK_MODEL_MODE") or "auto").strip().lower()
+    return mode if mode in ("auto", "on", "off") else "auto"
+
+
+def _weak_context_limit_threshold() -> int:
+    """Context-window size below which a model counts as weak, from WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD;
+    the low default stands in for an unset/malformed value rather than crashing startup."""
+    raw = reliability_settings.raw_setting("WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD")
+    if raw is None or not raw.strip():
+        return _DEFAULT_WEAK_CONTEXT_LIMIT_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        logger.debug(
+            "llm_client: invalid WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD=%r, using default %d",
+            raw, _DEFAULT_WEAK_CONTEXT_LIMIT_THRESHOLD,
+        )
+        return _DEFAULT_WEAK_CONTEXT_LIMIT_THRESHOLD
+
+
+def _compute_weak_profile(tool_mode: str, context_limit: int | None, is_free: bool | None) -> tuple[bool, list[str]]:
+    """Decide once whether this model is 'weak' and record why, for debug visibility. Auto rule:
+    weak when the provider has no native tool-calling (prompt mode -- a strong correlate of a small/
+    local model) OR a known context window below the threshold. is_free is only a contributing signal
+    in the reasons, never a trigger on its own (far too broad -- plenty of capable models are free).
+    WEAK_MODEL_MODE on/off overrides the auto decision entirely for a model the catalog can't judge."""
+    mode = _weak_model_mode()
+    threshold = _weak_context_limit_threshold()
+    reasons: list[str] = []
+    if tool_mode == "prompt":
+        reasons.append("no native tool-calling (prompt mode)")
+    if context_limit is not None and context_limit < threshold:
+        reasons.append(f"context_limit {context_limit} < threshold {threshold}")
+    if is_free:
+        reasons.append("free model (contributing signal, not a trigger)")
+
+    if mode == "on":
+        return True, ["WEAK_MODEL_MODE=on (forced)"] + reasons
+    if mode == "off":
+        return False, ["WEAK_MODEL_MODE=off (forced)"] + reasons
+    auto_weak = (tool_mode == "prompt") or (context_limit is not None and context_limit < threshold)
+    return auto_weak, reasons
+
+
+def _tool_instructions_text(tools: list[dict], structured: bool = False) -> str:
     schemas = [tool["function"] for tool in tools]
-    return (
-        "You have access to the following tools:\n"
-        f"{json.dumps(schemas, indent=2)}\n\n"
+    header = f"You have access to the following tools:\n{json.dumps(schemas, indent=2)}\n\n"
+    if structured:
+        # Envelope protocol for json_object structured output: the whole reply must be one JSON
+        # object, so the <tool_call> tag can't be used -- instead a flat {message, tool_call} object
+        # carries either a tool call or a plain-text answer. "JSON" must appear in the prompt (Qwen's
+        # json_object mode errors without it). The two worked examples teach both branches.
+        return header + (
+            "Respond with a single JSON object and nothing else, in exactly this shape:\n"
+            '{"message": <string or null>, "tool_call": {"name": "<tool name>", "arguments": {<json arguments>}} | null}\n'
+            "To call a tool, fill tool_call with the tool name and arguments (message may be null). "
+            "To answer without calling a tool, put your text in message and set tool_call to null.\n"
+            "Example tool call:\n"
+            '{"message": null, "tool_call": {"name": "dns_lookup", "arguments": {"domain": "example.com"}}}\n'
+            "Example plain answer:\n"
+            '{"message": "No open ports were found on the target.", "tool_call": null}\n'
+            "Return only that JSON object -- no markdown fences, no text before or after it."
+        )
+    return header + (
         "To call a tool, respond with exactly one line in this exact format:\n"
         '<tool_call>{"name": "<tool name>", "arguments": {<json arguments>}}</tool_call>\n'
+        # One fully-filled example of the wrapper. Weaker/local models fall into this prompt path and
+        # reproduce the shape far more reliably from a concrete sample than from the format spec alone.
+        # A single static example (not per-tool) -- it teaches the wrapper, not any one schema.
+        "For example:\n"
+        '<tool_call>{"name": "dns_lookup", "arguments": {"domain": "example.com"}}</tool_call>\n'
         "Only emit a tool_call block when you actually want to call a tool; otherwise respond normally with plain text."
     )
 
 
-def _inject_tool_instructions(messages: list[dict], tools: list[dict]) -> list[dict]:
-    instructions = _tool_instructions_text(tools)
+def _inject_tool_instructions(messages: list[dict], tools: list[dict], structured: bool = False) -> list[dict]:
+    instructions = _tool_instructions_text(tools, structured=structured)
     result = [dict(message) for message in messages]
     if result and result[0]["role"] == "system":
         result[0]["content"] = f"{result[0]['content']}\n\n{instructions}"
@@ -1427,6 +1546,33 @@ def _extract_prompt_tool_calls(content: str) -> list[ToolCallRequest]:
     return tool_calls
 
 
+def _extract_envelope_tool_calls(content: str) -> tuple[str, list[ToolCallRequest]]:
+    """Parse the structured-output JSON envelope {"message": ..., "tool_call": ...}, returning the
+    plain-text message (for LLMResponse.content) and any tool call. Tolerant by design so a reply
+    that isn't quite the envelope is never worse than today's behavior and never raises:
+    - a proper envelope -> its message plus its tool_call (if any);
+    - a bare tool-call object {"name": ..., "arguments": ...} -> accepted as that call;
+    - valid JSON that is neither, or text that isn't JSON at all -> treated as plain content, with
+      the ordinary tag/DSML parsers still given a chance over the raw text."""
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        logger.debug("llm_client: structured reply was not valid JSON, falling back to tag parsing")
+        return content, _extract_prompt_tool_calls(content)
+    if isinstance(payload, dict):
+        if "message" in payload or "tool_call" in payload:
+            message = payload.get("message")
+            message = message if isinstance(message, str) else ""
+            call = payload.get("tool_call")
+            if isinstance(call, dict) and call.get("name"):
+                return message, [ToolCallRequest(id="prompt_call_envelope", name=call.get("name", ""), arguments=call.get("arguments") or {})]
+            return message, []
+        if payload.get("name"):
+            return "", [ToolCallRequest(id="prompt_call_bare", name=payload.get("name", ""), arguments=payload.get("arguments") or {})]
+    logger.debug("llm_client: structured reply was JSON but not an envelope, treating as plain text")
+    return content, _extract_prompt_tool_calls(content)
+
+
 # Confirmed live: opencode.ai's own public "zen" free-tier endpoint applies a visibly harsher rate
 # limit to plain OpenAI-compatible API traffic than to the official opencode CLI's own requests --
 # a bare, anonymous request (no special headers, exactly what this provider sent before this) got
@@ -1491,6 +1637,23 @@ class OpenAICompatProvider:
         # Public: chat.py's compaction budget needs this to size how much history it can
         # send; None (catalog unreachable/model unlisted) means "unknown", callers must not guess.
         self.context_limit: int | None = capabilities["context_limit"] if capabilities else None
+        # Flipped off for the rest of this provider instance's life the first time an explicit
+        # tool-call temperature is rejected with a 400, so a provider that doesn't accept the param
+        # is only probed once rather than on every subsequent request.
+        self._tool_temperature_supported = True
+        # Opt-in json_object structured output for prompt mode (off unless LLM_STRUCTURED_OUTPUT is
+        # set). _supported is flipped off, like the temperature flag above, the first time a provider
+        # rejects response_format, so it's probed once and then degrades to the plain tag format.
+        self._structured_output_enabled = _structured_output_enabled()
+        self._structured_output_supported = True
+        # Computed once here (not per request), from the same capability signals already resolved
+        # above, so callers can shrink prompt/tool menu for a small/local model. Public for core.py.
+        is_free = is_model_free(models_dev_id, model)
+        self.weak_profile, self.weak_profile_reasons = _compute_weak_profile(self._tool_mode, self.context_limit, is_free)
+        logger.debug(
+            "llm_client: %s/%s weak_profile=%s reasons=%s",
+            self.provider_id, model, self.weak_profile, self.weak_profile_reasons or ["none"],
+        )
 
     def _auth_header_override(self) -> dict:
         """Despite the name (kept for the smallest possible diff at both real call sites), this is
@@ -1565,23 +1728,49 @@ class OpenAICompatProvider:
             self._tool_mode = "prompt"
             return self._complete_prompt_based(merged_messages, tools, stop_check)
 
+    def _create_with_temperature_guard(self, request_kwargs: dict, stop_check: Callable[[], bool] | None):
+        """Issue the completion, but if the provider rejects the explicit temperature with a 400,
+        drop just that param (for the rest of this provider instance's life) and retry once -- so a
+        provider that doesn't accept temperature degrades to its own default instead of failing, and
+        the 400 is never mistaken for a native-tool-calling rejection by complete()'s own fallback."""
+        try:
+            return _create_completion_with_backoff(
+                lambda: self._client.chat.completions.create(**request_kwargs, **self._auth_header_override()),
+                stop_check=stop_check,
+            )
+        except openai.BadRequestError as exc:
+            if "temperature" not in request_kwargs or not _is_temperature_rejection(exc):
+                raise
+            logger.debug(
+                "llm_client: provider=%s rejected temperature param (%s), dropping it for this session and retrying",
+                self.provider_id, exc,
+            )
+            self._tool_temperature_supported = False
+            request_kwargs.pop("temperature", None)
+            return _create_completion_with_backoff(
+                lambda: self._client.chat.completions.create(**request_kwargs, **self._auth_header_override()),
+                stop_check=stop_check,
+            )
+
     def _complete_native(
         self, messages: list[dict], tools: list[dict] | None, stop_check: Callable[[], bool] | None = None
     ) -> LLMResponse:
         request_kwargs = {"model": self._model, "messages": messages}
         if tools:
             request_kwargs["tools"] = tools
+            # Low-variance sampling for tool-call turns only -- see _DEFAULT_TOOL_CALL_TEMPERATURE.
+            # A plain-text turn (no tools) keeps the provider's own default untouched.
+            if self._tool_temperature_supported:
+                request_kwargs["temperature"] = _tool_call_temperature()
 
         logger.debug(
-            "llm_client: request provider=%s model=%s mode=native messages=%d tools=%d",
+            "llm_client: request provider=%s model=%s mode=native messages=%d tools=%d temperature=%s",
             self.provider_id, self._model, len(messages), len(tools or []),
+            request_kwargs.get("temperature", "default"),
         )
         log_memory_snapshot(logger, "llm_client: before request")
 
-        response = _create_completion_with_backoff(
-            lambda: self._client.chat.completions.create(**request_kwargs, **self._auth_header_override()),
-            stop_check=stop_check,
-        )
+        response = self._create_with_temperature_guard(request_kwargs, stop_check)
 
         choice = response.choices[0]
         message = choice.message
@@ -1606,32 +1795,188 @@ class OpenAICompatProvider:
             content_was_malformed=_content_is_malformed(message.content), usage=usage,
         )
 
+    def stream_complete(
+        self, messages: list[dict], tools: list[dict] | None = None,
+        on_delta: Callable[[str], None] | None = None, stop_check: Callable[[], bool] | None = None,
+    ) -> LLMResponse:
+        """Streaming sibling of complete(), used ONLY by the chat panel (agent/chat.py) so a reply
+        types out token-by-token instead of landing all at once after the whole turn finishes.
+        on_delta(text) is called with each content fragment as it arrives. The returned LLMResponse
+        is the exact same shape complete() produces, so every caller downstream is unchanged.
+
+        Only the native path streams; prompt-based tool injection can't be shown incrementally (its
+        reply may contain literal <tool_call> tags the operator must never see mid-stream), so it
+        degrades to the blocking complete() path -- same provider, same result, just no live typing
+        for those weaker/local models. complete() itself is deliberately untouched here: the
+        autonomous agent never calls this, so its path carries zero risk from streaming.
+        """
+        merged_messages = _merge_consecutive_system_messages(messages)
+
+        if tools and self._tool_mode == "prompt":
+            return self._complete_prompt_based(merged_messages, tools, stop_check)
+
+        try:
+            return self._stream_native(merged_messages, tools, on_delta, stop_check)
+        except openai.BadRequestError as exc:
+            if not tools or self._tool_mode != "native":
+                raise
+            logger.debug("llm_client: native streaming tool-calling rejected (%s), switching to prompt-based for this provider", exc)
+            self._tool_mode = "prompt"
+            return self._complete_prompt_based(merged_messages, tools, stop_check)
+
+    def _stream_native(
+        self, messages: list[dict], tools: list[dict] | None,
+        on_delta: Callable[[str], None] | None, stop_check: Callable[[], bool] | None,
+    ) -> LLMResponse:
+        request_kwargs: dict = {"model": self._model, "messages": messages, "stream": True}
+        if tools:
+            request_kwargs["tools"] = tools
+            if self._tool_temperature_supported:
+                request_kwargs["temperature"] = _tool_call_temperature()
+
+        logger.debug(
+            "llm_client: stream request provider=%s model=%s messages=%d tools=%d temperature=%s",
+            self.provider_id, self._model, len(messages), len(tools or []),
+            request_kwargs.get("temperature", "default"),
+        )
+        log_memory_snapshot(logger, "llm_client: before stream request")
+
+        def open_stream():
+            return self._client.chat.completions.create(**request_kwargs, **self._auth_header_override())
+
+        # Only the initial request is retried (connection drop / 429 before the first byte) -- an
+        # error mid-stream is surfaced to the chat loop, which falls back to a blocking retry for the
+        # whole turn. The temperature guard mirrors _create_with_temperature_guard: a provider that
+        # rejects the explicit tool-call temperature must degrade to its own default, not be mistaken
+        # for a native-tool-calling rejection by stream_complete()'s own fallback above.
+        try:
+            stream = _call_with_backoff(open_stream, stop_check=stop_check)
+        except openai.BadRequestError as exc:
+            if "temperature" not in request_kwargs or not _is_temperature_rejection(exc):
+                raise
+            logger.debug(
+                "llm_client: provider=%s rejected temperature on stream (%s), dropping it and retrying",
+                self.provider_id, exc,
+            )
+            self._tool_temperature_supported = False
+            request_kwargs.pop("temperature", None)
+            stream = _call_with_backoff(open_stream, stop_check=stop_check)
+
+        content_parts: list[str] = []
+        tool_slots: dict[int, dict] = {}
+        finish_reason: str | None = None
+        usage: dict | None = None
+        for chunk in stream:
+            if stop_check and stop_check():
+                # Same abort signal complete() raises on Stop (see _call_with_backoff) -- the chat
+                # loop's _complete_or_stop already turns LLMCallAborted into a clean ChatStopRequested.
+                raise LLMCallAborted("stop requested mid-stream")
+            # Some providers emit a trailing usage-only chunk (choices == []); grab it if present.
+            if getattr(chunk, "usage", None):
+                usage = _extract_usage(chunk)
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                if delta.content:
+                    content_parts.append(delta.content)
+                    if on_delta is not None:
+                        on_delta(delta.content)
+                for tc in (delta.tool_calls or []):
+                    slot = tool_slots.setdefault(tc.index, {"id": None, "name": None, "args": []})
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function is not None:
+                        if tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function.arguments:
+                            slot["args"].append(tc.function.arguments)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        content = _normalize_message_content("".join(content_parts)) if content_parts else None
+        tool_calls = [
+            ToolCallRequest(
+                id=slot["id"] or "", name=slot["name"] or "",
+                arguments=_parse_tool_call_arguments("".join(slot["args"])),
+            )
+            for _index, slot in sorted(tool_slots.items())
+            if slot["name"]
+        ]
+        logger.debug(
+            "llm_client: stream response finish_reason=%s tool_calls=%d usage=%s content_len=%d",
+            finish_reason, len(tool_calls), usage, len(content or ""),
+        )
+        # content_was_malformed is always False for a streamed reply: content here is a plain
+        # concatenation of string deltas, never the list-of-blocks shape that flag exists to catch.
+        return LLMResponse(
+            content=content, tool_calls=tool_calls, finish_reason=finish_reason,
+            content_was_malformed=False, usage=usage,
+        )
+
+    def _build_prompt_request_kwargs(self, messages: list[dict], tools: list[dict], structured: bool) -> dict:
+        """Assemble the prompt-mode request. In structured mode the tool instructions switch to the
+        JSON envelope and response_format forces a json_object reply; otherwise it's the plain tag
+        format. Temperature is added the same way in both (low-variance sampling, Phase of its own)."""
+        request_kwargs = {
+            "model": self._model,
+            "messages": _inject_tool_instructions(messages, tools, structured=structured),
+        }
+        # Prompt-mode is the path weak/local models without native tool-calling fall into -- exactly
+        # where low-variance sampling most helps the tool-call JSON come back parseable.
+        if self._tool_temperature_supported:
+            request_kwargs["temperature"] = _tool_call_temperature()
+        if structured:
+            request_kwargs["response_format"] = {"type": "json_object"}
+        return request_kwargs
+
+    def _create_prompt_completion(self, messages: list[dict], tools: list[dict], structured: bool, stop_check):
+        """Issue a prompt-mode completion, optionally forcing json_object structured output. If the
+        provider rejects response_format with a 400, drop structured output for the rest of this
+        instance's life, rebuild the prompt in the plain tag format (dropping response_format), and
+        retry once -- so an unsupported provider degrades to today's behavior instead of failing.
+        Returns the response and whether structured output was actually in effect, so the caller
+        parses the matching reply format."""
+        request_kwargs = self._build_prompt_request_kwargs(messages, tools, structured)
+        logger.debug(
+            "llm_client: request provider=%s model=%s mode=prompt structured=%s messages=%d tools=%d temperature=%s",
+            self.provider_id, self._model, structured, len(request_kwargs["messages"]), len(tools),
+            request_kwargs.get("temperature", "default"),
+        )
+        log_memory_snapshot(logger, "llm_client: before request")
+        if not structured:
+            return self._create_with_temperature_guard(request_kwargs, stop_check), False
+        try:
+            return self._create_with_temperature_guard(request_kwargs, stop_check), True
+        except openai.BadRequestError as exc:
+            if "response_format" not in request_kwargs or not _is_response_format_rejection(exc):
+                raise
+            logger.debug(
+                "llm_client: provider=%s rejected response_format (%s), dropping structured output and retrying with tag format",
+                self.provider_id, exc,
+            )
+            self._structured_output_supported = False
+            fallback_kwargs = self._build_prompt_request_kwargs(messages, tools, structured=False)
+            return self._create_with_temperature_guard(fallback_kwargs, stop_check), False
+
     def _complete_prompt_based(
         self, messages: list[dict], tools: list[dict], stop_check: Callable[[], bool] | None = None
     ) -> LLMResponse:
-        prompted_messages = _inject_tool_instructions(messages, tools)
-
-        logger.debug(
-            "llm_client: request provider=%s model=%s mode=prompt messages=%d tools=%d",
-            self.provider_id, self._model, len(prompted_messages), len(tools),
-        )
-        log_memory_snapshot(logger, "llm_client: before request")
-
-        response = _create_completion_with_backoff(
-            lambda: self._client.chat.completions.create(
-                model=self._model, messages=prompted_messages, **self._auth_header_override()
-            ),
-            stop_check=stop_check,
-        )
+        structured = self._structured_output_enabled and self._structured_output_supported
+        response, structured_used = self._create_prompt_completion(messages, tools, structured, stop_check)
 
         choice = response.choices[0]
         content = _normalize_message_content(choice.message.content) or ""
-        tool_calls = _extract_prompt_tool_calls(content)
+        if structured_used:
+            content, tool_calls = _extract_envelope_tool_calls(content)
+        else:
+            tool_calls = _extract_prompt_tool_calls(content)
 
         usage = _extract_usage(response)
         logger.debug(
-            "llm_client: response finish_reason=%s tool_calls=%d usage=%s content_preview=%s",
-            choice.finish_reason, len(tool_calls), usage,
+            "llm_client: response finish_reason=%s structured=%s tool_calls=%d usage=%s content_preview=%s",
+            choice.finish_reason, structured_used, len(tool_calls), usage,
             truncate_for_log(content, step_id=f"llm_response_{int(time.time() * 1000)}"),
         )
         return LLMResponse(

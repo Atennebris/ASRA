@@ -90,6 +90,20 @@ a per-session approval click in the UI instead.
   gobuster, ...) plus your own scripts via `custom_tools.yaml`. Arjun is the one exception to
   "installed by `setup_tools.sh`" — a pure-Python tool installed via `requirements.txt`/`run.sh`,
   no separate WSL step.
+- **Self-building skill library** — the cross-session playbook stores not just *what* worked but an
+  executable **skill** for it: a command, a sandboxed script, or an ordered step-list. When the
+  agent confirms a reusable win it can attach the skill it just ran; a later session on a
+  similarly-shaped target reruns it in one call via `run_skill` instead of re-deriving it, and
+  `run_skill(chain=true)` replays a whole proven multi-step recipe. Skills work across web, Reverse
+  Engineering and interactive modes, matched by **target shape** (e.g. `pe_x86_64`, `jvm_bytecode`,
+  `elf`, `web`) so binary/RE knowledge is first-class, not keyed only to web tech stacks. You can
+  author skills by hand (Playbook → New skill), run/edit/trust them from the Playbook tab, and
+  import/export them (an agent-agnostic schema) to move them between machines or agents — the
+  existing whole-playbook export carries them too. Study material you upload (books, writeups,
+  articles) is mined for skills, not just prose techniques. Security is central: any skill a session
+  didn't personally author — imported, or distilled from an uploaded document — is treated as
+  untrusted, starts unreviewed, and runs only inside the same sandbox as other model-written code;
+  its body is hash-pinned, so a tampered or out-of-band-edited body is refused until re-vetted.
 - **Real credential brute-forcing, without blocking the agent** — Hydra (SSH/FTP/telnet/
   MySQL/PostgreSQL/RDP/SMB) and a purpose-built CSRF-aware web-login brute-forcer both run as real
   background jobs: `hydra_start`/`web_login_bruteforce_start` return immediately with a job ID, and
@@ -114,7 +128,24 @@ a per-session approval click in the UI instead.
   `check_subagent_task` is a fallback for the rare case that push doesn't land. The **Tools** tab
   shows every registered tool and whether it's actually installed on this machine — the same live
   check feeds the Subagents tab's checklist, so a profile can only be given tools that genuinely
-  exist.
+  exist. The tab ships with a built-in roster of focused specialists (recon, brute-force,
+  SQLi/XSS verification, secrets exposure, reverse-engineering, OSINT, report writing) plus the
+  original generic profile — all disabled on arrival, so you review and enable only the ones you
+  want before anything can be delegated to them. A handful of tools a subagent can never actually
+  use (recording a finding, delegating to a further subagent, and similar) appear greyed-out and
+  un-switchable in the checklist, with the reason shown on hover, rather than silently hidden.
+- **Operator profile** — a standing, cross-project profile for the *main* agent (Settings →
+  Operator Profile), so you don't re-type the same priorities into every new project. Standing
+  instructions ("I care most about IDOR/broken-auth", "stay quiet on WAF-protected targets"), a
+  focus list of vulnerability classes to investigate first when time is short, and how verbose the
+  agent's live narration is. It applies by default to every new project; a specific project's own
+  "Custom instructions" (New Project form) still layer on top and win where they conflict.
+  Style/priorities only — never targets, scope, or credentials. Distinct from **Subagents** above
+  (that configures delegated workers; this configures the main agent itself). It also carries a
+  per-severity exploitation gate: pick which severities (Critical/High/…) must wait for your own
+  approval click before the agent exploits them, leaving the rest autonomous — this *adds* to the
+  global `EXPLOIT_REQUIRE_APPROVAL` switch (when that's on, everything is gated regardless), so a
+  high-value target can stay mostly hands-off while you still personally confirm the top-tier hits.
 - **Proof report export** — one click turns a completed session into a standalone HTML report:
   findings, real evidence, and the full human-approval audit trail.
 - **Local-only** — no cloud dependency besides the LLM API call itself, and no database; session
@@ -140,7 +171,19 @@ and Reverse Engineering modes, and on chat tool-call cards):
 
 ![ASRA session Logs tab in the neo theme](screenshots/ASRA_screenshot_logs_neo_theme.jpg)
 
-**Findings** (`mr-robot` theme) — severity/exploited/qualifies-for-bounty badges per finding:
+**Overview** — a live "what we know about this target so far" card at the top of each session:
+attack surface (hosts, open ports), detected stack and protections, findings broken down by a single
+derived verification status, open hypotheses, and an honest "known edge" line (what's verified vs
+still unconfirmed vs flagged for a human). It rebuilds itself as the scan turns up new facts, with no
+reload. The same tab has a **Scheduled repeat scans** control: set a project to re-run itself on a
+timer (every N minutes/hours/days), and each run reuses what recon already found — re-verifying
+existing findings and working off what changed, rather than scanning from scratch. Scheduled runs go
+through the same fleet queue manual starts use, so they respect the one concurrency cap.
+
+**Findings** (`mr-robot` theme) — per finding: a single verification-status badge (verified /
+inferred / needs-verification / refuted / disputed when two independent providers split), severity,
+exploited and qualifies-for-bounty badges, plus a computed CVSS score (with "agent-assessed" vs "from
+CVE" provenance) when a vector is present:
 
 ![ASRA session Findings tab in the mr-robot theme](screenshots/ASRA_screenshot_findings_mrrobot_theme.jpg)
 
@@ -322,7 +365,8 @@ having this at all), **gdb**,
 analysis), **heimdall** (EVM bytecode decompilation, via its own `bifrost` installer, which pulls a
 Rust/Cargo toolchain via `rustup` first if missing), **upx** (packed-binary unpacking),
 **osv-scanner** and **trufflehog** (source-repo dependency/secret scanning), **apktool** and
-**jadx** (Android APK decompilation), **binwalk** (firmware analysis), **tshark** (packet capture —
+**jadx** (Android APK plus plain Java/JVM bytecode — `.jar`/`.war`/`.dex`/`.class` — decompilation to
+readable Java source), **binwalk** (firmware analysis), **tshark** (packet capture —
 `dumpcap` is granted `cap_net_raw`/`cap_net_admin` via `setcap` so live capture never needs root;
 pass `raw_payload: true` to also pull the full TCP/UDP segment payload as hex, for a target's own
 custom binary protocol tshark has no built-in dissector for — a game's netcode, a proprietary
@@ -390,6 +434,23 @@ confidence caveat) in the result. `mode="nm_symbols"` reads the binary's own sym
 `go tool nm` — this one genuinely needs a Go toolchain, with no text-based fallback possible for a
 real binary section. Dependency names alone often point straight at a known-vulnerable third-party
 library worth checking before decompiling anything.
+
+A fifth always-available (pure-Python, no install) Reverse Engineering mode tool,
+**`extract_embedded_binary`**, pulls a native executable out of a container so a native decompiler
+can load a real PE/ELF/Mach-O instead of the wrapper. It both unzips a `.jar`/`.war`/`.ear`/`.apk`/
+`.zip` (reporting every extracted `.dll`/`.so`/`.dylib`/`.exe`) and raw-carves any embedded PE/ELF/
+Mach-O header a plain unzip would miss. The intended use is a native-wrapped JVM target — e.g. a
+JGuard-protected `.jar` that is really a Java stub around a native Windows DLL: extract the DLL
+first, then point radare2/ghidra at it (for the pure-Java side, use `jadx`).
+
+Three more always-available (pure-Python, read-only) Reverse Engineering mode tools let the agent
+actually look at what the other tools write to disk: **`list_dir`** (lists a directory's contents
+with each entry's identified type — e.g. the folder `jadx`/`apktool`/`ghidra` just decompiled into),
+**`read_file`** (reads a text file such as a decompiled `.java`, with `start_line`/`max_lines`
+paging; refuses a binary and points you to radare2/hex_view instead), and **`grep`** (searches a
+regex across a file or a whole directory tree for `file:line` matches — the fastest way to jump to a
+validation routine, e.g. `grep "valid|licen|serial"` over a jadx output directory). These replace the
+shell (`ls`/`cat`/`bash`) the chat has no access to.
 
 #### macOS
 
@@ -520,11 +581,14 @@ terminal, or for confirming the arsenal is still intact later.
   found automatically, whatever an individual operator's own folder structure happens to be.
 - **Custom tools** registers a binary ASRA's own registry has no builder for at all — "Test path"
   above also lists any executable it finds that matches no known tool, with an "Add" button per
-  candidate. Once added and enabled, it becomes a real, named tool the agent (and its subagents)
-  can call — using whichever flags its own usage text (captured automatically, editable after)
-  documents — sandboxed the same way model-written exploit scripts already are, since this is an
-  arbitrary binary the project has no track record with. A toggle, description, category, and
-  "requires a live target" checkbox are editable per tool at any time.
+  candidate, and an **"Add custom tool"** button lets you register one by hand (name, path,
+  description, category). Once added and enabled, it becomes a real, named tool — using whichever
+  flags its own usage text (captured automatically, editable after) documents — sandboxed the same
+  way model-written exploit scripts already are, since this is an arbitrary binary the project has
+  no track record with. A toggle, description, category, and "requires a live target" checkbox are
+  editable per tool at any time, plus **"Available to"** switches that decide which consumers get
+  the tool — main agent, chats, reverse-engineering mode, interactive mode, subagents (all on by
+  default). Each tool also has a trash button (with a confirmation) to remove it from the registry.
 
 ## Stage 2: install and run ASRA
 
@@ -638,6 +702,19 @@ cargo build --release            # needs Rust (rustup) + your OS's build tools
   never gated. Edge case: if the shell detects an already-running backend and adopts it instead of
   starting a fresh one, that adopted instance keeps whatever gating it already had — a token can
   only be set on a server this launch actually started.
+- **Versions and updating (code vs launcher).** Settings → General → Updates shows the release number
+  of the ASRA code on disk (e.g. `v0.7.1`, read from `desktop/src-tauri/Cargo.toml`) next to its git
+  commit; the Desktop app card below it shows the installed launcher's own version, even before
+  you press Check. They are two different files: "Update now" (git pull / source archive) updates the
+  code, and the exe's own file properties (Explorer → Details → File version) keep the number it
+  was built with. So when the launcher is behind, **"Update now" also downloads and checksum-verifies
+  the new launcher in the same step** and offers "Install & restart" — one restart finishes both. If
+  only the launcher is behind, the Desktop app card has a single "Update desktop app" button doing the
+  same. The swap works the same on Windows, Linux and macOS (the running binary is renamed aside, the
+  new one moved in, ASRA relaunches; if the exe sits on another drive than the app-data folder the
+  file is copied instead of moved). Prebuilt launchers exist for Windows x64, Linux x86_64 and macOS
+  Apple Silicon; on another CPU (Intel Mac, ARM Linux) the card says so instead of installing a
+  binary that cannot start — build it from source there (`cargo build --release`).
 
 ## Usage
 
@@ -669,13 +746,47 @@ that model request's answer time (`LLM 3.2s`), the tool's own run time (`9m 41s`
 finished, and the time its result landed. While a tool is still running the row shows a live
 `running 3m 12s` ticker instead, and no finish time is claimed in advance.
 
-**Zoom the whole UI** with `Ctrl` + `+` / `-` (or `Ctrl` + mouse wheel); `Ctrl` + `0` returns to 100%.
-The level is remembered on this machine (works in the desktop app and in a browser tab alike).
+**Export and import projects** from the Projects page — to work on the same projects with a teammate
+or to move them to another machine. **Export** (the button beside *Delete all projects*, or the
+per-project link on a row) builds one `.zip` of the projects you tick; **Import** reads such a
+`.zip` back. What travels and what deliberately doesn't:
+- Each project's folder (`session.json`, findings, artifacts) goes along. `debug.log` and the
+  `debug-tool-calls/` dumps are off by default (a checkbox adds them), the `backups/` folder never
+  goes, and `custom_headers` — which usually holds auth tokens — is blanked unless you tick
+  *Include custom headers*. Saved identity logins (`data/credentials`) live outside the project
+  folder and are never exported.
+- On import a project that already exists is **skipped** by default; choose **Import as copy** (new
+  id, name gets `(copy)`) or **Replace** (overwrites it, but never a project that is running right
+  now). A project that was running on the source machine arrives as *interrupted*, so you can
+  Resume it; machine-bound state (background-job PIDs, identity flags, the old folder path) is reset.
+- The archive is treated as untrusted: paths that try to escape the projects folder are rejected
+  before anything is written, and the unpacked size / file count are capped by
+  `PROJECTS_IMPORT_MAX_UNPACKED_MB` and `PROJECTS_IMPORT_MAX_FILES`.
+
+**Delete all projects** asks twice. The second, final warning only unlocks its button after you tick
+the acknowledgement checkbox **and** type `DELETE` (capital letters).
+
+**Zoom the whole UI** with `Ctrl` + `+` / `-` (or `Ctrl` + mouse wheel); `Ctrl` + `0` returns to 100%
+(Chrome-style steps, 50%–300%). In the desktop app this is the window's native zoom, so the layout
+re-flows like in a browser or an Electron app instead of just scaling; it needs desktop app
+v0.7.1 or newer (an older app shows "Zoom unavailable"). In a browser tab the browser's own zoom is
+used. The level is remembered on this machine.
 
 ## Configuration
 
 Every runtime setting lives in `.env` — `.env.example` has the full list with inline explanations.
 The ones worth knowing going in:
+
+> **Settings → Reliability.** The weak-model reliability knobs below — `LLM_TOOL_CALL_TEMPERATURE`,
+> `WEAK_MODEL_MODE`, `WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD`, `WEAK_MODEL_MAX_TOOLS`,
+> `LLM_STRUCTURED_OUTPUT`, `TOOL_ARG_COERCION`, `TOOL_NAME_FUZZY_MATCH`, `TOOL_NAME_FUZZY_CUTOFF`,
+> `WEAK_SIGNAL_ENABLED`, `WEAK_SIGNAL_WINDOW`, `WEAK_SIGNAL_INVALID_RATE` and
+> `WEAK_MODEL_VERIFICATION_HINT` — are all editable visually under **Settings → Reliability**
+> (tool-call temperature, structured-output toggle, the weak-model profile mode/thresholds, argument
+> coercion and fuzzy tool-name matching, the invalid-call quality signal, and the secondary-
+> verification hint). A value set there is saved to `data/reliability_settings.json` and takes
+> precedence over the `.env` default shown here — so `.env` is just the default *under* the control,
+> and nobody has to hand-edit it.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -683,13 +794,25 @@ The ones worth knowing going in:
 | `ENABLE_EXPLOIT` | `true` | `false` runs Recon + Analyze only — no exploitation phase at all |
 | `EXPLOIT_REQUIRE_APPROVAL` | `false` | `false` (default): exploitation proceeds autonomously the instant Exploit wants to run something (still fully logged). `true`: pause and wait for a per-session approval click before each attempt. The allowlist/scope check applies either way — this only gates the human-in-the-loop prompt |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | `120` | Per-call timeout for LLM API responses, before backoff retries |
+| `LLM_TOOL_CALL_TEMPERATURE` | `0.2` | Sampling temperature for tool-call turns only — low on purpose, so weak/small models emit less malformed tool-call JSON. Plain-text turns keep the provider default; a provider that rejects the param falls back to its default automatically |
+| `WEAK_MODEL_MODE` | `auto` | Weak/small-model profile. `auto` infers it from real signals (no native tool-calling, or a known context window below the threshold); `on`/`off` force it (useful for a custom local checkpoint the catalog doesn't list). When active, the agent condenses its system prompt and trims the tool menu so a small model isn't overwhelmed |
+| `WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD` | `16384` | Context window (tokens) below which a model counts as weak under `WEAK_MODEL_MODE=auto` |
+| `WEAK_MODEL_MAX_TOOLS` | `14` | Max tools offered per turn under the weak-model profile (the phase's terminal tool is always kept) |
+| `LLM_STRUCTURED_OUTPUT` | `false` | Opt-in structured output. When on, models without native tool-calling (prompt mode) are asked to force a single JSON-object reply, cutting malformed tool-call JSON from weak/local models at generation time. A provider that doesn't support `response_format=json_object` falls back to the normal format automatically |
+| `TOOL_ARG_COERCION` | `true` | Conservatively fix obvious tool-argument type/shape slips before dispatch (stringified bool/number, one-item list where a scalar is wanted, scalar where a list is wanted), guided by each tool's schema; anything ambiguous is left to the tool's own validator |
+| `TOOL_NAME_FUZZY_MATCH` / `TOOL_NAME_FUZZY_CUTOFF` | `true` / `0.8` | Hint "did you mean X?" when a model calls an unknown tool name that closely matches a real one (never a silent substitution); the cutoff (0.0–1.0) sets match strictness |
+| `WEAK_SIGNAL_ENABLED` / `WEAK_SIGNAL_WINDOW` / `WEAK_SIGNAL_INVALID_RATE` | `true` / `10` / `0.6` | Watch the rate of model-caused invalid tool calls over a sliding window; if it stays above the threshold, warn the operator once per phase in the session log that the model may be too weak — without stopping the run |
+| `WEAK_MODEL_VERIFICATION_HINT` | `true` | When the primary model looks weak and no secondary verification provider is configured, recommend enabling one once at session start (a hint only — never enables verification itself) |
 | `TOOL_TIMEOUT_SECONDS` / `EXPLOIT_TIMEOUT_SECONDS` | `600` / `600` | Per-call timeout for recon/scan tools vs. exploit tools |
 | `EXPLOIT_APPROVAL_TIMEOUT_SECONDS` | `300` | Only relevant when `EXPLOIT_REQUIRE_APPROVAL=true` — how long a pending exploit waits for approval before it's skipped |
 | `HYDRA_TIMEOUT_SECONDS` | `900` | How long a `hydra_start`/`web_login_bruteforce_start` background job runs before it's killed and marked `timeout` |
 | `HYDRA_MAX_CONCURRENT_JOBS` | `2` | Max background brute-force jobs at once per session — a further call is skipped, not queued, until one finishes |
 | `SUBAGENT_TASK_TIMEOUT_SECONDS` | `900` | How long a `delegate_to_subagent` task runs before it's cancelled and marked `timeout` |
 | `SUBAGENT_MAX_CONCURRENT_TASKS` | `2` | Max delegated subagent tasks at once per session — a further call is skipped until one finishes |
+| `RE_DYNAMIC_TOOL_TIMEOUT_SECONDS` / `RE_WINEPREFIX_BOOT_TIMEOUT_SECONDS` | `30` / `120` | Reverse-Engineering dynamic triage: a short per-run timeout for strace/Wine behavioral runs (so a cold Wine-prefix bootstrap can't hang for minutes), plus the bounded one-time Wine-prefix pre-warm budget |
+| `STALE_PROCESSING_HEAL_SECONDS` | `3600` | How long a session may sit `processing` with no agent-loop heartbeat before the session page self-heals it to `interrupted` — recovers an abandoned run (e.g. one killed mid provider-retry) without needing a restart |
 | `PROJECTS_DIR` | auto-detected | Where scan artifacts are saved; defaults to `Documents/ASRA Projects` per OS if unset |
+| `PROJECTS_IMPORT_MAX_UNPACKED_MB` / `PROJECTS_IMPORT_MAX_FILES` | `8192` / `200000` | Hard caps on a project archive being imported (unpacked size in MB, number of files) — guards against a decompression bomb |
 | `APP_DATA_DIR` | auto-detected | Where the global debug log is written; defaults to `Documents/ASRA` per OS if unset |
 | `DEBUG` | `false` | Verbose per-category logging — see Development below |
 | `INTERACTSH_CLIENT_PATH` | auto-detected | Override if `interactsh-client` isn't on PATH (blind SSRF/XSS confirmation) |

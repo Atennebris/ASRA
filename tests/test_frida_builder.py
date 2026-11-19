@@ -4,9 +4,11 @@ shape below mirrors its own documented plain-text output (no --json flag exists 
 process list).
 """
 import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
+import agent.tools.builders.frida as frida_module
 from agent.tools.builders.frida import (
     build_frida_ps_command,
     build_frida_trace_command,
+    frida_trace_working_dir,
     parse_frida_ps_output,
     parse_frida_trace_output,
 )
@@ -36,6 +38,32 @@ def test_build_frida_trace_command_omits_the_separator_with_no_args():
 
 def test_build_frida_ps_command_takes_no_arguments():
     assert build_frida_ps_command({}) == ["frida-ps"]
+
+
+def test_frida_trace_working_dir_is_writable_and_outside_the_repo(tmp_path, monkeypatch):
+    """frida-trace writes its __handlers__ into Path.cwd() with no flag to relocate it (confirmed
+    in frida_tools/tracer.py); the only real fix is running it from a guaranteed-writable dir. It
+    must resolve under the global app dir (writable in both root/non-root launches), never the
+    repo tree."""
+    monkeypatch.setattr(frida_module, "resolve_global_app_dir", lambda: tmp_path / "app")
+
+    working_dir = frida_trace_working_dir()
+
+    assert working_dir.is_dir()
+    assert str(tmp_path / "app") in str(working_dir)
+
+
+def test_build_frida_trace_command_survives_an_unpreparable_working_dir(monkeypatch):
+    """Preparing the writable working dir is best-effort -- a builder can't set its own subprocess
+    cwd, so a failure there must never break the build (worst case is the pre-existing CWD behavior)."""
+    def _boom():
+        raise OSError("read-only")
+
+    monkeypatch.setattr(frida_module, "frida_trace_working_dir", _boom)
+
+    command = build_frida_trace_command({"file_path": "/tmp/crackme", "function_pattern": "strcmp"})
+
+    assert command == ["frida-trace", "-f", "/tmp/crackme", "-i", "strcmp"]
 
 
 def test_parse_frida_trace_output_passes_text_through_unchanged():

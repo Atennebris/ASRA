@@ -50,6 +50,35 @@ CUSTOM_TOOLS_STORE_PATH = resolve_global_app_dir() / "data" / "custom_tools.json
 CUSTOM_TOOL_CATEGORIES = ("recon", "scan", "exploit", "re", "custom")
 _DEFAULT_CATEGORY = "custom"
 
+# Which consumers a custom tool is made available to -- toggled per tool in its own card
+# (Settings -> Tools -> Custom tools). Orthogonal to `category` (which decides which PHASE of the
+# main pipeline sees it): a tool can be, say, main_agent + subagent but not chat. A record created
+# before this field existed has no "scopes" key -- tool_scopes() treats that as "all consumers" so
+# the long-standing behavior (reachable everywhere its category allowed) is preserved, and the UI
+# shows every switch on, with no on-disk migration needed until the operator actually changes one.
+CUSTOM_TOOL_SCOPES = ("main_agent", "chat", "reverse", "interactive", "subagent")
+
+
+def tool_scopes(record: dict) -> list[str]:
+    """This record's enabled consumer scopes, in canonical order -- the single reader every runtime
+    gate and the UI go through, so a missing/legacy/garbled "scopes" field resolves to "all
+    consumers" in exactly one place instead of each call site re-deciding the default."""
+    stored = record.get("scopes")
+    if not isinstance(stored, list):
+        # Legacy/garbled record with no explicit choice -> available everywhere, as it always was.
+        return list(CUSTOM_TOOL_SCOPES)
+    # An explicit list is honored exactly, including an empty one (every consumer turned off).
+    return [s for s in CUSTOM_TOOL_SCOPES if s in stored]
+
+
+def _normalize_scopes(scopes: list[str] | None) -> list[str]:
+    """For a write (add/update): None -> all consumers (the chosen default); a real list -> only its
+    valid entries, in canonical order. An explicit empty list is kept empty (the operator turned
+    every consumer off on purpose), unlike tool_scopes()'s READ-side legacy handling above."""
+    if scopes is None:
+        return list(CUSTOM_TOOL_SCOPES)
+    return [s for s in CUSTOM_TOOL_SCOPES if s in scopes]
+
 
 def load_custom_tools() -> list[dict]:
     if not CUSTOM_TOOLS_STORE_PATH.exists():
@@ -79,7 +108,7 @@ def custom_tool_name_exists(name: str) -> bool:
     return any(r["name"] == name for r in load_custom_tools())
 
 
-def add_custom_tool(*, name: str, path: str, description: str, requires_target: bool, category: str) -> dict:
+def add_custom_tool(*, name: str, path: str, description: str, requires_target: bool, category: str, scopes: list[str] | None = None) -> dict:
     """Registers a newly-confirmed candidate -- never called from discovery alone (see this
     module's own docstring: discovery only ever SHOWS candidates, nothing is added until the
     operator explicitly confirms one in the UI). Starts enabled -- the confirm click itself is the
@@ -99,6 +128,7 @@ def add_custom_tool(*, name: str, path: str, description: str, requires_target: 
         "description": description,
         "requires_target": requires_target,
         "category": category,
+        "scopes": _normalize_scopes(scopes),
         "added_at": time.time(),
     }
     records = load_custom_tools()
@@ -119,7 +149,7 @@ def set_custom_tool_enabled(tool_id: str, enabled: bool) -> dict | None:
     return None
 
 
-def update_custom_tool(tool_id: str, *, description: str | None = None, requires_target: bool | None = None, category: str | None = None) -> dict | None:
+def update_custom_tool(tool_id: str, *, description: str | None = None, requires_target: bool | None = None, category: str | None = None, scopes: list[str] | None = None) -> dict | None:
     if category is not None and category not in CUSTOM_TOOL_CATEGORIES:
         raise ValueError(f"category must be one of {CUSTOM_TOOL_CATEGORIES}, got {category!r}")
     records = load_custom_tools()
@@ -131,6 +161,8 @@ def update_custom_tool(tool_id: str, *, description: str | None = None, requires
                 record["requires_target"] = requires_target
             if category is not None:
                 record["category"] = category
+            if scopes is not None:
+                record["scopes"] = _normalize_scopes(scopes)
             _write_custom_tools(records)
             logger.debug("custom_tools_store: %r updated", record["name"])
             return record

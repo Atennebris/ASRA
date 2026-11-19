@@ -1,0 +1,65 @@
+{# Export + Import dialogs for the Projects tab. Rendered once by sessions_list.html OUTSIDE the
+   5s-polled #sessions-list-fragment on purpose: that fragment is morph-swapped every poll, which
+   would reset a half-filled dialog (ticked boxes, a chosen file) mid-use. static/js/
+   projects_transfer.js fills the export list from the live rows in the fragment at open time. #}
+{% set input_btn = "inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 h-9 px-3 text-sm disabled:opacity-40 disabled:cursor-not-allowed" %}
+
+<dialog id="projects-export-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col backdrop:bg-black/50">
+  <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0 rounded-t-lg">
+    <span class="text-[13px] font-semibold">Export projects</span>
+    <button type="button" onclick="document.getElementById('projects-export-modal').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+  </div>
+  <div class="p-4 overflow-y-auto asra-scroll min-h-0 space-y-3">
+    <p class="text-[12px] text-secondary ui-desc">Saves the selected projects as one .zip &mdash; findings, chats, scripts and settings. Import it on another machine (or hand it to a teammate) from this same tab.</p>
+    <label class="flex items-center gap-2 text-[12px] text-primary select-none cursor-pointer">
+      <input type="checkbox" id="projects-export-all" checked class="rounded border-default">
+      <span>Select all <span id="projects-export-count" class="text-secondary tabular-nums"></span></span>
+    </label>
+    <ul id="projects-export-list" class="max-h-56 overflow-y-auto asra-scroll space-y-1 border border-default rounded p-2 bg-base"></ul>
+    <div class="space-y-2 border-t border-default pt-3">
+      <label class="flex items-start gap-2 text-[12px] text-secondary select-none cursor-pointer">
+        <input type="checkbox" id="projects-export-logs" class="rounded border-default mt-0.5">
+        <span>Include debug logs and raw tool-call dumps <span class="text-secondary/70 ui-desc">(can add hundreds of MB; rarely useful to a teammate)</span></span>
+      </label>
+      <label class="flex items-start gap-2 text-[12px] text-secondary select-none cursor-pointer">
+        <input type="checkbox" id="projects-export-headers" class="rounded border-default mt-0.5">
+        <span>Include custom request headers from project settings <span class="text-secondary/70 ui-desc">(may contain cookies or auth tokens)</span></span>
+      </label>
+    </div>
+    <p class="text-[11px] text-secondary/80 ui-desc">The archive holds real engagement data &mdash; share it only with people allowed to see it. Saved identity logins never leave this machine.</p>
+    <p id="projects-export-status" class="text-[12px] text-accent" hidden></p>
+  </div>
+  <div class="flex items-center justify-end gap-2 px-4 py-3 border-t border-default shrink-0 rounded-b-lg">
+    <button type="button" onclick="document.getElementById('projects-export-modal').close()" class="{{ input_btn }} bg-elevated text-primary border border-default hover:bg-overlay">Cancel</button>
+    <button type="button" id="projects-export-go" onclick="asraProjectsTransfer.runExport()" class="{{ input_btn }} bg-accent hover:bg-accent-hover text-white">Export</button>
+  </div>
+</dialog>
+
+<dialog id="projects-import-modal" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col backdrop:bg-black/50">
+  <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0 rounded-t-lg">
+    <span class="text-[13px] font-semibold">Import projects</span>
+    <button type="button" onclick="asraProjectsTransfer.closeImport()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+  </div>
+  <div class="p-4 overflow-y-auto asra-scroll min-h-0 space-y-3">
+    <p class="text-[12px] text-secondary ui-desc">Choose an ASRA projects archive (.zip) made by Export. Projects that were running on the other machine arrive as <span class="text-primary">interrupted</span> and can be resumed here.</p>
+    <input type="file" id="projects-import-file" accept=".zip,application/zip"
+           class="block w-full text-[12px] text-secondary file:mr-3 file:h-8 file:px-3 file:rounded file:border file:border-default file:bg-elevated file:text-primary file:text-[12px] file:cursor-pointer">
+    <div>
+      <label for="projects-import-conflict" class="block text-[12px] text-secondary mb-1">If a project with the same id already exists here</label>
+      <select id="projects-import-conflict" class="w-full h-9 px-2 rounded bg-elevated border border-default text-sm text-primary">
+        <option value="skip">Skip it (keep my version)</option>
+        <option value="copy">Import it as a separate copy</option>
+        <option value="replace">Replace mine with the imported one</option>
+      </select>
+      <p id="projects-import-replace-warning" class="text-[11px] text-severity-high mt-1" hidden>Replace permanently deletes your local version of that project first (a project that is running right now is never replaced).</p>
+    </div>
+    <p id="projects-import-status" class="text-[12px] text-accent" hidden></p>
+    <p id="projects-import-error" class="text-[12px] text-severity-high" hidden></p>
+    <ul id="projects-import-results" class="space-y-1 text-[12px]" hidden></ul>
+  </div>
+  <div class="flex items-center justify-end gap-2 px-4 py-3 border-t border-default shrink-0 rounded-b-lg">
+    <button type="button" onclick="asraProjectsTransfer.closeImport()" class="{{ input_btn }} bg-elevated text-primary border border-default hover:bg-overlay">Close</button>
+    <button type="button" id="projects-import-go" onclick="asraProjectsTransfer.runImport()" class="{{ input_btn }} bg-accent hover:bg-accent-hover text-white">Import</button>
+  </div>
+</dialog>
+<script src="{{ static_url('/static/js/projects_transfer.js') }}"></script>

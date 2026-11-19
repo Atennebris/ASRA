@@ -29,12 +29,6 @@
     (function () {
       var theme = localStorage.getItem("asra-theme") || "dark";
       document.documentElement.dataset.theme = theme;
-      // Remembered UI zoom (static/js/ui_zoom.js) -- applied here, before first paint, for the same
-      // no-flash reason as the theme above.
-      try {
-        var zoom = parseFloat(localStorage.getItem("asra-ui-zoom"));
-        if (zoom > 0 && zoom !== 1) document.documentElement.style.zoom = String(zoom);
-      } catch (e) { /* storage blocked: stays at 100% */ }
     })();
   </script>
 
@@ -409,7 +403,18 @@
      <script> tags already execute in), since that file reads window.ASRA_DEBUG synchronously at the
      top of its own IIFE. #}
   <script>window.ASRA_DEBUG = {{ "true" if debug_enabled else "false" }};</script>
+  {# Off by default: the once-a-second htmx polls (session tabs, findings, control bar) would
+     otherwise flood the debug console and bury real agent/tool/LLM activity. DEBUG_LOG_POLLS=true
+     restores them. A failing poll is still logged either way (htmx-error in debug_events.js). #}
+  <script>window.ASRA_DEBUG_POLLS = {{ "true" if debug_log_polls else "false" }};</script>
   <script src="{{ static_url('/static/js/debug_events.js') }}"></script>
+  {# Settings -> Customization -> "Show helper descriptions" (inverted). When true, the body carries
+     data-hide-descriptions and every `.ui-desc` helper paragraph is collapsed via CSS; the text is
+     still reachable on a long hover (ui_descriptions.js tooltip). Exposed as a window flag so the
+     tooltip script and the live Settings toggle (window.asraSetHideDescriptions) agree on the
+     current state without re-reading the DOM attribute. Read live per render (callable global). #}
+  <script>window.ASRA_HIDE_DESCRIPTIONS = {{ "true" if ui_descriptions_hidden() else "false" }};</script>
+  <script src="{{ static_url('/static/js/ui_descriptions.js') }}" defer></script>
   {# Settings -> Customization -> Sounds' current state, on every page (not just settings.html) -- static/js/
      sound_events.js's own event watchers (new finding, session done, approval needed, chat reply)
      have to fire from session.html/session pages, not just the Settings screen that edits this.
@@ -436,7 +441,8 @@
      which is where these functions used to live and the exact reason Agent-mode copy buttons were
      silently broken (window.asraCopyCard never existed for that branch at all). #}
   <script src="{{ static_url('/static/js/copy_card.js') }}"></script>
-  {# Ctrl +/-/0 and Ctrl+wheel whole-UI zoom, and the live "running Xm Ys" ticker on in-flight tool
+  {# Ctrl +/-/0 and Ctrl+wheel whole-UI zoom (desktop shell only -- it drives the webview's native
+     zoom via the set_page_zoom command; a plain browser tab keeps its own), and the live "running Xm Ys" ticker on in-flight tool
      rows -- both page-wide (the chat panel and the Logs views live on several different pages). #}
   <script src="{{ static_url('/static/js/ui_zoom.js') }}"></script>
   <script src="{{ static_url('/static/js/live_elapsed.js') }}"></script>
@@ -477,6 +483,9 @@
      v=7: added the optional opts.checkboxLabel opt-out checkbox (fallback chain's per-row Remove
      on Settings) -- see the dialog markup's own comment in base.html. #}
   <script src="{{ static_url('/static/js/confirm_dialog.js') }}"></script>
+  {# Reusable export flow for every Export button (warn + choose path, default Downloads on every OS)
+     -- after confirm_dialog.js since the macOS/Linux fallback path uses window.asraConfirm. #}
+  <script src="{{ static_url('/static/js/export_download.js') }}"></script>
   {# v2: the tooltip now re-parents into the currently open subagent Edit dialog (and switches to
      position:absolute while doing so) instead of always living fixed-positioned in <body> -- a
      real, confirmed bug where it rendered invisibly behind the dialog's own content. Same
@@ -565,7 +574,7 @@
   <script src="{{ static_url('/static/js/tool_api_key_field.js') }}"></script>
   {% block head %}{% endblock %}
 </head>
-<body class="font-mono bg-base text-primary min-h-screen">
+<body class="font-mono bg-base text-primary min-h-screen"{% if ui_descriptions_hidden() %} data-hide-descriptions="true"{% endif %}>
   {# Top loading bar (4.x): a thin accent strip pinned to the very top edge, driven by
      static/js/progress_bar.js. It fills while the initial document is still loading (removed on
      window 'load') and again during any htmx request (hx-boosted nav, SSE-triggered swaps, form
@@ -642,6 +651,15 @@
            class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/dashboard') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
           {{ nav_icon("dashboard") }}
           Dashboard
+        </a>
+
+        {# Operator Profile -- the main agent's standing, cross-project style/priorities. A top-level
+           nav item (real, explicit operator ask to lift it out of Settings and sit it right under
+           Dashboard), its own page (/operator-profile), not a Settings tab. #}
+        <a href="/operator-profile"
+           class="flex items-center gap-2.5 border-l-2 px-2 h-8 rounded text-[13px] transition-colors {{ 'border-accent bg-accent/10 text-accent font-medium' if request.url.path.startswith('/operator-profile') else 'border-transparent text-secondary hover:bg-elevated hover:text-primary' }}">
+          {{ nav_icon("operator") }}
+          Operator Profile
         </a>
 
         {# New project + Projects grouped as one visual unit -- a VSCode Explorer-style parent/child
@@ -789,6 +807,10 @@
         {{ nav_icon("settings") }}
         Settings
       </a>
+
+      {# Hairline between Settings and the "My IP" readout -- they are different kinds of row (a nav
+         link vs. a status readout), and without a line the IP text read as part of the Settings item. #}
+      <div class="mx-3 mt-2 border-t border-default" aria-hidden="true"></div>
 
       {# "My IP" block (real operator request: a bug bounty program may ask for the tester's own IP,
          and googling a 2ip-style site / typing terminal commands is slow and leaks it to a third
@@ -1201,13 +1223,21 @@
             <input type="checkbox" id="asra-confirm-checkbox" class="rounded border-default">
             <span id="asra-confirm-checkbox-label"></span>
           </label>
+          {# Optional typed-word gate (asraConfirm's opts.requireText) -- no flex/block class on this
+             row on purpose, so the plain `hidden` attribute actually hides it (see themes.css's
+             note on Tailwind utilities beating the user-agent [hidden] rule). #}
+          <div id="asra-confirm-text-row" hidden class="mt-3">
+            <label for="asra-confirm-text" id="asra-confirm-text-prompt" class="block mb-1 text-[12px] text-secondary"></label>
+            <input type="text" id="asra-confirm-text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                   class="w-full h-9 px-2 rounded bg-elevated border border-default text-sm font-mono text-primary focus:outline-none focus:border-accent">
+          </div>
         </div>
       </div>
       <div class="flex items-center justify-end gap-2 mt-4">
         <button type="button" id="asra-confirm-cancel"
                 class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-9 px-3 text-sm">Cancel</button>
         <button type="button" id="asra-confirm-ok"
-                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 h-9 px-3 text-sm">Confirm</button>
+                class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 h-9 px-3 text-sm disabled:opacity-40 disabled:cursor-not-allowed">Confirm</button>
       </div>
     </div>
   </dialog>

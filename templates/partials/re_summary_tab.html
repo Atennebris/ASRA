@@ -41,7 +41,7 @@
           </div>
         </div>
         <div class="flex-1 w-full space-y-1 text-[11px] text-secondary">
-          <p>Weighs failed/retried/duplicate tool calls and forced-stop stalls against the total —
+          <p class="ui-desc">Weighs failed/retried/duplicate tool calls and forced-stop stalls against the total —
             never how many findings turned up.</p>
           <p class="tabular-nums">Failed/error: {{ (eff.failure_rate * 100) | round(1) }}% &middot;
             Needed a retry: {{ (eff.retry_rate * 100) | round(1) }}% &middot;
@@ -108,7 +108,7 @@
           </tbody>
         </table>
       </div>
-      <p class="text-[11px] text-secondary mt-2">Cleanliness is this project's own process-efficiency
+      <p class="text-[11px] text-secondary mt-2 ui-desc">Cleanliness is this project's own process-efficiency
         score averaged across every session that provider handled; Findings/100 calls is a separate
         yield metric, not folded into it.</p>
     </div>
@@ -186,7 +186,7 @@
         </div>
       </div>
     {% else %}
-      <p class="text-[11px] text-secondary/70">Nothing recorded yet — this fills in as the pass confirms real issues.</p>
+      <p class="text-[11px] text-secondary/70 ui-desc">Nothing recorded yet — this fills in as the pass confirms real issues.</p>
     {% endif %}
   </div>
 
@@ -221,7 +221,9 @@
   {% if session.status == "completed" and session.findings %}
     <div class="bg-surface border border-default rounded-lg p-3">
       <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Export</span>
-      <form method="get" action="/api/session/{{ session.session_id }}/export" class="mt-2 flex items-center gap-2 flex-wrap">
+      <form method="get" action="/api/session/{{ session.session_id }}/export"
+            data-export data-export-filename-base="asra_report_{{ session.session_id }}" data-export-ext-from="format"
+            class="mt-2 flex items-center gap-2 flex-wrap">
         <label class="text-[11px] text-secondary" for="re-export-format-{{ session.session_id }}">Format</label>
         <select id="re-export-format-{{ session.session_id }}"
                 onchange="document.getElementById('re-export-word-variant-{{ session.session_id }}').hidden = (this.value !== 'word'); document.getElementById('re-export-format-value-{{ session.session_id }}').value = (this.value === 'word' ? document.getElementById('re-export-word-variant-{{ session.session_id }}').value : this.value);"

@@ -146,3 +146,36 @@ def test_run_registered_custom_tool_surfaces_stderr_on_a_nonzero_exit(monkeypatc
 
     assert result["status"] == "error"
     assert result["error"] == "permission denied"
+
+
+# --- build_dynamic_toolspecs consumer scoping -----------------------------------------------------
+
+
+def test_build_dynamic_toolspecs_filters_by_consumer_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(cts, "CUSTOM_TOOLS_STORE_PATH", tmp_path / "custom_tools.json")
+    cts.add_custom_tool(name="only_chat", path="/a/only_chat", description="", requires_target=False, category="recon", scopes=["chat"])
+    cts.add_custom_tool(name="only_sub", path="/a/only_sub", description="", requires_target=False, category="recon", scopes=["subagent"])
+    # No scopes given -> every consumer (the chosen default).
+    cts.add_custom_tool(name="everywhere", path="/a/everywhere", description="", requires_target=False, category="recon")
+
+    chat_names = {s.name for s in ctr.build_dynamic_toolspecs(consumer="chat")}
+    sub_names = {s.name for s in ctr.build_dynamic_toolspecs(consumer="subagent")}
+    all_names = {s.name for s in ctr.build_dynamic_toolspecs()}
+
+    assert chat_names == {"only_chat", "everywhere"}
+    assert sub_names == {"only_sub", "everywhere"}
+    assert all_names == {"only_chat", "only_sub", "everywhere"}
+
+
+def test_build_dynamic_toolspecs_legacy_record_without_scopes_is_available_everywhere(tmp_path, monkeypatch):
+    monkeypatch.setattr(cts, "CUSTOM_TOOLS_STORE_PATH", tmp_path / "custom_tools.json")
+    # Simulate a pre-scopes record written straight to disk with no "scopes" key at all.
+    import json
+    (tmp_path / "custom_tools.json").write_text(json.dumps([
+        {"id": "legacy1", "name": "legacytool", "path": "/a/legacytool", "enabled": True,
+         "description": "", "requires_target": False, "category": "recon", "added_at": 0.0},
+    ]), encoding="utf-8")
+
+    for consumer in cts.CUSTOM_TOOL_SCOPES:
+        names = {s.name for s in ctr.build_dynamic_toolspecs(consumer=consumer)}
+        assert "legacytool" in names, f"legacy record should be available to {consumer}"

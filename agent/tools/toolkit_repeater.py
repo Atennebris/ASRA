@@ -21,6 +21,7 @@ import httpx
 
 from agent.tools import toolkit_store
 from agent.tools.toolkit_store import TrafficSource
+from agent.utils.debug import session_log_scope
 from agent.utils.errors import describe_exception
 from agent.utils.logger import get_logger
 
@@ -72,7 +73,8 @@ async def send_raw_request(
         # confirmed here) has an empty str(), which used to log/return "" and leave a model's
         # 1-Step Retry with nothing to react to, only able to resend the identical failing call.
         described = describe_exception(exc)
-        logger.debug("toolkit_repeater: send failed session=%s method=%s url=%s (%s)", session_id, method, url, described)
+        with session_log_scope(session_id):
+            logger.debug("toolkit_repeater: send failed session=%s method=%s url=%s (%s)", session_id, method, url, described)
         return {"status": "error", "error": described}
     duration_ms = round((time.monotonic() - started_at) * 1000)
 
@@ -100,8 +102,9 @@ async def send_raw_request(
         intruder_payload_values=intruder_payload_values,
     )
     toolkit_store.append_traffic_entry(entry)
-    logger.debug(
-        "toolkit_repeater: session=%s method=%s url=%s status=%s duration_ms=%s source=%s",
-        session_id, method, url, response.status_code, duration_ms, source,
-    )
+    with session_log_scope(session_id):
+        logger.debug(
+            "toolkit_repeater: session=%s method=%s url=%s status=%s duration_ms=%s source=%s",
+            session_id, method, url, response.status_code, duration_ms, source,
+        )
     return {"status": "ok", "entry": entry}

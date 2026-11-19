@@ -48,7 +48,11 @@ _SESSION_FILENAME = "session.json"
 
 
 def _sanitize_folder_name(target: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", target).strip("-")
+    # Strip leading/trailing dots and spaces too, not just dashes: a name that already arrived
+    # ellipsized (e.g. a left-truncated display string "...r") would otherwise become a real folder
+    # literally named "...r", and an all-dots name could collapse to "."/".." -- both are confusing
+    # on disk and in Explorer. Interior dots (my.tool.v2) are still fine and preserved.
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", target).strip("-. ")
     return name[:60] or "target"
 
 
@@ -292,6 +296,19 @@ def _create_project_folder(session_id: str, name: str) -> Path | None:
     _save_index(index)
     logger.debug("_create_project_folder: session=%s folder=%s", session_id, project_dir)
     return project_dir
+
+
+def adopt_project_folder(session_id: str, project_dir: Path) -> None:
+    """Registers an already-populated project folder (sessions/transfer.py's import) so every normal
+    lookup finds it: index entry first, then a load+save round trip so the summary cache and the
+    listing cache pick it up exactly as they would for a freshly created session."""
+    index = _load_index()
+    index[session_id] = str(project_dir)
+    _save_index(index)
+    data = load_session(session_id)
+    if data is not None:
+        save_session(session_id, data)
+    logger.debug("adopt_project_folder: session=%s folder=%s loaded=%s", session_id, project_dir, data is not None)
 
 
 def name_exists(name: str) -> bool:
@@ -1165,6 +1182,17 @@ def save_session(session_id: str, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _preserve_newer_chat_threads(path, data)
     _preserve_appended_hypotheses(path, data)
+
+    # llm_retry_notice is a processing-only transient: agent/core.py's retry-progress sink writes it
+    # (via reload_merge_save) only to show "Reconnecting to provider... retry N" while an ACTIVE run
+    # waits out a provider backoff, and the only two places that render it (re_control_bar.html,
+    # session_fragment.html) both gate on status in (pending, processing). The sink relies on a later
+    # ordinary save overwriting it once the call succeeds -- but if the run ends (or the retry
+    # happened under a chat turn whose session status is already interrupted) no such save follows,
+    # and the stale notice sits in session.json forever. Dropping it on any non-active save clears
+    # that remnant in the one place every writer funnels through, matching exactly when it can show.
+    if data.get("status") not in ("pending", "processing"):
+        data.pop("llm_retry_notice", None)
 
     # Split chat_threads out to their own per-thread files (see this section's own module-level
     # docstring above) -- data["chat_threads"] itself is first re-hydrated so the CALLER's own dict

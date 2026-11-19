@@ -15,6 +15,16 @@ from typing import Any
 
 from agent.core import is_ungrounded_cve_lookup
 from agent.utils.logger import get_logger
+from agent.verification_status import EXPLOIT_STATUS_LABELS, derive_exploit_status
+
+
+def _non_exploited_status_label(finding: dict) -> str:
+    """The exploit-status word for a non-exploited finding's one-line report row, from the same
+    derived state the live UI uses (agent/verification_status.py) -- so a downloaded report says
+    "Not attempted" for a skip and "Not exploited" for a real-but-unproven attempt, matching the
+    card the operator saw, instead of the old flat (and overclaiming) "Not exploitable" everywhere.
+    """
+    return EXPLOIT_STATUS_LABELS[derive_exploit_status(finding)]
 
 logger = get_logger("API")
 
@@ -190,7 +200,7 @@ def render_txt(data: dict) -> str:
         if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
             lines.append(f"    EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".rstrip())
         elif not f.get("exploited") and f.get("advisory_note"):
-            lines.append(f"    Not exploitable: {f['advisory_note']}")
+            lines.append(f"    {_non_exploited_status_label(f)}: {f['advisory_note']}")
         if f.get("false_positive_reason"):
             lines.append(f"    Likely false positive: {f['false_positive_reason']}")
         elif is_ungrounded_cve_lookup(f):
@@ -288,7 +298,7 @@ def render_md(data: dict) -> str:
                 lines.append(f"> `{f['extracted_artifact']}`")
             lines.append("")
         elif not f.get("exploited") and f.get("advisory_note"):
-            lines.append(f"> **Not exploitable:** {f['advisory_note']}")
+            lines.append(f"> **{_non_exploited_status_label(f)}:** {f['advisory_note']}")
             lines.append("")
         if f.get("false_positive_reason"):
             lines.append(f"> ⊘ **Likely false positive:** {f['false_positive_reason']}")
@@ -433,7 +443,7 @@ def render_pdf(data: dict) -> bytes:
         if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
             line(5, f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
         elif not f.get("exploited") and f.get("advisory_note"):
-            line(5, f"Not exploitable: {f['advisory_note']}")
+            line(5, f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
         if f.get("false_positive_reason"):
             line(5, f"Likely false positive: {f['false_positive_reason']}")
         elif is_ungrounded_cve_lookup(f):
@@ -565,7 +575,7 @@ def render_doc(data: dict) -> bytes:
         if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
             para(f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
         elif not f.get("exploited") and f.get("advisory_note"):
-            para(f"Not exploitable: {f['advisory_note']}")
+            para(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
         if f.get("false_positive_reason"):
             para(f"Likely false positive: {f['false_positive_reason']}")
         elif is_ungrounded_cve_lookup(f):
@@ -658,7 +668,7 @@ def render_docx(data: dict) -> bytes:
             p = doc.add_paragraph()
             p.add_run(f"Exploited — access confirmed. {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip()).bold = True
         elif not f.get("exploited") and f.get("advisory_note"):
-            doc.add_paragraph(f"Not exploitable: {f['advisory_note']}")
+            doc.add_paragraph(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
         if f.get("false_positive_reason"):
             doc.add_paragraph(f"Likely false positive: {f['false_positive_reason']}")
         elif is_ungrounded_cve_lookup(f):

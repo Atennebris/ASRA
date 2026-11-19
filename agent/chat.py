@@ -45,6 +45,7 @@ module already used for provider/model/pending before threads existed.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import itertools
 import json
 import os
@@ -64,6 +65,8 @@ from agent.core import (
     _embed_playbook_query,
     _playbook_fingerprint_key,
     _goal_task_addendum,
+    _operator_profile_task_addendum,
+    _PROGRESS_RECORDING_TOOLS,
     _playbook_task_addendum,
     _re_experience_level_addendum,
     _run_tool_with_retry,
@@ -79,8 +82,27 @@ from agent.core import (
 from agent.llm_client import LLMCallAborted, LLMProvider, ToolCallRequest, describe_response_origin, get_provider, stamp_response_origin
 from agent.opencode_cli import OpencodeCliUnavailable
 from agent.prompts import CHAT_COMPACTION_PROMPT, CHAT_PROMPT, INTERACTIVE_CHAT_PROMPT, PLAYBOOK_STRATEGY_PROMPT, RE_CHAT_PROMPT, STANDALONE_CHAT_PROMPT
+
+# Two symbols are owned by sibling modules edited concurrently with this one: agent.core's
+# auto_record_target_profile_from_tool (deterministic target_profile auto-record) and agent.prompts'
+# build_re_chat_prompt (target-shape-aware RE chat system prompt). Import them directly -- but tolerate
+# a landing order where this module is loaded before the sibling edit has landed, so a merge in the
+# wrong order can never hard-crash the ENTIRE chat feature on an ImportError. The fallbacks are
+# behavior-preserving no-ops (auto-record simply records nothing; the RE prompt falls back to the
+# existing static RE_CHAT_PROMPT) and are transparently superseded the instant the real symbol exists.
+try:
+    from agent.core import auto_record_target_profile_from_tool
+except ImportError:  # sibling edit not landed yet
+    def auto_record_target_profile_from_tool(session, tool_name, result):  # type: ignore[misc]
+        return None
+try:
+    from agent.prompts import build_re_chat_prompt
+except ImportError:  # sibling edit not landed yet
+    def build_re_chat_prompt(target_shape=None):  # type: ignore[misc]
+        return RE_CHAT_PROMPT
 from agent.tools import chat_settings_store, playbook_store
 from agent.tools.allowed_targets import authorize_all_targets_for_context, deauthorize_all_targets_for_context
+from agent.tools.builders.re_target import RE_TARGET_TOOLSETS, describe_directory_target
 from agent.tools.registry import ToolSpec, get_tool, get_tools_by_category
 from agent.tools.subagent_store import get_enabled_profiles
 from agent.tools.toolkit_settings_store import load_toolkit_agent_settings
@@ -106,6 +128,54 @@ _RECENT_LOG_ENTRIES_IN_SNAPSHOT = 5
 # going. Env-configurable (same shape as SUBAGENT_MAX_CONCURRENT_TASKS/WEB_FETCH_MAX_TEXT_CHARS) for
 # anyone who wants a hard ceiling back.
 _CHAT_MAX_TOOL_ITERATIONS = int(os.getenv("CHAT_MAX_TOOL_ITERATIONS", "0"))  # 0/unset = unlimited
+# Decoder-loop guard thresholds -- real, confirmed incident this fixes: a chat turn spent ~70
+# minutes rewriting near-identical custom_re_script decoder variations, zero new findings/profile
+# facts recorded the whole time, with no mechanism anywhere in chat able to notice or stop it
+# (agent/core.py's own _run_llm_tool_loop_impl has this exact protection already --
+# progress_stall_threshold -- but this loop is a deliberately separate implementation that never
+# got it ported over; see _run_chat_tool_loop's own docstring for why). _NUDGE fires first (a
+# hint injected into the failing tool's own result, same _dead_end_hint pattern agent/core.py
+# already uses); _HARD_STOP, left at 2x the nudge default, actually ends the turn early with a
+# forced summary instead of continuing to spend tool calls on more of the same.
+_DEFAULT_CHAT_DECODER_LOOP_NUDGE_THRESHOLD = 6
+_DEFAULT_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD = 12
+_CHAT_DECODER_LOOP_NUDGE_THRESHOLD = int(os.getenv("CHAT_DECODER_LOOP_NUDGE_THRESHOLD", str(_DEFAULT_CHAT_DECODER_LOOP_NUDGE_THRESHOLD)))
+_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD = int(os.getenv("CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD", str(_DEFAULT_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD)))
+# How similar (stdlib difflib.SequenceMatcher ratio, 0-1) two consecutive calls to the SAME
+# result-progress tool have to be -- comparing their OUTPUT, not their input -- to count as "another
+# near-identical attempt that produced nothing new". custom_re_script/custom_exploit_run rewrite a
+# few lines each call and a radare2/gdb pass re-runs on the same binary, so the honest signal for "a
+# dead loop" is the RESULT barely changing call after call, not the source text matching exactly
+# (already the generic stall signal above).
+_CHAT_NEAR_DUPLICATE_SIMILARITY_THRESHOLD = float(os.getenv("CHAT_NEAR_DUPLICATE_SIMILARITY_THRESHOLD", "0.75"))
+# How many times ONE operator message may trigger an automatic extra turn because the model stated
+# it was about to act itself ("I'll run X", "сейчас запущу") yet ended the turn without the matching
+# tool call -- the "promises then cuts off" failure. Bounded so a model that keeps re-promising
+# without ever acting can't spin forever; the existing per-turn iteration/decoder-loop caps still
+# apply on top. Env-overridable (same shape as the decoder-loop knobs above) for anyone who wants it
+# off (0) or looser.
+_DEFAULT_CHAT_MAX_AUTO_CONTINUE = 2
+_CHAT_MAX_AUTO_CONTINUE = int(os.getenv("CHAT_MAX_AUTO_CONTINUE", str(_DEFAULT_CHAT_MAX_AUTO_CONTINUE)))
+# The two chat modes that end a turn by handing the operator a clickable next-step menu
+# (suggest_next_steps -> "suggested_actions") and whose "promises then cuts off" follow-through is
+# worth auto-continuing. Agent/standalone modes don't offer that menu and aren't covered.
+_SUGGESTION_MODES = ("interactive", "reverse_engineering")
+# The only tools whose arguments are free-form code rather than structured parameters.
+_FREE_FORM_CODE_TOOL_NAMES = frozenset({"custom_re_script", "custom_exploit_run"})
+# Tools the decoder-loop guard judges by whether their RESULT materially changed from the same
+# tool's previous call, instead of blindly counting every call as "no progress". Real, confirmed
+# incident this fixes (win-framework solve): the guard used to treat ANY non-record_* call as lack
+# of progress, so a turn making genuine incremental parser progress across varied custom_re_script/
+# radare2 calls looked identical to a true 70-minute dead loop and got force-stopped mid-solve. A
+# call whose output genuinely changed is real work ("iterating toward a result"); only a call whose
+# output barely moved is the "rewriting the same dead variation" shape the hard stop exists for. The
+# free-form code runs plus the heavy analysis tools an RE solve actually iterates on (radare2/gdb)
+# are exactly the tools that legitimately make many productive, output-changing calls in a row.
+_RESULT_PROGRESS_TOOL_NAMES = _FREE_FORM_CODE_TOOL_NAMES | frozenset({"radare2", "gdb"})
+# Only these result fields carry the tool's actual output -- everything else on a result dict
+# (echoed-back arguments, which provider answered, timing) changes every call regardless of real
+# progress and would make every call look "new" if folded into the comparison below.
+_RESULT_PROGRESS_SIGNATURE_KEYS = ("stdout", "stderr", "exit_code", "output", "result", "summary")
 # Handled directly inside _run_chat_tool_loop (queue a directive) rather than dispatched through
 # _run_tool_with_retry -- they're not real registered ToolSpecs, just chat's own bookkeeping.
 _CHAT_BOOKKEEPING_TOOL_NAMES = {"skip_finding", "add_guidance", "correct_finding"}
@@ -143,11 +213,39 @@ def request_chat_stop(session_id: str, thread_id: str) -> None:
     get_chat_stop_event(session_id, thread_id).set()
 
 
+# Live, partial assistant text for a turn still being generated, so the reply types out token-by-
+# token like a real chat app instead of landing all at once when the whole turn finishes. Kept
+# purely IN MEMORY (never written to session.json): the LLM stream fills it (set_chat_stream_draft)
+# as deltas arrive, main.py's chat_stream SSE route overlays it onto the active thread's render while
+# the thread is pending, and it is cleared the instant the real, persisted text segment is appended.
+# This is why no per-token disk write is needed at all -- the draft lives next to the stop events
+# above, read by the same single process that serves the SSE (one local operator, one uvicorn worker).
+_chat_stream_drafts: dict[tuple[str, str], str] = {}
+
+
+def set_chat_stream_draft(session_id: str, thread_id: str, text: str) -> None:
+    _chat_stream_drafts[(session_id, thread_id)] = text
+
+
+def get_chat_stream_draft(session_id: str, thread_id: str) -> str:
+    """The live partial reply for this thread, or "" when nothing is streaming -- what main.py's
+    chat_stream render overlays as a typing bubble."""
+    return _chat_stream_drafts.get((session_id, thread_id), "")
+
+
+def clear_chat_stream_draft(session_id: str, thread_id: str) -> None:
+    _chat_stream_drafts.pop((session_id, thread_id), None)
+
+
 # The three tool names _CHAT_TOOLS_SCHEMA below already provides for every mode -- used to
 # exclude agent/core.py's own category="re" ToolSpec registrations of the identical names
 # (registered there for run_re_triage/run_re_reverify's benefit, not for chat) from ever also
 # landing in an RE-mode chat turn's own tools_schema. See _chat_tool_specs's own comment.
-_PLAYBOOK_TOOL_NAMES = frozenset({"query_playbook", "playbook_strategy", "record_technique"})
+# run_skill/update_skill are registered under category="re" (agent/core.py) too, but chat offers
+# them via _INTERACTIVE_CHAT_TOOLS_SCHEMA (interactive AND reverse) with its own explicit dispatch
+# handlers that pass ctx.session_id -- so they are excluded from the reverse-mode category="re"
+# sweep here to avoid two same-named definitions in one turn's schema, exactly like the trio above.
+_PLAYBOOK_TOOL_NAMES = frozenset({"query_playbook", "playbook_strategy", "record_technique", "run_skill", "update_skill"})
 
 _CHAT_TOOLS_SCHEMA = [
     {
@@ -232,7 +330,18 @@ _CHAT_TOOLS_SCHEMA = [
                     "tech_keywords": {"type": "array", "items": {"type": "string"}, "description": "The tech stack it applies to, e.g. [\"nginx\",\"php\",\"wordpress\"] -- used to key + retrieve it. Include at least one."},
                     "waf_vendors": {"type": "array", "items": {"type": "string"}, "description": "WAF/CDN vendors it applies to, e.g. [\"cloudflare\"] -- optional"},
                     "vuln_class": {"type": "string", "description": "Vulnerability class, e.g. sqli / xss / ssrf / rce / auth_bypass -- optional"},
+                    "target_shape": {"type": "string", "description": "The target shape this applies to, e.g. web / pe_x86_64 / elf / jvm_bytecode / apk -- lets it be retrieved cross-mode even without tech-keyword overlap. Optional."},
                     "worked": {"type": "boolean", "description": "true = it worked (a lead for next time); false = a confirmed dead-end (skip it next time). Defaults to true."},
+                    "skill": {
+                        "type": "object",
+                        "description": "OPTIONAL reusable, executable form of this technique so a future session runs it in one call via run_skill. Fill it only from a command/script YOU actually constructed and ran here -- never raw bytes pasted from the target's own response.",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["command", "script", "instructions"], "description": "command = one registry-tool invocation; script = a full script run sandboxed; instructions = ordered steps (not executed)"},
+                            "body": {"type": "string", "description": "The command template (with {{param}} slots), script source, or step list"},
+                            "interpreter": {"type": "string", "enum": ["sh", "python", "pwntools", "none"], "description": "For script kind: how to run body. 'none' for command/instructions."},
+                            "params": {"type": "array", "items": {"type": "object"}, "description": "Optional [{name, desc, required}] for the {{slots}} in body"},
+                        },
+                    },
                 },
                 "required": ["technique"],
             },
@@ -356,6 +465,47 @@ _INTERACTIVE_CHAT_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_skill",
+            "description": (
+                "Execute a reusable skill already stored on a playbook technique (by that technique's "
+                "id, as surfaced by query_playbook/playbook_strategy) -- reuse a proven win in one call "
+                "instead of re-deriving it. A script runs sandboxed; a command invokes a known tool; "
+                "'instructions' are returned as steps for you to follow. Put any {{param}} values in `params`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "technique_id": {"type": "string", "description": "The id of the playbook technique whose attached skill to run"},
+                    "params": {"type": "object", "description": "Values for the skill's {{param}} slots, e.g. {\"target\": \"./crackme\"}"},
+                    "chain": {"type": "boolean", "description": "If true, replay the whole proven multi-step recipe (every skill along this technique's kill-chain, in order, stopping at the first failure) instead of just this one skill. Defaults to false."},
+                },
+                "required": ["technique_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_skill",
+            "description": (
+                "Refine a technique's stored skill after reuse shows a cleaner/more general form -- the "
+                "self-improving loop. Pass a new body and/or params. Changing the body re-pins its "
+                "safety hash and resets any operator-trusted mark."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "technique_id": {"type": "string", "description": "The id of the playbook technique whose skill to update"},
+                    "body": {"type": "string", "description": "New body (command template / script source / steps). Optional."},
+                    "params": {"type": "array", "items": {"type": "object"}, "description": "New [{name, desc, required}] param specs. Optional."},
+                },
+                "required": ["technique_id"],
+            },
+        },
+    },
 ]
 
 
@@ -389,6 +539,12 @@ def _session_snapshot(session: dict) -> str:
     hypotheses = session.get("hypotheses", [])
     recon_targets = session.get("recon_result", {}).get("targets", [])
     recent_logs = session.get("logs", [])[-_RECENT_LOG_ENTRIES_IN_SNAPSHOT:]
+    # When the target is a DIRECTORY, give the chat the same listing the triage task already gets --
+    # every file inside with its identified type, plus the one most worth analyzing. Without this the
+    # chat only saw the bare folder path and would ask the operator "which file?" instead of looking
+    # (the real "it doesn't see the crackme.jar in the folder" complaint). None for a single-file or
+    # multi-target string, so the two keys simply don't appear and cost nothing.
+    dir_desc = describe_directory_target(session.get("target") or "")
     snapshot = {
         "target": session.get("target"),
         "status": session.get("status"),
@@ -397,6 +553,24 @@ def _session_snapshot(session: dict) -> str:
         # Included unconditionally (empty list costs nothing) rather than gated on session mode, so
         # this needs no special-casing here if a future mode ever starts using the same tool.
         "target_profile": session.get("target_profile", []),
+        # The same deterministic shape -> toolset mapping agent/core.py's own
+        # _target_shape_task_addendum injects into the triage pass's task text
+        # (detect_target_shape, agent/tools/builders/re_target.py) -- included here too so a
+        # follow-up chat turn gets the same "what is this and where do I start" head start, not
+        # just the initial triage pass. {} for a session with no detected shape (e.g. an Agent-
+        # mode session, or an RE target detection didn't confidently classify) costs nothing.
+        "target_shape": session.get("target_shape"),
+        "recommended_tools": RE_TARGET_TOOLSETS.get(session.get("target_shape"), {}),
+        # Present only for a directory target (see dir_desc above).
+        **(
+            {
+                "directory_contents": [
+                    {"name": e["name"], "type": e["type"]} for e in dir_desc["entries"][:60]
+                ],
+                "primary_artifact": dir_desc["primary_artifact"],
+            }
+            if dir_desc else {}
+        ),
         "recon_targets": [
             {"id": f"R{i}", "host": t.get("host"), "port": t.get("port"), "service": t.get("service"), "version": t.get("version")}
             for i, t in enumerate(recon_targets, start=1)
@@ -740,7 +914,7 @@ def _apply_chat_finding_correction(session_id: str, arguments: dict) -> str:
     return f'Updated "{finding.get("title")}": ' + ", ".join(changes) + "."
 
 
-def _apply_chat_record_technique(session_id: str, arguments: dict, llm=None) -> tuple[str, dict | None]:
+def _apply_chat_record_technique(session_id: str, arguments: dict, llm=None, mode: str | None = None) -> tuple[str, dict | None]:
     """Writes a chat-discovered technique (or dead-end) into the cross-session playbook -- the write
     path the autonomous agent has always had (agent/core.py's _maybe_capture_playbook_entry) but the
     chat never did, so an interactive-mode session's own confirmed knowledge now accumulates too.
@@ -764,6 +938,8 @@ def _apply_chat_record_technique(session_id: str, arguments: dict, llm=None) -> 
 
     worked = arguments.get("worked", True)
     outcome = "worked" if worked else "failed"
+    target_shape = (arguments.get("target_shape") or "").strip().lower() or None
+    capture_mode = (mode or "").strip().lower() or None
     key = _playbook_fingerprint_key(tech_keywords, waf_vendors)
     now = datetime.now(timezone.utc).isoformat()
     entry = {
@@ -775,6 +951,10 @@ def _apply_chat_record_technique(session_id: str, arguments: dict, llm=None) -> 
         "evidence_ref": "",
         "tech_keywords": sorted(tech_keywords),
         "waf_vendors": sorted(waf_vendors),
+        # Cross-mode matching dimensions, same as the autonomous RE path -- lets a chat capture be
+        # retrieved by target shape even when its tech tokens don't overlap a later target's.
+        "target_shape": target_shape,
+        "mode": capture_mode,
         "outcome": outcome,
         "times_confirmed": 1,
         # Attribution counters -- see agent/core.py's _maybe_capture_playbook_entry for what drives
@@ -797,13 +977,27 @@ def _apply_chat_record_technique(session_id: str, arguments: dict, llm=None) -> 
     recorded_id = playbook_store.record_technique(key, entry)
     if llm is not None and recorded_id:
         _embed_playbook_entries(llm, [{**entry, "id": recorded_id}])
+    skill_note = ""
+    skill_param = arguments.get("skill")
+    if isinstance(skill_param, dict) and recorded_id:
+        # derived_from='agent_run': the body is something this session itself constructed, not raw
+        # bytes pasted from the target's output -- the anti-poisoning rule run_skill's gate enforces.
+        skill = playbook_store.build_skill(
+            kind=str(skill_param.get("kind") or ""), body=str(skill_param.get("body") or ""),
+            params=skill_param.get("params"), interpreter=str(skill_param.get("interpreter") or "none"),
+            session_id=session_id, target_shape=target_shape, mode=capture_mode, derived_from="agent_run",
+        )
+        if skill is not None:
+            playbook_store.attach_skill(recorded_id, skill)
+            skill_note = f" A reusable {skill['kind']} skill was attached (run it later with run_skill)."
+            logger.debug("chat: session=%s attached %s skill to technique id=%s", session_id, skill["kind"], recorded_id)
     total = playbook_store.count_techniques()
     logger.debug("chat: session=%s recorded playbook technique outcome=%s key=%r total=%d", session_id, outcome, key, total)
 
     verb = "technique" if worked else "dead-end"
     confirmation = (
         f'Saved a {"working technique" if worked else "dead-end"} to the playbook — it\'ll surface as '
-        f'a lead on similarly fingerprinted stacks in future sessions. {total} technique(s) stored now.'
+        f'a lead on similarly fingerprinted stacks in future sessions. {total} technique(s) stored now.{skill_note}'
     )
     reward = {
         "kind": "technique", "label": f"New {verb} captured", "delta": 1,
@@ -867,6 +1061,198 @@ def _sanitize_suggested_steps(arguments: dict) -> list[str]:
     raw = arguments.get("steps") or []
     steps = [str(s).strip() for s in raw if str(s).strip()]
     return steps[:_MAX_SUGGESTED_STEPS]
+
+
+# --- BUG1/BUG2 guards: always-show suggestion cards, and follow through on a stated-but-undone action ---
+#
+# Two recurring operator complaints these address, both in interactive/RE chat:
+#   BUG1 -- the model writes its next steps as a prose numbered/bulleted list instead of calling
+#           suggest_next_steps, so no clickable cards ever render.
+#   BUG2 -- the model says it is ABOUT to do something itself ("I'll run X", "сейчас запущу Y") and
+#           then ends the turn with no matching tool call, leaving the operator hanging.
+# agent/prompts.py (owned by a sibling task) carries the matching prompt wording; this is the
+# deterministic code-side enforcement so the behavior holds even when a model ignores the prompt.
+
+# A trailing numbered ("1." / "1)") or bulleted ("-", "*", "•"...) list line. group(1) is its text.
+_LIST_ITEM_PATTERN = re.compile(r"^\s*(?:\d+[.)]|[-*•·▪►o])\s+(.*\S)\s*$")
+# A clear list of next steps needs at least this many items to be worth synthesizing into cards --
+# a lone "1." line is too thin to call a menu; those fall back to the one bounded forced model step.
+_MIN_SYNTHESIZED_SUGGESTIONS = 2
+# Only the tail of a final reply is inspected for a stated intent / a prose "next steps" offer: a
+# genuine closing commitment or handoff menu is the last thing written, not something recounted
+# mid-explanation (where "I'll run it" is usually describing what was already done).
+_SELF_INTENT_TAIL_CHARS = 600
+
+# First-person, imminent self-action: an English intent phrase followed, within the same sentence, by
+# an actual action verb (so "I'll be happy to help" / "I'll need your input" don't count), or a
+# Russian first-person-future action verb (which is itself the whole signal). Deliberately narrow --
+# a false positive here spends a wasted extra LLM turn, so the bar is "clearly committing to act now".
+_SELF_ACTION_VERBS_EN = (
+    r"(?:run|check|try|trying|extract|test|fetch|look|analy[sz]e|scan|execute|examine|inspect|pull|"
+    r"grab|decode|decrypt|dump|enumerate|probe|verify|start|use|call|query|search|review|read|open|"
+    r"download|parse|build|send|go ahead|investigate|continue|proceed|dig|take a look|kick off)"
+)
+_SELF_INTENT_EN = re.compile(
+    r"\b(?:i'?ll|i will|i'?m going to|i am going to|let me|i'?m about to|i'?ll now|i'?ll go ahead and|"
+    r"next,?\s+i'?ll|i'?m now going to)\b[^.?!\n]*\b" + _SELF_ACTION_VERBS_EN + r"\b",
+    re.IGNORECASE,
+)
+_SELF_INTENT_RU = re.compile(
+    r"\b(?:запущу|проверю|попробую|сделаю|извлеку|посмотрю|проанализирую|прогоню|протестирую|выполню|"
+    r"настрою|соберу|напишу|декодирую|расшифрую|распакую|дизассемблирую|продолжу|сдамплю|считаю|"
+    r"попытаюсь|изучу|разберу)\b"
+    r"|\bдалее\s+[^.?!\n]*\b(?:сделаю|проверю|запущу|попробую)\b"
+    r"|\bнужно\s+(?:сделать|запустить|проверить|извлечь|прогнать|декодировать|расшифровать)\b",
+    re.IGNORECASE,
+)
+# A promise phrased AS a question, or offered to the OPERATOR, is not the model committing to act --
+# it's asking/offering, which must never trigger an auto-continue.
+_SELF_INTENT_EXCLUDE = re.compile(
+    r"\b(?:let me know|should i|shall i|do you want|would you like|if you(?:'?d)?\s+(?:want|like|prefer)|"
+    r"you can|you could|you might|you may|дайте знать|дай знать|хотите|хочешь|вы можете|ты можешь|"
+    r"если хотите|если хочешь|могу ли|мне запустить)\b",
+    re.IGNORECASE,
+)
+# A prose "here are your next steps" handoff WITHOUT a clean list -- the fallback (b) signal for when
+# the model proposed moves in sentences rather than a parseable list.
+_PROSE_NEXT_STEPS_PATTERN = re.compile(
+    r"\b(?:next steps?|you (?:can|could|may|might)|i (?:suggest|recommend|propose)|we (?:could|can)|"
+    r"следующи(?:е|й)\s+шаг|дальше\s+можно|дальнейши|вы можете|можно (?:также|было бы|попробовать)|"
+    r"рекоменду|предлага|варианты|options? (?:are|include|to try))\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_list_item_markup(text: str) -> str:
+    """A list item's text minus Markdown bold/code fences, so a synthesized card reads as the
+    operator's own plain next message (suggest_next_steps' own phrasing guidance)."""
+    return text.replace("**", "").replace("`", "").strip()
+
+
+def _trailing_list_steps(text: str) -> list[str]:
+    """Pulls the LAST contiguous numbered/bulleted list out of a final reply -- the prose form of
+    "next steps" BUG1 turns into clickable cards. The last run (not the first) is taken so a list
+    buried earlier in a long explanation is ignored in favor of the real closing menu, and a short
+    closing remark after the list doesn't hide it."""
+    runs: list[list[str]] = []
+    current: list[str] = []
+    for line in (text or "").splitlines():
+        match = _LIST_ITEM_PATTERN.match(line)
+        if match:
+            current.append(_strip_list_item_markup(match.group(1)))
+        elif line.strip():
+            # A non-blank, non-list line closes any run in progress; a blank line is tolerated
+            # between items (the run stays open) so a double-spaced list still parses as one.
+            if current:
+                runs.append(current)
+                current = []
+    if current:
+        runs.append(current)
+    return [step for step in (runs[-1] if runs else []) if step]
+
+
+# A line that is nothing but a "next steps" handoff heading (optional leading Markdown ###/**, an
+# optional trailing colon). Only such a heading, directly followed by an enumerated run, justifies
+# removing that run as a duplicate of the cards -- a bare list with no heading may be real analysis.
+_NEXT_STEPS_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s*)?\*{0,3}\s*(?:"
+    r"next\s+steps?"
+    r"|next\s+technical\s+threads?"
+    r"|next\s+threads?"
+    r"|recommended\s+next\s+steps?"
+    r"|suggested\s+next\s+steps?"
+    r"|what(?:'|’)?s?\s+next"
+    r"|what\s+to\s+try\s+next"
+    r"|дальнейшие\s+шаги"   # дальнейшие шаги
+    r"|что\s+дальше"                                 # что дальше
+    r"|следующие\s+шаги"         # следующие шаги
+    r")\s*\*{0,3}\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_duplicated_next_steps(text: str) -> str:
+    """Remove a next-steps handoff block -- a recognized heading line immediately followed by an
+    enumerated run -- from reply text when the same menu is already shown as clickable cards, so the
+    operator never sees it both ways. Conservative on purpose: strips ONLY when a recognized heading
+    is present (a bare list with no heading is left untouched, it may be analysis), and never blanks
+    the whole reply (if stripping would leave only whitespace, the original text is returned as-is)."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    for start in range(len(lines)):
+        if not _NEXT_STEPS_HEADING.match(lines[start]):
+            continue
+        cursor = start + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1  # tolerate blank lines between the heading and its list
+        if cursor >= len(lines) or not _LIST_ITEM_PATTERN.match(lines[cursor]):
+            continue  # heading not actually followed by a list -- not a handoff block, leave it
+        last_item = cursor
+        probe = cursor
+        while probe < len(lines):
+            if _LIST_ITEM_PATTERN.match(lines[probe]):
+                last_item = probe
+                probe += 1
+            elif not lines[probe].strip():
+                probe += 1  # a blank line between items keeps the run open (as _trailing_list_steps does)
+            else:
+                break
+        remaining = "\n".join(lines[:start] + lines[last_item + 1:])
+        collapsed = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+        return collapsed if collapsed else text
+    return text
+
+
+def _sentence_around(text: str, index: int) -> str:
+    """The sentence (bounded by . ! ? or newline) that contains position `index` -- used to check
+    whether a matched self-intent phrase sits inside a question."""
+    start = max((text.rfind(ch, 0, index) for ch in ".!?\n"), default=-1)
+    ends = [pos for pos in (text.find(ch, index) for ch in ".!?\n") if pos != -1]
+    end = min(ends) if ends else len(text) - 1
+    return text[start + 1:end + 1]
+
+
+def _states_imminent_self_action(text: str) -> bool:
+    """BUG2 detector: True only when the reply's tail clearly states the AGENT will act now/next
+    (imperative self-intent), not when it asks the operator a question, offers options, or describes
+    what the operator could do. Conservative on purpose -- a false positive wastes an extra turn."""
+    tail = (text or "").strip()[-_SELF_INTENT_TAIL_CHARS:]
+    if not tail or _SELF_INTENT_EXCLUDE.search(tail):
+        return False
+    match = _SELF_INTENT_EN.search(tail) or _SELF_INTENT_RU.search(tail)
+    if match is None:
+        return False
+    # A commitment phrased as a question ("Shall I run X?" / "Запущу X?") is asking, not acting.
+    return not _sentence_around(tail, match.start()).rstrip().endswith("?")
+
+
+def _proposes_next_steps_in_prose(text: str) -> bool:
+    """BUG1 fallback signal: the reply's tail reads like a next-steps handoff even though no clean
+    list was found -- the only case that justifies spending one extra model step to get real cards
+    (a plain answer with no such handoff correctly produces no cards)."""
+    return bool(_PROSE_NEXT_STEPS_PATTERN.search((text or "").strip()[-_SELF_INTENT_TAIL_CHARS:]))
+
+
+def _emit_suggestions_from_response(session_id: str, thread_id: str, response, *, forced: bool) -> bool:
+    """Appends a "suggested_actions" segment from any suggest_next_steps call in `response`,
+    reusing _sanitize_suggested_steps for cleanup/caps. Returns whether anything was shown. Shared by
+    the normal forced-stop exit and BUG1's forced-suggestion fallback."""
+    if response is None or not getattr(response, "tool_calls", None):
+        return False
+    emitted = False
+    for call in response.tool_calls:
+        if call.name != "suggest_next_steps":
+            continue
+        steps = _sanitize_suggested_steps(call.arguments)
+        if steps:
+            _append_segment_and_save(session_id, thread_id, {"type": "suggested_actions", "actions": steps})
+            logger.debug(
+                "chat: session=%s thread=%s %s %d suggested next step(s)",
+                session_id, thread_id, "forced" if forced else "offered", len(steps),
+            )
+            emitted = True
+    return emitted
 
 
 def _retrieve_playbook_matches(arguments: dict, llm, limit: int) -> tuple[list[dict], str, str]:
@@ -1063,8 +1449,15 @@ def _chat_tool_specs(mode: str = "agent", allowed_subagent_ids: list[str] | None
             specs.append(job_check_spec)
         # Same "never found automatically" gap as every other get_tools_by_category("re") call
         # site (agent/core.py's _custom_tool_extras own docstring) -- an enabled "(custom)" RE tool
-        # reaches chat's own Reverse Engineering mode only through this explicit append too.
-        specs.extend(_custom_tool_extras("re"))
+        # reaches chat's own Reverse Engineering mode only through this explicit append too, now
+        # gated on the tool's own "reverse" availability scope (custom_tools_store.tool_scopes).
+        specs.extend(_custom_tool_extras("re", "reverse"))
+    else:
+        # Non-RE chat modes (interactive / standalone / agent) get every enabled custom tool the
+        # operator scoped to THIS consumer -- category=None, since chat has no phase-category
+        # assembly to filter against (the per-tool availability toggle is the gate here, not the
+        # tool's pipeline category). Nothing appears unless the operator turned this consumer on.
+        specs.extend(_custom_tool_extras(consumer=("interactive" if mode == "interactive" else "chat")))
     return specs
 
 
@@ -1233,6 +1626,30 @@ def _append_segment_and_save(session_id: str, thread_id: str, segment: dict) -> 
     save_session(session_id, session)
 
 
+def _dedup_persisted_next_steps(session_id: str, thread_id: str, text: str) -> str:
+    """After a turn has emitted suggestion cards, strip a now-duplicated next-steps prose block out of
+    the final visible text segment so the operator sees that handoff only as cards. Re-reads and
+    re-saves because the already-appended segment on disk is a copy, not the in-memory dict; returns
+    the stripped text so the turn's return value matches what was persisted."""
+    stripped = _strip_duplicated_next_steps(text)
+    if stripped == text:
+        return text
+    found = _reload_active_message(session_id, thread_id)
+    if found is not None:
+        session, thread, last_message = found
+        for seg in reversed(last_message["segments"]):
+            if seg.get("type") == "text" and not seg.get("error") and (seg.get("content") or "") == text:
+                seg["content"] = stripped
+                thread["updated_at"] = datetime.now(timezone.utc).isoformat()
+                save_session(session_id, session)
+                break
+    logger.debug(
+        "chat: session=%s thread=%s stripped duplicated next-steps prose from reply (cards already shown)",
+        session_id, thread_id,
+    )
+    return stripped
+
+
 def _tool_finish_fields(started_monotonic: float) -> dict:
     """finished_at + duration_ms for a tool_call segment's done-update: the real moment its result
     landed and how long the tool itself ran. The Logs view shows finished_at as the row's time (not
@@ -1269,7 +1686,7 @@ _abandoned_llm_calls: set[asyncio.Task] = set()
 _abandoned_tool_calls: set[asyncio.Task] = set()
 
 
-async def _complete_or_stop(ctx: RunContext, thread_id: str, messages: list[dict], tools: list[dict] | None):
+async def _complete_or_stop(ctx: RunContext, thread_id: str, messages: list[dict], tools: list[dict] | None, on_delta=None):
     """Runs ctx.llm.complete(...), racing it against the operator's own Stop signal so a click
     actually aborts THIS in-flight call -- not just noticed the next time _run_chat_tool_loop
     happens to check between calls (the checkpoint agent/core.py's own SessionStopRequested uses,
@@ -1297,7 +1714,15 @@ async def _complete_or_stop(ctx: RunContext, thread_id: str, messages: list[dict
     stop_check = lambda: stop_event.is_set()  # noqa: E731
     llm = ctx.llm
     call_started = time.monotonic()
-    call_task = asyncio.ensure_future(asyncio.to_thread(llm.complete, messages, tools, stop_check=stop_check))
+    # When the caller wants live typing (on_delta given) and this provider can stream, use the
+    # streaming path; otherwise fall back to the blocking complete() -- same result, just no live
+    # token-by-token reply. getattr-guarded so a provider/wrapper without stream_complete can never
+    # break a chat turn, it just behaves exactly as before.
+    stream_fn = getattr(llm, "stream_complete", None)
+    if on_delta is not None and stream_fn is not None:
+        call_task = asyncio.ensure_future(asyncio.to_thread(stream_fn, messages, tools, on_delta, stop_check))
+    else:
+        call_task = asyncio.ensure_future(asyncio.to_thread(llm.complete, messages, tools, stop_check=stop_check))
     stop_task = asyncio.ensure_future(stop_event.wait())
     try:
         done, _pending = await asyncio.wait({call_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -1382,6 +1807,244 @@ def _looks_like_narrated_fake_tool_call(text: str) -> bool:
     return bool(text) and bool(_FAKE_TOOL_CALL_PATTERN.search(text))
 
 
+def _result_progress_signature(result: dict) -> str:
+    """The output-bearing part of a tool result, for the decoder-loop guard's 'did this call
+    actually produce materially new output' check. Joins the output fields that genuinely move as a
+    free-form script or a radare2/gdb pass makes real progress (stdout/stderr/exit/...), falling
+    back to the whole result minus volatile metadata (timing, which provider answered, the echoed-
+    back arguments, a hint the guard itself injected) that would otherwise make every call look new.
+    """
+    parts = [str(result[key]) for key in _RESULT_PROGRESS_SIGNATURE_KEYS if result.get(key) is not None]
+    if parts:
+        return "\n".join(parts)
+    volatile = {"used_arguments", "llm", "started_at", "playbook_hint", "status"}
+    return json.dumps({k: v for k, v in sorted(result.items()) if k not in volatile}, default=str, sort_keys=True)
+
+
+# A final RE answer that asserts a concrete secret -- "the password is X", "flag: X", "serial = X",
+# "ключ — X", "расшифрованная строка: X" -- where X never appeared in any recorded tool output is
+# exactly the hallucination this project has seen for real (crypto_crackme: a confident
+# "super_secret_password_123" verdict with no tool run ever producing it). Match a secret-shaped
+# KEYWORD + connector + literal; the literal is either explicitly quoted or a bare token, and
+# _is_secret_shaped() below then filters generic prose so plain words never trip this.
+_VERDICT_SECRET_ASSERTION_PATTERN = re.compile(
+    r"(?:password|passphrase|flag|serial(?:\s*(?:number|key|code))?|licen[sc]e\s*key|secret|"
+    r"decrypted\s+\w+|пароль|флаг|ключ|серийн\w*|секрет|расшифрован\w*(?:\s+\w+)?)"
+    r"\s*(?:is|are|was|=|:|—|–|->|equals?|равен|равняется|это)\s*"
+    r"(?:[`\"'«]([^`\"'»\n]{3,80})[`\"'»]|([^\s`\"'»\n]{6,80}))",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_shaped(literal: str) -> bool:
+    """True only for a literal that actually looks like a password/serial/flag/key, so the verdict
+    guard never fires on an ordinary word ("unknown", "MinGW") the model happened to put after a
+    keyword. A digit/underscore/brace, a hyphenated alphanumeric serial, or a long unbroken token
+    are the shapes real secrets take; plain prose has none of them."""
+    literal = literal.strip()
+    if len(literal) < 6:
+        return False
+    if re.search(r"[0-9_{}]", literal):
+        return True
+    if "-" in literal and any(ch.isalnum() for ch in literal):
+        return True
+    return len(literal) >= 12 and " " not in literal
+
+
+def _unconfirmed_secret_assertions(text: str, haystack: str) -> list[str]:
+    """Secret-shaped literals asserted in `text` that appear in NONE of the recorded tool output
+    `haystack` (case-insensitive substring) -- i.e. values the model is presenting as solved that no
+    real tool run this session ever produced."""
+    haystack_lower = haystack.lower()
+    unconfirmed: list[str] = []
+    for match in _VERDICT_SECRET_ASSERTION_PATTERN.finditer(text or ""):
+        literal = (match.group(1) or match.group(2) or "").strip().strip(".,;:!?)]}»\"'`")
+        if not _is_secret_shaped(literal):
+            continue
+        if literal.lower() in haystack_lower:
+            continue
+        if literal not in unconfirmed:
+            unconfirmed.append(literal)
+    return unconfirmed
+
+
+def _recorded_tool_output_haystack(session_id: str, current_messages: list[dict]) -> str:
+    """Every tool output recorded for this session -- the current turn's own tool-role messages
+    (freshest, fullest) plus every persisted tool_call segment across all of its chat threads --
+    concatenated into one blob the verdict guard checks a claimed secret against."""
+    parts: list[str] = []
+    for message in current_messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            parts.append(str(message.get("content") or ""))
+    session = load_session(session_id)
+    for thread in (session or {}).get("chat_threads") or []:
+        for message in thread.get("messages") or []:
+            for segment in message.get("segments") or []:
+                if segment.get("type") == "tool_call" and segment.get("output"):
+                    parts.append(str(segment["output"]))
+    return "\n".join(parts)
+
+
+# Terminal-success markers in a tool's OWN output (a wine/dotnet run of the target printing that the
+# key/password was accepted). Deliberately specific phrases, not bare "ok"/"success", so an ordinary
+# diagnostic line doesn't read as "solved".
+_RE_SUCCESS_MARKER_PATTERN = re.compile(
+    r"congratulat|access granted|correct\s+(?:password|serial|key|flag|code)|well done|you win|"
+    r"authentication successful|license\s+valid|valid\s+(?:serial|key|license)|\bflag\{|\bctf\{|"
+    r"правильн\w*\s+(?:парол|ключ|серийн|код)|верн\w*\s+(?:парол|ключ|серийн)|доступ\s+разреш|поздравля",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_re_success(result: dict) -> bool:
+    for key in _RESULT_PROGRESS_SIGNATURE_KEYS:
+        value = result.get(key)
+        if value is not None and _RE_SUCCESS_MARKER_PATTERN.search(str(value)):
+            return True
+    confirmation = result.get("confirmation")
+    return bool(confirmation and _RE_SUCCESS_MARKER_PATTERN.search(str(confirmation)))
+
+
+def _flag_thread_for_next_turn(session_id: str, thread_id: str, **flags: bool) -> None:
+    """Persists a carry-over flag the NEXT turn of this thread must act on (verdict was cut short by
+    the decoder-loop guard; a real success went unrecorded). Via reload_merge_save so it never
+    clobbers the turn's own incrementally-saved segments already on disk."""
+    def apply(session: dict) -> None:
+        thread = _find_thread(session, thread_id)
+        if thread is not None:
+            for name, value in flags.items():
+                if value:
+                    thread[name] = True
+    reload_merge_save(session_id, apply)
+
+
+def _consume_carryover_notes(session_id: str, thread_id: str, thread: dict) -> str:
+    """Reads this thread's carry-over flags (set by the previous turn), turns them into a short
+    system-prompt addendum for THIS turn, and clears them so they fire exactly once. Returns "" when
+    nothing is pending. RE-mode only (its callers are), so the wording is RE-specific."""
+    notes: list[str] = []
+    if thread.get("decoder_loop_cut"):
+        notes.append(
+            "\n\nIMPORTANT: your PREVIOUS turn was cut short by the repetition guard -- you were "
+            "repeating a near-identical approach without recording new progress. Treat any "
+            "conclusion from that cut-off turn as NOT confirmed: do not present a password/serial/"
+            "flag/key/decrypted value as solved unless a real tool run this session actually "
+            "produced it. Now PICK UP where that turn left off and CONTINUE the work toward finishing "
+            "it with a genuinely different, concrete next step -- don't just restate being stuck or "
+            "repeat the same variation. If you truly cannot proceed, say so plainly and propose one "
+            "concrete next step."
+        )
+    if thread.get("re_success_unrecorded"):
+        notes.append(
+            "\n\nIMPORTANT: a tool run last turn looked like a terminal SUCCESS (a confirmed "
+            "password/flag/decrypted secret) yet nothing durable was recorded. Call record_finding "
+            "with the confirmed result and record_technique(worked=true) for the approach that "
+            "cracked it, so the Findings panel and the cross-session playbook are not left empty "
+            "after a real solve."
+        )
+    if not notes:
+        return ""
+
+    def clear(session: dict) -> None:
+        fresh = _find_thread(session, thread_id)
+        if fresh is not None:
+            fresh.pop("decoder_loop_cut", None)
+            fresh.pop("re_success_unrecorded", None)
+    reload_merge_save(session_id, clear)
+    logger.debug("chat: session=%s thread=%s injected %d carry-over note(s) into this turn's prompt", session_id, thread_id, len(notes))
+    return "".join(notes)
+
+
+# Appended, visibly, to a final RE answer that asserts a secret no tool run confirmed. Plain text (no
+# emoji -- it renders in the chat UI), Russian to match the operator. Keeps the model's own wording
+# intact and adds the caveat after it, so nothing is silently rewritten.
+_UNCONFIRMED_VERDICT_CAVEAT = (
+    "\n\n[не подтверждено инструментами] Значение {literals} не встречается ни в одном записанном "
+    "выводе инструментов этой сессии — это гипотеза, а не подтверждённый результат. Прежде чем "
+    "считать это решением, подтвердите его реальным запуском (например, прогоном бинарного файла)."
+)
+
+
+def _guard_final_re_verdict(session_id: str, thread_id: str, messages: list[dict], text: str, segment: dict, mode: str) -> str:
+    """RC#3 (B3): before a final RE answer is committed, refuse to let it present a concrete secret
+    (password/serial/flag/key/decrypted string) as confirmed when that literal appears in NONE of
+    the session's recorded tool output. Real incident this fixes: crypto_crackme's chat produced a
+    confident "super_secret_password_123" with "no crypto / MinGW" -- every claim absent from the
+    recorded output (the binary was MSVC with a splitmix64/fmix64 hash). Appends a visible caveat and
+    marks the segment; never deletes or rewrites what the model said. RE mode only -- other modes'
+    replies are not RE verdicts. Returns the (possibly caveat-appended) text."""
+    if mode != "reverse_engineering" or not (text or "").strip():
+        return text
+    haystack = _recorded_tool_output_haystack(session_id, messages)
+    unconfirmed = _unconfirmed_secret_assertions(text, haystack)
+    if not unconfirmed:
+        return text
+    text += _UNCONFIRMED_VERDICT_CAVEAT.format(literals=", ".join(repr(value) for value in unconfirmed))
+    segment["content"] = text
+    segment["unconfirmed_verdict"] = True
+    logger.debug(
+        "chat: session=%s thread=%s RE verdict asserts %d tool-unconfirmed secret literal(s) -- appended caveat",
+        session_id, thread_id, len(unconfirmed),
+    )
+    return text
+
+
+def _flush_re_success_nudge_flag(session_id: str, thread_id: str, mode: str, re_success_signal: bool, record_finding_called: bool) -> None:
+    """RC#4 (chat half): if a terminal RE success was seen this turn but record_finding never
+    followed, flag the thread so the next turn is nudged to record it (the Findings panel/playbook
+    must not be left empty after a real solve)."""
+    if mode == "reverse_engineering" and re_success_signal and not record_finding_called:
+        _flag_thread_for_next_turn(session_id, thread_id, re_success_unrecorded=True)
+        logger.debug("chat: session=%s thread=%s RE success unrecorded (no record_finding this turn) -- flagging next-turn nudge", session_id, thread_id)
+
+
+# Model-facing nudge (not operator-facing) that drives BUG2's auto-continue -- same English register
+# as the forced-stop instruction below.
+_AUTO_CONTINUE_INSTRUCTION = (
+    "You just said you would carry out an action yourself, but the turn ended without you actually "
+    "doing it -- no tool call was made. Do it NOW: make the tool call(s) you described instead of "
+    "only describing them. If it turns out you cannot or should not run it after all, say so plainly "
+    "and explain why -- do not silently drop it."
+)
+# Operator-facing, appended as its own error-flagged segment (so it renders yet never replays into
+# the model's own later history, like the unconfirmed-verdict caveat). Russian to match the operator.
+_AUTO_CONTINUE_EXHAUSTED_NOTE = (
+    "[не выполнено] Несколько раз подряд я собирался выполнить действие, но так и не запустил его. "
+    "Похоже, я застрял на этом шаге — уточните задачу или попросите выполнить конкретный шаг."
+)
+
+
+async def _ensure_suggestion_cards(ctx: RunContext, thread_id: str, messages: list[dict], bookkeeping_schema: list[dict], final_text: str) -> bool:
+    """BUG1 enforcement: an interactive/RE turn that proposed next steps must end with clickable
+    cards, not only a numbered list in prose. Prefers parsing a trailing list straight into a
+    "suggested_actions" segment (no extra LLM cost); falls back to ONE bounded model step allowed only
+    to call suggest_next_steps when the proposal was prose without a clean list. Produces nothing when
+    the reply proposes no next steps at all (a fully closed task). Returns whether cards were shown."""
+    steps = _sanitize_suggested_steps({"steps": _trailing_list_steps(final_text)})
+    if len(steps) >= _MIN_SYNTHESIZED_SUGGESTIONS:
+        _append_segment_and_save(ctx.session_id, thread_id, {"type": "suggested_actions", "actions": steps})
+        logger.debug("chat: session=%s thread=%s auto-synthesized %d suggestion card(s) from a prose list", ctx.session_id, thread_id, len(steps))
+        return True
+    if not _proposes_next_steps_in_prose(final_text):
+        return False
+    forced_tools = [t for t in bookkeeping_schema if t["function"]["name"] == "suggest_next_steps"] or None
+    if forced_tools is None:
+        return False
+    messages.append({"role": "user", "content": (
+        "You proposed next steps in your reply as prose. Call suggest_next_steps ONCE to present "
+        "those same 2-4 concrete next actions as clickable options for the operator -- do not call "
+        "any other tool and do not add more prose."
+    )})
+    try:
+        response = await _complete_or_stop(ctx, thread_id, messages, forced_tools)
+    except ChatStopRequested:
+        raise
+    except Exception as exc:
+        logger.debug("chat: session=%s thread=%s forced-suggestion step itself failed (%s)", ctx.session_id, thread_id, exc)
+        return False
+    return _emit_suggestions_from_response(ctx.session_id, thread_id, response, forced=True)
+
+
 async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[dict], real_tool_specs: list[ToolSpec], pending_rewards: list[dict] | None = None, mode: str = "agent") -> str:
     """The actual LLM<->tools conversation for one chat turn — bounded, small, and deliberately its
     own thing rather than agent/core.py's _run_llm_tool_loop_impl: that function unconditionally
@@ -1419,10 +2082,59 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
     # plain between-call check alone isn't responsive enough for a typical few-second chat reply).
     stop_check = lambda: get_chat_stop_event(ctx.session_id, thread_id).is_set()  # noqa: E731
 
+    # Decoder-loop guard -- real, confirmed incident this fixes: a chat turn spent ~70 minutes
+    # rewriting near-identical custom_re_script decoder variations with zero new findings/profile
+    # facts recorded, and nothing here could notice or stop it (_run_llm_tool_loop_impl,
+    # agent/core.py's own engine behind run_re_triage/run_session, already has this exact
+    # protection; this loop is a deliberately separate implementation -- see this function's own
+    # docstring -- that never got it ported over). calls_since_progress is the generic signal
+    # (reset the instant any _PROGRESS_RECORDING_TOOLS call actually succeeds, same rule
+    # agent/core.py's own progress_stall_threshold uses, OR a _RESULT_PROGRESS_TOOL_NAMES call whose
+    # OUTPUT materially changed -- real incremental work, not a dead loop). near_duplicate_streaks/
+    # near_duplicate_last_result are the result-progress signal: difflib similarity of a tool's
+    # output against its OWN previous output -- when that barely moves call after call, the model is
+    # "rewriting the same dead variation" (what the 70-minute incident actually was), which is the
+    # only thing that should drive the hard stop; a turn whose output keeps changing is iterating
+    # toward a result and must not be cut off (win-framework solve, re-prompted "делай/ищи" 6 times).
+    calls_since_progress = 0
+    near_duplicate_streaks: dict[str, int] = {}
+    near_duplicate_last_result: dict[str, str] = {}
+    decoder_loop_stop_reason: str | None = None
+    # RC#4 (chat half): a terminal RE success (a wine/dotnet run printing that a key/password was
+    # accepted) that the model never follows with record_finding leaves the Findings panel/playbook
+    # empty after a real solve -- flagged here, nudged on the next turn (_consume_carryover_notes).
+    re_success_signal = False
+    record_finding_called = False
+    # BUG1/BUG2 per-turn state (interactive/RE only). suggested_actions_emitted: did a
+    # suggest_next_steps call already show cards this turn (so BUG1 need not synthesize any).
+    # auto_continues / last_stated_intent: bound and de-duplicate BUG2's "promises then cuts off"
+    # auto-continue so a model that keeps re-promising the same undone action can't loop forever.
+    suggested_actions_emitted = False
+    auto_continues = 0
+    last_stated_intent: str | None = None
+    # The most recent non-empty assistant prose this turn -- what to dedup/return when
+    # suggest_next_steps ends the turn (cards are terminal, see the break after the tool batch).
+    last_assistant_text = ""
+
+    # Live token-by-token typing: each content delta appends to draft_box[0] and publishes it to the
+    # in-memory draft registry, which main.py's chat_stream SSE overlays as a typing bubble. A list
+    # cell (not a plain nonlocal) because this closure runs in the LLM worker thread.
+    draft_box = [""]
+    def _on_delta(chunk: str) -> None:
+        draft_box[0] += chunk
+        set_chat_stream_draft(ctx.session_id, thread_id, draft_box[0])
+
     iteration_budget = itertools.count() if _CHAT_MAX_TOOL_ITERATIONS <= 0 else range(_CHAT_MAX_TOOL_ITERATIONS)
     for _ in iteration_budget:
-        response = await _complete_or_stop(ctx, thread_id, messages, tools_schema)
+        # Reset the live draft for this iteration -- a previous tool-call turn's own preamble text
+        # must not linger under the next iteration's output.
+        draft_box[0] = ""
+        clear_chat_stream_draft(ctx.session_id, thread_id)
+        response = await _complete_or_stop(ctx, thread_id, messages, tools_schema, on_delta=_on_delta)
         if not response.tool_calls:
+            # Clear the live draft BEFORE the real text segment is appended+saved below, so the SSE
+            # never renders both the typing bubble and the finished message for one frame.
+            clear_chat_stream_draft(ctx.session_id, thread_id)
             text = response.content or ""
             segment = {"type": "text", "content": text}
             if _looks_like_narrated_fake_tool_call(text):
@@ -1431,7 +2143,57 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                     "chat: session=%s thread=%s reply narrates what looks like a tool call but tool_calls was empty -- flagging, not trusting",
                     ctx.session_id, thread_id,
                 )
+            # BUG2 -- "promises then cuts off": the reply states the agent will act now itself, yet
+            # the turn ended with no matching tool call. Auto-continue ONE more turn so it actually
+            # performs it, instead of returning control to the operator mid-promise. Bounded by
+            # _CHAT_MAX_AUTO_CONTINUE and stopped early if the same promise just repeats verbatim
+            # (reusing the decoder-loop similarity threshold), so a model re-promising without ever
+            # acting can't spin forever.
+            if mode in _SUGGESTION_MODES and _CHAT_MAX_AUTO_CONTINUE > 0 and _states_imminent_self_action(text):
+                repeats_last = (
+                    last_stated_intent is not None
+                    and difflib.SequenceMatcher(None, last_stated_intent, text).ratio() >= _CHAT_NEAR_DUPLICATE_SIMILARITY_THRESHOLD
+                )
+                if auto_continues < _CHAT_MAX_AUTO_CONTINUE and not repeats_last:
+                    _append_segment_and_save(ctx.session_id, thread_id, segment)
+                    auto_continues += 1
+                    last_stated_intent = text
+                    logger.debug(
+                        "chat: session=%s thread=%s unfulfilled stated intent detected -- auto-continuing (%d/%d)",
+                        ctx.session_id, thread_id, auto_continues, _CHAT_MAX_AUTO_CONTINUE,
+                    )
+                    messages.append({"role": "assistant", "content": text})
+                    messages.append({"role": "user", "content": _AUTO_CONTINUE_INSTRUCTION})
+                    continue
+                # Cap reached (or the promise is just repeating) and the action still hasn't landed --
+                # be honest about it rather than silently dropping it, and still offer next-step cards.
+                logger.debug(
+                    "chat: session=%s thread=%s auto-continue exhausted (%d used, repeat=%s) -- action still unfulfilled",
+                    ctx.session_id, thread_id, auto_continues, repeats_last,
+                )
+                text = _guard_final_re_verdict(ctx.session_id, thread_id, messages, text, segment, mode)
+                _append_segment_and_save(ctx.session_id, thread_id, segment)
+                _append_segment_and_save(ctx.session_id, thread_id, {"type": "text", "content": _AUTO_CONTINUE_EXHAUSTED_NOTE, "error": True})
+                cards_shown = suggested_actions_emitted
+                if not suggested_actions_emitted:
+                    cards_shown = await _ensure_suggestion_cards(ctx, thread_id, messages, bookkeeping_schema, text)
+                if cards_shown:
+                    text = _dedup_persisted_next_steps(ctx.session_id, thread_id, text)
+                _flush_re_success_nudge_flag(ctx.session_id, thread_id, mode, re_success_signal, record_finding_called)
+                return text
+
+            text = _guard_final_re_verdict(ctx.session_id, thread_id, messages, text, segment, mode)
             _append_segment_and_save(ctx.session_id, thread_id, segment)
+            # BUG1 -- cards must ALWAYS show: if this interactive/RE turn proposed next steps but only
+            # wrote them as prose (no suggest_next_steps call), guarantee a "suggested_actions" segment.
+            cards_shown = suggested_actions_emitted
+            if mode in _SUGGESTION_MODES and not suggested_actions_emitted:
+                cards_shown = await _ensure_suggestion_cards(ctx, thread_id, messages, bookkeeping_schema, text)
+            # Cards are the ONLY place a next-steps menu belongs: once they are shown, drop any prose
+            # restatement of that same menu from the reply so it isn't duplicated above the cards.
+            if mode in _SUGGESTION_MODES and cards_shown:
+                text = _dedup_persisted_next_steps(ctx.session_id, thread_id, text)
+            _flush_re_success_nudge_flag(ctx.session_id, thread_id, mode, re_success_signal, record_finding_called)
             return text
 
         # A model occasionally emits reasoning text alongside a tool call in the same turn --
@@ -1439,6 +2201,7 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
         # same ordering Piligrim's own segment model uses.
         if response.content:
             _append_segment_and_save(ctx.session_id, thread_id, {"type": "text", "content": response.content})
+            last_assistant_text = response.content
 
         messages.append({
             "role": "assistant",
@@ -1473,10 +2236,26 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                     # tool_call segment's own done-update just below, breaking _reload_active_
                     # message's "last message is the active assistant message" assumption. Flushed
                     # by run_chat_turn_background once the whole turn has finished persisting.
-                    confirmation, reward = _apply_chat_record_technique(ctx.session_id, call.arguments, ctx.llm)
+                    confirmation, reward = _apply_chat_record_technique(ctx.session_id, call.arguments, ctx.llm, mode)
                     if reward is not None:
                         pending_rewards.append(reward)
                     result = {"status": "ok", "confirmation": confirmation}
+                elif call.name == "run_skill" and mode in ("interactive", "reverse_engineering"):
+                    from agent.tools.skill_runner import execute_skill, execute_skill_chain
+                    skill_runner_fn = execute_skill_chain if call.arguments.get("chain") else execute_skill
+                    result = skill_runner_fn(
+                        (call.arguments.get("technique_id") or "").strip(),
+                        call.arguments.get("params") or {}, ctx.session_id,
+                    )
+                elif call.name == "update_skill" and mode in ("interactive", "reverse_engineering"):
+                    ok = playbook_store.update_skill_body(
+                        (call.arguments.get("technique_id") or "").strip(),
+                        body=call.arguments.get("body"), params=call.arguments.get("params"),
+                    )
+                    result = (
+                        {"status": "ok", "confirmation": "Skill updated."} if ok
+                        else {"status": "error", "error": "no skill is attached to that technique id"}
+                    )
                 elif call.name == "query_playbook":
                     result = {"status": "ok", "confirmation": _apply_chat_query_playbook(call.arguments, ctx.llm)}
                 elif call.name == "playbook_strategy":
@@ -1487,14 +2266,18 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                     confirmation, reward = _apply_chat_record_finding(ctx.session_id, call.arguments)
                     if reward is not None:
                         pending_rewards.append(reward)
+                    record_finding_called = True
                     result = {"status": "ok", "confirmation": confirmation}
-                elif call.name == "suggest_next_steps" and mode in ("interactive", "reverse_engineering"):
+                elif call.name == "suggest_next_steps" and mode in _SUGGESTION_MODES:
                     # A real, separate segment (not folded into this tool_call's own output) --
                     # chat_messages.html renders "suggested_actions" as its own row of buttons, not
                     # tucked inside the collapsed tool-call card nobody would think to expand.
                     steps = _sanitize_suggested_steps(call.arguments)
                     if steps:
                         _append_segment_and_save(ctx.session_id, thread_id, {"type": "suggested_actions", "actions": steps})
+                        # Marks BUG1's "cards already shown this turn" so the end-of-turn guard
+                        # doesn't also synthesize a second, redundant menu.
+                        suggested_actions_emitted = True
                         logger.debug("chat: session=%s thread=%s offered %d suggested next step(s)", ctx.session_id, thread_id, len(steps))
                         result = {"status": "ok", "confirmation": "Shown to the operator as clickable options."}
                     else:
@@ -1547,11 +2330,114 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                 else:
                     _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=str(exc), error=True, done=True, **_tool_finish_fields(tool_started))
                 raise
+
+            # RC#1 (chat half): deterministic auto-record. A radare2 info/analysis result carries
+            # durable target facts (file format, arch, compiler) the autonomous loop already auto-
+            # records via this same helper in agent/core.py; the chat RE loop is a separate
+            # implementation that never did, so an operator continuing a solve in chat left
+            # target_profile emptier than a scripted triage pass would -- leaving later turns to
+            # re-derive what a tool already proved. Record straight from the output here too, so a
+            # durable fact survives even if the model never calls record_target_profile itself.
+            # Extraction/dedup live inside the helper; reload_merge_save (not a blind save of the
+            # turn-start snapshot) persists it without clobbering this turn's own segment writes.
+            if call.name == "radare2" and isinstance(result, dict):
+                reload_merge_save(
+                    ctx.session_id,
+                    lambda session, tool_name=call.name, tool_result=result: auto_record_target_profile_from_tool(session, tool_name, tool_result),
+                )
+                logger.debug("chat: session=%s thread=%s auto-recorded target_profile facts from radare2 output", ctx.session_id, thread_id)
+
+            # Terminal-success detection for the record_finding nudge (RC#4) -- a real crack printed
+            # by a wine/dotnet run of the target, seen in the tool's OWN output.
+            if (
+                mode == "reverse_engineering" and isinstance(result, dict)
+                and call.name in _RESULT_PROGRESS_TOOL_NAMES and result.get("status") == "ok"
+                and _looks_like_re_success(result)
+            ):
+                re_success_signal = True
+                logger.debug("chat: session=%s thread=%s terminal RE success marker seen in %s output", ctx.session_id, thread_id, call.name)
+
+            # Decoder-loop guard -- see this function's own counters/docstring above for the real
+            # incident this fixes. "Progress" now means either a _PROGRESS_RECORDING_TOOLS call that
+            # actually succeeded (same reset rule as agent/core.py's own progress_stall_threshold),
+            # OR a _RESULT_PROGRESS_TOOL_NAMES call whose OUTPUT materially changed from that tool's
+            # previous call -- real incremental work toward a result, not a dead loop. Only a call
+            # that recorded nothing AND produced near-identical output (or any other non-progress
+            # call) advances the counters toward the hard stop.
+            if isinstance(result, dict) and call.name in _PROGRESS_RECORDING_TOOLS and result.get("status") == "ok":
+                calls_since_progress = 0
+                near_duplicate_streaks.clear()
+                near_duplicate_last_result.clear()
+            elif isinstance(result, dict) and call.name in _RESULT_PROGRESS_TOOL_NAMES:
+                current_result = _result_progress_signature(result)
+                previous_result = near_duplicate_last_result.get(call.name)
+                near_duplicate_last_result[call.name] = current_result
+                # The FIRST call to a tool has no baseline, so it can't yet count as "new output" --
+                # it only establishes one and advances the counter like any other non-progress call
+                # (same as the old source-based guard's first call). Only a LATER call whose output
+                # genuinely differs from that baseline is real incremental progress.
+                materially_changed = (
+                    previous_result is not None
+                    and difflib.SequenceMatcher(None, previous_result, current_result).ratio() < _CHAT_NEAR_DUPLICATE_SIMILARITY_THRESHOLD
+                )
+                if materially_changed:
+                    # Genuinely new output -- iterating toward a result, not the "same dead
+                    # variation" shape the hard stop exists for. Reset both the generic counter and
+                    # this tool's own near-duplicate streak so a productive turn never trips it.
+                    calls_since_progress = 0
+                    near_duplicate_streaks[call.name] = 0
+                else:
+                    calls_since_progress += 1
+                    near_duplicate_streaks[call.name] = near_duplicate_streaks.get(call.name, 0) + 1
+            else:
+                calls_since_progress += 1
+            effective_streak = max(calls_since_progress, near_duplicate_streaks.get(call.name, 0))
+            if isinstance(result, dict) and effective_streak >= _CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD:
+                decoder_loop_stop_reason = (
+                    f"You've just made {effective_streak} tool calls in a row -- most recently "
+                    f"{call.name!r} -- with nothing new recorded (no successful record_finding/"
+                    "record_target_profile/record_hypothesis/record_technique in between), repeating "
+                    "a near-identical approach. Stop here instead of trying yet another variation. "
+                    "Summarize plainly what you actually tried and why it didn't pan out."
+                )
+            elif isinstance(result, dict) and effective_streak >= _CHAT_DECODER_LOOP_NUDGE_THRESHOLD:
+                # Same placement/reasoning as agent/core.py's own _dead_end_hint -- a field on the
+                # result itself, json.dumps'd straight into the model's own next tool-result
+                # message, not buried in a system prompt read many tool calls ago.
+                result["playbook_hint"] = (
+                    f"{effective_streak} tool calls in a row now with nothing new recorded. If this "
+                    "is a CONFIRMED dead end (not just unlucky timing), call "
+                    "record_technique(worked=false) so future sessions don't repeat it; otherwise "
+                    "switch to a genuinely different tool or approach instead of another close "
+                    "variation of the same one -- or say plainly to the operator that you're stuck "
+                    "and why."
+                )
+
             logger.debug("chat: session=%s tool call %s -> status=%s", ctx.session_id, call.name, result.get("status"))
             is_error = result.get("status") in ("error", "failed")
             output_text = result.get("confirmation") or json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]
             _update_last_tool_call_segment_and_save(ctx.session_id, thread_id, call.id, output=output_text, error=is_error, done=True, **_tool_finish_fields(tool_started))
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
+            if decoder_loop_stop_reason:
+                break
+
+        if decoder_loop_stop_reason:
+            break
+
+        # Cards are TERMINAL: the moment suggest_next_steps shows the operator a menu, this turn is
+        # done -- no further LLM call, no further tool, no more prose. Real, confirmed complaint this
+        # fixes: the model offered cards and then kept working (another decompile, a browser_navigate
+        # to a local .class that 404'd) while still "thinking", so clicking a card would interrupt a
+        # half-finished action. The cards are meant to be the LAST thing: everything is tried first,
+        # THEN the menu. The operator picking one starts the next turn. Finalize exactly like the
+        # clean no-tool-calls exit (dedup the prose menu, flush the RE-success nudge) and return,
+        # rather than falling through to the forced-summary exit which would add text after the cards.
+        if suggested_actions_emitted:
+            logger.debug("chat: session=%s thread=%s suggestion cards shown -- ending turn, nothing runs after the menu", ctx.session_id, thread_id)
+            if mode in _SUGGESTION_MODES and last_assistant_text:
+                last_assistant_text = _dedup_persisted_next_steps(ctx.session_id, thread_id, last_assistant_text)
+            _flush_re_success_nudge_flag(ctx.session_id, thread_id, mode, re_success_signal, record_finding_called)
+            return last_assistant_text
 
         # Real, confirmed operator complaint this fixes: append_pending_chat_message's own
         # queued_messages path (this file's docstring above) only ever got drained by
@@ -1585,17 +2471,41 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
                 ctx.session_id, thread_id, len(next_item["text"]), len(queued),
             )
 
-    logger.debug("chat: session=%s tool loop exhausted its %d-iteration budget without a final answer", ctx.session_id, _CHAT_MAX_TOOL_ITERATIONS)
-    # Real, confirmed operator complaint: this used to just give up with a flat "try again in
-    # smaller steps" the instant the budget ran out -- discarding every real tool result already
-    # sitting in `messages` (a press_key failure diagnosed, a click confirmed, a page navigated) and
-    # making a genuinely multi-step investigation look like it accomplished nothing at all. One more
-    # LLM call with NO tools (tools=None forces free-text content, the model can't try to squeeze in
-    # a 21st tool call) asks it to actually summarize what it already found from that same message
-    # history, instead of the operator having to re-read the raw tool-call cards themselves to
-    # reconstruct it. Still falls back to the plain apology if even this call fails outright (a
-    # provider outage, not just "ran out of budget") -- never let a summary attempt's own failure
-    # replace a real error with a misleadingly generic one.
+    # Two ways to reach here: the ordinary tool-budget exhaustion below, or the decoder-loop guard
+    # above breaking out early. Either way this is the SAME shared "one more forced, tool-
+    # restricted LLM call asking for an honest summary instead of a flat apology" exit -- see the
+    # comments just below (written for the budget case originally) for the real operator
+    # complaints this whole mechanism fixes; the decoder-loop guard reuses it verbatim rather than
+    # inventing a second, purely synthetic (no real LLM involvement) exit message.
+    if decoder_loop_stop_reason:
+        logger.debug("chat: session=%s decoder-loop guard stopped the turn early", ctx.session_id)
+        forced_stop_instruction = decoder_loop_stop_reason
+        exhausted_fallback_text = "I got stuck repeating a similar approach without making progress — try a different angle, or ask me to explain what I tried."
+        # RC#3: a turn the guard cut short reached no sound conclusion -- flag it so the NEXT turn is
+        # explicitly told not to present whatever it had as confirmed (_consume_carryover_notes,
+        # RE mode only, so the flag is only set there -- nothing else would ever read it).
+        if mode == "reverse_engineering":
+            _flag_thread_for_next_turn(ctx.session_id, thread_id, decoder_loop_cut=True)
+    else:
+        logger.debug("chat: session=%s tool loop exhausted its %d-iteration budget without a final answer", ctx.session_id, _CHAT_MAX_TOOL_ITERATIONS)
+        # Real, confirmed operator complaint: this used to just give up with a flat "try again in
+        # smaller steps" the instant the budget ran out -- discarding every real tool result already
+        # sitting in `messages` (a press_key failure diagnosed, a click confirmed, a page navigated) and
+        # making a genuinely multi-step investigation look like it accomplished nothing at all. One more
+        # LLM call with NO tools (tools=None forces free-text content, the model can't try to squeeze in
+        # a 21st tool call) asks it to actually summarize what it already found from that same message
+        # history, instead of the operator having to re-read the raw tool-call cards themselves to
+        # reconstruct it. Still falls back to the plain apology if even this call fails outright (a
+        # provider outage, not just "ran out of budget") -- never let a summary attempt's own failure
+        # replace a real error with a misleadingly generic one.
+        forced_stop_instruction = (
+            "You've used up your tool budget for this turn. Stop here -- do not attempt another "
+            "tool call except suggest_next_steps. Summarize plainly what you actually "
+            "found/did/confirmed so far, and what (if anything) is still unresolved. If it's a "
+            "genuine, natural point to hand back a menu of next moves, you may also call "
+            "suggest_next_steps once alongside your summary."
+        )
+        exhausted_fallback_text = "I wasn't able to finish looking into that within my tool budget — try asking again with a narrower question, or in smaller steps."
     # Real, confirmed operator complaint this half fixes: with tools=None here, a turn that got cut
     # off by the budget mid-investigation could NEVER offer a suggest_next_steps menu on the way
     # out, even in Interactive/RE mode where it's otherwise the normal way to hand control back --
@@ -1603,14 +2513,7 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
     # else -- no 21st real tool call) lets the forced summary still end with a real menu grounded in
     # whatever got done before the budget cut it off, instead of silently downgrading to plain text.
     forced_tools = [t for t in bookkeeping_schema if t["function"]["name"] == "suggest_next_steps"] or None
-    messages.append({
-        "role": "user",
-        "content": "You've used up your tool budget for this turn. Stop here -- do not attempt another "
-                   "tool call except suggest_next_steps. Summarize plainly what you actually "
-                   "found/did/confirmed so far, and what (if anything) is still unresolved. If it's a "
-                   "genuine, natural point to hand back a menu of next moves, you may also call "
-                   "suggest_next_steps once alongside your summary.",
-    })
+    messages.append({"role": "user", "content": forced_stop_instruction})
     response = None
     try:
         response = await _complete_or_stop(ctx, thread_id, messages, forced_tools)
@@ -1618,19 +2521,15 @@ async def _run_chat_tool_loop(ctx: RunContext, thread_id: str, messages: list[di
     except ChatStopRequested:
         raise
     except Exception as exc:
-        logger.debug("chat: session=%s budget-exhausted summary call itself failed (%s)", ctx.session_id, exc)
+        logger.debug("chat: session=%s forced-stop summary call itself failed (%s)", ctx.session_id, exc)
         fallback = ""
     if not fallback.strip():
-        fallback = "I wasn't able to finish looking into that within my tool budget — try asking again with a narrower question, or in smaller steps."
-    _append_segment_and_save(ctx.session_id, thread_id, {"type": "text", "content": fallback})
-    if response is not None and response.tool_calls:
-        for call in response.tool_calls:
-            if call.name != "suggest_next_steps":
-                continue
-            steps = _sanitize_suggested_steps(call.arguments)
-            if steps:
-                _append_segment_and_save(ctx.session_id, thread_id, {"type": "suggested_actions", "actions": steps})
-                logger.debug("chat: session=%s thread=%s offered %d suggested next step(s) on budget-exhausted exit", ctx.session_id, thread_id, len(steps))
+        fallback = exhausted_fallback_text
+    fallback_segment = {"type": "text", "content": fallback}
+    fallback = _guard_final_re_verdict(ctx.session_id, thread_id, messages, fallback, fallback_segment, mode)
+    _append_segment_and_save(ctx.session_id, thread_id, fallback_segment)
+    _flush_re_success_nudge_flag(ctx.session_id, thread_id, mode, re_success_signal, record_finding_called)
+    _emit_suggestions_from_response(ctx.session_id, thread_id, response, forced=True)
     return fallback
 
 
@@ -1900,20 +2799,34 @@ async def _run_one_chat_turn(session_id: str, thread_id: str, mode: str) -> bool
         )
         await _compact_if_needed(llm, thread, session_id)
 
-        system_prompt = {
-            "interactive": INTERACTIVE_CHAT_PROMPT,
-            "reverse_engineering": RE_CHAT_PROMPT,
-            "standalone": STANDALONE_CHAT_PROMPT,
-        }.get(mode, CHAT_PROMPT)
+        # RE mode's system prompt is built from the detected target shape (build_re_chat_prompt,
+        # agent.prompts) so the guidance matches what this binary actually is, rather than one static
+        # RE_CHAT_PROMPT for every target; every other mode keeps its own static prompt.
+        if mode == "reverse_engineering":
+            system_prompt = build_re_chat_prompt(session.get("target_shape"))
+        else:
+            system_prompt = {
+                "interactive": INTERACTIVE_CHAT_PROMPT,
+                "standalone": STANDALONE_CHAT_PROMPT,
+            }.get(mode, CHAT_PROMPT)
         # Only for RE mode -- Agent-mode's own chat sidebar has never surfaced session["scope_rules"]/
         # ["goal"]/["re_experience_level"] either (a pre-existing gap for the first two, and simply
         # not applicable for the third, neither something this touches), so these stay scoped to the
         # one mode that actually has a real way to set them (main.py's start_re route).
         re_addenda = ""
         if mode == "reverse_engineering":
-            re_addenda = _re_experience_level_addendum(session) + _scope_rules_task_addendum(session) + _goal_task_addendum(session)
+            # _consume_carryover_notes reads+clears flags the PREVIOUS turn left (verdict cut short by
+            # the decoder-loop guard; a real success that went unrecorded), so this turn is told once.
+            re_addenda = (
+                _re_experience_level_addendum(session) + _scope_rules_task_addendum(session)
+                + _goal_task_addendum(session) + _consume_carryover_notes(session_id, thread_id, thread)
+            )
         messages = [
-            {"role": "system", "content": system_prompt + re_addenda + _playbook_task_addendum(session, llm=llm) + _chat_subagent_addendum(mode, session.get("enabled_subagent_ids"))},
+            # The operator profile applies to EVERY mode's chat (agent, interactive, standalone, RE) --
+            # the one place the operator actually talks to the agent, and the only place a chat-only
+            # "interactive" session ever reads it at all (that mode runs no pipeline). Its "reply in
+            # Russian"/style/priorities directives are useless if they never reach here.
+            {"role": "system", "content": system_prompt + _operator_profile_task_addendum() + re_addenda + _playbook_task_addendum(session, llm=llm) + _chat_subagent_addendum(mode, session.get("enabled_subagent_ids"))},
             {"role": "user", "content": f"Current session state:\n{_session_snapshot(session)}"},
         ]
         if thread["summary"]:
@@ -2049,6 +2962,10 @@ async def run_chat_turn_background(session_id: str) -> None:
             pass
     finally:
         current_session_id.reset(session_context_token)
+        # Safety net for the live-typing draft: the tool loop clears it on every normal path, but a
+        # turn that errors or is stopped mid-stream could otherwise leave a stale partial reply in
+        # the registry, which the SSE would keep overlaying after the turn is gone.
+        clear_chat_stream_draft(session_id, thread_id)
         # Only this turn's own context loses the authorization -- a Subagent task spawned during it
         # copied the context at create_task time, so its own (separate) copy keeps the authorization
         # for its whole run and is unaffected by this reset.

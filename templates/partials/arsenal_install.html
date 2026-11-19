@@ -48,7 +48,7 @@
     {% if not running %}
       <div class="flex items-center gap-2 mt-3">
         {% if status.succeeded %}
-          <p class="text-[11px] text-secondary">Restart the agent so the new tools are picked up (and the system if needed).</p>
+          <p class="ui-desc text-[11px] text-secondary">Restart the agent so the new tools are picked up (and the system if needed).</p>
         {% endif %}
         <button type="button" hx-get="/api/tools/arsenal/check" hx-target="#arsenal-output" hx-swap="innerHTML"
                 class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-3 text-[12px]">

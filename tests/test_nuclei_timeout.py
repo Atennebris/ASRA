@@ -5,6 +5,11 @@ finish even once in 4/4 attempts at TOOL_TIMEOUT_SECONDS=600 against a real targ
 whose own real-world duration doesn't fit the generic scan-category bucket deserves its own,
 separate budget. Deliberately a generic ToolSpec field, not a hardcoded tool-name check inside
 _timeout_for, so the next tool found to need its own budget plugs in the same way.
+
+nuclei's own default (1800) is itself live-measured, not guessed: a live -duc run against an
+approved target (ginandjuice.shop) confirmed -duc fixed the update-check stall (real scan progress
+throughout) but still hadn't reached 100% at 1500s (85% done at a steady request rate) --
+extrapolated full completion is ~1600-1700s, so 1800 leaves real margin above that measured figure.
 """
 import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
 from agent.tools.registry import ToolSpec, get_tool
@@ -45,7 +50,7 @@ def test_a_tool_without_the_override_still_uses_the_old_category_based_behavior(
 def test_nuclei_is_registered_with_its_own_timeout_override():
     spec = get_tool("nuclei")
     assert spec.timeout_env_var == "NUCLEI_TIMEOUT_SECONDS"
-    assert spec.timeout_default_seconds == 1200
+    assert spec.timeout_default_seconds == 1800
 
 
 def test_nuclei_actually_honors_its_own_env_var(monkeypatch):
@@ -55,4 +60,4 @@ def test_nuclei_actually_honors_its_own_env_var(monkeypatch):
 
 def test_nuclei_falls_back_to_its_own_default_when_the_env_var_is_unset(monkeypatch):
     monkeypatch.delenv("NUCLEI_TIMEOUT_SECONDS", raising=False)
-    assert _timeout_for(get_tool("nuclei")) == 1200
+    assert _timeout_for(get_tool("nuclei")) == 1800

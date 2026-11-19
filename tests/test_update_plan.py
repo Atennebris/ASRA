@@ -151,6 +151,36 @@ def test_update_plan_carries_no_reminder_for_a_normal_native_array_call():
     assert "reminder" not in result["recorded"]
 
 
+def test_update_plan_recovers_phases_wrapped_as_the_sole_item_of_a_one_item_list():
+    """Real incident this covers (Telenor-Sweden-YesWeHack rescan session): the same double-
+    encoding as the bare-string case above, except the model (or the generic schema-coercion layer)
+    wraps that JSON string as the lone element of a one-item list -- {"phases": ['[{"phase": ...}]']}
+    -- instead of making "phases" itself a string."""
+    import json
+
+    phases = [{"phase": "recon", "tasks": [{"text": "x", "subtasks": [{"text": "y"}]}]}]
+    result = update_plan({"phases": [json.dumps(phases)]})
+    assert result["status"] == "ok"
+    assert result["recorded"]["phases"][0]["phase"] == "recon"
+
+
+def test_update_plan_repairs_a_truncated_phases_string_wrapped_in_a_one_item_list():
+    """Real, confirmed incident this covers (rev-game.ru live session, usr_450dea): the SAME
+    truncation _attempt_json_truncation_repair already heals for the bare-string shape above can
+    also happen to the string wrapped inside a one-item list (the model's own output cut off
+    mid-argument, then the generic scalar->list schema coercion wraps what's left) -- this used to
+    fall straight through to the generic "each phase entry must be an object" error instead of
+    self-healing the same way, costing an avoidable extra correction round-trip 4 times in one real
+    45-minute session."""
+    import json
+
+    phases = [{"phase": "recon", "tasks": [{"text": "x", "subtasks": [{"text": "y"}]}]}]
+    truncated = json.dumps(phases)[:-1]  # drop exactly the final ']'
+    result = update_plan({"phases": [truncated]})
+    assert result["status"] == "ok"
+    assert result["recorded"]["phases"][0]["phase"] == "recon"
+
+
 def test_update_plan_still_rejects_a_string_that_isnt_valid_json():
     result = update_plan({"phases": "not json at all"})
     assert result["status"] == "error"
@@ -199,6 +229,28 @@ def test_update_plan_rejects_an_empty_subtasks_list():
 
 def test_update_plan_rejects_a_subtask_with_no_text():
     result = update_plan({"phases": [{"phase": "recon", "tasks": [{"text": "x", "subtasks": [{"status": "pending"}]}]}]})
+    assert result["status"] == "error"
+
+
+def test_update_plan_accepts_step_as_an_alias_for_a_subtask_text():
+    """Real incident this covers (Kiwi/Temu HackerOne log-review audit): a weaker model reliably
+    emitted subtasks shaped {'step': '...'} instead of {'text': '...'}, so update_plan rejected
+    every such call and the forced correction retry -- on the same slow free model -- regenerated
+    the identical mistake, marking the planning step failed after burning a 200s+ round-trip. The
+    aliases are normalized in the same "tolerate a real-world variant" spirit as the status
+    fallback, recovering the step with no LLM round-trip at all."""
+    for alias in ("step", "description", "name"):
+        result = update_plan({"phases": [{"phase": "recon", "tasks": [
+            {"text": "Enumerate the attack surface", "subtasks": [{alias: "WHOIS lookup"}]},
+        ]}]})
+        assert result["status"] == "ok", f"alias {alias!r} should be accepted"
+        assert result["recorded"]["phases"][0]["tasks"][0]["subtasks"][0]["text"] == "WHOIS lookup"
+
+
+def test_update_plan_still_rejects_a_subtask_with_no_text_or_known_alias():
+    result = update_plan({"phases": [{"phase": "recon", "tasks": [
+        {"text": "x", "subtasks": [{"status": "pending", "unknown_key": "y"}]},
+    ]}]})
     assert result["status"] == "error"
 
 

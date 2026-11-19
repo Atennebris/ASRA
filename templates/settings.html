@@ -149,7 +149,7 @@
           </span>
           <input type="text" name="base_url" autocomplete="off" value="{{ provider_base_url_value[pid] }}" placeholder="{{ provider_base_url_default[pid] }}"
                  class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary font-mono placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-          <span class="block text-[11px] text-secondary mt-1">Leave empty to use the default above. Point this at a proxy, gateway, or a non-default local port.</span>
+          <span class="ui-desc block text-[11px] text-secondary mt-1">Leave empty to use the default above. Point this at a proxy, gateway, or a non-default local port.</span>
         </label>
         <div class="flex items-center justify-end gap-2">
           {{ button("Save", variant="primary", type="submit") }}
@@ -204,7 +204,7 @@
         <input type="password" name="api_key" autocomplete="off"
                placeholder="{{ '••••••••' if p.api_key else 'not set' }}"
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary font-mono placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-        <span class="block text-[11px] text-secondary mt-1">Leave blank to keep the saved key. Type a new one to replace it.</span>
+        <span class="ui-desc block text-[11px] text-secondary mt-1">Leave blank to keep the saved key. Type a new one to replace it.</span>
       </label>
       <label class="block">
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model <span class="normal-case font-normal text-secondary">(optional &mdash; leave blank)</span></span>
@@ -260,6 +260,9 @@
     <input type="radio" id="settings-tab-customization" name="settings-tab" class="sr-only">
     <label for="settings-tab-customization" role="button"
            class="settings-tab-label flex items-center gap-1.5 cursor-pointer whitespace-nowrap rounded-t px-3 py-2 text-[12px] font-semibold text-secondary hover:text-primary">{{ nav_icon("customization") }}Customization</label>
+    <input type="radio" id="settings-tab-reliability" name="settings-tab" class="sr-only">
+    <label for="settings-tab-reliability" role="button"
+           class="settings-tab-label flex items-center gap-1.5 cursor-pointer whitespace-nowrap rounded-t px-3 py-2 text-[12px] font-semibold text-secondary hover:text-primary">{{ nav_icon("reliability") }}Reliability</label>
   </div>
 
 
@@ -333,7 +336,7 @@
       <div class="space-y-5">
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("AI Provider & Model") }}
-        <p class="text-[11px] text-secondary mb-3">Applies everywhere &mdash; new scans and the session chat both use this, not just one project.</p>
+        <p class="ui-desc text-[11px] text-secondary mb-3">Applies everywhere &mdash; new scans and the session chat both use this, not just one project.</p>
         <form method="post" action="/api/settings/llm" class="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
           <label class="flex-1 min-w-0 block">
             <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Provider</span>
@@ -553,7 +556,7 @@
 
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Reserve providers (fallback chain)") }}
-        <p class="text-[11px] text-secondary mb-3">
+        <p class="ui-desc text-[11px] text-secondary mb-3">
           Off by default. Today, if the provider/model above fails mid-scan (an outage, a quota limit),
           ASRA simply stops and reports the error &mdash; it never automatically switches to another
           configured provider on its own, so it can never spend a paid provider's tokens/money you
@@ -575,12 +578,12 @@
             {{ toggle_switch("enabled", checked=fallback_chain_enabled, onchange="return handleFallbackChainToggle(event);") }}
             <span class="text-sm">
               <span class="block text-primary">Enable custom fallback chain</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Asks for confirmation when turning this on. Applies to the main agent AND every delegated subagent. Leave off to keep the safe default (no automatic cross-provider fallback at all).</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Asks for confirmation when turning this on. Applies to the main agent AND every delegated subagent. Leave off to keep the safe default (no automatic cross-provider fallback at all).</span>
             </span>
           </label>
 
           <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Chain &mdash; one reserve step per row, tried top to bottom</span>
-          <p class="text-[11px] text-secondary mb-2">
+          <p class="ui-desc text-[11px] text-secondary mb-2">
             Each row is a real provider + one of its own actual configured models &mdash; picked from
             dropdowns, never typed. Two rows sharing the same provider (with different models) means
             "try this model, then that one, before moving on." A provider with no API key configured
@@ -686,13 +689,14 @@
          single-model verification behavior unchanged. #}
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Secondary verification provider") }}
-        <p class="text-[11px] text-secondary mb-3">
+        <p class="ui-desc text-[11px] text-secondary mb-3">
           Off by default. When set, Critical/High findings get a genuinely independent second
           opinion from THIS provider/model after Skeptical Verification's own pass — real
           motivation: a single model can share its own blind spots between the original pass and
           its later self-check. Disagreement between the two is shown on the finding, never
           silently resolved by picking one. This is an EXTRA LLM pass per Critical/High finding —
-          real added cost, opt in deliberately.
+          real added cost, opt in deliberately. Especially useful when the primary model is weak or
+          small — a stronger second opinion best offsets a weak model's own mistakes.
         </p>
         <form method="post" action="/api/settings/secondary-verification">
           <div class="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
@@ -783,7 +787,7 @@
           <button type="button" onclick="asraOpenDialog('add-custom-provider-modal')"
                   class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-8 px-3 text-[12px] shrink-0">+ Add Provider</button>
         </div>
-        <p class="text-[11px] text-secondary mb-4">Only providers you've added show up here. Click "+ Add Provider" to hook up a built-in (opencode-zen, Qwen, Mistral, OpenRouter, OpenAI, Anthropic, Groq, xAI, Cerebras, NVIDIA, DeepSeek, Moonshot AI, MiniMax, Zhipu/Z.ai, Google Gemini, Perplexity, Xiaomi MiMo, LM Studio, Ollama) or a genuinely custom endpoint — an added row can be tested, paused, or removed on its own.</p>
+        <p class="ui-desc text-[11px] text-secondary mb-4">Only providers you've added show up here. Click "+ Add Provider" to hook up a built-in (opencode-zen, Qwen, Mistral, OpenRouter, OpenAI, Anthropic, Groq, xAI, Cerebras, NVIDIA, DeepSeek, Moonshot AI, MiniMax, Zhipu/Z.ai, Google Gemini, Perplexity, Xiaomi MiMo, LM Studio, Ollama) or a genuinely custom endpoint — an added row can be tested, paused, or removed on its own.</p>
 
         {# One flat list per group (Cloud/Local/Custom) -- only providers actually added
            (main.py's provider_added, agent/settings.py's added_providers) render as a row here.
@@ -830,7 +834,7 @@
         {% if opencode_local_added %}
         <div class="mt-5">
           <p class="text-[11px] text-secondary uppercase tracking-wider mb-1">Local dependency</p>
-          <p class="text-[11px] text-secondary mb-2">Not one of ASRA's own recon/exploit tools — a free, no-key, no-sign-in LLM backend that spawns the opencode CLI as a local server (Tools tab lists it as a dependency, not a tool).</p>
+          <p class="ui-desc text-[11px] text-secondary mb-2">Not one of ASRA's own recon/exploit tools — a free, no-key, no-sign-in LLM backend that spawns the opencode CLI as a local server (Tools tab lists it as a dependency, not a tool).</p>
           <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-default bg-elevated {{ '' if opencode_local_enabled else 'opacity-60' }}">
             {{ provider_avatar(active=opencode_cli_found) }}
             <div class="min-w-0 flex-1">
@@ -961,7 +965,7 @@
            form. codex-login-status/codex-login-btn ids are read by the vanilla JS block below. #}
         <div class="mt-5">
           <p class="text-[11px] text-secondary uppercase tracking-wider mb-1">ChatGPT sign-in</p>
-          <p class="text-[11px] text-secondary mb-2">Uses an existing ChatGPT Plus/Pro/Team subscription instead of a separate, pay-per-token OpenAI API key.</p>
+          <p class="ui-desc text-[11px] text-secondary mb-2">Uses an existing ChatGPT Plus/Pro/Team subscription instead of a separate, pay-per-token OpenAI API key.</p>
           <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-default bg-elevated">
             {{ provider_avatar(active=codex_signed_in) }}
             <div class="min-w-0 flex-1">
@@ -1005,7 +1009,7 @@
            copilot-login-btn/copilot-login-code ids are read by the vanilla JS block below. #}
         <div class="mt-3">
           <p class="text-[11px] text-secondary uppercase tracking-wider mb-1">GitHub Copilot sign-in</p>
-          <p class="text-[11px] text-secondary mb-2">Uses an existing GitHub Copilot subscription instead of a separate, pay-per-token API key.</p>
+          <p class="ui-desc text-[11px] text-secondary mb-2">Uses an existing GitHub Copilot subscription instead of a separate, pay-per-token API key.</p>
           <div class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-default bg-elevated">
             {{ provider_avatar(active=copilot_signed_in) }}
             <div class="min-w-0 flex-1">
@@ -1049,7 +1053,7 @@
     <section data-settings-tab="wordlists" class="max-w-3xl space-y-5">
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Wordlists") }}
-        <p class="text-[11px] text-secondary mb-3">Detected automatically on this machine (setup_tools.sh's own installs), plus anything downloaded below. Assign one to a tool to override its built-in default &mdash; ffuf, Arjun, Hydra, and the web-login brute-forcer all check here first.</p>
+        <p class="ui-desc text-[11px] text-secondary mb-3">Detected automatically on this machine (setup_tools.sh's own installs), plus anything downloaded below. Assign one to a tool to override its built-in default &mdash; ffuf, Arjun, Hydra, and the web-login brute-forcer all check here first.</p>
 
         {% if wordlist_error %}
           <p class="mb-3 px-3 py-2 rounded border border-severity-high/40 bg-severity-high/10 text-severity-high text-sm break-words">{{ wordlist_error }}</p>
@@ -1147,12 +1151,12 @@
     <section data-settings-tab="general" class="w-full max-w-4xl space-y-5">
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Updates") }}
-        <p class="text-[12px] text-secondary mb-3">Check for and apply new versions from the git repository.</p>
+        <p class="ui-desc text-[12px] text-secondary mb-3">Check for and apply new versions from the git repository.</p>
         <label class="flex items-start gap-3 cursor-pointer mb-3">
           {{ toggle_switch("enabled", checked=update_check_on_startup, extra_attrs='hx-post="/api/settings/updates/check-on-startup" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
           <span>
             <span class="block text-sm font-medium text-primary">Check for updates at startup</span>
-            <span class="block text-[11px] text-secondary mt-0.5">On by default. Takes effect on your next launch, not this session. Off still lets you check manually below.</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">On by default. Takes effect on your next launch, not this session. Off still lets you check manually below.</span>
           </span>
         </label>
         <div id="update-panel" hx-get="/api/updates/status" hx-trigger="load" hx-swap="innerHTML"></div>
@@ -1160,7 +1164,7 @@
 
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Desktop app") }}
-        <p class="text-[12px] text-secondary mb-3">The installed launcher binary itself (Windows/Linux/macOS) — a separate thing from the code above, since `desktop/bin/` isn't part of the git repo. Only relevant when running via the desktop app.</p>
+        <p class="ui-desc text-[12px] text-secondary mb-3">The installed launcher binary itself (Windows/Linux/macOS) — a separate thing from the code above, since `desktop/bin/` isn't part of the git repo. Only relevant when running via the desktop app.</p>
         <div id="desktop-update-panel" hx-get="/api/desktop-update/status" hx-trigger="load" hx-swap="innerHTML"></div>
       </div>
 
@@ -1173,7 +1177,7 @@
          depends on any of these -- it always works, on or off. #}
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Native toolkit access") }}
-        <p class="text-[11px] text-secondary mb-4">
+        <p class="ui-desc text-[11px] text-secondary mb-4">
           Whether the autonomous agent, chat, and subagents can use the native toolkit's own tools
           (the same Proxy/Repeater/Decoder/Comparer/Intruder/Sequencer/Racer engine as the Toolkit
           tab on a session page) -- independent of whether YOU can use them by hand there, which
@@ -1184,7 +1188,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_proxy_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_proxy_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Proxy (list_captured_traffic)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">List this session's own captured HTTP traffic (from the agent's browser, and any send_raw_request calls) -- method, URL, status, id.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">List this session's own captured HTTP traffic (from the agent's browser, and any send_raw_request calls) -- method, URL, status, id.</span>
             </span>
           </label>
 
@@ -1192,7 +1196,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_repeater_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_repeater_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Repeater (send_raw_request)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Send one raw HTTP request (any method/headers/body) to the target and see the real response -- gated by the same exploitation allowlist sqlmap/Metasploit already require.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Send one raw HTTP request (any method/headers/body) to the target and see the real response -- gated by the same exploitation allowlist sqlmap/Metasploit already require.</span>
             </span>
           </label>
 
@@ -1200,7 +1204,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_decoder_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_decoder_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Decoder (decode_value)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Encode/decode a string (base64, URL, HTML entities, hex, gzip) -- pure text transform, no network involved.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Encode/decode a string (base64, URL, HTML entities, hex, gzip) -- pure text transform, no network involved.</span>
             </span>
           </label>
 
@@ -1208,7 +1212,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_comparer_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_comparer_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Comparer (diff_requests)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Diff the request or response of two captured traffic entries, line by line.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Diff the request or response of two captured traffic entries, line by line.</span>
             </span>
           </label>
 
@@ -1216,7 +1220,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_intruder_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_intruder_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Intruder (intruder_run)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Run an automated §...§ payload-substitution sweep (sniper/pitchfork) against the target -- gated by the same exploitation allowlist sqlmap/Metasploit already require, since this sends a whole batch of attacker-chosen payloads to the real target.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Run an automated §...§ payload-substitution sweep (sniper/pitchfork) against the target -- gated by the same exploitation allowlist sqlmap/Metasploit already require, since this sends a whole batch of attacker-chosen payloads to the real target.</span>
             </span>
           </label>
 
@@ -1224,7 +1228,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_sequencer_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_sequencer_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Sequencer (sequencer_analyze)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Entropy/predictability analysis of a session/CSRF/reset token across several real samples -- stored mode reads already-captured traffic (no gate needed); live mode fires fresh repeated requests, gated by the same exploitation allowlist as Repeater/Intruder above.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Entropy/predictability analysis of a session/CSRF/reset token across several real samples -- stored mode reads already-captured traffic (no gate needed); live mode fires fresh repeated requests, gated by the same exploitation allowlist as Repeater/Intruder above.</span>
             </span>
           </label>
 
@@ -1232,7 +1236,7 @@
             {{ toggle_switch("enabled", checked=toolkit_agent_settings.toolkit_racer_enabled, extra_attrs='hx-post="/api/toolkit-agent-settings/toolkit_racer_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Racer (racer_run)</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Race-condition testing -- fires the same request several times with last-byte synchronization (or plain sequential as a baseline) to catch limit-overrun/coupon-reuse/TOCTOU bugs -- gated by the same exploitation allowlist as Repeater/Intruder above.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Race-condition testing -- fires the same request several times with last-byte synchronization (or plain sequential as a baseline) to catch limit-overrun/coupon-reuse/TOCTOU bugs -- gated by the same exploitation allowlist as Repeater/Intruder above.</span>
             </span>
           </label>
         </div>
@@ -1249,7 +1253,7 @@
         <details class="group">
           {{ disclosure_summary("Optional interpreters/compilers") }}
           <div class="px-3 pb-4 pt-1 border-t border-default">
-            <p class="text-[11px] text-secondary mb-3">Not installed by default. "Install" runs the real package-manager command on this machine (Linux/WSL2 only -- on macOS or an unsupported distro, install manually). "Path" lets you point at an install in a non-standard location instead.</p>
+            <p class="ui-desc text-[11px] text-secondary mb-3">Not installed by default. "Install" runs the real package-manager command on this machine (Linux/WSL2 only -- on macOS or an unsupported distro, install manually). "Path" lets you point at an install in a non-standard location instead.</p>
 
             {# Optional -- with nothing saved here, Install still works exactly as before: it tries
                a passwordless sudo, and on this machine's own current password setup, fails fast and
@@ -1336,7 +1340,7 @@
         <details class="group">
           {{ disclosure_summary("Tool API Keys") }}
           <div class="px-3 pb-4 pt-1 border-t border-default">
-            <p class="text-[11px] text-secondary mb-3">Optional per-tool credentials, passed as that tool's own API-key flag on every call once saved. Every tool listed here still works without one -- a key just unlocks extra data (e.g. a vulnerability-database cross-reference) that tool's free/unauthenticated mode doesn't have.</p>
+            <p class="ui-desc text-[11px] text-secondary mb-3">Optional per-tool credentials, passed as that tool's own API-key flag on every call once saved. Every tool listed here still works without one -- a key just unlocks extra data (e.g. a vulnerability-database cross-reference) that tool's free/unauthenticated mode doesn't have.</p>
             <div class="space-y-2">
               {% for name, spec in tool_api_key_specs.items() %}
                 {% set configured = tool_api_key_status[name] %}
@@ -1388,7 +1392,7 @@
          scroll straight to. #}
       <div id="settings-chat-section" class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("What the chat panel can do") }}
-        <p class="text-[11px] text-secondary mb-4">
+        <p class="ui-desc text-[11px] text-secondary mb-4">
           Applies to every chat in ASRA — a project's own chat sidebar and the standalone
           <a href="/chat" class="text-accent hover:underline">Quick Chat</a> alike. Chat can always
           answer from what it already knows (a project's own findings/recon/recent activity, or
@@ -1408,7 +1412,7 @@
             {{ toggle_switch("enabled", checked=chat_settings.web_fetch_enabled, extra_attrs='hx-post="/api/chat-settings/web_fetch_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Web fetch</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Read an external page (a bug-bounty
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Read an external page (a bug-bounty
                 program's own page, a CVE advisory, a write-up) — a fast, plain read, tried first.</span>
             </span>
           </label>
@@ -1417,7 +1421,7 @@
             {{ toggle_switch("enabled", checked=chat_settings.browser_enabled, extra_attrs='hx-post="/api/chat-settings/browser_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Browser</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Fallback for a page Web fetch can't
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Fallback for a page Web fetch can't
                 get through (a CAPTCHA/challenge page) or one that needs real interaction — click,
                 fill a form, log in, read something only rendered by JavaScript.</span>
             </span>
@@ -1427,7 +1431,7 @@
             {{ toggle_switch("enabled", checked=chat_settings.dork_engine_enabled, extra_attrs='hx-post="/api/chat-settings/dork_engine_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Dork Engine</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Build a search-engine dork or
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Build a search-engine dork or
                 third-party OSINT lookup for a target from the curated catalog (the same one behind the
                 <a href="/dorks" class="text-accent hover:underline">Dorks tab</a>), or run one of
                 ASRA's own passive recon lookups (crt.sh, Wayback, WHOIS, DNS, ...) under it.</span>
@@ -1438,7 +1442,7 @@
             {{ toggle_switch("enabled", checked=chat_settings.subagents_enabled, extra_attrs='hx-post="/api/chat-settings/subagents_enabled" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Subagent delegation</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Let chat hand off a task to a
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Let chat hand off a task to a
                 Subagent on its own judgment, or when you explicitly ask it to ("use a subagent to
                 check X") — the same delegate_to_subagent tool the autonomous agent's own phases use.
                 {% if not get_enabled_subagent_profiles() %}
@@ -1476,6 +1480,20 @@
       </div>
 
       <div data-customization-subtab="visual" class="space-y-5">
+      {# Interface density -- the app-wide "Show helper descriptions" switch. Its own explanation
+         stays plain text (NOT .ui-desc) so the control that brings descriptions back is never itself
+         hidden. onchange flips the whole app live via window.asraSetHideDescriptions (the save
+         follows over hx-post), the live-visual-feedback split this project's rules require. #}
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Interface density") }}
+        <label class="flex items-start gap-3 cursor-pointer">
+          {{ toggle_switch("enabled", checked=(not ui_descriptions_hidden()), onchange="window.asraSetHideDescriptions(!this.checked)", extra_attrs='hx-post="/api/settings/ui-descriptions" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
+          <span>
+            <span class="block text-sm font-medium text-primary">Show helper descriptions</span>
+            <span class="block text-[11px] text-secondary mt-0.5">On by default. Turn off for a cleaner, less dense interface &mdash; the explanatory text under headings, cards, and fields is hidden, but still appears when you hover over an item for a moment. Applies everywhere, instantly.</span>
+          </span>
+        </label>
+      </div>
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Appearance") }}
         {# A custom dropdown, not a native <select> -- a native one can't be hooked for per-option
@@ -1624,7 +1642,7 @@
          there is no live element to restyle in this session. #}
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Launch screen") }}
-        <p class="text-[12px] text-secondary mb-3">What the desktop app shows while the backend starts up. Takes effect on your next launch, not this session. Only matters for the desktop app -- there's nothing to start up in a browser tab.</p>
+        <p class="ui-desc text-[12px] text-secondary mb-3">What the desktop app shows while the backend starts up. Takes effect on your next launch, not this session. Only matters for the desktop app -- there's nothing to start up in a browser tab.</p>
         <div id="launch-screen-choice" class="grid grid-cols-1 sm:grid-cols-3 gap-3" role="radiogroup" aria-label="Launch screen">
           {% for value, name, desc in [
             ("intro", "Animated intro", "Cinematic title sequence. The default."),
@@ -1671,7 +1689,7 @@
          picker layer needed. #}
       <div id="settings-timezone-section" class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Timezone") }}
-        <p class="text-[11px] text-secondary mb-3">Every timestamp shown in this app (findings, hypotheses, approvals, the clock in the sidebar footer) is converted to this zone for display. Doesn't affect what's actually stored, or debug.log (which deliberately always uses this machine's own local clock, see its own Settings-independent reasoning).</p>
+        <p class="ui-desc text-[11px] text-secondary mb-3">Every timestamp shown in this app (findings, hypotheses, approvals, the clock in the sidebar footer) is converted to this zone for display. Doesn't affect what's actually stored, or debug.log (which deliberately always uses this machine's own local clock, see its own Settings-independent reasoning).</p>
         <form method="post" action="/api/settings/timezone" class="flex items-center gap-2">
           <select name="tz" class="flex-1 min-w-0 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
             {% for tz in available_timezones %}
@@ -1719,7 +1737,7 @@
             {{ toggle_switch("enabled", checked=clock_show_time, onchange="asraClockSetVisible('asra-clock-line', this.checked)", extra_attrs='hx-post="/api/settings/clock-display/show_clock" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Show clock</span>
-              <span class="block text-[11px] text-secondary mt-0.5">The live time in the sidebar footer, on every page.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">The live time in the sidebar footer, on every page.</span>
             </span>
           </label>
           <label class="flex items-start gap-3 cursor-pointer">
@@ -1730,14 +1748,14 @@
                  not a hardcoded example zone. A fixed placeholder here would drift from whatever
                  the operator actually picked above, showing e.g. "Europe/Chisinau" as the preview
                  even when their real saved zone is something else entirely. #}
-              <span class="block text-[11px] text-secondary mt-0.5">E.g. "{{ current_display_timezone }}" next to the time. Off by default -- just the time shows otherwise.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">E.g. "{{ current_display_timezone }}" next to the time. Off by default -- just the time shows otherwise.</span>
             </span>
           </label>
           <label class="flex items-start gap-3 cursor-pointer">
             {{ toggle_switch("enabled", checked=clock_show_date, onchange="asraClockSetVisible('asra-clock-date', this.checked)", extra_attrs='hx-post="/api/settings/clock-display/show_date" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
             <span>
               <span class="block text-sm font-medium text-primary">Show date</span>
-              <span class="block text-[11px] text-secondary mt-0.5">Today's date underneath the time, in this same display zone. Off by default.</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Today's date underneath the time, in this same display zone. Off by default.</span>
             </span>
           </label>
         </div>
@@ -1745,7 +1763,7 @@
 
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Mascot") }}
-        <p class="text-[11px] text-secondary mb-3">A small ASCII companion in the session header that reacts to what's happening &mdash; a new finding, an error, the scan finishing. Purely cosmetic &mdash; the agent itself never reads this choice.</p>
+        <p class="ui-desc text-[11px] text-secondary mb-3">A small ASCII companion in the session header that reacts to what's happening &mdash; a new finding, an error, the scan finishing. Purely cosmetic &mdash; the agent itself never reads this choice.</p>
         {# Each swatch shows the pet's real walk frame, injected from static/js/mascot.js
            (window.asraMascotFrame) by the script below -- one source of truth for the art,
            never a re-typed copy that could drift from what actually walks in the header. #}
@@ -1803,13 +1821,13 @@
          only after a reload. #}
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Header light") }}
-        <p class="text-[11px] text-secondary mb-3">A decorative lamp that hangs over the page title bar and lights it up. Click the lamp there to switch it on or off (remembered on this browser) -- separate from the enable switch below, which removes it entirely.</p>
+        <p class="ui-desc text-[11px] text-secondary mb-3">A decorative lamp that hangs over the page title bar and lights it up. Click the lamp there to switch it on or off (remembered on this browser) -- separate from the enable switch below, which removes it entirely.</p>
 
         <label class="flex items-start gap-3 cursor-pointer mb-4">
           {{ toggle_switch("enabled", checked=true, id="header-light-enabled-input") }}
           <span>
             <span class="block text-sm font-medium text-primary">Show header light</span>
-            <span class="block text-[11px] text-secondary mt-0.5">Off removes the light and everything below it from the header entirely.</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">Off removes the light and everything below it from the header entirely.</span>
           </span>
         </label>
 
@@ -1889,7 +1907,7 @@
               </label>
             {% endfor %}
           </div>
-          <p class="text-[11px] text-secondary mb-3">Auto follows the current theme's accent color, and plays a rainbow cycle on the handful of themes that are already an intentionally neon/vivid palette (Neo, Matrix, Synthwave &apos;84, Cobalt2). RGB cycle plays that same rainbow on every theme. Fixed uses one color you pick below, always. Temperature uses a real warm-to-cold bulb color computed from the Kelvin value below, instead of a picked color.</p>
+          <p class="ui-desc text-[11px] text-secondary mb-3">Auto follows the current theme's accent color, and plays a rainbow cycle on the handful of themes that are already an intentionally neon/vivid palette (Neo, Matrix, Synthwave &apos;84, Cobalt2). RGB cycle plays that same rainbow on every theme. Fixed uses one color you pick below, always. Temperature uses a real warm-to-cold bulb color computed from the Kelvin value below, instead of a picked color.</p>
 
           <label id="header-light-fixed-color-row" class="flex items-center gap-3 mb-4 hidden">
             <span class="text-sm text-primary">Custom color</span>
@@ -2233,12 +2251,12 @@
       } %}
       <div class="bg-surface border border-default rounded-xl p-5">
         {{ section_label("Sound notifications") }}
-        <p class="text-[12px] text-secondary mb-3">Short, synthesized tones (no audio files, generated in the browser) for real session events. Everything below is off by default -- turn on only what you actually want to hear.</p>
+        <p class="ui-desc text-[12px] text-secondary mb-3">Short, synthesized tones (no audio files, generated in the browser) for real session events. Everything below is off by default -- turn on only what you actually want to hear.</p>
         <label class="flex items-start gap-3 cursor-pointer">
           {{ toggle_switch("enabled", checked=sound_settings.master_enabled, onchange="asraSoundSettings.setMasterEnabled(this.checked)", extra_attrs='hx-post="/api/settings/sounds/master" hx-trigger="change" hx-swap="none" hx-disabled-elt="this"') }}
           <span>
             <span class="block text-sm font-medium text-primary">Enable sound notifications</span>
-            <span class="block text-[11px] text-secondary mt-0.5">Master switch -- must be on for any event below to actually play, even if that event's own toggle is also on.</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">Master switch -- must be on for any event below to actually play, even if that event's own toggle is also on.</span>
           </span>
         </label>
 
@@ -2261,7 +2279,7 @@
                 {{ toggle_switch("enabled", checked=event_state.enabled, onchange="asraSoundSettings.setEvent('" ~ event.id ~ "', this.checked, this.form.sound.value)") }}
                 <span class="min-w-0">
                   <span class="block text-sm font-medium text-primary">{{ event.label }}</span>
-                  <span class="block text-[11px] text-secondary mt-0.5">{{ event.description }}</span>
+                  <span class="ui-desc block text-[11px] text-secondary mt-0.5">{{ event.description }}</span>
                 </span>
               </label>
               <select name="sound"
@@ -2290,7 +2308,7 @@
           {{ toggle_switch("enabled", checked=false, disabled=true) }}
           <span>
             <span class="block text-sm font-medium text-secondary">Play intro sound</span>
-            <span class="block text-[11px] text-secondary mt-0.5">Ambient drone plus glass-impact hits for the animated launch intro. Not available yet -- coming soon.</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">Ambient drone plus glass-impact hits for the animated launch intro. Not available yet -- coming soon.</span>
           </span>
         </label>
       </div>
@@ -2302,6 +2320,161 @@
        so it can still be reasoned about as its own unit; `sections`/`nuclei_packs` come from the
        same _grouped_tools_context()/list_nuclei_packs() the old page used, now merged into
        get_settings's own context (main.py). #}
+    {# Weak-model reliability knobs (tool-call temperature, structured output, the weak-model
+       profile, argument coercion, fuzzy tool names, the invalid-call signal, the verification hint).
+       Each control saves one key to data/reliability_settings.json, which the matching resolver then
+       reads ahead of its .env default -- .env stays the quiet default UNDER these controls, so
+       nobody hand-edits .env. These change how FUTURE turns/sessions behave, not this page, so the
+       only live feedback needed is each control reflecting its own new state, which native inputs do
+       instantly on change; asraReliabilitySave persists it in the background (hx-style split). #}
+    <section data-settings-tab="reliability" class="w-full max-w-4xl space-y-5">
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Sampling") }}
+        <p class="ui-desc text-[12px] text-secondary mb-3">Lower sampling temperature on tool-call turns means less random, more parseable output — it most helps a weak model send valid tool-call JSON. Applies from the next turn.</p>
+        <label class="flex items-center justify-between gap-3">
+          <span class="block text-sm font-medium text-primary">Tool-call temperature</span>
+          <input type="number" min="0" max="1" step="0.05" value="{{ reliability_settings['LLM_TOOL_CALL_TEMPERATURE'] }}"
+                 onchange="asraReliabilitySave('LLM_TOOL_CALL_TEMPERATURE', this.value)"
+                 class="w-24 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Structured output") }}
+        <p class="ui-desc text-[12px] text-secondary mb-3">Force prompt-mode models (those without a native tool-calling API) to answer as one JSON object, cutting malformed tool-call JSON at generation time. Off by default. A provider that rejects it falls back automatically. Takes effect on your next session.</p>
+        <label class="flex items-start gap-3 cursor-pointer">
+          {{ toggle_switch("enabled", checked=reliability_settings['LLM_STRUCTURED_OUTPUT'], onchange="asraReliabilitySave('LLM_STRUCTURED_OUTPUT', this.checked)") }}
+          <span>
+            <span class="block text-sm font-medium text-primary">Enforce JSON structured output</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">Only affects the prompt-based tool-calling path; native tool-calling is untouched.</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Weak-model profile") }}
+        <p class="ui-desc text-[12px] text-secondary mb-4">When the primary model is detected as weak/small, ASRA shortens its system prompt and trims the tool menu so the model isn't overwhelmed. Auto decides from real signals (no native tool-calling, or a small context window); force it on/off for a custom checkpoint the model catalog can't judge.</p>
+        <div class="space-y-4">
+          <label class="flex items-center justify-between gap-3">
+            <span class="block text-sm font-medium text-primary">Detection mode</span>
+            <select onchange="asraReliabilitySave('WEAK_MODEL_MODE', this.value)"
+                    class="w-40 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+              {% for opt in ["auto", "on", "off"] %}
+              <option value="{{ opt }}" {% if reliability_settings['WEAK_MODEL_MODE'] == opt %}selected{% endif %}>{{ opt }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label class="flex items-center justify-between gap-3">
+            <span>
+              <span class="block text-sm font-medium text-primary">Context-window threshold</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">A known context limit below this counts as weak.</span>
+            </span>
+            <input type="number" min="1" step="1024" value="{{ reliability_settings['WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD'] }}"
+                   onchange="asraReliabilitySave('WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD', this.value)"
+                   class="w-28 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+          <label class="flex items-center justify-between gap-3">
+            <span>
+              <span class="block text-sm font-medium text-primary">Max tools offered at once</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Under the weak profile, the per-turn tool menu is trimmed to this many (the phase's terminal tool is always kept).</span>
+            </span>
+            <input type="number" min="1" step="1" value="{{ reliability_settings['WEAK_MODEL_MAX_TOOLS'] }}"
+                   onchange="asraReliabilitySave('WEAK_MODEL_MAX_TOOLS', this.value)"
+                   class="w-24 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+        </div>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Argument robustness") }}
+        <p class="ui-desc text-[12px] text-secondary mb-4">Quietly fix the small, unambiguous slips weak models make in tool calls — a stringified number/bool, a one-item list where a scalar is wanted — and hint the closest real tool name when the model calls one that doesn't exist. Both on by default.</p>
+        <div class="space-y-4">
+          <label class="flex items-start gap-3 cursor-pointer">
+            {{ toggle_switch("enabled", checked=reliability_settings['TOOL_ARG_COERCION'], onchange="asraReliabilitySave('TOOL_ARG_COERCION', this.checked)") }}
+            <span>
+              <span class="block text-sm font-medium text-primary">Coerce tool arguments toward the schema</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">Only unambiguous type/shape fixes; anything ambiguous is left for the tool's own validator.</span>
+            </span>
+          </label>
+          <label class="flex items-start gap-3 cursor-pointer">
+            {{ toggle_switch("enabled", checked=reliability_settings['TOOL_NAME_FUZZY_MATCH'], onchange="asraReliabilitySave('TOOL_NAME_FUZZY_MATCH', this.checked)") }}
+            <span>
+              <span class="block text-sm font-medium text-primary">Suggest the closest tool name</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">An unknown tool name gets a "did you mean X?" hint — never a silent substitution; the model re-issues the call itself.</span>
+            </span>
+          </label>
+          <label class="flex items-center justify-between gap-3">
+            <span>
+              <span class="block text-sm font-medium text-primary">Fuzzy-match strictness</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">0–1; higher means only very close names are suggested.</span>
+            </span>
+            <input type="number" min="0" max="1" step="0.05" value="{{ reliability_settings['TOOL_NAME_FUZZY_CUTOFF'] }}"
+                   onchange="asraReliabilitySave('TOOL_NAME_FUZZY_CUTOFF', this.value)"
+                   class="w-24 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+        </div>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Quality signal") }}
+        <p class="ui-desc text-[12px] text-secondary mb-4">Watch for a model that keeps producing invalid tool calls (not just identical repeats) and warn you once in the session log instead of silently burning the whole budget. On by default; it never stops the session on its own.</p>
+        <div class="space-y-4">
+          <label class="flex items-start gap-3 cursor-pointer">
+            {{ toggle_switch("enabled", checked=reliability_settings['WEAK_SIGNAL_ENABLED'], onchange="asraReliabilitySave('WEAK_SIGNAL_ENABLED', this.checked)") }}
+            <span>
+              <span class="block text-sm font-medium text-primary">Flag a struggling model</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">One warning per phase in the live session log when the invalid-call rate crosses the threshold.</span>
+            </span>
+          </label>
+          <label class="flex items-center justify-between gap-3">
+            <span class="block text-sm font-medium text-primary">Window (recent calls)</span>
+            <input type="number" min="1" step="1" value="{{ reliability_settings['WEAK_SIGNAL_WINDOW'] }}"
+                   onchange="asraReliabilitySave('WEAK_SIGNAL_WINDOW', this.value)"
+                   class="w-24 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+          <label class="flex items-center justify-between gap-3">
+            <span>
+              <span class="block text-sm font-medium text-primary">Invalid-rate threshold</span>
+              <span class="ui-desc block text-[11px] text-secondary mt-0.5">0–1; fraction of the window that must be invalid to warn.</span>
+            </span>
+            <input type="number" min="0.05" max="1" step="0.05" value="{{ reliability_settings['WEAK_SIGNAL_INVALID_RATE'] }}"
+                   onchange="asraReliabilitySave('WEAK_SIGNAL_INVALID_RATE', this.value)"
+                   class="w-24 bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          </label>
+        </div>
+      </div>
+
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Verification hint") }}
+        <p class="ui-desc text-[12px] text-secondary mb-3">When the primary model is weak and no secondary verification provider is set, point it out once at session start. This only recommends — it never enables verification, which stays your own opt-in. Configure the provider itself under <a href="#providers" class="text-accent hover:underline">LLM Providers</a>.</p>
+        <label class="flex items-start gap-3 cursor-pointer">
+          {{ toggle_switch("enabled", checked=reliability_settings['WEAK_MODEL_VERIFICATION_HINT'], onchange="asraReliabilitySave('WEAK_MODEL_VERIFICATION_HINT', this.checked)") }}
+          <span>
+            <span class="block text-sm font-medium text-primary">Recommend secondary verification</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">A one-line recommendation in the session log — especially useful with a weak primary model.</span>
+          </span>
+        </label>
+      </div>
+
+      <script>
+        // One tiny persister for every Reliability control: the native input already reflects its
+        // own new state instantly (the live feedback), this just saves it in the background to the
+        // one generic key/value route. Boolean toggles send this.checked, numbers/selects this.value.
+        window.asraReliabilitySave = window.asraReliabilitySave || function (key, value) {
+          var body = new URLSearchParams({ key: key, value: String(value) });
+          fetch("/api/settings/reliability", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body,
+          }).then(function (r) {
+            if (!r.ok) console.error("[UI] reliability save failed", key, r.status);
+          }).catch(function (err) {
+            console.error("[UI] reliability save error", key, err);
+          });
+        };
+      </script>
+    </section>
+
     <section data-settings-tab="tools" class="w-full">
       {% include "partials/tools_panel.html" %}
     </section>
@@ -2332,7 +2505,7 @@
           <span class="w-1.5 h-1.5 rounded-full bg-severity-high shrink-0"></span><span class="text-[11px] text-severity-high">{{ "opencode found on Windows only" if opencode_cli_status.state == "windows_only" else "opencode CLI not found" }}</span>
         {% endif %}
       </div>
-      <p class="text-[11px] text-secondary">Nothing to configure here -- no API key, no base URL, no model to type. This provider spawns the opencode CLI as a local server on this machine and talks to it directly; its own model list is read live once it's running.</p>
+      <p class="ui-desc text-[11px] text-secondary">Nothing to configure here -- no API key, no base URL, no model to type. This provider spawns the opencode CLI as a local server on this machine and talks to it directly; its own model list is read live once it's running.</p>
       {% if not opencode_cli_found %}
         <p class="text-[11px] text-secondary">{{ opencode_cli_status.explanation() }}</p>
       {% endif %}
@@ -2402,7 +2575,7 @@
             {% endfor %}
           </optgroup>
         </select>
-        <span class="block text-[11px] text-secondary mt-1">A built-in provider activates its own real row above (with its own key/endpoint) &mdash; it never creates a second, separate entry. Pick Custom only for a genuinely different, not-already-listed endpoint.</span>
+        <span class="ui-desc block text-[11px] text-secondary mt-1">A built-in provider activates its own real row above (with its own key/endpoint) &mdash; it never creates a second, separate entry. Pick Custom only for a genuinely different, not-already-listed endpoint.</span>
       </label>
       <label class="block" data-add-provider-name-field>
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Display name <span class="normal-case font-normal text-secondary">(custom only)</span></span>
@@ -2423,7 +2596,7 @@
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Model <span class="normal-case font-normal text-secondary">(optional &mdash; leave blank)</span></span>
         <input type="text" name="model" placeholder="only needed if the live list below can't load"
                class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-        <span class="block text-[11px] text-secondary mt-1">You won't normally need this: once added, this provider's own real model dropdown (in AI Provider &amp; Model above, or Reserve providers) queries its endpoint live and lists whatever it actually serves &mdash; nothing to type or guess. This field only matters as a fallback for the rare case that live lookup fails (the endpoint isn't reachable yet, or doesn't expose a model list at all).</span>
+        <span class="ui-desc block text-[11px] text-secondary mt-1">You won't normally need this: once added, this provider's own real model dropdown (in AI Provider &amp; Model above, or Reserve providers) queries its endpoint live and lists whatever it actually serves &mdash; nothing to type or guess. This field only matters as a fallback for the rare case that live lookup fails (the endpoint isn't reachable yet, or doesn't expose a model list at all).</span>
       </label>
       {# Shown instead of the three fields above when the picked Type has nothing to configure at
          all (opencode-local -- combined_type_presets' own no_config flag, set below) -- a local

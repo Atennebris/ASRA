@@ -176,3 +176,45 @@ def test_run_tool_with_retry_allows_wpscan_once_wordpress_is_confirmed(tmp_path,
         assert result["status"] == "ok"
     finally:
         TOOL_REGISTRY[index] = original_spec
+
+
+def test_run_tool_with_retry_marks_wpscan_db_updated_only_once_per_session(tmp_path, monkeypatch):
+    """Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): WPScan's own
+    --update default (build_wpscan_command) re-ran on every WordPress host a scan touched, even
+    though the local vulnerability database it refreshes is one global file, not per-host -- N
+    hosts paid the real update cost N times in the same session. _run_tool_with_retry marks the
+    session the first time wpscan actually dispatches, then tells build_wpscan_command (via the
+    `_wpscan_skip_update` marker) to skip it on every later call this same session.
+    """
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    captured_params = []
+    index = next(i for i, s in enumerate(TOOL_REGISTRY) if s.name == "wpscan")
+    original_spec = TOOL_REGISTRY[index]
+
+    def fake_native(params):
+        captured_params.append(dict(params))
+        return {"status": "ok", "stdout": "[+] WordPress version 5.8.1 identified.\n"}
+
+    TOOL_REGISTRY[index] = dataclasses.replace(original_spec, tool_tier=1, native_function=fake_native)
+    try:
+        session = {
+            "session_id": "usr_wpscan_update_once", "target": "example.com", "status": "processing",
+            "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+            "recon_result": {"targets": [], "cves": [], "technologies": {
+                "http://site1.example.com": ["WordPress[5.8.1]"],
+                "http://site2.example.com": ["WordPress[5.8.1]"],
+            }},
+        }
+        ctx = RunContext(llm=_FailIfCalledLLM(), session=session, session_id=session["session_id"])
+        spec = TOOL_REGISTRY[index]
+
+        first = _run(_run_tool_with_retry(ctx, spec, {"target": "http://site1.example.com"}))
+        second = _run(_run_tool_with_retry(ctx, spec, {"target": "http://site2.example.com"}))
+
+        assert first["status"] == "ok" and second["status"] == "ok"
+        assert captured_params[0].get("_wpscan_skip_update") is not True  # 1st host: real --update
+        assert captured_params[1].get("_wpscan_skip_update") is True  # 2nd host: skip, DB already fresh
+        assert ctx.session["_wpscan_db_updated"] is True
+    finally:
+        TOOL_REGISTRY[index] = original_spec

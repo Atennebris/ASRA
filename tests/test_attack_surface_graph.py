@@ -538,3 +538,75 @@ def test_first_seen_at_is_none_when_no_source_has_a_timestamp():
     session = _session(recon_result={"targets": [{"host": "example.com", "port": 80}]})
     node = main._build_attack_surface_graph(session)["nodes"][0]
     assert node["first_seen_at"] is None
+
+
+# ---- attack_path verification (attack-ver): a proven pivot must look different from an inferred one
+
+def test_agent_relationship_edge_is_marked_verified():
+    # record_host_relationship's tool contract required real evidence, so its pivot is drawn solid
+    # ("verified"); the Map must not render it the same as a reasoned/chain-derived hop.
+    session = _session(
+        recon_result={"targets": [{"host": "a.example.com", "port": 80}, {"host": "b.example.com", "port": 80}]},
+        agent_relationships=[{
+            "source_host": "a.example.com", "target_host": "b.example.com",
+            "mechanism": "leaked credentials", "evidence": "authenticated_request succeeded",
+        }],
+    )
+    edges = [e for e in main._build_attack_surface_graph(session)["edges"] if e["kind"] == "attack_path"]
+    assert len(edges) == 1
+    assert edges[0]["verification"] == "verified"
+
+
+def test_chain_derived_edge_is_marked_reasoned():
+    # A chain-reconstructed pivot is inferred from reasoning, not evidence -- "reasoned" (drawn
+    # dashed), never "verified".
+    session = _session(
+        recon_result={"targets": [{"host": "a.example.com", "port": 80}, {"host": "b.example.com", "port": 80}]},
+        findings=[
+            {"title": "SSRF on a.example.com", "host": "a.example.com", "severity": "High"},
+            {"title": "Admin panel on b.example.com", "host": "b.example.com", "severity": "Critical"},
+        ],
+        chain_attempts=[{
+            "outcome": "chain_confirmed",
+            "finding_titles": ["SSRF on a.example.com", "Admin panel on b.example.com"],
+            "reasoning": "SSRF reached the internal admin panel.",
+        }],
+    )
+    edges = [e for e in main._build_attack_surface_graph(session)["edges"] if e["kind"] == "attack_path"]
+    assert len(edges) == 1
+    assert edges[0]["verification"] == "reasoned"
+
+
+def test_verified_pivot_keeps_its_verification_when_a_chain_edge_exists_for_the_same_pair():
+    # Dedup prefers the evidence-backed edge; its "verified" state must survive, never get downgraded
+    # to the chain edge's "reasoned".
+    session = _session(
+        recon_result={"targets": [{"host": "a.example.com", "port": 80}, {"host": "b.example.com", "port": 80}]},
+        findings=[
+            {"title": "SSRF on a.example.com", "host": "a.example.com", "severity": "High"},
+            {"title": "Admin panel on b.example.com", "host": "b.example.com", "severity": "Critical"},
+        ],
+        chain_attempts=[{
+            "outcome": "chain_confirmed",
+            "finding_titles": ["SSRF on a.example.com", "Admin panel on b.example.com"],
+            "reasoning": "chain reasoning",
+        }],
+        agent_relationships=[{
+            "source_host": "a.example.com", "target_host": "b.example.com",
+            "mechanism": "SSRF", "evidence": "real evidence",
+        }],
+    )
+    edges = [e for e in main._build_attack_surface_graph(session)["edges"] if e["kind"] == "attack_path"]
+    assert len(edges) == 1
+    assert edges[0]["verification"] == "verified"
+
+
+def test_non_attack_path_edges_carry_no_verification_field():
+    # verification is attack_path-only -- a dns/shared_surface/credential edge must not sprout it.
+    session = _session(recon_result={
+        "targets": [{"host": "a.example.com", "port": 443}],
+        "dns_map": {"a.example.com": ["9.9.9.9"], "b.example.com": ["9.9.9.9"]},
+    })
+    for edge in main._build_attack_surface_graph(session)["edges"]:
+        if edge["kind"] != "attack_path":
+            assert "verification" not in edge

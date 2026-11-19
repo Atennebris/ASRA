@@ -48,9 +48,9 @@
         {% endfor %}
       </div>
       {% if result.response_status_counts and (result.response_status_counts.values() | max) > 1 %}
-        <p class="text-[11px] text-secondary">Several attempts landed on the same status. For an endpoint that should only allow ONE success (redeeming a coupon, applying a one-time discount, a limited-stock purchase), multiple identical successes here is the actual race win -- compare response bodies in the Site Map to confirm it's not just N idempotent reads.</p>
+        <p class="text-[11px] text-secondary ui-desc">Several attempts landed on the same status. For an endpoint that should only allow ONE success (redeeming a coupon, applying a one-time discount, a limited-stock purchase), multiple identical successes here is the actual race win -- compare response bodies in the Site Map to confirm it's not just N idempotent reads.</p>
       {% endif %}
-      <p class="text-[11px] text-secondary">Inspect individual attempts in the Site Map -- filter <code class="font-mono">source.eq:racer</code>.</p>
+      <p class="text-[11px] text-secondary ui-desc">Inspect individual attempts in the Site Map -- filter <code class="font-mono">source.eq:racer</code>.</p>
     </div>
   {% endif %}
 </div>

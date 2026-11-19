@@ -2,16 +2,22 @@
    /api/updates/status (startup cache), /api/updates/check (fresh git fetch), and
    /api/updates/apply (after a pull). `u` is an UpdateStatus or None; `result` is the
    apply result dict or None. #}
+{# Release number first (from the code on disk, known even before any check), then the git commit
+   it sits on. A release-marker install keeps its installed version in current_sha -- used as the
+   number only when the project version couldn't be read, never printed twice. #}
+{% set is_git = u and u.install_kind != "release" %}
+{% set shown_version = project_version or (u.current_sha if u and not is_git else "") %}
+{% if shown_version or (is_git and u.current_sha) %}
+  <p class="text-[12px] text-secondary">Current version:
+    {% if shown_version %}<span class="text-primary font-medium">v{{ shown_version }}</span>{% endif %}
+    {% if is_git and u.current_sha %}{% if shown_version %}<span aria-hidden="true">·</span> {% endif %}<span class="{{ '' if shown_version else 'text-primary font-medium' }}">{{ u.current_sha }}</span>{% if u.current_subject %} — {{ u.current_subject }}{% endif %}{% endif %}
+  </p>
+{% endif %}
 {% if u is none %}
-  <p class="text-[13px] text-secondary">Not checked yet — click “Check for updates”.</p>
+  <p class="mt-2 text-[13px] text-secondary">Not checked yet — click “Check for updates”.</p>
 {% else %}
-  {% if u.current_sha %}
-    <p class="text-[12px] text-secondary">Current version:
-      <span class="text-primary font-medium">{{ u.current_sha }}</span>{% if u.current_subject %} — {{ u.current_subject }}{% endif %}
-    </p>
-  {% endif %}
   {% if u.install_kind == "release" %}
-    <p class="text-[11px] text-secondary">This install has no git history (installed from a downloaded source archive) — updates are checked against GitHub Releases instead.</p>
+    <p class="text-[11px] text-secondary ui-desc">This install has no git history (installed from a downloaded source archive) — updates are checked against GitHub Releases instead.</p>
   {% endif %}
 
   {% if result %}
@@ -19,6 +25,25 @@
     {% for note in result.notes or [] %}
       <div class="mt-1 text-[12px] text-secondary">• {{ note }}</div>
     {% endfor %}
+  {% endif %}
+
+  {# One-flow follow-up (main.py's _desktop_follow_up): the launcher was behind too and is already
+     downloaded + verified, so a single restart finishes BOTH updates. data-auto-apply makes
+     desktop_update.js ask for that restart right away instead of leaving a second button to find. #}
+  {% if desktop_stage %}
+    <div class="mt-3" data-desktop-update-block>
+      {% if desktop_stage.ok %}
+        <div class="text-[13px] text-primary">Desktop app v{{ desktop_status.latest_version }} is downloaded and verified — one restart finishes both updates.</div>
+        <div data-desktop-update-error class="mt-1 text-[12px] text-accent"></div>
+        <button type="button" data-desktop-update-apply data-auto-apply
+          data-staged-path="{{ desktop_stage.windows_path }}"
+          class="mt-2 px-3 h-8 rounded text-[12px] bg-accent text-white font-medium">
+          Install &amp; restart
+        </button>
+      {% else %}
+        <div class="text-[12px] text-accent">The desktop app update (v{{ desktop_status.latest_version }}) could not be prepared: {{ desktop_stage.message }} Use Settings → Desktop app below to retry.</div>
+      {% endif %}
+    </div>
   {% endif %}
 
   {% if u.error %}

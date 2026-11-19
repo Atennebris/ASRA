@@ -22,7 +22,13 @@
    the surrounding folders already spell the path out. Rows are also genuinely tighter (py-0.5, not
    py-1.5/2) -- a real explorer tree reads as dense, not spacious. #}
 {% macro _tree_node(node, depth) %}
-  <details {% if depth < 1 %}open{% endif %} class="site-tree-node border-b border-default last:border-0">
+  {# id=node.id (main.py's _build_site_map_tree, a hash of this node's own full host/path -- stable
+     across the alphabetical re-sort every 4s poll redoes) is what lets Idiomorph match this exact
+     <details> across polls instead of treating a sibling that shifted position as a brand-new node
+     -- see that function's own comment for the real "tree keeps closing/jumping itself" bug this
+     fixes; without it, the open-attribute-removal guard base.html already installs for Idiomorph
+     never even gets a matched node to apply to. #}
+  <details id="site-tree-{{ node.id }}" {% if depth < 1 %}open{% endif %} class="site-tree-node border-b border-default last:border-0">
     <summary class="cursor-pointer select-none pl-2 pr-2 py-0.5 text-[11px] font-mono text-primary hover:bg-elevated flex items-center gap-1.5">
       <svg class="folder-icon-closed w-3.5 h-3.5 shrink-0 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -99,5 +105,5 @@
     </details>
   {% endif %}
 {% else %}
-  <p class="text-[11px] text-secondary italic py-4 text-center">Nothing here yet -- browse the target through the Toolkit's own Proxy, let the agent's own tool calls capture it, or run wayback_urls/common_crawl_urls for passively-discovered paths, and this tree fills in live.</p>
+  <p class="text-[11px] text-secondary italic py-4 text-center ui-desc">Nothing here yet -- browse the target through the Toolkit's own Proxy, let the agent's own tool calls capture it, or run wayback_urls/common_crawl_urls for passively-discovered paths, and this tree fills in live.</p>
 {% endif %}

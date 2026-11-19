@@ -18,6 +18,7 @@ from agent.prompts import (
     RECON_PROMPT,
     REVERIFY_PROMPT,
     VALIDATE_PROMPT,
+    condense_for_weak_model,
 )
 
 # len // 4 is the same rough chars-per-token estimate used elsewhere in this codebase
@@ -27,8 +28,10 @@ from agent.prompts import (
 # tied to any provider's real limit) — raised from 2000 to 2700 with the operator's explicit
 # go-ahead when EXPLOIT_PROMPT's own corrected_severity/corrected_qualifies_for_bounty guidance
 # needed more room than the old ceiling allowed, and again to 3100 when EXPLOIT_PROMPT's own
-# GraphQL authz/batching-probe guidance needed more room still.
-_MAX_TOKENS_PER_PROMPT = 3100
+# GraphQL authz/batching-probe guidance needed more room still, and again to 3300 when
+# ANALYZE_PROMPT's own nikto scan-selection guidance needed room (ANALYZE_PROMPT already sat right
+# at the old ceiling, so any genuinely new per-tool rule required headroom).
+_MAX_TOKENS_PER_PROMPT = 3300
 _MIN_PROMPT_CHARS = 200
 
 _CYRILLIC_PATTERN = re.compile(r"[Ѐ-ӿ]")
@@ -111,3 +114,31 @@ def test_analyze_and_validate_prompts_define_verification_states():
     for name, text in (("ANALYZE_PROMPT", ANALYZE_PROMPT), ("VALIDATE_PROMPT", VALIDATE_PROMPT)):
         for state in ("verified", "inferred", "needs_verification"):
             assert state in text, f"{name} must define the {state!r} verification state"
+
+
+# --- condense_for_weak_model: a shorter, more directive prompt for a weak/small model -------------
+
+
+def test_condense_for_weak_model_actually_shortens_a_real_prompt():
+    condensed = condense_for_weak_model(RECON_PROMPT)
+    assert len(condensed) < len(RECON_PROMPT)
+
+
+def test_condense_for_weak_model_keeps_core_instructions_and_rules():
+    condensed = condense_for_weak_model(RECON_PROMPT)
+    # The role line, the Rules: block, and the live JSON-shaped example must all survive.
+    assert "Reconnaissance agent" in condensed
+    assert "Rules:" in condensed
+    assert '{"host": "<hostname or ip>"' in condensed
+
+
+def test_condense_for_weak_model_never_mangles_a_json_shaped_example():
+    prompt = 'Keep this: {"a": 1, "b": 2} intact.\nAnd (this long parenthetical aside should be removed entirely).'
+    condensed = condense_for_weak_model(prompt)
+    assert '{"a": 1, "b": 2}' in condensed
+    assert "long parenthetical aside" not in condensed
+
+
+def test_condense_for_weak_model_leaves_short_tags_alone():
+    prompt = "You are the Recon agent (ASRA), reporting findings."
+    assert condense_for_weak_model(prompt) == prompt  # "(ASRA)" is below the aside length threshold

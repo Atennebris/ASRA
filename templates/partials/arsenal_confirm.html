@@ -16,15 +16,15 @@
     {% if measured_gb %}
       <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Arsenal on disk (measured here)</span>
       <span class="text-[15px] font-bold text-severity-medium">~{{ measured_gb }} GB</span>
-      <span class="text-[10.5px] text-secondary">of readable install locations on this machine</span>
+      <span class="ui-desc text-[10.5px] text-secondary">of readable install locations on this machine</span>
     {% else %}
       <span class="text-[10px] font-semibold uppercase tracking-wider text-secondary">Rough estimate (fresh install)</span>
       <span class="text-[15px] font-bold text-severity-medium">~{{ approx_gb }} GB</span>
-      <span class="text-[10.5px] text-secondary">— exact size depends on the distro &amp; already-present shared deps</span>
+      <span class="ui-desc text-[10.5px] text-secondary">— exact size depends on the distro &amp; already-present shared deps</span>
     {% endif %}
   </div>
 
-  <p class="text-[11px] text-secondary leading-relaxed max-w-[46rem] mb-3">
+  <p class="ui-desc text-[11px] text-secondary leading-relaxed max-w-[46rem] mb-3">
     {% if heavy %}
       Runs the local <code class="font-mono text-primary">setup_tools_heavy.sh</code> from this
       repository. Installs substantially larger/slower tools kept out of the fast base install:

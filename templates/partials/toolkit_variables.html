@@ -5,7 +5,7 @@
    docstring explains why). #}
 {% from "macros/ui.html" import button %}
 <div id="toolkit-variables-container">
-  <p class="text-[11px] text-secondary mb-3">
+  <p class="text-[11px] text-secondary mb-3 ui-desc">
     Define a value once, reference it as <code class="font-mono">{{ '{{name}}' }}</code> in the URL/headers/body
     of Repeater, Intruder, or Racer. Resolved right before sending -- the form itself keeps showing
     your <code class="font-mono">{{ '{{name}}' }}</code> template, not the resolved value.
@@ -29,7 +29,7 @@
       {% endfor %}
     </div>
   {% else %}
-    <p class="text-sm text-secondary italic py-2 mb-3">No variables defined yet.</p>
+    <p class="text-sm text-secondary italic py-2 mb-3 ui-desc">No variables defined yet.</p>
   {% endif %}
 
   <form hx-post="{{ toolkit_base_url }}/variables/set" hx-target="#toolkit-variables-container" hx-swap="outerHTML" hx-disabled-elt="this" class="flex gap-2">

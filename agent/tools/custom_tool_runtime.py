@@ -23,7 +23,7 @@ from functools import partial
 from pathlib import Path
 
 from agent.tools.builders.discovered import make_generic_discovered_command
-from agent.tools.custom_tools_store import load_custom_tools
+from agent.tools.custom_tools_store import load_custom_tools, tool_scopes
 from agent.tools.registry import Category, ToolSpec
 from agent.tools.sandbox import run_sandboxed
 from agent.utils.debug import truncate_for_log
@@ -138,12 +138,20 @@ def _mint_toolspec(record: dict) -> ToolSpec:
     )
 
 
-def build_dynamic_toolspecs() -> list[ToolSpec]:
+def build_dynamic_toolspecs(consumer: str | None = None) -> list[ToolSpec]:
     """Every ENABLED custom-tool record, minted fresh on each call -- never cached, so flipping a
     toggle in Settings takes effect on the very next tool-set assembly (the next phase transition,
     or the next subagent delegation), not only after a server restart. Returns [] with negligible
     cost when no custom tools are registered at all, the common case -- this is called from every
     phase's own tool-set assembly (agent/core.py), same unconditional-append pattern already used
     for the toolkit's own extras, so it must stay cheap when there is nothing to add.
+
+    consumer (one of custom_tools_store.CUSTOM_TOOL_SCOPES: main_agent/chat/reverse/interactive/
+    subagent) narrows to only the tools the operator allowed for THAT consumer, via each record's
+    own per-tool availability toggles (tool_scopes). consumer=None keeps every enabled tool
+    regardless of scope -- used only where a scope gate doesn't apply (e.g. listing).
     """
-    return [_mint_toolspec(record) for record in load_custom_tools() if record.get("enabled")]
+    records = [r for r in load_custom_tools() if r.get("enabled")]
+    if consumer is not None:
+        records = [r for r in records if consumer in tool_scopes(r)]
+    return [_mint_toolspec(record) for record in records]

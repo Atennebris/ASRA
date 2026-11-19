@@ -1583,6 +1583,99 @@ def test_run_chat_tool_loop_summarizes_real_progress_once_the_budget_runs_out(mo
     assert final_call_args.args[1] is None
 
 
+# --- _run_chat_tool_loop: decoder-loop guard -- real, confirmed incident this fixes: a chat turn
+# spent ~70 minutes rewriting near-identical custom_re_script decoder variations with zero new
+# findings/profile facts recorded, and nothing in this loop could notice or stop it. ---
+
+def _similar_decoder_source(i: int) -> str:
+    """Several real-looking lines, only a small substring differing call to call -- the exact
+    shape the real incident's own repeated custom_re_script rewrites had (same overall approach,
+    a tweaked constant each time), not a byte-identical repeat (which the OLDER, already-existing
+    exact-signature stall detector would have caught on its own)."""
+    return f"import subprocess\nfor i in range(10):\n    attempt_decode(data, key={i})\nprint('done')\n"
+
+
+def test_run_chat_tool_loop_decoder_loop_nudge_injected_after_near_identical_calls(monkeypatch):
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_NUDGE_THRESHOLD", 3)
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD", 100)
+    ctx = _ctx("usr_decoder_nudge")
+    custom_re_script_spec = get_tool("custom_re_script")
+    tool_call_responses = [
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id=f"c{i}", name="custom_re_script", arguments={"source": _similar_decoder_source(i)})])
+        for i in range(4)
+    ]
+    final_response = LLMResponse(content="Still haven't recovered the real key.")
+    ctx.llm = SimpleNamespace(complete=MagicMock(side_effect=tool_call_responses + [final_response]))
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "keep trying to decode it"}]
+    session = _session(ctx.session_id, chat_threads=[{**_new_thread(), "id": "thread_1", "messages": [_msg("user", "keep trying")]}], active_chat_thread_id="thread_1")
+
+    p1, p2 = _patch_chat_persistence(session, "thread_1")
+    with p1, p2, patch("agent.chat._run_tool_with_retry", new=AsyncMock(return_value={"status": "ok"})):
+        reply = _run(_run_chat_tool_loop(ctx, "thread_1", messages, [custom_re_script_spec]))
+
+    assert reply == final_response.content  # a natural finish, never hard-stopped
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    # The 3rd near-identical call (effective_streak reaches the nudge threshold of 3) is the first
+    # one to carry the hint; the 1st and 2nd must not yet.
+    assert "playbook_hint" not in tool_messages[0]["content"]
+    assert "playbook_hint" not in tool_messages[1]["content"]
+    assert "playbook_hint" in tool_messages[2]["content"]
+    assert "record_technique" in tool_messages[2]["content"]
+
+
+def test_run_chat_tool_loop_decoder_loop_hard_stop_ends_the_turn_early(monkeypatch):
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_NUDGE_THRESHOLD", 2)
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD", 4)
+    ctx = _ctx("usr_decoder_hard_stop")
+    custom_re_script_spec = get_tool("custom_re_script")
+    tool_call_responses = [
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id=f"c{i}", name="custom_re_script", arguments={"source": _similar_decoder_source(i)})])
+        for i in range(4)
+    ]
+    forced_summary_response = LLMResponse(content="I got stuck trying variations of the same decode approach.")
+    ctx.llm = SimpleNamespace(complete=MagicMock(side_effect=tool_call_responses + [forced_summary_response]))
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "keep trying to decode it"}]
+    session = _session(ctx.session_id, chat_threads=[{**_new_thread(), "id": "thread_1", "messages": [_msg("user", "keep trying")]}], active_chat_thread_id="thread_1")
+
+    p1, p2 = _patch_chat_persistence(session, "thread_1")
+    with p1, p2, patch("agent.chat._run_tool_with_retry", new=AsyncMock(return_value={"status": "ok"})):
+        reply = _run(_run_chat_tool_loop(ctx, "thread_1", messages, [custom_re_script_spec]))
+
+    assert reply == forced_summary_response.content
+    # Stopped exactly at the hard-stop threshold -- never kept going for a 5th/6th near-identical
+    # attempt, and the forced-stop call itself must have had no tools (can't just try another one).
+    assert ctx.llm.complete.call_count == 5
+    final_call_args = ctx.llm.complete.call_args_list[-1]
+    assert final_call_args.args[1] is None
+
+
+def test_run_chat_tool_loop_decoder_loop_resets_on_real_progress(monkeypatch):
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_NUDGE_THRESHOLD", 2)
+    monkeypatch.setattr(chat, "_CHAT_DECODER_LOOP_HARD_STOP_THRESHOLD", 100)
+    ctx = _ctx("usr_decoder_reset")
+    custom_re_script_spec = get_tool("custom_re_script")
+    target_profile_spec = get_tool("record_target_profile")
+    responses = [
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id="c1", name="custom_re_script", arguments={"source": _similar_decoder_source(1)})]),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id="c2", name="record_target_profile", arguments={"label": "Compiler", "value": "go1.22"})]),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id="c3", name="custom_re_script", arguments={"source": _similar_decoder_source(1)})]),
+        LLMResponse(content="Confirmed the compiler, still working on the decode."),
+    ]
+    ctx.llm = SimpleNamespace(complete=MagicMock(side_effect=responses))
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "keep going"}]
+    session = _session(ctx.session_id, chat_threads=[{**_new_thread(), "id": "thread_1", "messages": [_msg("user", "keep going")]}], active_chat_thread_id="thread_1")
+
+    p1, p2 = _patch_chat_persistence(session, "thread_1")
+    with p1, p2, patch("agent.chat._run_tool_with_retry", new=AsyncMock(return_value={"status": "ok"})):
+        reply = _run(_run_chat_tool_loop(ctx, "thread_1", messages, [custom_re_script_spec, target_profile_spec]))
+
+    assert reply == "Confirmed the compiler, still working on the decode."
+    # Two custom_re_script calls total would have reached the nudge threshold of 2 WITHOUT the
+    # reset -- the intervening successful record_target_profile call must have cleared it.
+    tool_messages = [m for m in messages if m.get("role") == "tool"]
+    assert all("playbook_hint" not in m["content"] for m in tool_messages)
+
+
 def test_run_chat_tool_loop_raises_chat_stop_requested_when_the_operator_stops_it():
     """The Stop button's own checkpoint (main.py's /chat/stop route -> request_chat_stop) -- must
     be noticed BEFORE the loop's first LLM call even runs, mirroring agent/core.py's own pre-call

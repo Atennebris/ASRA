@@ -63,11 +63,28 @@
   // debug console's own UI-click/htmx-lifecycle tracking (get_logger("UI")) never fired a single
   // event, the entire time DEBUG has been enabled. `document` is always available regardless of
   // parse timing, and these events bubble to it exactly the same way they would to document.body.
+  // A request fired by an `hx-trigger="every Ns"` poll (the session tabs, findings list, and RE
+  // control bar each refresh ~once a second). These dominate the debug console and bury the real
+  // agent/tool/LLM activity, so their request/response pair is suppressed unless the operator opts
+  // back in with DEBUG_LOG_POLLS=true (window.ASRA_DEBUG_POLLS). A genuinely failing poll still
+  // logs via htmx:responseError below — only the routine ok/ok chatter is dropped.
+  function isPollRequest(event) {
+    try {
+      var elt = event.detail && event.detail.elt;
+      var trig = elt && elt.getAttribute && elt.getAttribute("hx-trigger");
+      return !!(trig && trig.indexOf("every") !== -1);
+    } catch (e) {
+      return false;
+    }
+  }
+
   document.addEventListener("htmx:beforeRequest", function (event) {
+    if (isPollRequest(event) && !window.ASRA_DEBUG_POLLS) return;
     var cfg = event.detail.requestConfig;
     send("htmx-request", cfg.verb.toUpperCase() + " " + cfg.path);
   });
   document.addEventListener("htmx:afterRequest", function (event) {
+    if (isPollRequest(event) && !window.ASRA_DEBUG_POLLS) return;
     var cfg = event.detail.requestConfig;
     var status = event.detail.xhr.status;
     // Not event.detail.successful -- htmx's own HX-Redirect handling (vendor/htmx.min.js) returns

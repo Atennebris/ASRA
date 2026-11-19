@@ -51,6 +51,43 @@ def test_record_finding_accepts_a_well_formed_call():
     assert result["recorded"]["severity"] == "High"
 
 
+def test_record_finding_collapses_a_none_sentinel_false_positive_reason_to_empty():
+    """Real incident this fixes (Temu HackerOne log-review audit): a model filled
+    false_positive_reason with "None - finding is real and verified; TLS 1.1 genuinely present" --
+    a truthy string that says the OPPOSITE of a false positive. Because every consumer (report's
+    "Likely false positive" banner, the muted severity badge) treats ANY non-empty value as "this
+    is a false positive", the finding got muted and banner-flagged while its own text insisted it
+    was real. A "no-reason" sentinel must collapse to None so only a genuine reason trips that."""
+    for sentinel in (
+        "None - finding is real and verified; TLS 1.1 genuinely present",
+        "None – not applicable",
+        "N/A: nothing disproves it",
+        "none.",
+        "   ",
+    ):
+        result = record_finding({
+            "title": "X", "severity": "Low", "description": "d",
+            "exploitation_scenario": "remote_direct", "false_positive_reason": sentinel,
+        })
+        assert result["status"] == "ok"
+        assert result["recorded"]["false_positive_reason"] is None, f"{sentinel!r} should collapse"
+
+
+def test_record_finding_keeps_a_genuine_false_positive_reason():
+    """The collapse must never swallow a real reason, including ones that merely start with the
+    letters of a sentinel word ("Nonexistent", "National")."""
+    for real in (
+        "The named host does not resolve, so this can never be exploited",
+        "Nonexistent endpoint: returns 404 for every user, no data exposed",
+    ):
+        result = record_finding({
+            "title": "X", "severity": "Low", "description": "d",
+            "exploitation_scenario": "remote_direct", "false_positive_reason": real,
+        })
+        assert result["status"] == "ok"
+        assert result["recorded"]["false_positive_reason"] == real
+
+
 def test_record_finding_omits_exploited_and_evidence_when_not_given():
     """The normal Recon/Analyze case -- Exploit confirms these fields later, so record_finding
     must not inject false defaults that would shadow _FINDING_DEFAULTS' own exploited=False/

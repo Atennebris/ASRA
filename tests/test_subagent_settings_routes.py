@@ -26,6 +26,24 @@ def test_get_subagents_renders(tmp_path, monkeypatch):
     assert "Default Subagent" in resp.text  # the seeded default profile
 
 
+def test_subagent_disallowed_tools_are_shown_greyed_with_a_reason_not_hidden(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+
+    resp = client.get("/subagents")
+
+    assert resp.status_code == 200
+    # A tool a subagent can never use (record_finding) is still rendered -- not silently filtered --
+    # and carries the "why it can't be enabled" reason the operator sees on hover.
+    assert "record_finding" in resp.text
+    # Jinja escapes the apostrophe in "Can't" to &#39; inside the attribute, so match an
+    # apostrophe-free slice of the reason text instead.
+    assert "be enabled for a subagent" in resp.text
+    # Its reason is the recording-tool one, and delegate_to_subagent carries the nesting one.
+    assert "delegate_to_subagent" in resp.text
+    assert "must not spawn or manage further subagents" in resp.text
+
+
 def test_edit_dialog_is_not_nested_inside_the_subagents_table(tmp_path, monkeypatch):
     """Real, confirmed bug this fixes: each profile's Edit <dialog> (and its own <form>, holding
     the Provider & Model picker's new Test button) used to render INLINE inside the table's

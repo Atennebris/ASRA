@@ -3,6 +3,7 @@ known WSL install locations, plus list_all_wordlists()'s merge with operator-dow
 (agent/tools/wordlist_store.py). Every test points _SCAN_ROOTS/WORDLIST_STORE_PATH at a real
 tmp_path structure and reads real files back -- no mocking of the filesystem itself.
 """
+import os
 from pathlib import Path
 
 from agent.tools import wordlist_catalog, wordlist_store
@@ -57,6 +58,22 @@ def test_count_lines_returns_none_for_a_file_over_the_size_cap(tmp_path, monkeyp
 
     monkeypatch.setattr(wordlist_catalog, "_MAX_LINE_COUNT_BYTES", 10)
     assert wordlist_catalog._count_lines(big_file, big_file.stat().st_size) is None
+
+
+def test_count_lines_is_cached_until_the_file_changes(tmp_path):
+    wordlist = tmp_path / "words.txt"
+    wordlist.write_text("a\nb\n", newline="")
+    size = wordlist.stat().st_size
+    assert wordlist_catalog._count_lines(wordlist, size) == 2
+
+    # Same size + mtime => served from the cache, never re-read (Settings renders this on every visit).
+    stat = wordlist.stat()
+    wordlist.write_text("x\ny\n", newline="")
+    os.utime(wordlist, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert wordlist_catalog._count_lines(wordlist, size) == 2
+
+    wordlist.write_text("a\nb\nc\n", newline="")
+    assert wordlist_catalog._count_lines(wordlist, wordlist.stat().st_size) == 3
 
 
 def test_guess_kind_matches_known_hints():

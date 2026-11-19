@@ -6,11 +6,13 @@ from agent.tools.builders.adb import build_adb_command
 from agent.tools.builders.apktool import build_apktool_command
 from agent.tools.builders.binary_semantic_diff import binary_semantic_diff_available, run_binary_semantic_diff
 from agent.tools.builders.binwalk import build_binwalk_command
+from agent.tools.builders.embedded_extract import run_extract_embedded_binary
+from agent.tools.builders.fs_inspect import run_grep, run_list_dir, run_read_file
 from agent.tools.builders.qiling import build_qiling_command, qiling_available, qiling_parsed_error_override
 from agent.tools.builders.dalfox import build_dalfox_command
 from agent.tools.builders.exploit import build_exploit_command, build_msf_module_search_command
 from agent.tools.builders.ffuf import build_ffuf_command
-from agent.tools.builders.frida import build_frida_ps_command, build_frida_trace_command
+from agent.tools.builders.frida import build_frida_ps_command, build_frida_trace_command, frida_trace_working_dir
 from agent.tools.builders.gdb import build_gdb_command
 from agent.tools.builders.ghidra import ghidra_available, run_ghidra
 from agent.tools.builders.heimdall import build_heimdall_command
@@ -21,7 +23,6 @@ from agent.tools.builders.native_binary_metadata import run_native_binary_metada
 from agent.tools.builders.nikto import build_nikto_command
 from agent.tools.builders.nmap import (
     build_nmap_command,
-    retry_nmap_with_pn_if_host_seemed_down,
     retry_nmap_without_os_detection_on_timeout,
 )
 from agent.tools.builders.nuclei import build_nuclei_command
@@ -220,7 +221,6 @@ register_tool(
         tool_tier=2,
         executable="nmap",
         build_command=build_nmap_command,
-        retry_command_on_result=retry_nmap_with_pn_if_host_seemed_down,
         retry_command_on_timeout=retry_nmap_without_os_detection_on_timeout,
         requires_allowed_target=False,
         installed_by_default=True,
@@ -305,14 +305,20 @@ register_tool(
         installed_by_default=True,
         # Own timeout budget, not the generic TOOL_TIMEOUT_SECONDS every other "scan" tool shares
         # -- see ToolSpec.timeout_env_var's own docstring and build_nuclei_command's -duc comment
-        # for the real incident (Live-Nation-HackerOne-usr_0f5c71) this exists for. 1200s is a
-        # reasoned safety-net default, not a tightly measured one (the live -duc isolation test
-        # meant to pin this exactly was interrupted by an unrelated out-of-memory kill, not a code
-        # failure) -- re-verify with a live timed -duc run against an approved target
-        # (ginandjuice.shop) when that's possible again, and adjust if it proves too tight or
-        # unnecessarily generous.
+        # for the real incident (Live-Nation-HackerOne-usr_0f5c71) this exists for. 1800s is a
+        # live-measured value, not a guess: with -duc confirmed actually fixing the update-check
+        # stall (real scan progress the whole run, no stall), a full default-tag run against an
+        # approved target (ginandjuice.shop) still hadn't reached 100% at 1500s (killed at 85%,
+        # 153656/179940 requests) -- extrapolated from its own steady request rate, full completion
+        # lands at roughly 1600-1700s. The remaining time here (beyond the update-check fix) is
+        # genuine scan work: the xss/ssrf/rce-class generic templates fuzz every discovered
+        # parameter/URL on a real app, which is why "templates" in nuclei's own -stats inflates to
+        # tens of thousands for a single host even though the installed template files themselves
+        # don't (confirmed: 13761 official + 226 geeknik-pack yaml files on disk, nowhere near that
+        # count -- the inflation is nuclei's own per-parameter expansion, not an installed-pack
+        # size problem). 1800s leaves real margin above the ~1600-1700s measured figure.
         timeout_env_var="NUCLEI_TIMEOUT_SECONDS",
-        timeout_default_seconds=1200,
+        timeout_default_seconds=1800,
         description=(
             "Runs Nuclei vulnerability templates against a URL/host — active checks, not just "
             "passive banner matching (default tags: cve,vuln,exposure,rce,misconfig,takeover,"
@@ -3876,7 +3882,9 @@ register_tool(
         description=(
             "Ghidra's own headless decompiler -- static analysis of a local binary (ELF/PE/"
             "Mach-O), complementing radare2's decompile_function with Ghidra's own, generally "
-            "higher-quality decompiler for complex/obfuscated binaries. mode=\"info\": program "
+            "higher-quality decompiler for complex/obfuscated binaries. Unlike radare2, this tool "
+            "has NO strings/imports/exports/symbols/hex_view mode -- use radare2 for those; ghidra "
+            "exposes only the modes listed here. mode=\"info\": program "
             "metadata (format, language, image base, entry/exit addresses, function count). "
             "mode=\"functions\": the function list (name, entry address, size). "
             "mode=\"decompile_function\": pseudo-C for one function (target=its name or address). "
@@ -4703,6 +4711,96 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="extract_embedded_binary",
+        category="re",
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=run_extract_embedded_binary,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description="Pulls the native executable(s) hidden inside a container into their own files so radare2/ghidra can load a real PE/ELF/Mach-O instead of the container. Two strategies at once: unzips a .jar/.war/.ear/.apk/.zip and reports every extracted native binary (.dll/.so/.dylib/.exe or by magic), AND raw-carves any embedded PE/ELF/Mach-O header a plain unzip would miss (a DLL stored/appended raw). Use this for a native-wrapped JVM target (e.g. a JGuard-protected jar that wraps a Windows DLL): extract first, then point ghidra/radare2 at native_binaries[].path; for the pure-Java side use jadx.",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local container/binary to extract from (a .jar/.zip/.apk, or any file with an embedded native binary)."},
+                "output_dir": {"type": "string", "description": "Optional directory to extract/carve into. Defaults to a '<name>_extracted' folder next to the input file."},
+            },
+            "required": ["file_path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="list_dir",
+        # Read-only inspection, useful in every mode (not just RE): walking a downloaded-loot
+        # folder, a config tree, or decompiled output. Web/agentic phases query recon/scan/exploit/
+        # post_exploit, so it must carry those too, or the main pipeline flails on a missing `ls`.
+        category=("re", "recon", "scan", "exploit", "post_exploit"),
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=run_list_dir,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description="Lists one directory's immediate contents (names, file/dir, size, identified type) -- read-only. Use this to look inside a tool's OUTPUT directory, e.g. the folder jadx/apktool/ghidra just wrote decompiled source into, or the target directory itself. Not recursive; use grep to search a whole tree.",
+        parameters_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Absolute path of the directory to list."}},
+            "required": ["path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="read_file",
+        category=("re", "recon", "scan", "exploit", "post_exploit"),
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=run_read_file,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description="Reads a TEXT file with line/byte bounds (read-only) -- e.g. a jadx-decompiled .java, a config, a script. Optional start_line/max_lines page through a large file. Refuses a binary (pointing you to radare2/ghidra/hex_view instead), so never use it to 'read' an .exe/.dll/.class/.jar.",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the text file to read."},
+                "start_line": {"type": "integer", "description": "1-based line to start at (default 1)."},
+                "max_lines": {"type": "integer", "description": "How many lines to return (default 600)."},
+            },
+            "required": ["path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="grep",
+        category=("re", "recon", "scan", "exploit", "post_exploit"),
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=run_grep,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description="Searches a regex across a file or (recursively) a directory tree and returns file:line matches (read-only, case-insensitive by default, skips binaries). The fastest way to find a check in decompiled output -- e.g. grep 'valid|licen|serial|registered|key' over a jadx output directory to jump straight to the validation logic.",
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "A Python regular expression to search for."},
+                "path": {"type": "string", "description": "Absolute path of a file, or a directory to search recursively."},
+                "case_sensitive": {"type": "boolean", "description": "Match case exactly (default false)."},
+            },
+            "required": ["pattern", "path"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="binwalk",
         category="re",
         tool_tier=2,
@@ -4789,6 +4887,9 @@ register_tool(
         build_command=build_frida_trace_command,
         requires_allowed_target=False,
         installed_by_default=True,
+        # frida-trace writes its generated handlers into `cwd/__handlers__`; run it from a writable
+        # ASRA-owned dir so it never tries to create that under the read-only install-dir CWD.
+        working_dir_factory=frida_trace_working_dir,
         # Confirmed live: frida-trace's own exit code is NOT a reliable success/failure signal --
         # the exact same spawn+trace call (a genuinely successful trace, real output captured)
         # returned 0 run directly in a shell but 1 through this project's own subprocess dispatch,

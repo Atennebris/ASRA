@@ -12,6 +12,7 @@
     "allow-launch-backend",
     "allow-apply-desktop-update",
     "allow-bootstrap-full-project",
+    "allow-save-export-file",
     "allow-force-restart-agent",
     "allow-save-env",
     "allow-open-in-browser",
@@ -19,6 +20,7 @@
     "allow-notify-session-done",
     "allow-install-wsl",
     "allow-get-wsl-setup-status",
-    "allow-test-wsl-setup"
+    "allow-test-wsl-setup",
+    "allow-set-page-zoom"
   ]
 }

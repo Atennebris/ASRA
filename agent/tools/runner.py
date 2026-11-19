@@ -58,7 +58,7 @@ current_subprocess_registry: contextvars.ContextVar[set | None] = contextvars.Co
 )
 
 
-def _run_tracked(command: list[str], timeout_seconds: int) -> subprocess.CompletedProcess:
+def _run_tracked(command: list[str], timeout_seconds: int, cwd: str | None = None) -> subprocess.CompletedProcess:
     """subprocess.run()-equivalent (same TimeoutExpired-on-its-own-timeout behavior, same return
     shape) that also registers its live Popen handle in current_subprocess_registry, if the caller
     set one, so an external asyncio-level cancellation — which this call has no way to observe on
@@ -100,9 +100,14 @@ def _run_tracked(command: list[str], timeout_seconds: int) -> subprocess.Complet
     # rather than hanging -- the same fail-fast guarantee capability_install.py's own sudo -n path
     # gets, just from the interactive prompt's own EOF instead of -n.
     sudo_password = os.getenv("SUDO_PASSWORD") if command[:2] == ["sudo", "-S"] else None
+    # cwd is set only for the handful of tools whose output machinery writes into their own working
+    # dir (frida-trace's __handlers__); passing it only when present keeps the Popen call identical
+    # to its historical form for every other tool (and the test doubles that mock it).
+    cwd_kwargs = {"cwd": cwd} if cwd is not None else {}
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         stdin=subprocess.PIPE if sudo_password else subprocess.DEVNULL, text=True, errors="replace",
+        **cwd_kwargs,
     )
     if registry is not None:
         registry.add(process)
@@ -319,9 +324,21 @@ def _run_subprocess(spec: ToolSpec, params: dict) -> dict:
             _debug("run_tool: %s served from result cache (key=%s)", spec.name, cache_key)
             return {**cached, "from_cache": True}
 
+    # Resolved once so both the first dispatch and any corrected-retry dispatch share it. None for
+    # almost every tool (keeps Popen's inherited CWD); set only by a tool whose output machinery
+    # writes into its own working dir (frida-trace's __handlers__, which can't land in a read-only
+    # install-dir CWD -- see ToolSpec.working_dir_factory).
+    working_dir = spec.working_dir_factory() if spec.working_dir_factory is not None else None
+    # Only thread cwd when a tool actually asks for one -- the empty-kwargs path keeps the call
+    # signature byte-identical to the historical _run_tracked(command, timeout) for every other
+    # tool, so existing callers/test doubles that never knew about cwd stay valid.
+    track_kwargs = {"cwd": working_dir} if working_dir is not None else {}
+    if working_dir is not None:
+        _debug("run_tool: %s runs in working_dir=%s", spec.name, working_dir)
+
     timeout_retried = False
     try:
-        result = _run_tracked(command, timeout_seconds)
+        result = _run_tracked(command, timeout_seconds, **track_kwargs)
     except subprocess.TimeoutExpired:
         _debug("run_tool: %s timed out after %ss command=%s", spec.name, timeout_seconds, redact_secrets_in_command(command))
         retry_command = spec.retry_command_on_timeout(command) if spec.retry_command_on_timeout is not None else None
@@ -329,7 +346,7 @@ def _run_subprocess(spec: ToolSpec, params: dict) -> dict:
             return {"status": "timeout", "tool": spec.name, "command": redact_secrets_in_command(command)}
         _debug("run_tool: %s timeout needs a corrected retry, command=%s", spec.name, redact_secrets_in_command(retry_command))
         try:
-            result = _run_tracked(retry_command, timeout_seconds)
+            result = _run_tracked(retry_command, timeout_seconds, **track_kwargs)
         except subprocess.TimeoutExpired:
             _debug("run_tool: %s corrected retry also timed out after %ss command=%s", spec.name, timeout_seconds, redact_secrets_in_command(retry_command))
             return {"status": "timeout", "tool": spec.name, "command": redact_secrets_in_command(retry_command)}
@@ -369,12 +386,13 @@ def _run_subprocess(spec: ToolSpec, params: dict) -> dict:
         result_dict["retried"] = True
 
     # A tool that came back "ok" (a real exit code, no error) but whose own output already names a
-    # known fix for a silent degradation (nmap's "Host seems down... try -Pn") -- see
-    # retry_nmap_with_pn_if_host_seemed_down's own docstring for the real incident. Deliberately a
-    # plain code-level retry, not routed through agent/core.py's 1-Step Retry (that mechanism only
-    # ever fires on a genuine error/timeout status and spends a whole extra LLM call reasoning
-    # about corrected arguments neither tool nor operator needs guessed here -- the fix is already
-    # fully determined by the tool's own output).
+    # known fix for a silent degradation -- radare2's write-permission-denied retry
+    # (retry_radare2_write_on_permission_denied's own docstring has the real incident) is the
+    # current live user of this hook. Deliberately a plain code-level retry, not routed through
+    # agent/core.py's 1-Step Retry (that mechanism only ever fires on a genuine error/timeout
+    # status and spends a whole extra LLM call reasoning about corrected arguments neither tool
+    # nor operator needs guessed here -- the fix is already fully determined by the tool's own
+    # output).
     if spec.retry_command_on_result is not None:
         retry_command = spec.retry_command_on_result(command, result_dict)
         if retry_command is not None:

@@ -469,9 +469,16 @@
     tab.ws = ws;
 
     ws.onopen = function () {
-      tab.reconnectAttempts = 0;
       setTabLive(terminalId, true);
       if (window.asraDebugEvent) window.asraDebugEvent("terminal", "connected " + terminalId);
+      // Reset the backoff only once the socket has PROVEN stable (survived a short grace window),
+      // never the instant it opens. A tab whose backend PTY is gone (a server restart wiped the
+      // in-memory registry, or the PTY long since exited) still gets its WS accepted, is told
+      // "terminal not found", and is closed again within milliseconds -- resetting on open would
+      // peg that flap at the minimum delay forever, a once-per-second reconnect storm that floods
+      // the debug log. Surviving the window is what distinguishes a real, usable connection.
+      if (tab.stableTimer) clearTimeout(tab.stableTimer);
+      tab.stableTimer = setTimeout(function () { tab.reconnectAttempts = 0; }, 1500);
       try {
         var dims = tab.fitAddon.proposeDimensions();
         if (dims) ws.send(encodeResize(dims.cols, dims.rows));
@@ -486,6 +493,14 @@
             setTabLive(terminalId, false);
           } else if (msg.type === "error") {
             tab.term.write("\r\n\x1b[31m[" + (msg.message || "terminal error") + "]\x1b[0m\r\n");
+            // The only error the server sends on this socket is "terminal not found" -- this id no
+            // longer exists server-side and never will again (a new terminal gets a new id). That
+            // is PERMANENT, so stop reconnecting: retrying would loop forever at the minimum delay.
+            // The tab stays visible with its scrollback + this notice, marked dead (not live).
+            tab.serverGone = true;
+            // One informative line in its place -- so the debug trail shows WHY this tab stopped,
+            // instead of the old once-per-second connected/disconnected flood that said nothing.
+            if (window.asraDebugEvent) window.asraDebugEvent("terminal", "gone server-side, stopped reconnecting " + terminalId);
           }
         } catch (e) {}
         return;
@@ -493,8 +508,9 @@
       tab.term.write(new Uint8Array(event.data));
     };
     ws.onclose = function () {
+      if (tab.stableTimer) { clearTimeout(tab.stableTimer); tab.stableTimer = null; }
       setTabLive(terminalId, false);
-      if (tab.closedByUser) return;
+      if (tab.closedByUser || tab.serverGone) return;
       if (window.asraDebugEvent) window.asraDebugEvent("terminal", "disconnected " + terminalId);
       // Local-only backend (127.0.0.1) -- a close almost always means a dev/server restart, not a
       // real network failure, so a patient, indefinite backoff (capped at 10s) is the right shape:
@@ -669,6 +685,7 @@
       tabButton: tabButton, dotEl: dotEl, labelEl: labelEl,
       cwd: cwd, shellName: shellName, shellKind: kind || "wsl", defaultLabel: defaultLabel, color: null,
       reconnectAttempts: 0, reconnectTimer: null, closedByUser: false, renaming: false,
+      serverGone: false, stableTimer: null,
     };
     tabs[terminalId] = tab;
     if (color) setTabColor(terminalId, color);

@@ -10,6 +10,7 @@ for the same reason (agent/tools/discovery.py's KNOWN_TOOLS comment) -- nikto fo
 from __future__ import annotations
 
 import os
+import re
 
 from agent.tools.builders.validators import strip_flag_with_value, validate_safe_value, validate_target
 
@@ -54,3 +55,63 @@ def build_nikto_command(params: dict) -> list[str]:
         command += ["-maxtime", f"{maxtime_seconds}s"]
     command += extra_args
     return command
+
+
+# Nikto prints every line of its report with a leading "+ ". Most of those lines are fixed run
+# metadata (the scanned IP/host/port, SSL details, start/end timestamps) or progress/summary
+# bookkeeping, not scan findings -- dropping them is the whole point of this parser, so the model
+# sees the handful of real reported items instead of the full banner+progress dump that made nikto
+# low-signal even when it worked. Matched against the text AFTER the leading "+ " is stripped.
+_METADATA_PREFIXES = (
+    "Target IP:",
+    "Target Hostname:",
+    "Target Port:",
+    "SSL Info:",
+    "Start Time:",
+    "End Time:",
+    "Root page",
+)
+# "+ 8074 requests: 0 error(s) and 5 item(s) reported on remote host" -- the per-run summary line.
+# The item count is worth keeping (it tells the model how many findings nikto itself claims, a
+# cross-check against how many this parser actually extracted); the request/error tally is noise.
+_ITEMS_REPORTED_RE = re.compile(r"(\d+)\s+item\(s\)\s+reported", re.IGNORECASE)
+_REQUESTS_SUMMARY_RE = re.compile(r"^\d+\s+requests?:", re.IGNORECASE)
+_HOSTS_TESTED_RE = re.compile(r"host\(s\)\s+tested", re.IGNORECASE)
+
+
+def parse_nikto_output(stdout: str) -> dict:
+    """Extracts the real reported items from nikto's default stdout text.
+
+    The JSON output mode (-Format json) is deliberately NOT used: it only writes to a file, never
+    stdout -- and stdout is all this parser ever receives -- and it has a long cross-version history
+    of emitting invalid JSON. The default stdout text is present and stable on every install path
+    (package manager or the git-clone fallback in setup_tools.sh), so it's the robust thing to parse.
+    """
+    findings: list[str] = []
+    server: str | None = None
+    items_reported: int | None = None
+
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("+ "):
+            continue
+        content = line[2:].strip()
+        if not content:
+            continue
+
+        items_match = _ITEMS_REPORTED_RE.search(content)
+        if items_match:
+            items_reported = int(items_match.group(1))
+            continue
+        if _REQUESTS_SUMMARY_RE.match(content) or _HOSTS_TESTED_RE.search(content):
+            continue
+        if content.startswith(_METADATA_PREFIXES):
+            continue
+        # The detected server banner is useful context but isn't itself a vulnerability -- surface
+        # it as its own field rather than mixed into the findings list.
+        if content.startswith("Server:"):
+            server = content[len("Server:"):].strip() or server
+            continue
+        findings.append(content)
+
+    return {"findings": findings, "server": server, "items_reported": items_reported}

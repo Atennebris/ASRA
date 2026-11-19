@@ -1,6 +1,6 @@
 [package]
 name = "asra-desktop"
-version = "0.7.0"
+version = "0.8.1"
 edition = "2021"
 description = "ASRA desktop shell — native window over the local FastAPI web UI"
 publish = false
@@ -22,6 +22,16 @@ tauri-plugin-dialog = "2"
 # same tailing console/window reads both without a second parser.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1.0.154"
+# Decode base64 payloads for the client-blob Export path (save_export_bytes in main.rs): a PNG
+# generated in the webview arrives base64-encoded, since a native "Save As" dialog is the one the
+# operator asked for over a silent browser download.
+base64 = "0.22"
+# Blocking HTTP client for the STREAMING Export path (save_export_url in main.rs): for a large
+# server-side export (a multi-GB project .zip) Rust fetches the local loopback URL and streams the
+# body straight to the chosen file, so the archive never has to sit in webview memory as base64.
+# TLS disabled (default-features = false) on purpose -- the target is always http://127.0.0.1, so
+# rustls would only bloat the build; gzip kept in case the local server ever content-encodes.
+ureq = { version = "2", default-features = false, features = ["gzip"] }
 
 # Windows-only -- mem_bridge.rs itself is already `#[cfg(windows)] mod mem_bridge;` in main.rs, but
 # a plain [dependencies] entry still gets resolved/compiled for EVERY target regardless of that

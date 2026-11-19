@@ -177,7 +177,9 @@ def test_library_upload_url_route_rejects_bad_url():
     resp = client.post("/api/library/upload-url", data={"url": "not-a-url"})
 
     assert resp.status_code == 200
-    assert "fetch that URL" in resp.text  # HTML-escapes the apostrophe in "Couldn't", so match around it
+    # A malformed (non-http) link gets the "not a valid link" message; a well-formed link that the
+    # SITE blocked/was-unreachable gets the separate "couldn't fetch" message instead.
+    assert "not a valid http(s) link" in resp.text
     assert library_store.list_sources() == []
 
 
@@ -211,7 +213,7 @@ def test_library_sources_analyzed_card_links_to_playbook_review(monkeypatch):
     llm = type("Fake", (), {
         "context_limit": 100_000, "provider_id": "fake", "model": "fake-model",
         "complete": lambda self, messages, tools, stop_check=None: type("R", (), {
-            "content": '[{"technique": "X", "tech_keywords": ["mysql"], "waf_vendors": []}]',
+            "content": '[{"technique": "X", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]',
         })(),
         "embed": lambda self, texts, model: None,
     })()
@@ -251,7 +253,7 @@ def test_library_estimate_route_returns_a_chunk_count_label():
     assert "chunk" in resp.text
 
 
-def test_library_estimate_route_flags_when_over_the_chunk_limit(monkeypatch):
+def test_library_estimate_route_shows_coverage_when_over_the_budget(monkeypatch):
     monkeypatch.setattr(library_store, "_MAX_CHUNKS", 1)
     # A tiny context_limit, mocked rather than relying on whatever this machine's real Settings
     # default provider happens to resolve to -- guarantees 2+ chunks regardless of environment.
@@ -263,7 +265,10 @@ def test_library_estimate_route_flags_when_over_the_chunk_limit(monkeypatch):
     resp = client.get(f"/api/library/{sid}/estimate", params={"provider": "fake", "model": "fake-model"})
 
     assert resp.status_code == 200
-    assert "over the" in resp.text and "limit" in resp.text
+    # Covered, not refused -- no "over the limit, pick a bigger model" error anymore.
+    assert "covering the whole source" in resp.text
+    assert "sampled from" in resp.text
+    assert "over the limit" not in resp.text
 
 
 def test_library_analyze_route_runs_the_pipeline_and_ingests_into_playbook(monkeypatch):
@@ -276,7 +281,7 @@ def test_library_analyze_route_runs_the_pipeline_and_ingests_into_playbook(monke
 
         def complete(self, messages, tools, stop_check=None):
             class _R:
-                content = '[{"technique": "SQLi bypass", "tech_keywords": ["mysql"], "waf_vendors": []}]'
+                content = '[{"technique": "SQLi bypass", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]'
             return _R()
 
         def embed(self, texts, model):
@@ -331,7 +336,7 @@ def test_library_analyze_route_first_response_already_shows_analyzing(monkeypatc
 
     assert resp.status_code == 200
     assert "Analyzing" in resp.text
-    assert f'hx-get="/api/library/{sid}/card"' in resp.text and "every 2s" in resp.text
+    assert f'hx-get="/api/library/{sid}/card"' in resp.text and "every 1s" in resp.text
 
 
 def test_library_analyze_route_surfaces_the_concurrency_refusal_message(monkeypatch):
@@ -378,10 +383,10 @@ def test_only_the_analyzing_card_carries_its_own_self_poll():
     resp = client.get("/api/library/sources")
 
     assert f'id="library-card-{analyzing_id}"' in resp.text
-    assert f'hx-get="/api/library/{analyzing_id}/card" hx-trigger="every 2s"' in resp.text
+    assert f'hx-get="/api/library/{analyzing_id}/card" hx-trigger="every 1s"' in resp.text
     assert f'hx-get="/api/library/{normalized_id}/card"' not in resp.text
     # The OLD whole-list poll must be gone entirely.
-    assert 'hx-get="/api/library/sources" hx-trigger="every 2s"' not in resp.text
+    assert 'hx-get="/api/library/sources" hx-trigger="every 1s"' not in resp.text
 
 
 def test_analyzing_card_shows_a_stop_button():

@@ -33,10 +33,16 @@ def test_ffuf_explicit_wordlist_wins_over_the_assignment(tmp_path, monkeypatch):
     assigned = tmp_path / "assigned.txt"
     assigned.write_text("a\n", encoding="utf-8")
     wordlist_store.set_assignment("ffuf", str(assigned))
+    # Must actually exist on disk -- build_ffuf_command's own existence check (see
+    # tests/test_ffuf_builder.py's sibling fallback test) only lets a REAL explicit path win over
+    # the assignment; a model-guessed path that isn't there is exactly the case that check exists
+    # to catch, not a legitimate "deliberate choice" this test is meant to cover.
+    custom = tmp_path / "custom-list.txt"
+    custom.write_text("b\n", encoding="utf-8")
 
-    command = build_ffuf_command({"target": "http://example.com/FUZZ", "wordlist": "/custom/list.txt"})
+    command = build_ffuf_command({"target": "http://example.com/FUZZ", "wordlist": str(custom)})
 
-    assert command[command.index("-w") + 1] == "/custom/list.txt"
+    assert command[command.index("-w") + 1] == str(custom)
 
 
 def test_hydra_uses_assigned_usernames_and_passwords_when_the_model_gives_none(tmp_path, monkeypatch):

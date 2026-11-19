@@ -225,6 +225,72 @@ def validate_scope_entry(value: str) -> str:
     return stripped
 
 
+_COERCIBLE_SCALAR_TYPES = frozenset({"string", "integer", "number", "boolean"})
+
+
+def _coerce_one_param(value, json_type):
+    """Coerce a single argument value toward one JSON-schema type, but only for the unambiguous
+    shape mistakes a small/weak model routinely makes. Returns (new_value, note) where note is a
+    short human-readable description of what changed, or None when nothing was (or should be)
+    changed -- anything ambiguous or potentially lossy is deliberately left untouched."""
+    # Scalar expected, a one-item list given: unwrap it (generalizes the validate_target [x]->x case
+    # to any scalar parameter). A zero- or multi-item list is ambiguous, so it is left as-is.
+    if json_type in _COERCIBLE_SCALAR_TYPES and isinstance(value, list):
+        if len(value) == 1:
+            final, _ = _coerce_one_param(value[0], json_type)
+            return final, "single-item list -> scalar"
+        return value, None
+    # Array expected, a bare scalar given: wrap it in a one-item list. None is left alone (that is
+    # "not provided", not "a scalar that should be a list").
+    if json_type == "array" and not isinstance(value, list) and value is not None:
+        return [value], "scalar -> single-item list"
+    # Stringified primitives: "true"/"false" -> bool, "8080" -> int, "1.5" -> float. A string that
+    # does not cleanly parse is left for the tool's own validator to reject.
+    if json_type == "boolean" and isinstance(value, str):
+        low = value.strip().lower()
+        if low == "true":
+            return True, "'true' string -> bool"
+        if low == "false":
+            return False, "'false' string -> bool"
+        return value, None
+    if json_type == "integer" and isinstance(value, str):
+        try:
+            return int(value.strip()), "numeric string -> int"
+        except ValueError:
+            return value, None
+    if json_type == "number" and isinstance(value, str):
+        try:
+            return float(value.strip()), "numeric string -> float"
+        except ValueError:
+            return value, None
+    return value, None
+
+
+def coerce_arguments_to_schema(arguments: dict, parameters_schema: dict | None) -> tuple[dict, list[str]]:
+    """Conservatively coerce model-supplied tool arguments toward the types the tool's own JSON
+    schema declares, fixing only the unambiguous type/shape slips small models make (a stringified
+    bool/number, a one-item list where a scalar is wanted, a bare scalar where a list is wanted).
+    Never raises, never guesses on an ambiguous value, and leaves anything with no schema entry
+    untouched -- so the tool's existing validator/builder still owns the real decision. Returns the
+    (possibly new) arguments dict and a list of per-parameter notes for debug logging."""
+    if not isinstance(arguments, dict) or not isinstance(parameters_schema, dict):
+        return arguments, []
+    properties = parameters_schema.get("properties")
+    if not isinstance(properties, dict):
+        return arguments, []
+    coerced = dict(arguments)
+    notes: list[str] = []
+    for name, value in arguments.items():
+        prop = properties.get(name)
+        if not isinstance(prop, dict):
+            continue
+        new_value, note = _coerce_one_param(value, prop.get("type"))
+        if note is not None:
+            coerced[name] = new_value
+            notes.append(f"{name}: {note}")
+    return coerced, notes
+
+
 def classify_target_type(value: str) -> str:
     """Informational-only classification (UI label, never a validation/routing decision) of one
     already-validated target/scope entry into "ip" | "subnet" | "wildcard" | "url" | "domain" |

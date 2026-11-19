@@ -189,3 +189,88 @@ def test_run_recon_allows_nmap_against_a_host_discovered_earlier_this_same_run(t
     finally:
         TOOL_REGISTRY[dns_index] = dns_original
         TOOL_REGISTRY[nmap_index] = nmap_original
+
+
+# --- nmap's _skip_os_detection marker: drives the REAL _run_recon execute() closure, not just the
+# builder in isolation -- a live mechanism test for the Telenor-Sweden-YesWeHack rescan session's
+# own root cause (os_guesses already known, nmap's -O/--osscan-guess ran again anyway) ------------
+
+
+def test_run_recon_skips_os_detection_for_a_host_already_known_from_a_rescan_carryover(tmp_path, monkeypatch):
+    """session["recon_result"]["os_guesses"] survives rescan_session's own carryover (main.py) --
+    pre-seeding it here simulates exactly that: a fresh rescan session whose recon_result already
+    carries an earlier pass's confident OS fingerprint for the literal target."""
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    index, original_spec, calls = _swap_nmap({"status": "ok", "stdout": "PORT 80/tcp open http"})
+    try:
+        session = {
+            "session_id": "usr_os_already_known", "target": "example.com", "status": "processing",
+            "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+            "recon_result": {"targets": [], "cves": [], "os_guesses": {"example.com": "FreeBSD 11.0-STABLE (90%)"}},
+        }
+        llm = _ScriptedLLM([("nmap", {"target": "example.com"})])
+        ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+
+        _run(_run_recon(ctx, "example.com"))
+
+        assert len(calls) == 1
+        assert calls[0].get("_skip_os_detection") is True
+    finally:
+        TOOL_REGISTRY[index] = original_spec
+
+
+def test_run_recon_does_not_skip_os_detection_when_nothing_is_known_yet(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    index, original_spec, calls = _swap_nmap({"status": "ok", "stdout": "PORT 80/tcp open http"})
+    try:
+        session = {
+            "session_id": "usr_os_unknown", "target": "example.com", "status": "processing",
+            "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+        }
+        llm = _ScriptedLLM([("nmap", {"target": "example.com"})])
+        ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+
+        _run(_run_recon(ctx, "example.com"))
+
+        assert len(calls) == 1
+        assert calls[0].get("_skip_os_detection") is not True
+    finally:
+        TOOL_REGISTRY[index] = original_spec
+
+
+def test_run_recon_skips_os_detection_for_the_same_host_under_its_other_dns_identity(tmp_path, monkeypatch):
+    """Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): the SAME
+    physical host got OS-fingerprinted twice within 35 seconds -- once by hostname, once by its
+    own dns_map-resolved IP -- because os_guesses is keyed by literal string and nothing checked
+    the other identity before redoing the ~30s raw-socket fingerprint a second time."""
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    dns_index = next(i for i, s in enumerate(TOOL_REGISTRY) if s.name == "dns_lookup")
+    dns_original = TOOL_REGISTRY[dns_index]
+    TOOL_REGISTRY[dns_index] = dataclasses.replace(
+        dns_original, tool_tier=1,
+        native_function=lambda params: {"status": "ok", "ips": ["37.247.0.224"]},
+    )
+    nmap_index, nmap_original, calls = _swap_nmap({"status": "ok", "stdout": "OS details: FreeBSD 11.0-STABLE"})
+    try:
+        session = {
+            "session_id": "usr_dual_identity_skip", "target": "example.com", "status": "processing",
+            "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+        }
+        llm = _ScriptedLLM([
+            ("dns_lookup", {"domain": "webapp01.example.com"}),
+            ("nmap", {"target": "webapp01.example.com"}),  # 1st scan -- records os_guesses by hostname
+            ("nmap", {"target": "37.247.0.224"}),  # 2nd scan -- same physical host, its own resolved IP
+        ])
+        ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+
+        _run(_run_recon(ctx, "example.com"))
+
+        assert len(calls) == 2
+        assert calls[0].get("_skip_os_detection") is not True  # genuinely the first time -- must run
+        assert calls[1].get("_skip_os_detection") is True  # same host, already known under its hostname
+    finally:
+        TOOL_REGISTRY[dns_index] = dns_original
+        TOOL_REGISTRY[nmap_index] = nmap_original

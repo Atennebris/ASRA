@@ -374,11 +374,13 @@ def test_chat_settings_post_rejects_an_unknown_field(tmp_path, monkeypatch):
 
 
 # --- chat_panel.html's own Subagents button/dialog (partials/chat_subagents_panel.html):
-# QUICK CHAT ONLY -- a real project already picked its own Subagents once, up front, on its New
-# Project form (partials/new_project_form.html's subagent_project_checklist()); Quick Chat has no
-# such form at all, so this live, in-chat control is the only way to narrow it, ever. The backing
-# routes (get_session_subagents_panel/save_session_enabled_subagents) stay plain and session-id-
-# generic -- only this ONE button's own visibility is restricted to mode == "standalone". ---
+# every session mode, not just Quick Chat -- a real project's New Project form (partials/
+# new_project_form.html's subagent_project_checklist()) still picks session["enabled_subagent_ids"]
+# once at creation, but this live, in-chat control lets that choice be REVISITED later too (e.g. to
+# pick up a Subagent profile created or enabled after that project already existed), the same way
+# Quick Chat (which has no New Project form at all) always relied on it. The backing routes
+# (get_session_subagents_panel/save_session_enabled_subagents) stay plain and session-id-generic,
+# and now so is this button's own visibility. ---
 
 
 def _isolate_subagents(tmp_path, monkeypatch):
@@ -387,10 +389,11 @@ def _isolate_subagents(tmp_path, monkeypatch):
     return subagent_store
 
 
-def test_chat_panel_never_shows_the_subagents_button_for_a_real_project(tmp_path, monkeypatch):
-    """Real project already chose its own Subagents once at creation -- this button must never
-    appear on its chat sidebar regardless of the chat_settings subagents_enabled toggle, since
-    showing it there would just be a second, redundant control over the same already-made choice."""
+def test_chat_panel_also_shows_the_subagents_button_for_a_real_project(tmp_path, monkeypatch):
+    """Real incident this fixes: a project that narrowed its picker at creation (unchecked some
+    profiles) had no way at all to later grant it a specialist created afterward. The button must
+    appear on a real project's own chat sidebar too, not just Quick Chat's, whenever a profile is
+    enabled and the chat_settings subagents_enabled toggle is on."""
     subagent_store = _isolate_subagents(tmp_path, monkeypatch)
     _isolate(tmp_path, monkeypatch)
     subagent_store.update_profile(subagent_store.add_profile("Recon Helper", [], "", None, None)["profiles"][-1]["id"], enabled=True)
@@ -400,7 +403,7 @@ def test_chat_panel_never_shows_the_subagents_button_for_a_real_project(tmp_path
 
     resp = client.get(f"/session/{session_id}")
 
-    assert 'id="chat-subagents-btn"' not in resp.text
+    assert 'id="chat-subagents-btn"' in resp.text
 
 
 def test_chat_panel_hides_the_subagents_button_on_quick_chat_when_no_profile_is_enabled(tmp_path, monkeypatch):

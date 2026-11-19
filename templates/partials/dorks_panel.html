@@ -72,7 +72,7 @@
               <code class="block text-[12px] text-secondary bg-elevated rounded px-2 py-1.5 mb-2 break-all">{{ result.query }}</code>
             {% endif %}
             <a href="{{ result.url }}" target="_blank" rel="noopener noreferrer" class="text-[12px] text-accent hover:underline break-all">{{ result.url }}</a>
-            <p class="text-[11px] text-secondary mt-2">{{ result.note }}</p>
+            <p class="ui-desc text-[11px] text-secondary mt-2">{{ result.note }}</p>
           {% endcall %}
 
         {% elif result.status == "ok" %}

@@ -10,7 +10,7 @@
   </div>
 
   <div id="transfer-export-choose" class="p-4 space-y-4">
-    <p class="text-[12px] text-secondary">
+    <p class="text-[12px] text-secondary ui-desc">
       Choose what goes into the export. You get the same data both as a code you can paste and as a file.
     </p>
 
@@ -20,7 +20,7 @@
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Export without sensitive data
       </button>
-      <p class="text-[11px] text-secondary">Settings only. No API keys, no sudo password, no sign-in tokens.</p>
+      <p class="text-[11px] text-secondary ui-desc">Settings only. No API keys, no sudo password, no sign-in tokens.</p>
     </div>
 
     <div class="rounded-lg border border-severity-high/30 bg-severity-high/5 p-3 space-y-3">
@@ -85,7 +85,7 @@
       <span id="transfer-copy-status" role="status" class="hidden text-[12px] font-medium"></span>
       <button type="button" data-transfer-action="export-back" class="ml-auto text-[12px] text-secondary hover:text-primary">Back</button>
     </div>
-    <p class="text-[11px] text-secondary">The code and the file hold exactly the same data; either one works in Import settings.</p>
+    <p class="text-[11px] text-secondary ui-desc">The code and the file hold exactly the same data; either one works in Import settings.</p>
   </div>
 </dialog>
 
@@ -96,7 +96,7 @@
   </div>
 
   <div class="p-4 space-y-3">
-    <p class="text-[12px] text-secondary">
+    <p class="text-[12px] text-secondary ui-desc">
       Paste a settings code, or choose an exported file. You will see what it contains before anything is changed.
     </p>
     <textarea id="transfer-import-data" rows="4" spellcheck="false" autocomplete="off" placeholder="ASRA1:..."
@@ -120,7 +120,7 @@
       <div>
         <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">This code contains</p>
         <ul id="transfer-import-sections" class="space-y-1 rounded border border-default bg-elevated px-3 py-2"></ul>
-        <p class="text-[11px] text-secondary mt-1">Only the settings listed are changed. Anything not listed stays as it is on this machine.</p>
+        <p class="text-[11px] text-secondary mt-1 ui-desc">Only the settings listed are changed. Anything not listed stays as it is on this machine.</p>
       </div>
 
       <div id="transfer-import-sensitive" class="hidden rounded-lg border border-severity-high/30 bg-severity-high/5 p-3 space-y-2">

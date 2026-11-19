@@ -24,13 +24,49 @@ bounded synchronous call, not something this builder can paper over.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent.tools.builders.validators import validate_safe_value
+from agent.utils.logger import get_logger
+from projects.paths import resolve_global_app_dir
+
+logger = get_logger("TOOLS")
+
+
+def frida_trace_working_dir() -> Path:
+    """The writable, ASRA-controlled directory frida-trace MUST be launched from.
+
+    frida-trace auto-generates one logging handler script per matched function into
+    `Path.cwd() / "__handlers__"` -- it reads the CURRENT WORKING DIRECTORY directly (confirmed in
+    frida_tools/tracer.py: FileRepository._repo_dir and its handler_dir.mkdir) and offers NO CLI
+    flag or env var to relocate it (`-o` only redirects the trace MESSAGES to a file, and worse,
+    diverts them off stdout where parse_frida_trace_output reads them). Real, confirmed incident:
+    with ASRA's own cwd on a read-only path, that mkdir raised
+    `OSError: Read-only file system: '/mnt/e/ASRA/__handlers__/...'` and the whole trace died.
+
+    So the only real fix is to run frida-trace from a guaranteed-writable directory. This returns
+    one under resolve_global_app_dir() (Documents/ASRA/data, writable in both the operator's
+    root-mode and non-root launches -- NOT a drvfs-unsupported thing like a unix socket, just plain
+    .js text files, so the Documents path is fine), never the repo tree or an ambient $HOME-relative
+    path. The tier-2 runner must pass this as the subprocess cwd for frida_trace (reported
+    separately -- a builder returns argv only and cannot set its own cwd)."""
+    working_dir = resolve_global_app_dir() / "data" / "frida_trace"
+    working_dir.mkdir(parents=True, exist_ok=True)
+    return working_dir
 
 
 def build_frida_trace_command(params: dict) -> list[str]:
     file_path = validate_safe_value(str(params["file_path"]).strip())
     function_pattern = validate_safe_value(str(params["function_pattern"]).strip())
     args = [validate_safe_value(str(a)) for a in (params.get("args") or [])]
+    # Make sure the writable working directory frida-trace has to run in actually exists before the
+    # runner launches it there -- see frida_trace_working_dir() for the read-only-CWD crash this
+    # prevents. Best-effort: a builder can't set its own subprocess cwd, so never fail the build if
+    # this one preparatory step can't be done; worst case is the pre-existing CWD behavior.
+    try:
+        logger.debug("frida_trace: writable working directory ready at %s", frida_trace_working_dir())
+    except OSError as exc:
+        logger.debug("frida_trace: could not prepare the writable working directory (%s)", exc)
     # -f spawns the target fresh (not attach-by-name/pid) -- the common RE case is "run this local
     # binary while watching it", not instrumenting something already running. "--" separates
     # frida-trace's own flags from the target's own argv, same convention every CLI tool here uses.

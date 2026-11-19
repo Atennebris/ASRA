@@ -36,19 +36,19 @@
 {% if not techniques %}
   <div class="flex flex-col items-center justify-center text-center py-16 px-6">
     <svg class="w-8 h-8 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 5h16M4 12h16M4 19h10" stroke-linecap="round"/></svg>
-    {% if query or outcome or rank or confidence or source_id %}
+    {% if query or outcome or rank or confidence or source_id or skills_only %}
       <p class="text-sm font-medium text-primary mt-3">No techniques match your filters</p>
-      <p class="text-[11px] text-secondary mt-1.5">Try a different search or filter, or clear them to see all {{ total }}.</p>
+      <p class="text-[11px] text-secondary mt-1.5 ui-desc">Try a different search or filter, or clear them to see all {{ total }}.</p>
     {% else %}
       <p class="text-sm font-medium text-primary mt-3">The playbook is empty</p>
-      <p class="text-[11px] text-secondary mt-1.5 max-w-sm leading-relaxed">Techniques accrue automatically as the agent confirms exploits, and from the chat's own <code class="text-[10px]">record_technique</code>. Or import the built-in <strong>Seed pack</strong> above to prime it with public WAF-bypass patterns.</p>
+      <p class="text-[11px] text-secondary mt-1.5 max-w-sm leading-relaxed ui-desc">Techniques accrue automatically as the agent confirms exploits, and from the chat's own <code class="text-[10px]">record_technique</code>. Or import the built-in <strong>Seed pack</strong> above to prime it with public WAF-bypass patterns.</p>
     {% endif %}
   </div>
 {% else %}
-  <p class="text-[11px] text-secondary mb-3">{{ techniques | length }} shown{% if query or outcome or rank or confidence or source_id %} of {{ total }}{% else %} technique{{ "s" if total != 1 else "" }}{% endif %}.</p>
+  <p class="text-[11px] text-secondary mb-3">{{ techniques | length }} shown{% if query or outcome or rank or confidence or source_id or skills_only %} of {{ total }}{% else %} technique{{ "s" if total != 1 else "" }}{% endif %}.</p>
   <div class="space-y-2.5">
     {% for t in techniques %}
-      <article class="rounded-lg border {{ 'border-severity-high/40' if t.outcome == 'failed' else 'border-default' }} bg-elevated overflow-hidden">
+      <article data-skill-card class="rounded-lg border {{ 'border-severity-high/40' if t.outcome == 'failed' else 'border-default' }} bg-elevated overflow-hidden">
         <div class="p-3">
           <div class="flex items-start gap-2.5">
             <span class="shrink-0 mt-0.5 inline-flex items-center px-1.5 py-0.5 rounded text-[9.5px] font-semibold uppercase tracking-wide border
@@ -77,12 +77,12 @@
               {% if t.confidence == "unreviewed" %}
                 <button type="button" class="p-1 rounded text-secondary hover:bg-severity-low/15 hover:text-severity-low" title="Confirm — mark this as reviewed and correct"
                         hx-post="/api/playbook/{{ t.id }}/review" hx-target="#playbook-list" hx-swap="innerHTML"
-                        hx-vals='{"confirmed": "true", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}"}'>
+                        hx-vals='{"confirmed": "true", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}", "filter_skills_only": "{{ skills_only }}"}'>
                   <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 12l5 5L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </button>
                 <button type="button" class="p-1 rounded text-secondary hover:bg-severity-high/15 hover:text-severity-high" title="Reject — this doesn't hold up, remove it"
                         hx-post="/api/playbook/{{ t.id }}/review" hx-target="#playbook-list" hx-swap="innerHTML"
-                        hx-vals='{"confirmed": "false", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}"}'
+                        hx-vals='{"confirmed": "false", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}", "filter_skills_only": "{{ skills_only }}"}'
                         hx-confirm="Reject this unreviewed technique? It'll be removed from the playbook.">
                   <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 6l12 12M18 6L6 18" stroke-linecap="round"/></svg>
                 </button>
@@ -93,7 +93,7 @@
               </button>
               <button type="button" class="p-1 rounded text-secondary hover:bg-severity-high/15 hover:text-severity-high" title="Delete"
                       hx-post="/api/playbook/{{ t.id }}/delete" hx-target="#playbook-list" hx-swap="innerHTML"
-                      hx-vals='{"q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}"}'
+                      hx-vals='{"q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}", "filter_skills_only": "{{ skills_only }}"}'
                       hx-confirm="Delete this technique from the playbook? This can't be undone.">
                 <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </button>
@@ -174,6 +174,159 @@
               </ol>
             </div>
           {% endif %}
+
+          {# Executable skill: a reusable command/script/instruction-list so a proven win reruns in
+             one action (agent/tools/playbook_store.py's skill + agent/tools/skill_runner.py's
+             execute_skill, which sandbox/hash/provenance-gates every run). The whole block only
+             exists for a technique that actually carries one. #}
+          {% if t.skill %}
+            {% set sk = t.skill %}
+            {% set trusted = sk.trust == "operator_trusted" %}
+            {# skill_enabled is bool here (an entry WITH a skill); legacy/None reads as enabled so an
+               old skill keeps behaving exactly as before. A disabled skill is refused by
+               execute_skill and no longer surfaced to the agent -- this is purely the operator's
+               shelf-without-deleting control. #}
+            {% set enabled = t.skill_enabled is not false %}
+            <div data-skill-block data-enabled="{{ 'true' if enabled else 'false' }}" class="mt-2.5 rounded-md border border-accent/30 bg-accent/5 p-2.5 transition-opacity {{ '' if enabled else 'opacity-60' }}">
+              <div class="flex items-center flex-wrap gap-1.5 mb-1.5">
+                <span class="flex items-center gap-1 text-[9.5px] font-semibold uppercase tracking-wider text-accent">
+                  <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  Skill
+                </span>
+                {# "Disabled" state marker -- shown only while off (flipped live by
+                   window.asraFlipSkillEnabled, hidden attribute toggled client-side). #}
+                <span data-skill-disabled-badge {% if enabled %}hidden{% endif %}
+                      class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium border uppercase tracking-wide text-severity-high border-severity-high/40 bg-severity-high/10">
+                  <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5" stroke-linecap="round"/></svg>
+                  Disabled
+                </span>
+                <span class="px-1.5 py-0.5 rounded-full border border-default text-secondary text-[9px] uppercase tracking-wide">{{ sk.kind }}{% if sk.kind != "instructions" and sk.interpreter and sk.interpreter != "none" %} · {{ sk.interpreter }}{% endif %}</span>
+                {# Trust badge -- advisory only (never gates execution). Flipped instantly client-side
+                   by the "Trusted on/off" button below (static/js/playbook_skill.js) before the real
+                   server toggle re-renders the list. #}
+                <span data-skill-trust-badge data-trusted="{{ 'true' if trusted else 'false' }}"
+                      class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium border uppercase tracking-wide
+                        {{ 'text-severity-low border-severity-low/40 bg-severity-low/10' if trusted else 'text-secondary border-default bg-elevated border-dashed' }}">
+                  <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l7 3v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span data-skill-trust-label>{{ "Operator-trusted" if trusted else "Unreviewed" }}</span>
+                </span>
+                {% if sk.runs %}
+                  <span class="text-[9.5px] text-secondary/80">{{ sk.runs }} run{{ "s" if sk.runs != 1 else "" }}{% if t.skill_success_rate is not none %} · {{ (t.skill_success_rate * 100) | round | int }}% ok{% endif %}</span>
+                {% else %}
+                  <span class="text-[9.5px] text-secondary/60">never run</span>
+                {% endif %}
+                {% if sk.provenance and sk.provenance.derived_from %}
+                  <span class="text-[9.5px] text-secondary/60" title="Where this skill's body came from — gates whether it may run at all">from {{ sk.provenance.derived_from }}</span>
+                {% endif %}
+              </div>
+
+              {# Hash-mismatch: the stored body no longer matches its pinned hash (hand-edited store,
+                 tampered import). execute_skill refuses it until re-saved -- re-pinning the hash via
+                 "Edit body" below is the fix. #}
+              {% if t.skill_tampered %}
+                <p class="flex items-start gap-1.5 mb-1.5 text-[10px] text-severity-high leading-relaxed">
+                  <svg class="w-3.5 h-3.5 shrink-0 mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9L2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span>Body changed out-of-band — won't run until re-saved (which re-pins its hash). Open <strong>Edit body</strong> and save to re-vet it.</span>
+                </p>
+              {% endif %}
+
+              <pre class="whitespace-pre-wrap break-words text-[10.5px] font-mono text-primary bg-surface border border-default rounded px-2 py-1.5 max-h-40 overflow-y-auto asra-scroll">{{ sk.body }}</pre>
+
+              {% if sk.params %}
+                <div class="flex flex-wrap items-center gap-1.5 mt-1.5 text-[9.5px]">
+                  <span class="text-secondary/70 uppercase tracking-wide">params:</span>
+                  {% for p in sk.params %}
+                    <span class="px-1.5 py-0.5 rounded-full border border-default text-secondary font-mono" title="{{ p.desc or '' }}{{ ' (required)' if p.required else '' }}">{{ p.name }}{{ "*" if p.required else "" }}</span>
+                  {% endfor %}
+                </div>
+              {% endif %}
+
+              {# Run form -- one input per declared param (fills the body's {{ '{{slots}}' }}); posts
+                 to the run route, result lands in this card's own result slot. Instructions skills
+                 and param-less command/script skills still submit (an empty params dict). #}
+              <form class="mt-2" hx-post="/api/playbook/{{ t.id }}/run-skill" hx-target="#skill-result-{{ t.id }}" hx-swap="innerHTML"
+                    hx-on::before-request="this.querySelector('[data-skill-run-label]').textContent = 'Running…'"
+                    hx-on::after-request="this.querySelector('[data-skill-run-label]').textContent = 'Run';">
+                {% for p in sk.params %}
+                  <label class="block mb-1.5">
+                    <span class="block text-[9px] font-semibold uppercase tracking-wide text-secondary mb-0.5">{{ p.name }}{% if p.desc %} <span class="normal-case text-secondary/60">— {{ p.desc }}</span>{% endif %}</span>
+                    <input type="text" name="param_{{ p.name }}" {{ "required" if p.required else "" }}
+                           class="w-full bg-elevated border border-default rounded px-2 py-1 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+                  </label>
+                {% endfor %}
+                <div class="flex flex-wrap items-center gap-2">
+                  {# Run is hidden while the skill is disabled (execute_skill would refuse it anyway) --
+                     the hidden attribute is toggled live by window.asraFlipSkillEnabled. #}
+                  <button type="submit" data-skill-run-btn {% if not enabled %}hidden{% endif %} class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-accent bg-accent/10 hover:bg-accent/20 text-accent text-[11px] font-medium transition-colors">
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M6 4l14 8-14 8V4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span data-skill-run-label>Run</span>
+                  </button>
+                  {# Enable/disable on/off -- shelve a stored skill without deleting it. Instant
+                     client-side flip (dims the block, hides Run, toggles the Disabled badge) before
+                     the real server toggle (set_skill_enabled) re-renders the list. #}
+                  <button type="button" onclick="window.asraFlipSkillEnabled && window.asraFlipSkillEnabled(this)"
+                          hx-post="/api/playbook/{{ t.id }}/skill-enabled" hx-target="#playbook-list" hx-swap="innerHTML"
+                          hx-vals='{"enabled": "{{ "false" if enabled else "true" }}", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}", "filter_skills_only": "{{ skills_only }}"}'
+                          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-default text-secondary hover:bg-overlay hover:text-primary text-[11px] transition-colors">
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v8M18.4 6.6a9 9 0 1 1-12.8 0" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span data-skill-enabled-action>{{ "Disable" if enabled else "Enable" }}</span>
+                  </button>
+                  {# Trusted on/off -- instant client-side badge flip (window.asraFlipSkillTrust),
+                     then the real toggle re-renders the list. hx-vals carries the current toolbar
+                     state so the toggle doesn't reset the operator's filters. #}
+                  <button type="button" onclick="window.asraFlipSkillTrust && window.asraFlipSkillTrust(this)"
+                          hx-post="/api/playbook/{{ t.id }}/skill-trust" hx-target="#playbook-list" hx-swap="innerHTML"
+                          hx-vals='{"trusted": "{{ "false" if trusted else "true" }}", "q": "{{ query }}", "filter_outcome": "{{ outcome }}", "filter_rank": "{{ rank }}", "sort": "{{ sort }}", "filter_confidence": "{{ confidence }}", "filter_source_id": "{{ source_id }}", "filter_skills_only": "{{ skills_only }}"}'
+                          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-default text-secondary hover:bg-overlay hover:text-primary text-[11px] transition-colors">
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l7 3v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span data-skill-trust-action>{{ "Trusted on" if trusted else "Mark trusted" }}</span>
+                  </button>
+                  <button type="button" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-default text-secondary hover:bg-overlay hover:text-primary text-[11px] transition-colors"
+                          onclick="this.closest('article').querySelector('.pb-skill-edit').toggleAttribute('open')">
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Edit body
+                  </button>
+                  {# Confirm, then choose where to save (File System Access API; falls back to a
+                     normal Downloads download) -- static/js/playbook_skill.js's asraExportJson. #}
+                  <button type="button" onclick="window.asraExportJson('/api/playbook/{{ t.id }}/skill-export', 'asra_skill.json')"
+                     title="Download this skill as a portable JSON envelope"
+                     class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-default text-secondary hover:bg-overlay hover:text-primary text-[11px] transition-colors">
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Export
+                  </button>
+                </div>
+              </form>
+
+              {# Edit-body form -- re-pins the hash on save (and resets trust to unreviewed on a real
+                 body change). This is also how a tampered body becomes runnable again. #}
+              <details class="pb-skill-edit mt-2">
+                <summary class="hidden"></summary>
+                <form hx-post="/api/playbook/{{ t.id }}/update-skill" hx-target="#playbook-list" hx-swap="innerHTML" class="space-y-2">
+                  <input type="hidden" name="q" value="{{ query }}">
+                  <input type="hidden" name="filter_outcome" value="{{ outcome }}">
+                  <input type="hidden" name="filter_rank" value="{{ rank }}">
+                  <input type="hidden" name="sort" value="{{ sort }}">
+                  <input type="hidden" name="filter_confidence" value="{{ confidence }}">
+                  <input type="hidden" name="filter_source_id" value="{{ source_id }}">
+                  <input type="hidden" name="filter_skills_only" value="{{ skills_only }}">
+                  <label class="block">
+                    <span class="block text-[9px] font-semibold uppercase tracking-wide text-secondary mb-0.5">Body</span>
+                    <textarea name="body" rows="4" class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ sk.body }}</textarea>
+                  </label>
+                  <label class="block">
+                    <span class="block text-[9px] font-semibold uppercase tracking-wide text-secondary mb-0.5">Params <span class="normal-case text-secondary/60">— comma-separated names, each a required {{ '{{slot}}' }}</span></span>
+                    <input type="text" name="params" value="{{ sk.params | map(attribute='name') | join(', ') }}" placeholder="target, port" class="w-full bg-elevated border border-default rounded px-2 py-1.5 text-[11px] font-mono text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+                  </label>
+                  <div class="flex justify-end gap-2">
+                    <button type="button" onclick="this.closest('.pb-skill-edit').removeAttribute('open')" class="px-3 py-1.5 text-[12px] rounded border border-default text-secondary hover:text-primary hover:bg-overlay">Cancel</button>
+                    <button type="submit" class="px-3 py-1.5 text-[12px] rounded bg-accent hover:bg-accent-hover text-white font-medium">Save &amp; re-pin</button>
+                  </div>
+                </form>
+              </details>
+
+              <div id="skill-result-{{ t.id }}"></div>
+            </div>
+          {% endif %}
         </div>
 
         {# Inline edit (soft fields only -- tech/WAF keys define the fingerprint and aren't edited here) #}
@@ -186,6 +339,7 @@
             <input type="hidden" name="sort" value="{{ sort }}">
             <input type="hidden" name="filter_confidence" value="{{ confidence }}">
             <input type="hidden" name="filter_source_id" value="{{ source_id }}">
+            <input type="hidden" name="filter_skills_only" value="{{ skills_only }}">
             {# Read-only provenance -- what a reviewer actually needs to judge whether an LLM's own
                reading of a source is trustworthy enough to confirm, which the rest of this form
                (built for editing a live-captured finding's own soft fields) never surfaced at all.
@@ -195,7 +349,7 @@
             {% if t.source_type == "extracted" %}
               <div class="rounded-md border border-accent/30 bg-accent/5 px-2.5 py-2 text-[11px] text-secondary space-y-0.5">
                 <p><span class="text-secondary/70">Source:</span> <span class="text-primary">{{ t.source_title or "an uploaded source" }}</span>{% if t.source_author %} <span class="text-secondary/70">by</span> {{ t.source_author }}{% endif %}{% if t.source_ref %} <span class="text-secondary/70">·</span> {{ t.source_ref }}{% endif %}</p>
-                <p class="text-secondary/70">An LLM's own reading of this source, not a tested fact — verify against the source itself before confirming.</p>
+                <p class="text-secondary/70 ui-desc">An LLM's own reading of this source, not a tested fact — verify against the source itself before confirming.</p>
                 {% if t.source_id and t.source_id in library_source_ids %}
                   <a href="#" onclick="window.asraToggleLibraryPanel(true); return false;" class="inline-flex items-center gap-1 text-accent hover:underline">
                     Open in Library

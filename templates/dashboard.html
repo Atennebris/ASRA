@@ -17,7 +17,7 @@
   <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
     <div class="min-w-0">
       <h1 class="text-[15px] font-semibold text-primary">Dashboard</h1>
-      <p class="text-[11px] text-secondary mt-0.5 max-w-2xl">Cost and process-efficiency across every project on disk — which programs and providers are actually worth continued LLM spend, without opening each project individually.</p>
+      <p class="ui-desc text-[11px] text-secondary mt-0.5 max-w-2xl">Cost and process-efficiency across every project on disk — which programs and providers are actually worth continued LLM spend, without opening each project individually.</p>
     </div>
     {% include "macros/header_light.html" %}
   </div>
@@ -108,7 +108,7 @@
           </tbody>
         </table>
       </div>
-      <p class="text-[11px] text-secondary mt-2">Cleanliness is process-efficiency (failed/retried/duplicate calls, never how much was found) averaged across every session that provider handled — same definition used by this same table on each project's own Summary tab.</p>
+      <p class="ui-desc text-[11px] text-secondary mt-2">Cleanliness is process-efficiency (failed/retried/duplicate calls, never how much was found) averaged across every session that provider handled — same definition used by this same table on each project's own Summary tab.</p>
     {% else %}
       {{ empty_state("No provider usage recorded yet.", "Shows up once at least one session has made a real LLM call.") }}
     {% endif %}

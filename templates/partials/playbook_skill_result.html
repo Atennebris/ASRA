@@ -1,0 +1,37 @@
+{# The outcome of one Run of a technique's skill (main.py's playbook_run_skill -> skill_runner.
+   execute_skill). Swapped into the card's own #skill-result-<id> slot, so running one skill never
+   disturbs the rest of the list. execute_skill always returns a {status, ...} dict and never raises
+   -- a bad/absent/tampered skill comes back as status="error" with an actionable message here. #}
+{% set ok = result.status == "ok" %}
+<div class="mt-2 rounded-md border px-2.5 py-2 text-[11px] leading-relaxed
+            {{ 'border-severity-low/40 bg-severity-low/5' if ok else 'border-severity-high/40 bg-severity-high/5' }}">
+  <div class="flex items-center gap-1.5 font-semibold
+              {{ 'text-severity-low' if ok else 'text-severity-high' }}">
+    {% if ok %}
+      <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    {% else %}
+      <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9L2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    {% endif %}
+    <span>{{ "Ran" if ok else "Did not run" }}{% if result.exit_code is defined %} · exit {{ result.exit_code }}{% endif %}</span>
+  </div>
+
+  {% if result.kind == "instructions" %}
+    {# An instructions skill is never executed -- it's handed back as steps to follow. #}
+    <pre class="mt-1.5 whitespace-pre-wrap break-words font-mono text-[10.5px] text-primary bg-surface border border-default rounded px-2 py-1.5 max-h-48 overflow-y-auto asra-scroll">{{ result.instructions }}</pre>
+  {% endif %}
+  {% if result.error %}
+    <p class="mt-1.5 text-secondary break-words">{{ result.error }}</p>
+  {% endif %}
+  {% if result.stdout %}
+    <div class="mt-1.5">
+      <span class="text-[9px] font-semibold uppercase tracking-wide text-secondary">stdout</span>
+      <pre class="mt-0.5 whitespace-pre-wrap break-words font-mono text-[10.5px] text-primary bg-surface border border-default rounded px-2 py-1.5 max-h-48 overflow-y-auto asra-scroll">{{ result.stdout }}</pre>
+    </div>
+  {% endif %}
+  {% if result.stderr %}
+    <div class="mt-1.5">
+      <span class="text-[9px] font-semibold uppercase tracking-wide text-secondary">stderr</span>
+      <pre class="mt-0.5 whitespace-pre-wrap break-words font-mono text-[10.5px] text-secondary bg-surface border border-default rounded px-2 py-1.5 max-h-32 overflow-y-auto asra-scroll">{{ result.stderr }}</pre>
+    </div>
+  {% endif %}
+</div>

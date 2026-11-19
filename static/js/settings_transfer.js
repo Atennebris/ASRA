@@ -147,15 +147,13 @@
 
   function downloadExport(host) {
     if (!currentExport) return;
-    var blob = new Blob([currentExport.fileJson], { type: "application/json" });
-    var url = URL.createObjectURL(blob);
-    var link = document.createElement("a");
-    link.href = url;
-    link.download = currentExport.filename;
-    host.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    // Route through the shared export flow (warn + choose path, default Downloads) instead of an
+    // instant anchor download -- CLAUDE.md's export rule.
+    window.asraExportDownload({
+      getBlob: function () { return Promise.resolve(new Blob([currentExport.fileJson], { type: "application/json" })); },
+      filename: currentExport.filename,
+      mime: "application/json",
+    });
   }
 
   // ---- import ----------------------------------------------------------------------------------

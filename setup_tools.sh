@@ -756,10 +756,10 @@ install_strace() {
 # function) is what actually drives it, via a real model-written script (e.g. pwntools'
 # process(["wine", target_exe, ...])) once static analysis alone can't answer a question -- this
 # function's only job is making sure the `wine`/`wine64` binaries exist on PATH for that script to
-# find. Confirmed live before adding this: on a fresh Ubuntu noble WSL2 install, apt's own `wine`
-# meta-package resolves to a pure 64-bit install (no i386/multiarch needed) for a 64-bit PE target,
-# ~100MB download / ~700-900MB installed (the bulk is one package, libwine) -- real disk space on
-# a real machine is essentially never the constraint that matters here.
+# find, plus 32-bit (i386) support so wine can actually build its WOW64 prefix on first run. apt's
+# `wine` meta-package is ~100MB download / ~700-900MB installed (the bulk is one package, libwine);
+# the i386 step below adds the 32-bit libs modern wine needs even for a 64-bit target -- real disk
+# space on a real machine is essentially never the constraint that matters here.
 install_wine() {
     have wine && { ok "wine already installed ($(command -v wine))"; return 0; }
     log "Installing wine (runs a Windows PE target directly for RE mode's dynamic-analysis path -- driven via custom_re_script, no dedicated ToolSpec)..."
@@ -773,6 +773,23 @@ install_wine() {
         return 0
     fi
     pkg_install wine || { warn "wine not available via $PKG_MANAGER -- RE mode's dynamic-analysis path (custom_re_script driving a Windows PE target) will fail until this is retried manually."; return 1; }
+    # 32-bit (i386) wine support. The earlier claim that a 64-bit PE needs no i386/multiarch was
+    # over-optimistic: modern wine builds a shared WOW64 prefix on first run and, without 32-bit
+    # libs, `wine`/`wineboot` prints "it looks like wine32 is missing, you should install it" and can
+    # fail to initialize the prefix at all -- observed live when a dynamic-analysis path tried to run
+    # a target under wine and had to fall back to a static approach. Best-effort (apt/dpkg only, the
+    # realistic WSL2 runtime): enable the i386 architecture and pull wine's 32-bit package. Never
+    # fatal -- a pure-64-bit target may still run without it, so a failure here is a warning, not a
+    # hard stop, same posture as the xvfb step below.
+    if [ "$(uname -s)" != "Darwin" ] && command -v dpkg >/dev/null 2>&1; then
+        $SUDO dpkg --add-architecture i386 2>/dev/null || true
+        $SUDO apt-get update -y >/dev/null 2>&1 || true
+        if $SUDO apt-get install -y wine32 >/dev/null 2>&1 || $SUDO apt-get install -y wine32:i386 >/dev/null 2>&1; then
+            ok "wine 32-bit support (wine32) installed -- WOW64 prefixes initialize cleanly."
+        else
+            warn "could not install wine32 (32-bit wine). Running some Windows PE targets under wine may print 'wine32 is missing' and fail to build its prefix. Retry manually: sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install wine32"
+        fi
+    fi
     # Xvfb (agent/tools/sandbox.py's own run_sandboxed/_start_offscreen_display) is what actually
     # makes wine headless on this project's real Windows-hosted runtime -- confirmed live, real
     # incident: WSLg forwards the sandbox's own DISPLAY straight to the operator's real Windows

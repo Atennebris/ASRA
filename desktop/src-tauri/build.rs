@@ -18,6 +18,7 @@ fn main() {
                 "launch_backend",
                 "apply_desktop_update",
                 "bootstrap_full_project",
+                "save_export_file",
                 "force_restart_agent",
                 "save_env",
                 "open_in_browser",
@@ -26,6 +27,7 @@ fn main() {
                 "install_wsl",
                 "get_wsl_setup_status",
                 "test_wsl_setup",
+                "set_page_zoom",
             ]),
         ),
     )

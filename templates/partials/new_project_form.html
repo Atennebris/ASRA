@@ -38,7 +38,7 @@
   <div class="block text-left">
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Subagents for this project</span>
     {% if enabled_subagents %}
-      <p class="text-[11px] text-secondary mb-2">
+      <p class="text-[11px] text-secondary mb-2 ui-desc">
         {{ enabled_subagents | length }} subagent{{ "s" if enabled_subagents | length != 1 else "" }}
         enabled globally, available to this project by default — uncheck any the agent shouldn't
         be able to delegate to here. Manage the full list on the
@@ -56,7 +56,7 @@
         </div>
       </div>
     {% else %}
-      <p class="text-[11px] text-secondary">No subagents enabled — the agent works alone. Configure one on the Subagents tab.</p>
+      <p class="text-[11px] text-secondary ui-desc">No subagents enabled — the agent works alone. Configure one on the Subagents tab.</p>
     {% endif %}
   </div>
 {% endmacro %}
@@ -99,7 +99,7 @@
   <section class="np-step np-step-mode">
     <p class="np-eyebrow">Step 01 · Select mode</p>
     <h2 class="np-step-title">How do you want to work?</h2>
-    <p class="np-step-lead">Pick a posture for this engagement. You can set everything else on the next step.</p>
+    <p class="np-step-lead ui-desc">Pick a posture for this engagement. You can set everything else on the next step.</p>
 
     <div class="np-mode-grid">
       <label for="np-mode-agent" class="np-mode-card">
@@ -113,7 +113,7 @@
           <circle cx="18" cy="6" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/><circle cx="18" cy="18" r="1.6"/>
         </svg>
         <span class="np-mode-name">Agent</span>
-        <span class="np-mode-desc">Full autonomous run — recon, analysis, and exploitation across the whole scope, hands-off.</span>
+        <span class="np-mode-desc ui-desc">Full autonomous run — recon, analysis, and exploitation across the whole scope, hands-off.</span>
         <span class="np-mode-tags">
           <span class="np-mode-tag">Recon</span><span class="np-mode-tag">Analyze</span><span class="np-mode-tag">Exploit</span>
         </span>
@@ -130,7 +130,7 @@
           <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
         </svg>
         <span class="np-mode-name">Interactive</span>
-        <span class="np-mode-desc">Chat-only console — name the target and task in chat, do fast pinpoint actions, no full scan.</span>
+        <span class="np-mode-desc ui-desc">Chat-only console — name the target and task in chat, do fast pinpoint actions, no full scan.</span>
         <span class="np-mode-tags">
           <span class="np-mode-tag">Chat</span><span class="np-mode-tag">Pinpoint</span><span class="np-mode-tag">Subagents</span>
         </span>
@@ -146,7 +146,7 @@
           <path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4" stroke-linecap="round"/>
         </svg>
         <span class="np-mode-name">Reverse Engineering</span>
-        <span class="np-mode-desc">A short automatic baseline pass over a local binary, smart contract, or source repo, then a chat panel to dig deeper.</span>
+        <span class="np-mode-desc ui-desc">A short automatic baseline pass over a local binary, smart contract, or source repo, then a chat panel to dig deeper.</span>
         <span class="np-mode-tags">
           <span class="np-mode-tag">Binaries</span><span class="np-mode-tag">Contracts</span><span class="np-mode-tag">SAST</span>
         </span>
@@ -182,7 +182,7 @@
 <div class="bg-surface border border-default rounded-lg p-4 mb-4 space-y-2.5">
   <div>
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Import from a link (optional)</span>
-    <p class="text-[11px] text-secondary mb-2">
+    <p class="text-[11px] text-secondary mb-2 ui-desc">
       Paste a bug-bounty program page (HackerOne/Bugcrowd/YesWeHack/...) to have the agent read its
       scope table and rules and fill the fields below — or paste a specific web app's own URL to
       pentest that exact link directly, no program page involved.
@@ -192,7 +192,7 @@
        provider/model Recon/Analyze/Exploit already run on, never the Chat panel's own separately
        pickable provider. Stated explicitly here since a program-page read + one LLM extraction
        call is real usage against whatever that provider's own quota/credits are. #}
-    <p class="text-[11px] text-secondary mb-2">
+    <p class="text-[11px] text-secondary mb-2 ui-desc">
       Uses the main agent's own LLM provider (<a href="/settings" class="text-accent hover:underline">Settings → LLM Provider</a>) —
       make sure that provider has working credits/quota before clicking either button below.
     </p>
@@ -252,16 +252,16 @@
     <input type="text" name="target" value="{{ target }}" required autocomplete="off"
            class="chip-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
            placeholder="example.com">
-    <span class="block text-[11px] text-secondary mt-1">URL, domain, host, IPv4, or IPv6. Multiple targets (a scope)? Separate with a comma, e.g.
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">URL, domain, host, IPv4, or IPv6. Multiple targets (a scope)? Separate with a comma, e.g.
       <code class="text-[10px]">example.com, 10.0.0.5, https://app.example.com, [2001:db8::1]</code></span>
-    <span class="block text-[11px] text-secondary mt-1">A whole address pool? A CIDR block
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">A whole address pool? A CIDR block
       (<code class="text-[10px]">10.0.0.0/24</code>) or an explicit range
       (<code class="text-[10px]">192.168.1.1 - 192.168.1.254</code>) both work — every real IP
       inside is treated as in scope.</span>
-    <span class="block text-[11px] text-secondary mt-1">Bug-bounty-style wildcard scope? Write an entry as
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">Bug-bounty-style wildcard scope? Write an entry as
       <code class="text-[10px]">*.example.com</code> to mean the whole subdomain tree — or just check
       "Enumerate subdomains" below to apply that to every target above without typing it per entry.</span>
-    <span class="block text-[11px] text-secondary mt-1">One domain, many TLDs? Write
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">One domain, many TLDs? Write
       <code class="text-[10px]">example.(com|de|fr)</code> — the parenthesized, pipe-separated
       alternatives expand automatically into one target per option (shown below as it's typed), no
       need to type each one out by hand.</span>
@@ -276,7 +276,7 @@
      "Use this link as the target" leaves this blank on purpose (that URL is the pentest target,
      not a program page). #}
   {{ input_field("program_url", "Program URL (optional)", value=program_url|default(''), placeholder="https://hackerone.com/your-program") }}
-  <p class="text-[11px] text-secondary -mt-3">Link to this project's bug-bounty/VDP program page, if any — the agent can browse it and check its Hacktivity feed for likely duplicates on its own.</p>
+  <p class="text-[11px] text-secondary -mt-3 ui-desc">Link to this project's bug-bounty/VDP program page, if any — the agent can browse it and check its Hacktivity feed for likely duplicates on its own.</p>
 
   {# Optional, off by default (blank -> session["out_of_scope"]/["out_of_scope_notes"] both [] ->
      no exclusion, agent scans exactly as it always has). Each comma-separated entry is checked on
@@ -295,7 +295,7 @@
     <input type="text" name="out_of_scope" value="{{ out_of_scope }}" autocomplete="off"
            class="chip-input w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
            placeholder="staging.example.com, *.internal.example.com, All domains or subdomains not listed above">
-    <span class="block text-[11px] text-secondary mt-1">Hosts/domains explicitly excluded from this engagement — same
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">Hosts/domains explicitly excluded from this engagement — same
       comma-separated syntax as Target(s) above, wildcards included; a matching tool call is skipped automatically.
       A qualifying phrase instead of a concrete host (e.g. "all domains not listed in the Scopes table") also works —
       it's shown to the agent as an instruction to apply itself rather than enforced automatically.</span>
@@ -306,7 +306,7 @@
     {{ toggle_switch("authorize_exploit", checked=true) }}
     <span class="text-sm">
       <span class="block text-primary">Authorize exploitation</span>
-      <span class="block text-[11px] text-secondary mt-0.5">Allows Metasploit/sqlmap against every target above. Recon always runs either way. Uncheck for recon/detection only.</span>
+      <span class="block text-[11px] text-secondary mt-0.5 ui-desc">Allows Metasploit/sqlmap against every target above. Recon always runs either way. Uncheck for recon/detection only.</span>
     </span>
   </label>
 
@@ -314,7 +314,7 @@
     {{ toggle_switch("enumerate_subdomains") }}
     <span class="text-sm">
       <span class="block text-primary">Enumerate subdomains</span>
-      <span class="block text-[11px] text-secondary mt-0.5">Off by default — recon stays limited to exactly
+      <span class="block text-[11px] text-secondary mt-0.5 ui-desc">Off by default — recon stays limited to exactly
         what's typed above. Check this to actively search for subdomains of every target above (same effect
         as writing each one as *.example.com, just applied to the whole scope at once) and scan whatever
         turns up too.</span>
@@ -346,7 +346,7 @@
       <input type="number" name="time_budget_custom_minutes" min="1" step="1" placeholder="Minutes"
              class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
     </div>
-    <span class="block text-[11px] text-secondary mt-1">With a budget set, the agent keeps working the full duration even after an early success — deepening confirmed footholds, chaining further, and hunting for additional distinct vulnerabilities — instead of stopping the moment the first pass finishes. It's also a real ceiling, checked continuously while the scan runs, not just between passes: the session pauses at the next safe checkpoint once the budget genuinely runs out, even mid-pass — the Overview tab can then add more time, drop the limit and keep going, or stop the timer without stopping the scan.</span>
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">With a budget set, the agent keeps working the full duration even after an early success — deepening confirmed footholds, chaining further, and hunting for additional distinct vulnerabilities — instead of stopping the moment the first pass finishes. It's also a real ceiling, checked continuously while the scan runs, not just between passes: the session pauses at the next safe checkpoint once the budget genuinely runs out, even mid-pass — the Overview tab can then add more time, drop the limit and keep going, or stop the timer without stopping the scan.</span>
   </div>
 
   {# Optional, off by default (blank -> session["goal"] "" -> agent behaves exactly as it always
@@ -360,7 +360,7 @@
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Goal for this engagement (optional)</span>
     <input type="text" name="goal" value="{{ goal }}" placeholder="e.g. reach the admin panel, deepen an existing foothold, full compromise..."
            class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
-    <span class="block text-[11px] text-secondary mt-1">What you're actually trying to achieve, not just where to look — left blank, the agent prioritizes entirely at its own discretion, same as today.</span>
+    <span class="block text-[11px] text-secondary mt-1 ui-desc">What you're actually trying to achieve, not just where to look — left blank, the agent prioritizes entirely at its own discretion, same as today.</span>
   </label>
 
   {# Optional, off by default (both blank -> session["scope_rules"] both "" -> agent scans exactly
@@ -373,7 +373,7 @@
   <details class="group rounded border border-default bg-elevated" {% if qualifying_vulnerabilities or non_qualifying_vulnerabilities %}open{% endif %}>
     {{ disclosure_summary("Bug-bounty scope rules (optional) — Qualifying / Non-qualifying vulnerabilities") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Paste this program's own scope-table language, if it has one. Left blank, the agent scans
         entirely at its own discretion, same as today. Filled in, it prioritizes finding Qualifying
         classes and flags confirmed matches in the session's own Summary tab, included in Export.
@@ -385,7 +385,7 @@
         </div>
         <textarea name="qualifying_vulnerabilities" rows="3" placeholder="e.g. RCE, SQLi, auth bypass, IDOR/broken access control, SSRF, stored XSS with real impact..."
                   class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ qualifying_vulnerabilities }}</textarea>
-        <span class="block text-[11px] text-secondary mt-1">"Everything else qualifies too" appends a standing rule to this field: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
+        <span class="block text-[11px] text-secondary mt-1 ui-desc">"Everything else qualifies too" appends a standing rule to this field: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
       </label>
       <label class="block">
         <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Non-qualifying vulnerabilities</span>
@@ -406,14 +406,14 @@
   <details class="group rounded border border-default bg-elevated">
     {{ disclosure_summary("Hypotheses to check (optional) — things you suspect might be there") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         One suspicion per line — a lead you already have (an old endpoint, a known-weak component,
         "the staging subdomain probably has debug mode on"). The agent must confirm or rule out
         every one with a real check before the scan is considered finished, not just mention it in
         passing. Left blank, nothing changes. You can add more of these later too, on the session's
         own Hypotheses tab — while it's still running, or even after it's done.
       </p>
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Not the place for the program's rules/policy page (testing policy, reward eligibility,
         disclosure terms) — paste that into "Custom instructions for this program" below instead.
         Every line typed here becomes its own hypothesis the agent must individually investigate.
@@ -434,7 +434,7 @@
   <details class="group rounded border border-default bg-elevated" {% if custom_instructions %}open{% endif %}>
     {{ disclosure_summary("Custom instructions for this program (optional)") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Paste any program-specific rules from its bug-bounty page that aren't covered by the
         Qualifying/Non-qualifying lists above — testing restrictions, required test accounts,
         specific focus areas, anything the agent should keep in mind during recon, analysis, and
@@ -455,7 +455,7 @@
   <details class="group rounded border border-default bg-elevated" {% if custom_user_agent or ua_snippet %}open{% endif %}>
     {{ disclosure_summary("Custom User-Agent header (optional)") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Some bug-bounty programs require a specific User-Agent string on all test traffic — paste
         it here exactly as the program specifies. Applied to every real HTTP request this agent
         makes (recon/analyze/exploit), not just something the model is told about. Left blank,
@@ -510,7 +510,7 @@
           in it with your real handle/username before starting the scan.
         </p>
       {% endif %}
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         "Insert my browser's UA" copies this browser's real User-Agent as-is. "Merge" takes this
         browser's real UA and appends the snippet typed above as its own trailing token (same spot
         real browsers add their own vendor tokens, e.g. "... Safari/537.36 Edg/124.0.0.0"), typed
@@ -532,7 +532,7 @@
   <details class="group rounded border border-default bg-elevated" {% if custom_headers %}open{% endif %}>
     {{ disclosure_summary("Custom HTTP Headers (optional)") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Some bug-bounty programs ask for an extra header on every request, e.g. one identifying you
         as the researcher (HackerOne: "X-HackerOne-Research: your_username"). One "Name: Value" pair
         per line — applied to every real HTTP request this agent makes, not just something the model
@@ -561,7 +561,7 @@
   <details class="group rounded border border-default bg-elevated">
     {{ disclosure_summary("Authenticated testing (optional) — for IDOR / access-control checks") }}
     <div class="px-3 pb-3 space-y-3 border-t border-default pt-3">
-      <p class="text-[11px] text-secondary">
+      <p class="text-[11px] text-secondary ui-desc">
         Give the agent one or more test accounts and it can compare what each can access —
         confirmed, remote_direct proof for the highest-value bug-bounty category unauthenticated
         scanning can never reach. Leave any field blank you don't have.
@@ -661,7 +661,7 @@
           });
         })();
       </script>
-      <p class="text-[11px] text-secondary">No MFA/2FA support — an account requiring a one-time code can't be used this way.</p>
+      <p class="text-[11px] text-secondary ui-desc">No MFA/2FA support — an account requiring a one-time code can't be used this way.</p>
     </div>
   </details>
 
@@ -1139,7 +1139,7 @@
         {{ input_field("name", "Project name", value=name, placeholder="CTF — SQLi challenge", required=true) }}
         {{ icon_picker(selected_icon=icon|default(''), selected_color=icon_color|default(''), id_prefix="interactive-") }}
       </div>
-      <p class="text-[11px] text-secondary text-left">
+      <p class="text-[11px] text-secondary text-left ui-desc">
         Start opens a full-window chat. Name the target (a URL, IP, or domain) and the task right
         there — the agent runs concrete, targeted actions with its own tools and subagents and
         reports back, instead of launching a long scan. Everything is authorized here; it acts only
@@ -1166,7 +1166,7 @@
        id_prefix fix: two copies of "the same-looking field" on one page need genuinely unique ids,
        not just visual separation via CSS show/hide). #}
     <div class="rounded border border-default bg-elevated p-3 mb-1">
-      <p class="text-[11px] text-secondary mb-2">
+      <p class="text-[11px] text-secondary mb-2 ui-desc">
         Paste a bug-bounty/vulnerability-disclosure PROGRAM page (HackerOne/Bugcrowd/YesWeHack/a
         project's own security policy — the same kind of link the Agent panel's own "Study program
         page" button reads) to have the agent pull out just the REVERSE-ENGINEERING-relevant scope
@@ -1174,7 +1174,7 @@
         binary/package) — shown below as removable chips, same as Agent mode's own Target(s) field
         — plus which vulnerability classes actually count here, read from that same page.
       </p>
-      <p class="text-[11px] text-secondary mb-2">
+      <p class="text-[11px] text-secondary mb-2 ui-desc">
         Uses the main agent's own LLM provider (<a href="/settings" class="text-accent hover:underline">Settings → LLM Provider</a>) —
         make sure that provider has working credits/quota before clicking.
       </p>
@@ -1219,7 +1219,7 @@
       <details class="group rounded border border-default bg-elevated" {% if qualifying_vulnerabilities or non_qualifying_vulnerabilities %}open{% endif %}>
         {{ disclosure_summary("Qualifying / non-qualifying vulnerabilities (optional)") }}
         <div class="px-3 pb-3 border-t border-default pt-2 space-y-2 text-left">
-          <p class="text-[11px] text-secondary">
+          <p class="text-[11px] text-secondary ui-desc">
             Scoped to what a code review can actually find — smart-contract classes (reentrancy,
             access control, oracle manipulation, ...), binary classes (memory corruption, hardcoded
             secrets, dangerous calls, ...), or source-audit classes. Not generic web CWEs, unless
@@ -1233,7 +1233,7 @@
             <textarea id="np-re-qualifying" name="qualifying_vulnerabilities" rows="3"
                       placeholder="e.g. reentrancy, unchecked external calls, hardcoded private keys, unsafe deserialization..."
                       class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ qualifying_vulnerabilities|default('') }}</textarea>
-            <span class="block text-[11px] text-secondary mt-1">"Everything else qualifies too" appends a standing rule: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
+            <span class="block text-[11px] text-secondary mt-1 ui-desc">"Everything else qualifies too" appends a standing rule: anything not explicitly listed under Non-qualifying is treated as Qualifying by default.</span>
           </div>
           <div>
             <label class="block text-[11px] font-medium text-secondary mb-1" for="np-re-non-qualifying">Non-qualifying vulnerabilities</label>
@@ -1266,12 +1266,12 @@
             <label class="np-re-level-card flex flex-col items-center text-center gap-1 rounded border border-default bg-surface px-2 py-2 cursor-pointer transition-colors">
               <input type="radio" name="re_experience_level" value="{{ level }}" class="sr-only" {% if _re_level == level %}checked{% endif %}>
               <span class="text-[12px] font-semibold text-primary">{{ label }}</span>
-              <span class="text-[10px] text-secondary leading-snug">{{ desc }}</span>
+              <span class="text-[10px] text-secondary leading-snug ui-desc">{{ desc }}</span>
             </label>
           {% endfor %}
         </div>
       </div>
-      <p class="text-[11px] text-secondary text-left">
+      <p class="text-[11px] text-secondary text-left ui-desc">
         Start runs a short automatic baseline pass (file-type ID, static analysis, and — for a
         binary — a decompile of the functions most worth a look), then opens a chat panel with the
         same tools for anything deeper.

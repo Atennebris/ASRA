@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import page_header, section_label, button %}
+{% block title %}ASRA &mdash; Operator Profile{% endblock %}
+
+{# Standalone page (sidebar nav, under Dashboard), not a Settings tab -- the MAIN agent's standing,
+   cross-project profile (agent/operator_profile_store.py): how the operator wants the agent to work
+   by default on every new project. Distinct from a project's own one-off "Custom instructions" (New
+   Project form), which still layers ON TOP of this as the more-specific override. Not subagents
+   (their own named profiles), not the default provider/model (Settings -> LLM Providers) --
+   style/priorities only, never scope or credentials. operator_profile() is a page-wide global
+   (main.py), read per render, so this page needs no extra context key. #}
+{% block content %}
+  {{ page_header("Operator Profile") }}
+  {% set profile = operator_profile() %}
+  <div class="w-full max-w-4xl space-y-5">
+    <div class="bg-surface border border-default rounded-xl p-5">
+      {{ section_label("Operator Profile") }}
+      <p class="ui-desc text-[12px] text-secondary mb-3">
+        Standing instructions and priorities applied to the main agent on every new project by
+        default, so you don't re-type them each time. A specific project's own "Custom instructions"
+        still override these where they conflict. Style and priorities only &mdash; never targets,
+        scope, or credentials.
+      </p>
+      {# Export = download this profile as one JSON file; Import = upload one and apply it (validated
+         server-side, so a foreign/hand-edited file can't wedge the profile). Separate from Settings
+         -> Transfer, which moves the whole settings bundle. #}
+      <div class="flex items-center gap-2 mb-4">
+        <a href="/api/operator-profile/export" download="asra_operator_profile.json"
+           data-export data-export-mime="application/json"
+           class="inline-flex items-center gap-1.5 rounded border border-default bg-elevated px-2.5 py-1.5 text-[12px] text-secondary hover:bg-overlay hover:text-primary transition-colors">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 2.5v7m0 0L5 6.5m3 3 3-3M3 13h10" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+          Export
+        </a>
+        <form method="post" action="/api/operator-profile/import" enctype="multipart/form-data" class="inline-flex">
+          <input type="file" name="file" accept="application/json,.json" class="hidden" id="op-import-file"
+                 onchange="if(this.files.length){this.form.submit();}">
+          <button type="button" onclick="document.getElementById('op-import-file').click()"
+                  class="inline-flex items-center gap-1.5 rounded border border-default bg-elevated px-2.5 py-1.5 text-[12px] text-secondary hover:bg-overlay hover:text-primary transition-colors">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 13.5v-7m0 0L5 9.5m3-3 3 3M3 3h10" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            Import
+          </button>
+        </form>
+      </div>
+      <form hx-post="/api/settings/operator-profile" hx-swap="none"
+            hx-disabled-elt="find button[type=submit]"
+            hx-on::after-request="if(event.detail.successful){var s=this.querySelector('[data-save-status]');if(s){s.hidden=false;clearTimeout(s._t);s._t=setTimeout(function(){s.hidden=true;},2500);}}"
+            class="space-y-4">
+        <label class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Standing instructions</span>
+          <span class="ui-desc block text-[11px] text-secondary mb-1.5">Priorities and constraints for every engagement &mdash; e.g. &ldquo;I care most about IDOR / broken-auth&rdquo;, &ldquo;prefer quiet techniques on WAF-protected targets&rdquo;, &ldquo;write findings simply, my English isn&rsquo;t native&rdquo;.</span>
+          <textarea name="standing_instructions" rows="5"
+                    class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+                    placeholder="e.g. Prioritize IDOR and broken access control. Stay quiet on WAF-protected targets.">{{ profile.standing_instructions }}</textarea>
+        </label>
+        <label class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Focus &mdash; vulnerability classes</span>
+          <span class="ui-desc block text-[11px] text-secondary mb-1.5">Classes you care about most, to investigate first when time is limited. A preference that shapes the agent&rsquo;s order of work, not a restriction &mdash; it never ignores a clearly higher-impact finding outside this list.</span>
+          <textarea name="focus_classes" rows="3"
+                    class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"
+                    placeholder="e.g. IDOR, broken access control, SSRF, auth bypass">{{ profile.focus_classes }}</textarea>
+        </label>
+        <label class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Communication style</span>
+          <span class="ui-desc block text-[11px] text-secondary mb-1.5">How verbose the agent&rsquo;s live step-by-step narration is in the chat/log. Doesn&rsquo;t change the depth of the final report.</span>
+          <select name="communication_style"
+                  class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <option value="" {% if not profile.communication_style %}selected{% endif %}>Default (no preference)</option>
+            <option value="concise" {% if profile.communication_style == "concise" %}selected{% endif %}>Concise &mdash; less filler before a verdict</option>
+            <option value="detailed" {% if profile.communication_style == "detailed" %}selected{% endif %}>Detailed &mdash; explain each step as it goes</option>
+          </select>
+        </label>
+        <div class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Require my approval before exploiting</span>
+          <span class="ui-desc block text-[11px] text-secondary mb-2">Pick the severities you want to personally confirm with a click before the agent exploits a finding of that severity. Unchecked severities run autonomously (still fully logged). This <em>adds</em> to the global <code class="text-[10px]">EXPLOIT_REQUIRE_APPROVAL</code> switch &mdash; when that&rsquo;s on, everything is gated regardless of these. Leave all unchecked for the default (gating governed by that switch alone).</span>
+          <div class="flex flex-wrap gap-2">
+            {% for sev in ["critical", "high", "medium", "low", "info"] %}
+              <label class="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-default bg-elevated px-2.5 py-1.5 text-[12px] text-primary hover:bg-overlay has-[:checked]:border-accent has-[:checked]:bg-accent/10">
+                <input type="checkbox" name="approval_severities" value="{{ sev }}" {% if sev in profile.approval_severities %}checked{% endif %}
+                       class="h-3.5 w-3.5 rounded border-default text-accent focus:ring-accent/30">
+                <span class="capitalize">{{ sev }}</span>
+              </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="flex items-center gap-3 pt-1">
+          {{ button("Save profile", variant="primary", type="submit") }}
+          <span data-save-status hidden class="inline-flex items-center gap-1.5 text-[12px] text-severity-low">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            Saved
+          </span>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}

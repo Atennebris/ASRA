@@ -145,6 +145,14 @@ class ToolSpec:
     # successful tool call -- a green dot -- for a run that never actually emulated anything, with
     # the real failure visible only to a model (or operator) that happened to read the raw JSON text.
     parsed_error_override: Callable[[dict], str | None] | None = None
+    # tool_tier=2 only, optional: the working directory the subprocess is launched in. WHY this
+    # exists: frida-trace hardwires its generated-handler directory to `Path.cwd()/__handlers__`
+    # with no CLI flag or env var to relocate it, so when the server's own CWD is the read-only
+    # ASRA install dir (the normal WSL2 "run as root" launch), frida_trace dies with
+    # `OSError: Read-only file system: '.../__handlers__/...'` before tracing anything. A factory
+    # (not a static string) so the dir is resolved at dispatch time against the live app-data path
+    # and created on demand; returning None (or leaving this unset) keeps the default inherited CWD.
+    working_dir_factory: Callable[[], str | None] | None = None
 
     # requires_allowed_target=True is the default expectation for exploit/post_exploit tools,
     # but not an absolute rule: msf_module_search is category="exploit"

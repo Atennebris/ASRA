@@ -234,7 +234,7 @@ def test_env_var_disabled_keeps_decompile_function_fully_cold_with_no_sentinel(t
     command = build_radare2_command({"file_path": str(target), "analysis": "decompile_function", "address": "main"})
     r2_cmd = command[command.index("-c") + 1]
 
-    assert r2_cmd == "aaa; e r2ghidra.pdg=true; pdgj @ main"  # byte-identical to this feature not existing
+    assert r2_cmd == "aaa; pdgj @ main"  # byte-identical to the warm-cache feature not existing
 
 
 def test_functions_and_xrefs_to_are_never_touched_by_the_warm_path(tmp_path):

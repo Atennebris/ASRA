@@ -23,18 +23,181 @@ Seatbelt (`sandbox-exec`) branch.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from agent.utils.logger import get_logger
 from projects.paths import resolve_global_app_dir
 
 logger = get_logger("TOOLS")
+
+_WINE_PREFIX_ROOT = Path(tempfile.gettempdir()) / "asra-wine-prefixes"
+
+
+def wine_prefix_dir(key: str) -> Path:
+    """A WINEPREFIX location guaranteed to sit on a genuinely Linux-owned filesystem
+    (tempfile.gettempdir(), never a path under a Windows-mounted drive) -- wine refuses to create
+    its own configuration directory under a path it doesn't consider "owned" by the invoking user,
+    and that is exactly what WSL2's drvfs reports for paths under /mnt/c/... even when the real
+    OS-level user is identical. Real, confirmed incident this fixes (CM-usr_b416f2): a
+    custom_re_script call ran plain `wine <target>` with cwd set to this session's own scripts/
+    folder (itself under /mnt/c/Users/...) and no WINEPREFIX override, through run_sandboxed's own
+    unsandboxed fallback (bubblewrap not installed on this machine) -- wine refused outright:
+    "'<scripts dir>' is not owned by you, refusing to create a configuration directory there". The
+    bwrap-sandboxed branch doesn't hit this (--unshare-user remaps the sandbox's own view of file
+    ownership, so every path inside it reads as owned by the current user regardless of the real
+    underlying filesystem), so this is only needed where that isolation isn't available: here, and
+    strace.py's own via_wine path (agent/tools/builders/strace.py), which never goes through bwrap
+    at all. Keyed so repeat calls for the same caller/target reuse the same already-initialized
+    prefix instead of paying wine's one-time setup cost again on every single call.
+    """
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    path = _WINE_PREFIX_ROOT / digest
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# How often run_with_process_group_timeout re-checks an optional stop_check callback while a child
+# is still running -- 1s is responsive enough for an operator-initiated stop without busy-looping.
+# Only consulted when a stop_check is actually passed; the plain path stays a single blocking
+# communicate() call with no polling at all.
+_STOP_CHECK_POLL_INTERVAL_SECONDS = 1.0
+
+
+class _ProcessGroupKillHandle:
+    """A kill handle for the process-GROUP leader run_with_process_group_timeout spawns, registered
+    into runner.current_subprocess_registry so agent/core.py's _dispatch_tool CancelledError handler
+    (the operator clicking Stop) can tear this run down the same way it already kills every plain
+    Popen a Tier-2 tool registers there. Why a handle instead of the bare Popen: that handler only
+    ever calls .kill() on each registered entry, and Popen.kill() signals ONLY the direct child --
+    here that's the group leader, so its own children (the confirmed case: wine -> wineserver) would
+    be orphaned and keep holding whatever lock hung the run in the first place. os.killpg tears down
+    the whole group, the same SIGKILL the function's own timeout path already uses on that group."""
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self._proc = proc
+
+    def kill(self) -> None:
+        # Distinguishable in the log from the function's own-timeout kill below, so an audit can
+        # tell an operator Stop apart from a run that simply exhausted its timeout budget.
+        logger.debug("run_with_process_group_timeout: killing process group pid=%s via operator Stop", self._proc.pid)
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _register_kill_handle(proc: subprocess.Popen):
+    """Register a group-kill handle for `proc` into current_subprocess_registry so operator Stop can
+    reach it, returning (registry, handle) for later discard -- or (None, None) when there is no
+    registry to join (a direct, non-dispatch call), which keeps behavior byte-identical to before.
+
+    Deferred import by design: current_subprocess_registry lives in agent.tools.runner, which itself
+    imports this module, so a module-top import would be circular -- modules are fully loaded by the
+    time this runs. The whole thing is best-effort: sandbox must never hard-depend on runner being
+    importable, hence the broad guard."""
+    try:
+        from agent.tools.runner import current_subprocess_registry
+        registry = current_subprocess_registry.get(None)
+    except Exception:
+        return None, None
+    if registry is None:
+        return None, None
+    handle = _ProcessGroupKillHandle(proc)
+    registry.add(handle)
+    return registry, handle
+
+
+def run_with_process_group_timeout(
+    command: list[str], *, cwd: Path | str | None = None, env: dict | None = None,
+    timeout_seconds: int, stop_check: Callable[[], bool] | None = None,
+) -> subprocess.CompletedProcess:
+    """Runs `command` the same way subprocess.run(..., timeout=...) would -- raises
+    subprocess.TimeoutExpired on timeout, returns a normal CompletedProcess (text stdout/stderr) on
+    completion -- but kills the WHOLE process group on timeout instead of just the one direct
+    child. start_new_session=True at spawn + os.killpg(..., SIGKILL) on TimeoutExpired, the same
+    pattern agent/tools/nuclei_template_packs.py's install_pack/cancel_pack and
+    agent/tools/terminal_manager.py already rely on. Needed anywhere a subprocess might itself
+    spawn a child that can outlive a bare SIGKILL to the direct process alone -- the confirmed real
+    case (CM-usr_b416f2): `wine` spawning `wineserver`, which can survive the direct process being
+    killed and keep holding whatever single-instance lock/mutex the traced program itself held,
+    hanging every subsequent attempt against the same target identically, for a full repeated
+    timeout each time. Plain subprocess.run's own timeout only ever reaches the one process it
+    started directly -- this is the fix for everywhere that isn't already covered by bubblewrap's
+    own PID-namespace teardown (_run_sandboxed_linux above, which gets this property for free from
+    --unshare-pid and needs no equivalent of this function).
+
+    stop_check (optional): a callback polled ~once a second while the child runs. When it returns
+    True -- an operator stopping the live session, say -- the whole group is killed promptly and a
+    TimeoutExpired is raised, so a run nobody wants any more is abandoned without waiting out the
+    full timeout_seconds budget. Default None keeps the original behavior exactly: one blocking
+    communicate(timeout=...), no polling.
+
+    On timeout OR stop the captured partial stdout/stderr is attached to the raised TimeoutExpired
+    (exc.stdout/exc.stderr), the same way subprocess.run() populates them -- a half-finished run
+    (a strace trace cut off mid-flight, say) still carries real signal a caller can surface instead
+    of throwing it away. Callers that ignore those attributes are unaffected.
+    """
+    proc = subprocess.Popen(
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdin=subprocess.DEVNULL, env=env, start_new_session=True,
+    )
+    # Join the operator-Stop registry right after spawn so a Stop mid-run reaches this group too,
+    # discarding in the finally regardless of how the run ends (normal, timeout, or stop-kill).
+    registry, handle = _register_kill_handle(proc)
+    try:
+        if stop_check is None:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        else:
+            stdout, stderr = _communicate_until_stop_or_timeout(proc, timeout_seconds, stop_check)
+    except subprocess.TimeoutExpired as exc:
+        logger.debug("run_with_process_group_timeout: killing process group pid=%s on own timeout after %ss", proc.pid, timeout_seconds)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Drain (and reap) the killed group, attaching whatever it already wrote to the exception.
+        # Replaces the bare proc.wait() this used to do -- that both discarded the partial output
+        # and could deadlock against a still-full pipe the dead process left behind.
+        try:
+            exc.stdout, exc.stderr = proc.communicate()
+        except Exception:
+            pass
+        raise
+    finally:
+        if registry is not None:
+            registry.discard(handle)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def _communicate_until_stop_or_timeout(
+    proc: subprocess.Popen, timeout_seconds: int, stop_check: Callable[[], bool],
+) -> tuple[str, str]:
+    """communicate() the child in short slices so stop_check gets honored promptly, all within the
+    same overall timeout_seconds budget. Raises subprocess.TimeoutExpired on either the real
+    timeout OR a stop_check that returns True -- both are handled identically by the caller (kill
+    the group, surface partial output). Split out so the common no-stop_check path above stays a
+    single plain communicate() call."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if stop_check():
+            raise subprocess.TimeoutExpired(proc.args, timeout_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout_seconds)
+        try:
+            return proc.communicate(timeout=min(_STOP_CHECK_POLL_INTERVAL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _sensitive_paths() -> tuple[str, ...]:
@@ -133,6 +296,24 @@ def _run_sandboxed_linux(command: list[str], scratch_dir: Path, timeout_seconds:
         "TMPDIR": scratch_path,
         "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
         "WINEPREFIX": f"{scratch_path}/.wine",
+        # $HOME inside the sandbox is still the host's real home (/root in the operator's normal
+        # "run as root" launch), and `--ro-bind / /` makes it READ-ONLY -- so any tool that writes
+        # $HOME-relative state dies before it can do real work. Confirmed, high-cost incident: the
+        # .NET SDK (csc/dotnet) could not compile a single reflection helper because its very first
+        # writes -- $HOME/.dotnet/<ver>.toolpath.sentinel and the $HOME/.nuget restore cache --
+        # raised "Read-only file system: '/root/.dotnet/...'" / "csc: Permission denied", forcing
+        # ~50 hand-rolled metadata-parser iterations in place of ~2 reflection calls. Pin HOME (and
+        # dotnet/nuget's own state dirs) at the one writable bind the sandbox grants -- the same
+        # ASRA-controlled-writable-path treatment TMPDIR/WINEPREFIX already get above, and exactly
+        # the "$HOME-relative tool state" class the project's runtime-architecture notes warn about
+        # (the nuclei-templates incident): never trust the ambient, read-only $HOME here. Telemetry/
+        # logo opt-outs keep a first dotnet invocation from also trying to write a telemetry
+        # sentinel and printing a first-run banner into the captured output.
+        "HOME": scratch_path,
+        "DOTNET_CLI_HOME": scratch_path,
+        "NUGET_PACKAGES": f"{scratch_path}/.nuget/packages",
+        "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+        "DOTNET_NOLOGO": "1",
     }
     # Real, confirmed incident (WSLg -- this project's own actual Windows-hosted runtime): the host
     # process's own DISPLAY/WAYLAND_DISPLAY point at the REAL Windows-forwarded compositor, not a
@@ -290,6 +471,28 @@ def run_sandboxed(command: list[str], scratch_dir: Path, timeout_seconds: int) -
         logger.debug("run_sandboxed: bubblewrap not installed, running unsandboxed")
     else:
         logger.debug("run_sandboxed: no sandbox implementation for platform=%r, running unsandboxed", sys.platform)
-    return subprocess.run(
-        command, cwd=scratch_dir, capture_output=True, text=True, timeout=timeout_seconds, stdin=subprocess.DEVNULL,
-    )
+    # No bwrap PID-namespace here to tear down a hung process tree or --unshare-user to fix wine's
+    # ownership check for free (that's the whole branch above) -- this tail is the real, confirmed
+    # LIVE path on this project's own actual deployment (bubblewrap not installed), so it gets the
+    # same two protections explicitly: wine_prefix_dir() for a WINEPREFIX wine will actually accept
+    # (see that function's own docstring for the real incident), and the private offscreen Xvfb
+    # display _run_sandboxed_linux already has (this branch had neither before, so a wine call
+    # routed through here could both get refused outright AND, had it not been, popped a real
+    # window on the operator's desktop).
+    env = {**os.environ, "WINEPREFIX": str(wine_prefix_dir(str(scratch_dir.resolve())))}
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    xvfb_process, display = start_offscreen_display()
+    if display is not None:
+        env["DISPLAY"] = display
+    else:
+        logger.debug("run_sandboxed: Xvfb not installed/failed to start -- a GUI-capable program the script spawns (e.g. wine) may show a real window on the host desktop")
+    try:
+        return run_with_process_group_timeout(command, cwd=scratch_dir, env=env, timeout_seconds=timeout_seconds)
+    finally:
+        if xvfb_process is not None:
+            xvfb_process.terminate()
+            try:
+                xvfb_process.wait(timeout=3)
+            except Exception:
+                xvfb_process.kill()

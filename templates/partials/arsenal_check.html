@@ -26,7 +26,7 @@
         {{ summary.native_installed }}/{{ summary.native_total }}.
       </p>
       {% if verdict != "full" %}
-        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[46rem]">
+        <p class="ui-desc text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[46rem]">
           Without the external arsenal the needed scanners / interpreters / compilers are
           unavailable — the agent loses specific tools (not &ldquo;power&rdquo; in general):
           native detectors always work, the heavy arsenal does not. Click
@@ -80,7 +80,7 @@
             <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ 'bg-status-online' if dep.installed else 'bg-severity-high' }}"></span>
             <span class="font-mono text-primary">{{ dep.label }}</span>
             <span class="{{ 'text-severity-low' if dep.installed else 'text-severity-high' }}">{{ "installed" if dep.installed else "not installed" }}</span>
-            <span class="text-secondary">— {{ dep.note }}</span>
+            <span class="ui-desc text-secondary">— {{ dep.note }}</span>
             {% if not dep.installed and dep.name == "opencode" and dep.auto_install %}
               {% set install_label = dep.install_label %}
               {% include "partials/opencode_install_button.html" %}
@@ -102,7 +102,7 @@
       {% endfor %}
     </div>
     {% if not summary.present and not summary.missing %}
-      <p class="mt-2 text-secondary italic">No external tools registered.</p>
+      <p class="ui-desc mt-2 text-secondary italic">No external tools registered.</p>
     {% endif %}
   </details>
 </div>

@@ -91,8 +91,15 @@ def build_wpscan_command(params: dict) -> list[str]:
     # that reason -- always keep results as accurate as possible rather than just suppressing the
     # question. Skipped when the model already picked a choice itself (either flag), same
     # "explicit model choice wins outright" discipline as every other builder default in this file.
+    #
+    # `_wpscan_skip_update` (agent/core.py's _run_tool_with_retry) -- server-side injected, never
+    # model-supplied, same "_"-prefixed convention as _user_agent/_api_key below. Set once this
+    # SESSION has already run one real --update: the local vulnerability database is one global
+    # file, not a per-host resource, so refreshing it again for the 2nd/3rd/... WordPress host a
+    # scan touches buys nothing and pays the same real update cost every time. Still honors an
+    # explicit model choice (the _UPDATE_FLAGS check above) over this default either way.
     if not any(arg in _UPDATE_FLAGS for arg in extra_args):
-        command.append("--update")
+        command.append("--no-update" if params.get("_wpscan_skip_update") else "--update")
     command += extra_args
     # Server-side injected by agent/core.py's _run_tool_with_retry (New Project form's Custom
     # User-Agent + Custom HTTP Headers fields) — never part of this tool's own params schema, so

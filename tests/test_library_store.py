@@ -512,8 +512,8 @@ def test_run_analysis_multi_chunk_runs_a_merge_pass(monkeypatch):
     text = ("Paragraph about SQLi.\n\n" * 400) + ("Paragraph about XSS.\n\n" * 400)
     sid = library_store.add_source(text.encode(), "book.txt")
     llm = _FakeLLM(context_limit=200, extraction_replies=[
-        json.dumps([{"technique": "SQLi technique", "tech_keywords": ["mysql"], "waf_vendors": []}]),
-        json.dumps([{"technique": "XSS technique", "tech_keywords": ["react"], "waf_vendors": []}]),
+        json.dumps([{"technique": "SQLi technique", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]),
+        json.dumps([{"technique": "XSS technique", "vuln_class": "xss", "tech_keywords": ["react"], "waf_vendors": []}]),
     ])
     monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
 
@@ -549,8 +549,8 @@ def test_run_analysis_progresses_through_merging_and_saving_stages(monkeypatch):
     text = ("Paragraph about SQLi.\n\n" * 400) + ("Paragraph about XSS.\n\n" * 400)
     sid = library_store.add_source(text.encode(), "book.txt")
     llm = _FakeLLM(context_limit=200, extraction_replies=[
-        json.dumps([{"technique": "SQLi technique", "tech_keywords": ["mysql"], "waf_vendors": []}]),
-        json.dumps([{"technique": "XSS technique", "tech_keywords": ["react"], "waf_vendors": []}]),
+        json.dumps([{"technique": "SQLi technique", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]),
+        json.dumps([{"technique": "XSS technique", "vuln_class": "xss", "tech_keywords": ["react"], "waf_vendors": []}]),
     ])
     monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
     seen_stages = []
@@ -575,7 +575,7 @@ def test_run_analysis_survives_one_broken_chunk(monkeypatch):
     sid = library_store.add_source(text.encode(), "book.txt")
     llm = _FakeLLM(context_limit=200, extraction_replies=[
         "not valid json at all",
-        json.dumps([{"technique": "Recovered technique", "tech_keywords": ["php"], "waf_vendors": []}]),
+        json.dumps([{"technique": "Recovered technique", "vuln_class": "rce", "tech_keywords": ["php"], "waf_vendors": []}]),
     ])
     monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
 
@@ -599,22 +599,24 @@ def test_run_analysis_candidate_with_no_tech_keywords_and_no_derivable_ones_is_s
     assert playbook_store.load_playbook_store() == {}
 
 
-def test_run_analysis_refuses_when_chunk_count_exceeds_the_safety_cap(monkeypatch):
-    """Real, confirmed gap this guards: chunk count scales with document size / the chosen
-    model's own context window, with no cap of its own -- a big real document against a
-    small-context model could otherwise turn into hundreds of sequential LLM calls."""
+def test_run_analysis_samples_to_cover_when_over_the_chunk_budget(monkeypatch):
+    """A source bigger than the call budget is NOT refused (the old behavior, which with denser
+    chunking made big docs error out and extract nothing) -- it's analyzed with its chunks evenly
+    sampled across the WHOLE document, so later chapters are learned from too, bounded to the
+    budget's number of LLM calls."""
     monkeypatch.setattr(library_store, "_MAX_CHUNKS", 2)
     text = "Paragraph.\n\n" * 10_000  # comfortably splits into far more than 2 chunks
     sid = library_store.add_source(text.encode(), "book.txt")
-    llm = _FakeLLM(context_limit=200, extraction_replies=[])
+    llm = _FakeLLM(context_limit=200, extraction_replies=["[]", "[]"])
     monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
 
     _run(library_store._run_analysis(sid, "fake", "fake-model"))
 
     source = library_store.get_source(sid)
-    assert source["status"] == "error"
-    assert "chunk" in source["error"]
-    assert llm.calls == 0  # refused before making a single LLM call
+    assert source["status"] == "analyzed"       # covered, never refused
+    assert source["chunks_total"] == 2          # bounded to the budget
+    assert source["coverage_total"] > 2         # but the whole (much larger) doc is represented
+    assert llm.calls == 2                        # exactly the budget's worth of calls
 
 
 def test_run_analysis_unresolvable_provider_marks_source_error(monkeypatch):
@@ -674,7 +676,10 @@ def test_start_analysis_refuses_a_source_that_doesnt_exist():
     assert library_store.start_analysis("nope", "p", "m") != ""
 
 
-def test_start_analysis_refuses_beyond_max_concurrent_analyses(monkeypatch):
+def test_start_analysis_queues_beyond_max_concurrent_analyses(monkeypatch):
+    """When every concurrency slot is busy the source is QUEUED, not refused -- an artificial limit
+    degrades gracefully (it starts automatically when a slot frees) instead of stalling the operator
+    with a 'wait for one to finish' error."""
     monkeypatch.setattr(library_store, "_MAX_CONCURRENT_ANALYSES", 1)
     sid2 = library_store.add_source(b"para two", "b.txt")
 
@@ -683,11 +688,36 @@ def test_start_analysis_refuses_beyond_max_concurrent_analyses(monkeypatch):
         library_store._RUNNING_ANALYSES["other_source"] = never_done
         try:
             refusal = library_store.start_analysis(sid2, "fake", "fake-model")
-            assert refusal != ""
-            assert "already in progress" in refusal
+            assert refusal == ""  # accepted (queued), not refused
+            source = library_store.get_source(sid2)
+            assert source["status"] == "queued"
+            assert source["queued_model"] == "fake-model"
         finally:
             never_done.cancel()
             library_store._RUNNING_ANALYSES.pop("other_source", None)
+    _run(_main())
+
+
+def test_queued_source_starts_when_a_slot_frees(monkeypatch):
+    """The drain: a queued source begins on its own the moment a running analysis finishes."""
+    monkeypatch.setattr(library_store, "_MAX_CONCURRENT_ANALYSES", 1)
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=["[]", "[]"])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+    first = library_store.add_source(b"A paragraph about a technique.", "a.txt")
+    second = library_store.add_source(b"Another paragraph about a technique.", "b.txt")
+
+    async def _main():
+        assert library_store.start_analysis(first, "fake", "fake-model") == ""   # runs
+        assert library_store.start_analysis(second, "fake", "fake-model") == ""  # queued
+        assert library_store.get_source(second)["status"] == "queued"
+        # Await the first task; its done-callback drains the queue and starts the second.
+        await library_store._RUNNING_ANALYSES[first]
+        await asyncio.sleep(0)  # let the task's done-callback (the drain) run
+        second_task = library_store._RUNNING_ANALYSES.get(second)
+        assert second_task is not None, "queued source was not drained into a running task"
+        await second_task
+        assert library_store.get_source(first)["status"] == "analyzed"
+        assert library_store.get_source(second)["status"] == "analyzed"
     _run(_main())
 
 
@@ -736,11 +766,11 @@ class _SlowOnSecondCallLLM:
         if messages[-1]["content"].startswith("["):
             return _FakeResponse(messages[-1]["content"])
         if self.calls == 1:
-            return _FakeResponse('[{"technique": "T1 from chunk 1", "tech_keywords": ["mysql"], "waf_vendors": []}]')
+            return _FakeResponse('[{"technique": "T1 from chunk 1", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]')
         # The chunk stop_analysis is expected to interrupt -- a real, blocking (not async) sleep,
         # exactly like the real asyncio.to_thread-wrapped LLM call this stands in for.
         time.sleep(2)
-        return _FakeResponse('[{"technique": "T2 from chunk 2 -- should never be reached", "tech_keywords": ["mysql"], "waf_vendors": []}]')
+        return _FakeResponse('[{"technique": "T2 from chunk 2 -- should never be reached", "vuln_class": "sqli", "tech_keywords": ["mysql"], "waf_vendors": []}]')
 
     def embed(self, texts, model):
         return None
@@ -831,3 +861,156 @@ def test_run_analysis_never_refused_on_chunk_count_when_limit_is_zero(monkeypatc
     _run(library_store._run_analysis(sid, "fake", "fake-model"))
 
     assert library_store.get_source(sid)["status"] == "analyzed"  # not refused despite many chunks
+
+
+# --- extraction of skills / target_shape / mode, and the quality gate ---
+
+
+def _only_entry():
+    store = playbook_store.load_playbook_store()
+    return next(iter(store.values()))[0]
+
+
+def test_run_analysis_captures_a_skill_as_unreviewed_library_provenance(monkeypatch):
+    skill_body = "sqlmap -u 'https://target/item?id=1' --batch --risk 3"
+    sid = library_store.add_source(b"A paragraph with a concrete sqlmap command.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([{
+        "technique": "Automated SQLi with sqlmap",
+        "vuln_class": "sqli",
+        "payload_or_command": None,
+        "tech_keywords": ["mysql"],
+        "waf_vendors": [],
+        "target_shape": "web",
+        "mode": "web",
+        "recipe": [],
+        "skill": {"kind": "command", "interpreter": "sh", "body": skill_body, "params": ["target"]},
+        "source_ref": "page 7",
+    }])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    entry = _only_entry()
+    skill = entry["skill"]
+    assert skill is not None
+    assert skill["kind"] == "command"
+    assert skill["interpreter"] == "sh"
+    assert skill["body"] == skill_body  # transcribed verbatim
+    assert skill["trust"] == "unreviewed"
+    assert skill["provenance"]["derived_from"] == "library"
+    assert skill["body_sha256"] == playbook_store.skill_body_hash(skill_body)
+    # The skill inherits the entry's own classified shape/mode for cross-mode matching.
+    assert skill["provenance"]["target_shape"] == "web"
+    assert skill["provenance"]["mode"] == "web"
+
+
+def test_run_analysis_stores_target_shape_and_mode_on_the_entry(monkeypatch):
+    sid = library_store.add_source(b"A paragraph about a binary heap overflow.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([{
+        "technique": "Heap overflow via unchecked memcpy",
+        "vuln_class": "memory_corruption",
+        "payload_or_command": "pwntools ROP chain",
+        "tech_keywords": ["glibc"],
+        "waf_vendors": [],
+        "target_shape": "elf",
+        "mode": "reverse",
+        "recipe": ["find the overflow", "build the ROP chain", "pop a shell"],
+        "skill": None,
+        "source_ref": "chapter 4",
+    }])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    entry = _only_entry()
+    assert entry["target_shape"] == "elf"
+    assert entry["mode"] == "reverse"
+    # skill:null on a candidate must leave the technique with no attached skill.
+    assert entry.get("skill") is None
+
+
+def test_run_analysis_normalizes_an_invalid_target_shape_to_none(monkeypatch):
+    sid = library_store.add_source(b"A paragraph.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([{
+        "technique": "Some SSRF trick", "vuln_class": "ssrf", "tech_keywords": ["nginx"],
+        "waf_vendors": [], "target_shape": "not-a-real-shape", "mode": "sideways",
+        "payload_or_command": "curl http://169.254.169.254/",
+    }])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    entry = _only_entry()
+    assert entry["target_shape"] is None  # unknown enum value dropped, not stored verbatim
+    assert entry["mode"] is None
+
+
+def test_run_analysis_quality_gate_drops_pure_theory(monkeypatch):
+    # Has a technique name AND a tech stack, but no vuln_class, payload, recipe, skill, or CVE --
+    # pure reading-material prose, exactly what the quality gate exists to drop.
+    sid = library_store.add_source(b"A vague advisory paragraph.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([
+        {"technique": "Always validate your input", "tech_keywords": ["nginx"], "waf_vendors": []},
+    ])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    assert library_store.get_source(sid)["ingested_count"] == 0
+    assert playbook_store.load_playbook_store() == {}
+
+
+def test_run_analysis_quality_gate_keeps_a_candidate_with_only_a_recipe(monkeypatch):
+    sid = library_store.add_source(b"A paragraph with an ordered procedure.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([
+        {"technique": "Chained auth bypass", "tech_keywords": ["spring"], "waf_vendors": [],
+         "recipe": ["register a user", "flip the role cookie", "hit the admin endpoint"]},
+    ])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    assert library_store.get_source(sid)["ingested_count"] == 1
+
+
+def test_run_analysis_malformed_skill_without_body_is_not_attached(monkeypatch):
+    # A skill object with a kind but an empty body must never produce an attached skill -- the
+    # security invariant: only emit when kind+interpreter+body are all concretely present.
+    sid = library_store.add_source(b"A paragraph with a payload but a broken skill object.", "t.txt")
+    llm = _FakeLLM(context_limit=100_000, extraction_replies=[json.dumps([{
+        "technique": "XXE via external entity", "vuln_class": "xxe", "tech_keywords": ["java"],
+        "waf_vendors": [], "payload_or_command": "<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>",
+        "skill": {"kind": "command", "interpreter": "sh", "body": "   "},
+    }])])
+    monkeypatch.setattr(library_store, "get_provider", lambda provider_id, model: llm)
+
+    _run(library_store._run_analysis(sid, "fake", "fake-model"))
+
+    entry = _only_entry()
+    assert entry["technique"] == "XXE via external entity"  # still ingested on the payload alone
+    assert entry.get("skill") is None  # but the empty-body skill was rejected
+
+
+# --- denser chunk budget (LIBRARY_CHUNK_TARGET_TOKENS) ---
+
+
+def test_chunk_target_cap_lowers_the_budget_below_the_context_window():
+    big_context = 200_000
+    capped = library_store._chunk_char_budget(big_context)
+    # With the default cap, a huge context window no longer dictates the whole chunk size.
+    assert capped == library_store._CHUNK_TARGET_TOKENS * library_store._CHARS_PER_TOKEN
+
+
+def test_smaller_chunk_target_splits_a_source_into_more_chunks(monkeypatch):
+    # A multi-page source against a big-context model: capping the per-chunk token target makes it
+    # split into many denser passes instead of a couple of huge ones.
+    text = "A real SQLi bypass technique paragraph.\n\n" * 4000
+    big_context = 200_000
+
+    monkeypatch.setattr(library_store, "_CHUNK_TARGET_TOKENS", 0)  # no cap -> pure context budget
+    uncapped = len(library_store._split_into_chunks(text, library_store._chunk_char_budget(big_context)))
+
+    monkeypatch.setattr(library_store, "_CHUNK_TARGET_TOKENS", 1500)  # a much denser cap
+    capped = len(library_store._split_into_chunks(text, library_store._chunk_char_budget(big_context)))
+
+    assert capped > uncapped

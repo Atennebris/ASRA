@@ -34,9 +34,13 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 from agent.tools.builders.validators import validate_safe_value
-from agent.tools.sandbox import start_offscreen_display
+from agent.tools.sandbox import run_with_process_group_timeout, start_offscreen_display, wine_prefix_dir
+from agent.utils.logger import get_logger
+
+logger = get_logger("TOOLS")
 
 # strace's own built-in `-e trace=` category keywords -- deliberately not every one strace supports
 # (e.g. %clock/%creds/%pure are real but rarely useful for RE triage), just the ones that actually
@@ -104,10 +108,48 @@ def strace_available() -> bool:
 
 
 def _timeout_seconds() -> int:
-    # Same env var/default every other subprocess-backed RE tool honors (agent/tools/runner.py's
-    # own _timeout_for) -- run_strace bypasses that generic dispatch (see this module's own
-    # docstring for why), so it re-reads the same knob directly rather than inventing a separate one.
-    return int(os.getenv("TOOL_TIMEOUT_SECONDS", "600"))
+    # Dynamic behavioral triage (running a target under strace, especially through wine) is bounded
+    # TIGHT on purpose, not with the generic 600s TOOL_TIMEOUT_SECONDS: the traced target is
+    # EXPECTED to run briefly and exit, so a long budget just turns a cold-WINEPREFIX bootstrap
+    # hang into a ~10-minute dead run. Real, confirmed incident: a via_wine=true strace blocked
+    # ~600s on a first-ever WINEPREFIX bootstrap before the operator had to stop it by hand, then
+    # left wine orphaned ~7 more minutes. A short, separate, env-overridable knob self-terminates
+    # that class in ~30s while still being plenty for a real crackme/CLI target that exits on its own.
+    return int(os.getenv("RE_DYNAMIC_TOOL_TIMEOUT_SECONDS", "30"))
+
+
+def _wineprefix_boot_timeout_seconds() -> int:
+    # Own bounded budget for the one-time prefix bootstrap below -- separate from the (deliberately
+    # very short) per-run dynamic-triage timeout, since a genuine first-ever wineboot legitimately
+    # takes longer than a single traced run should. Still bounded so a bootstrap that itself wedges
+    # can't hang forever.
+    return int(os.getenv("RE_WINEPREFIX_BOOT_TIMEOUT_SECONDS", "120"))
+
+
+def _prewarm_wineprefix(prefix: str, env: dict) -> None:
+    """Pay wine's one-time prefix bootstrap (creating the fake C: drive, the registry hives, etc.)
+    BEFORE the real traced run, under its own bounded timeout -- so the first strace-under-wine
+    call doesn't burn its whole (deliberately short) dynamic-triage budget on a cold-prefix
+    bootstrap and capture nothing useful. Best-effort by design: a missing wineboot, a bootstrap
+    that times out, or any OS error just falls through to the real run (which bootstraps lazily as
+    before), never failing the tool. Skipped once the prefix already has a system.reg -- wine's own
+    marker that the prefix is already booted."""
+    try:
+        if (Path(prefix) / "system.reg").exists():
+            logger.debug("run_strace: WINEPREFIX already booted, skipping pre-warm (%s)", prefix)
+            return
+    except OSError:
+        return
+    if shutil.which("wineboot") is None:
+        logger.debug("run_strace: wineboot not found, skipping WINEPREFIX pre-warm")
+        return
+    logger.debug("run_strace: pre-warming cold WINEPREFIX %s (bounded at %ss)", prefix, _wineprefix_boot_timeout_seconds())
+    try:
+        run_with_process_group_timeout(["wineboot", "-i"], env=env, timeout_seconds=_wineprefix_boot_timeout_seconds())
+    except subprocess.TimeoutExpired:
+        logger.debug("run_strace: WINEPREFIX pre-warm timed out, falling through to a lazy bootstrap")
+    except OSError as exc:
+        logger.debug("run_strace: WINEPREFIX pre-warm failed (%s), falling through to a lazy bootstrap", exc)
 
 
 def run_strace(params: dict) -> dict:
@@ -129,14 +171,39 @@ def run_strace(params: dict) -> dict:
             xvfb_proc, display = start_offscreen_display()
             if display is not None:
                 env["DISPLAY"] = display
+            # wine_prefix_dir() -- see its own docstring for the real incident (CM-usr_b416f2):
+            # without an explicit WINEPREFIX on a genuinely Linux-owned path, wine can refuse to
+            # even start ("not owned by you") when launched from/against a Windows-mounted-drive
+            # path, which this tool's own file_path always is in the project's real deployment.
+            env["WINEPREFIX"] = str(wine_prefix_dir(str(params.get("file_path", ""))))
+            # Move the cold-prefix bootstrap cost OUT of the (short) traced run -- see
+            # _prewarm_wineprefix for the hang this prevents.
+            _prewarm_wineprefix(env["WINEPREFIX"], env)
 
         try:
-            result = subprocess.run(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=_timeout_seconds(), env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return {"status": "timeout", "tool": "strace_run", "command": command}
+            # run_with_process_group_timeout, not a plain subprocess.run -- see its own docstring
+            # for the real incident (CM-usr_b416f2): a bare subprocess.run timeout only SIGKILLs
+            # the direct `strace` process, never the `wine`/wineserver (or guest) process it
+            # spawned, which can survive and keep holding a single-instance mutex the next attempt
+            # against the same target then hangs on identically, every time, for a full repeated
+            # timeout.
+            result = run_with_process_group_timeout(command, env=env, timeout_seconds=_timeout_seconds())
+        except subprocess.TimeoutExpired as exc:
+            # Return whatever partial trace was captured before the timeout killed the run instead
+            # of discarding it (run_with_process_group_timeout attaches it to the exception) -- a
+            # strace trace cut off mid-flight still shows real behavior (files opened, connections
+            # made, processes spawned). strace writes the trace itself to STDERR (its default sink);
+            # stdout carries the traced program's own output.
+            partial_stdout, partial_stderr = exc.stdout or "", exc.stderr or ""
+            logger.debug("run_strace: timed out, returning partial output (stdout=%dB stderr=%dB)", len(partial_stdout), len(partial_stderr))
+            return {
+                "status": "timeout",
+                "tool": "strace_run",
+                "command": command,
+                "stdout": partial_stdout,
+                "stderr": partial_stderr,
+                "partial": True,
+            }
         except FileNotFoundError:
             return {"status": "tool_unavailable", "tool": "strace_run"}
 

@@ -25,6 +25,7 @@ surfaced as "rebuild/update the exe", not applied here (see agent/desktop_update
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import tarfile
 from dataclasses import dataclass, field
@@ -49,6 +50,15 @@ _DOWNLOAD_TIMEOUT_SECONDS = 120.0
 # an update signal rather than silently never checking again. Absent entirely for a real git clone.
 _VERSION_MARKER = _REPO / ".asra_installed_version"
 
+# The project's own declared version (the number shown as "Current version" in Settings -> Updates).
+# Cargo.toml's [package] version is already the number bumped for every release -- the release
+# workflow's check-version job compares the pushed tag against it -- so reading it here adds no
+# second place to keep in sync, and it ships in a git clone AND in a source tarball alike. Parsed
+# with a regex instead of tomllib: run.sh still accepts Python 3.10, which has no tomllib.
+_VERSION_SOURCE = _REPO / "desktop" / "src-tauri" / "Cargo.toml"
+_PACKAGE_SECTION_RE = re.compile(r"^\[package\]\s*$(.*?)(?=^\[|\Z)", re.MULTILINE | re.DOTALL)
+_VERSION_LINE_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+
 # Whether main.py's startup hook runs the quiet background check at all (Settings -> Updates'
 # "Check for updates at startup" switch). Same .env-backed convention as agent/intro_settings.py --
 # read once at process startup, before any JSON-store-backed Settings value would normally be
@@ -60,7 +70,9 @@ _ENV_PATH = find_dotenv(usecwd=True) or str(_REPO / ".env")
 
 
 def load_update_check_on_startup() -> bool:
-    raw = dotenv_values(_ENV_PATH).get(_UPDATE_CHECK_ON_STARTUP_VAR)
+    # interpolate=False: a plain flag needs no ${VAR} expansion, and the default re-copies the whole
+    # process environment for every binding in .env -- ~0.15s per read here, paid on each Settings render.
+    raw = dotenv_values(_ENV_PATH, interpolate=False).get(_UPDATE_CHECK_ON_STARTUP_VAR)
     if raw is None:
         return True
     return raw.strip().lower() in ("true", "1", "yes", "on")
@@ -69,6 +81,24 @@ def load_update_check_on_startup() -> bool:
 def save_update_check_on_startup(enabled: bool) -> None:
     set_key(_ENV_PATH, _UPDATE_CHECK_ON_STARTUP_VAR, "true" if enabled else "false")
     logger.debug("save_update_check_on_startup: %s=%s", _UPDATE_CHECK_ON_STARTUP_VAR, enabled)
+
+
+def read_project_version() -> str:
+    """The release number of the code on disk (e.g. "0.7.0"), or "" if it can't be read -- never
+    raises, the Settings panel simply omits the number then. Reflects the files on disk, so right
+    after "Update now" it is already the new number even though the running process only picks the
+    new code up on restart (the apply message says so)."""
+    try:
+        text = _VERSION_SOURCE.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.debug("read_project_version: cannot read %s: %s", _VERSION_SOURCE, exc)
+        return ""
+    section = _PACKAGE_SECTION_RE.search(text)
+    match = _VERSION_LINE_RE.search(section.group(1)) if section else None
+    if not match:
+        logger.debug("read_project_version: no [package] version in %s", _VERSION_SOURCE)
+        return ""
+    return match.group(1).strip()
 
 
 @dataclass

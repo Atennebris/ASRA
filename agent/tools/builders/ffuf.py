@@ -99,8 +99,22 @@ def build_ffuf_command(params: dict) -> list[str]:
     # Precedence: an explicit model-supplied wordlist always wins (it may have picked one for a
     # deliberate reason) -- otherwise the operator's own Settings-UI assignment (agent/tools/
     # wordlist_store.py), then the env override, then the small always-installed default.
+    requested_wordlist = params.get("wordlist")
+    if requested_wordlist and not os.path.isfile(str(requested_wordlist)):
+        # interpret_ffuf_failure's own hint already tells the model to omit 'wordlist' and let the
+        # guaranteed default take over -- but that hint only ever lands inside ONE call's isolated
+        # 1-Step Retry correction, which the model never sees again (the same "isolated side-
+        # conversation" gap already documented for update_plan's own phases-string reminder).
+        # Confirmed live (Telenor-Sweden-YesWeHack rescan session): the SAME model guessed a
+        # plausible-but-not-installed SecLists/dirb-style path on 9 SEPARATE, independent ffuf
+        # calls in one subagent task -- each one failed, got corrected, succeeded, and the VERY
+        # NEXT call repeated the identical mistake from scratch. Silently substituting here instead
+        # of letting the command run against a path we already know is missing turns every one of
+        # those into a normal, successful ffuf run on the first attempt -- no correction round-trip
+        # to repeat in the first place.
+        requested_wordlist = None
     wordlist = validate_safe_value(str(
-        params.get("wordlist") or get_assigned_wordlist("ffuf") or os.getenv(_DEFAULT_WORDLIST_ENV, _DEFAULT_WORDLIST_PATH)
+        requested_wordlist or get_assigned_wordlist("ffuf") or os.getenv(_DEFAULT_WORDLIST_ENV, _DEFAULT_WORDLIST_PATH)
     ))
     match_codes = validate_safe_value(str(params.get("match_status_codes") or _DEFAULT_MATCH_CODES))
     threads = int(params.get("threads") or _DEFAULT_THREADS)

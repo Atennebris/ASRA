@@ -4269,6 +4269,7 @@ form:has(#sequencer-mode-live:checked) [data-sequencer-mode="live"] {
 .settings-tabs:has(#settings-tab-general:checked) ~ #settings-panels section[data-settings-tab="general"],
 .settings-tabs:has(#settings-tab-chat:checked) ~ #settings-panels section[data-settings-tab="chat"],
 .settings-tabs:has(#settings-tab-customization:checked) ~ #settings-panels section[data-settings-tab="customization"],
+.settings-tabs:has(#settings-tab-reliability:checked) ~ #settings-panels section[data-settings-tab="reliability"],
 .settings-tabs:has(#settings-tab-tools:checked) ~ #settings-panels section[data-settings-tab="tools"] {
   display: block;
 }
@@ -4763,4 +4764,32 @@ section[data-tab="map"] [data-map-subtab] {
 .asra-bulk-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/* --- Helper-description visibility (Settings -> Customization -> "Show helper descriptions") ---
+   When the operator chooses the leaner layout, every .ui-desc explanatory paragraph collapses; the
+   same text stays reachable on a long hover via static/js/ui_descriptions.js (#asra-ui-tooltip). */
+body[data-hide-descriptions="true"] .ui-desc {
+  display: none !important;
+}
+#asra-ui-tooltip {
+  position: fixed;
+  z-index: 10000;
+  max-width: 340px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+#asra-ui-tooltip.asra-ui-tooltip-visible {
+  opacity: 1;
+  transform: translateY(0);
 }

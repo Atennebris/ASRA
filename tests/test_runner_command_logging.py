@@ -109,8 +109,9 @@ def test_with_no_override_the_resolved_absolute_path_is_what_actually_runs(monke
 
 # --- ToolSpec.retry_command_on_result: a deterministic, code-level one-shot retry for a tool that
 # comes back "ok" (no error/timeout status at all) but whose own output already names a fix for a
-# silent degradation -- nmap's "Host seems down... try -Pn" is the real incident this exists for.
-# Unlike agent/core.py's 1-Step Retry, this never needs (or costs) an LLM call.
+# silent degradation -- radare2's write-permission-denied retry (agent/tools/builders/radare2.py's
+# retry_radare2_write_on_permission_denied) is the real, currently-live user of this hook. Unlike
+# agent/core.py's 1-Step Retry, this never needs (or costs) an LLM call.
 
 
 def test_retry_command_on_result_reruns_once_with_the_corrected_command():

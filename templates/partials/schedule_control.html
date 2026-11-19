@@ -1,0 +1,55 @@
+{# Per-project unattended repeat-scan control (agent/tools/schedule_store.py). Lives in the session
+   Overview tab. Every form here is hx-post with hx-target on this same wrapper + hx-swap="outerHTML",
+   so the control updates LIVE in place the instant the operator changes it -- no reload, and no
+   dependence on the SSE session-fragment morph (a schedule lives in its own store, so it never bumps
+   the session revision the SSE stream watches). The whole wrapper is re-rendered by the route and
+   swapped back in.
+
+   Context: session_id, schedule (dict or None), min_interval_seconds, scheduler_enabled (the global
+   SCHEDULER_ENABLED worker switch). #}
+{% from "macros/ui.html" import button %}
+<div id="schedule-control-{{ session_id }}" class="mt-4 bg-elevated border border-default rounded-lg p-3">
+  <p class="text-sm font-semibold text-primary mb-1 flex items-center gap-1.5">
+    <svg class="w-4 h-4 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Scheduled repeat scans
+  </p>
+
+  {% if not scheduler_enabled %}
+    <p class="text-[11px] text-severity-medium mb-2">The scheduler is turned off server-side (<code>SCHEDULER_ENABLED=false</code>) — a schedule saved here will not auto-fire until it's re-enabled.</p>
+  {% endif %}
+
+  {% if schedule %}
+    {% set secs = schedule.interval_seconds %}
+    {% set human = (secs // 86400 ~ " day" ~ ("s" if secs // 86400 != 1 else "")) if secs % 86400 == 0 else ((secs // 3600 ~ " hour" ~ ("s" if secs // 3600 != 1 else "")) if secs % 3600 == 0 else (secs // 60 ~ " minute" ~ ("s" if secs // 60 != 1 else ""))) %}
+    <p class="text-[11px] text-secondary mb-2">
+      {% if schedule.enabled %}
+        <span class="text-status-online font-medium">Active</span> — re-runs this engagement every <strong class="text-primary">{{ human }}</strong>, reusing the prior recon (only re-verifies and digs the delta, never a blind re-scan).
+      {% else %}
+        <span class="text-severity-medium font-medium">Paused</span> — set to every <strong class="text-primary">{{ human }}</strong>, not firing.
+      {% endif %}
+      {% if schedule.last_triggered_at %}<br>Last triggered: {{ schedule.last_triggered_at | human_dt }}.{% endif %}
+    </p>
+    <div class="flex items-center gap-2 flex-wrap">
+      <form hx-post="/api/session/{{ session_id }}/schedule/toggle" hx-target="#schedule-control-{{ session_id }}" hx-swap="outerHTML">
+        {{ button("Resume" if not schedule.enabled else "Pause", variant="secondary", type="submit") }}
+      </form>
+      <form hx-post="/api/session/{{ session_id }}/schedule/delete" hx-target="#schedule-control-{{ session_id }}" hx-swap="outerHTML">
+        {{ button("Remove schedule", variant="secondary", type="submit") }}
+      </form>
+    </div>
+  {% else %}
+    <p class="text-[11px] text-secondary mb-2">Automatically re-run this engagement on a timer — each run reuses what recon already found and works off what changed, rather than scanning from scratch. Most useful once the first scan has finished.</p>
+    <form hx-post="/api/session/{{ session_id }}/schedule" hx-target="#schedule-control-{{ session_id }}" hx-swap="outerHTML" class="flex items-end gap-2 flex-wrap">
+      <label class="text-[11px] text-secondary">Every
+        <input type="number" name="interval" min="1" value="6" class="ml-1 w-16 bg-surface border border-default rounded px-2 py-1 text-primary text-sm" required>
+      </label>
+      <select name="unit" class="bg-surface border border-default rounded px-2 py-1 text-primary text-sm">
+        <option value="minutes">minutes</option>
+        <option value="hours" selected>hours</option>
+        <option value="days">days</option>
+      </select>
+      {{ button("Enable auto-repeat", variant="primary", type="submit") }}
+    </form>
+    <p class="text-[10px] text-secondary/70 mt-1">Minimum interval: {{ (min_interval_seconds // 60) if min_interval_seconds >= 60 else min_interval_seconds }}{{ " minutes" if min_interval_seconds >= 60 else " seconds" }}.</p>
+  {% endif %}
+</div>

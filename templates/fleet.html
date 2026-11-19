@@ -16,7 +16,7 @@
   <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
     <div class="min-w-0">
       <h1 class="text-[15px] font-semibold text-primary">Fleet</h1>
-      <p class="text-[11px] text-secondary mt-0.5 max-w-2xl">Run many projects unattended, one at a time, up to {{ max_concurrent }} concurrent session{{ "s" if max_concurrent != 1 else "" }} — create a project, then use "Queue for fleet mode" instead of Start.</p>
+      <p class="ui-desc text-[11px] text-secondary mt-0.5 max-w-2xl">Run many projects unattended, one at a time, up to {{ max_concurrent }} concurrent session{{ "s" if max_concurrent != 1 else "" }} — create a project, then use "Queue for fleet mode" instead of Start.</p>
     </div>
     {% include "macros/header_light.html" %}
   </div>
@@ -82,6 +82,40 @@
       {{ privacy_placeholder("fleet-queue", queue | length, "project") }}
     {% else %}
       {{ empty_state("Nothing queued.", "Create a project, then use \"Queue for fleet mode\" on it instead of Start.") }}
+    {% endif %}
+  </div>
+
+  {# Portfolio-level read-only view of which projects auto-repeat on a timer. The actual control
+     (set interval / pause / remove) lives on each project's own Overview tab -- this is just
+     "what's scheduled across everything", so each row links back to that project. #}
+  <div class="bg-surface border border-default rounded-lg p-3 mt-4" data-privacy-key="fleet-scheduled" data-privacy-collapsed="false">
+    <div class="flex items-center justify-between gap-2 mb-2">
+      {{ section_label("Scheduled repeat scans") }}
+      {% if scheduled %}{{ privacy_toggle_button("fleet-scheduled") }}{% endif %}
+    </div>
+    {{ privacy_restore_script("fleet-scheduled") }}
+    {% if not scheduler_enabled %}
+      <p class="text-[11px] text-severity-medium mb-2">The scheduler is turned off server-side (<code>SCHEDULER_ENABLED=false</code>) — these schedules are saved but not firing.</p>
+    {% endif %}
+    {% if scheduled %}
+      <div data-privacy-content class="space-y-1.5">
+        {% for entry in scheduled %}
+          {% set secs = entry.schedule.interval_seconds %}
+          {% set human = (secs // 86400 ~ " day" ~ ("s" if secs // 86400 != 1 else "")) if secs % 86400 == 0 else ((secs // 3600 ~ " hour" ~ ("s" if secs // 3600 != 1 else "")) if secs % 3600 == 0 else (secs // 60 ~ " minute" ~ ("s" if secs // 60 != 1 else ""))) %}
+          <div class="bg-elevated border border-default rounded-lg px-2.5 py-2 flex items-center justify-between gap-2 flex-wrap">
+            <a href="/session/{{ entry.session_id }}" class="text-primary font-medium text-[12px] hover:underline truncate">{{ entry.summary.name }}</a>
+            <span class="text-[11px] text-secondary truncate">every {{ human }}</span>
+            {% if entry.schedule.enabled %}
+              <span class="text-[11px] text-status-online">Active</span>
+            {% else %}
+              <span class="text-[11px] text-severity-medium">Paused</span>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+      {{ privacy_placeholder("fleet-scheduled", scheduled | length, "project") }}
+    {% else %}
+      {{ empty_state("Nothing scheduled.", "Open a project's Overview tab and use \"Scheduled repeat scans\" to have it re-run automatically.") }}
     {% endif %}
   </div>
 {% endblock %}

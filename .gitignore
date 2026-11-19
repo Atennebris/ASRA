@@ -28,6 +28,11 @@ venv/
 node_modules/
 *.rs.bk
 
+# JVM crash dumps — written to the CWD by any Java process that crashes (here, VS Code's
+# Red Hat Java language server on OOM), not produced by ASRA itself. Pure throwaway diagnostics.
+hs_err_pid*.log
+replay_pid*.log
+
 # Environment / secrets
 .env
 
@@ -79,6 +84,10 @@ data/chat_settings.json
 # Native toolkit's agent/chat/subagent access toggles (managed via the /settings UI, see
 # agent/tools/toolkit_settings_store.py) — machine-specific operator preference
 data/toolkit_agent_settings.json
+
+# Weak-model reliability knobs (managed via the /settings UI -> Reliability, see
+# agent/reliability_settings.py) — machine-specific operator preference, GUI default over .env
+data/reliability_settings.json
 
 # Custom LLM provider instances (managed via the /settings UI, see agent/custom_providers.py) —
 # each entry carries its own real API key in plain JSON (unlike the 6 built-in providers, which

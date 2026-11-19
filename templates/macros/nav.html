@@ -110,6 +110,14 @@
       <circle cx="10.5" cy="7" r="1.1" fill="currentColor" stroke="none"></circle>
       <circle cx="15" cy="7.5" r="1.1" fill="currentColor" stroke="none"></circle>
     </svg>
+  {% elif name == "operator" %}
+    {# A single person/identity glyph -- the operator's own standing profile for the MAIN agent.
+       Deliberately distinct from "subagents" (a delegation node-diagram) so "how I want the main
+       agent to work" doesn't read as a subagent setting at a glance. #}
+    <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <circle cx="12" cy="8" r="3.25"></circle>
+      <path d="M5.5 20a6.5 6.5 0 0 1 13 0" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
   {% elif name == "special_agents" %}
     {# A four-point sparkle -- "something special/new", deliberately distinct from "subagents" (a
        delegation node-diagram) so a placeholder-for-now tab doesn't read as a variant of the real,
@@ -117,6 +125,14 @@
     <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
       <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" stroke-linecap="round" stroke-linejoin="round"></path>
       <path d="M19 15.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+  {% elif name == "reliability" %}
+    {# A shield with a check -- the weak-model Reliability tab (robustness/safeguards for small or
+       unreliable models), distinct from "general" (behavior sliders) and "tools" so it reads as its
+       own thing: making the agent hold together on a weak model. #}
+    <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M12 3l7 2.5v5c0 4.3-2.9 7.6-7 9-4.1-1.4-7-4.7-7-9v-5z" stroke-linecap="round" stroke-linejoin="round"></path>
+      <path d="M9 12l2 2 4-4.5" stroke-linecap="round" stroke-linejoin="round"></path>
     </svg>
   {% endif %}
 {% endmacro %}

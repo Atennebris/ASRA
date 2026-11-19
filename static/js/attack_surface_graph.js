@@ -191,6 +191,10 @@
           interval: edge.interval || "",
           notes: edge.notes || "",
           at: edge.at || null,
+          // attack_path only: "verified" (an evidence-backed record_host_relationship pivot) vs
+          // "reasoned" (reconstructed from a Chain pass). Empty for every other edge kind. Drives
+          // the solid-vs-dashed distinction so a proven pivot never looks like an inferred one.
+          verification: edge.verification || "",
         },
       });
     });
@@ -326,6 +330,15 @@
         },
       },
       {
+        // A chain-reasoned pivot is the real "assumed, not proven live" half of attack_path: drawn
+        // dashed and dimmer than the evidence-backed (record_host_relationship) solid pivots above,
+        // so the Map never shows an inferred hop with the same authority as a proven one. More
+        // specific selector than the attack_path block above, so it wins line-style/opacity for a
+        // reasoned edge while still inheriting that block's Critical color + arrows.
+        selector: "edge[kind = 'attack_path'][verification = 'reasoned']",
+        style: { "line-style": "dashed", "line-opacity": 0.55, width: 2 },
+      },
+      {
         // Operator-drawn connections read as deliberate, not automated -- accent-colored and a
         // touch bolder than the neutral dns/credential lines, without introducing a third random
         // color into the palette.
@@ -385,6 +398,11 @@
       panel.innerHTML =
         '<p class="font-semibold text-primary mb-1">' + sourceLabel + " &rarr; " + targetLabel + "</p>" +
         (d.manual ? "" : '<p class="text-secondary mb-1 italic">' + d.kind + " (automatic)</p>") +
+        // attack_path only: the pivot's verification state, spelled out so clicking a dashed vs
+        // solid edge explains itself. "verified" = a record_host_relationship pivot the agent
+        // proved with real evidence; "reasoned" = reconstructed from a Chain pass, not re-verified.
+        (d.kind === "attack_path" && d.verification === "verified" ? '<p class="mb-1 font-semibold" style="color: ' + severityColor("Critical") + '">&#9679; Proven live &mdash; evidence-backed pivot</p>' : "") +
+        (d.kind === "attack_path" && d.verification === "reasoned" ? '<p class="text-secondary mb-1 italic">Reasoned from a Chain pass &mdash; inferred, not independently re-verified</p>' : "") +
         metaRows.map(function (row) { return "<p class=\"text-secondary\">" + row[0] + ": <span class=\"text-primary\">" + row[1] + "</span></p>"; }).join("") +
         (d.notes ? '<p class="text-secondary mt-2">' + d.notes + "</p>" : "") +
         (!d.manual && metaRows.length === 0 ? '<p class="text-secondary italic">No additional data recorded for this connection.</p>' : "") +
@@ -1326,12 +1344,13 @@
         // should show the whole map as arranged, not whatever happened to be panned into view.
         // scale:2 for a crisp image on a real document/slide, not a blurry 1x screen capture.
         var dataUri = cy.png({ full: true, scale: 2, bg: surfaceColor() });
-        var link = document.createElement("a");
-        link.href = dataUri;
-        link.download = "attack-surface-map.png";
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+        // Shared export flow (warn + choose path, default Downloads) -- CLAUDE.md's export rule --
+        // instead of an instant anchor download of the data URI.
+        window.asraExportDownload({
+          getBlob: function () { return fetch(dataUri).then(function (r) { return r.blob(); }); },
+          filename: "attack-surface-map.png",
+          mime: "image/png",
+        });
       });
     }
     // "Expand" -- real, confirmed operator complaint: the mount's own fixed height is cramped for

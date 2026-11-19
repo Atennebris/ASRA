@@ -5,16 +5,65 @@
    discipline every other Settings toggle in this app already follows. #}
 <div class="bg-elevated border border-default rounded-lg p-4 mb-6" id="custom-tools-list">
   <p class="text-[13px] font-semibold text-primary mb-1">Custom tools</p>
-  <p class="text-[11px] text-secondary mb-3 max-w-[46rem]">
-    Binaries you've registered yourself, discovered via "Test path" above (or added directly) --
-    ASRA's own registry has no builder for these at all. Each ENABLED one becomes a real, named
-    tool the agent and its subagents can call, using whichever flags its own usage text below
-    documents. Runs sandboxed (the same process/filesystem isolation custom-script tools already
-    get), since this project has no track record with an arbitrary added binary the way it does
-    with its own built-in tools.
+  <p class="ui-desc text-[11px] text-secondary mb-3 max-w-[46rem]">
+    Binaries you've registered yourself, discovered via "Test path" above or added directly with
+    "Add custom tool" -- ASRA's own registry has no builder for these at all. Each ENABLED one
+    becomes a real, named tool, using whichever flags its own usage text below documents, and its
+    own "Available to" switches decide which consumers actually get it (main agent, chats, reverse/
+    interactive modes, subagents). Runs sandboxed (the same process/filesystem isolation custom-
+    script tools already get), since this project has no track record with an arbitrary added binary
+    the way it does with its own built-in tools.
   </p>
+  {# Direct "Add custom tool" entry point (the manual=1 path of /api/tools/custom-tools/add) -- the
+     operator types the binary's path by hand instead of going through "Test path" discovery above. #}
+  <button type="button" class="mb-3 inline-flex items-center gap-1.5 h-8 px-3 text-[11px] font-medium rounded bg-surface border border-default text-primary hover:bg-overlay transition-colors"
+          onclick="document.getElementById('add-custom-tool-dialog').showModal()">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true" class="w-3.5 h-3.5">
+      <path d="M8 3.5v9M3.5 8h9" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    Add custom tool
+  </button>
+  <dialog id="add-custom-tool-dialog" class="bg-elevated border border-default rounded-xl p-0 max-w-lg w-[92vw] text-primary backdrop:bg-black/50">
+    <form method="post" action="/api/tools/custom-tools/add" class="p-4 space-y-3">
+      <input type="hidden" name="manual" value="1">
+      <p class="text-[13px] font-semibold">Add a custom tool</p>
+      <label class="block text-[11px] text-secondary">Name
+        <input type="text" name="name" required placeholder="mytool" class="mt-1 w-full bg-surface border border-default rounded px-2.5 py-1.5 text-[12px] text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent">
+      </label>
+      <label class="block text-[11px] text-secondary">Path to binary/script
+        <input type="text" name="path" required placeholder="/usr/local/bin/mytool" class="mt-1 w-full bg-surface border border-default rounded px-2.5 py-1.5 text-[12px] text-primary font-mono focus:outline-none focus:ring-1 focus:border-accent">
+      </label>
+      <label class="block text-[11px] text-secondary">Description (shown to the model)
+        <textarea name="description" rows="2" placeholder="What it does and how to call it -- leave blank to auto-capture --help." class="mt-1 w-full bg-surface border border-default rounded px-2.5 py-1.5 text-[11px] text-primary focus:outline-none focus:ring-1 focus:border-accent"></textarea>
+      </label>
+      <div class="flex items-center gap-3 flex-wrap">
+        <label class="text-[11px] text-secondary">Category
+          <select name="category" class="ml-1 bg-surface border border-default rounded px-2 py-1 text-[11px] text-primary">
+            {% for cat in custom_tool_categories %}<option value="{{ cat }}">{{ cat }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="flex items-center gap-1.5 text-[11px] text-secondary cursor-pointer select-none">
+          <input type="checkbox" name="requires_target" value="true"> Requires a live target
+        </label>
+      </div>
+      <div>
+        <span class="block text-[11px] text-secondary mb-1">Available to</span>
+        <div class="flex flex-wrap gap-x-4 gap-y-1">
+          {% for scope in custom_tool_scopes %}
+            <label class="flex items-center gap-1.5 text-[11px] text-primary cursor-pointer select-none">
+              <input type="checkbox" name="scopes" value="{{ scope }}" checked> {{ custom_tool_scope_labels[scope] }}
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="flex items-center justify-end gap-2 pt-1">
+        <button type="button" class="h-8 px-3 text-[11px] rounded border border-default text-secondary hover:text-primary hover:bg-overlay" onclick="document.getElementById('add-custom-tool-dialog').close()">Cancel</button>
+        <button type="submit" class="h-8 px-3 text-[11px] font-medium rounded bg-accent text-white hover:opacity-90">Add</button>
+      </div>
+    </form>
+  </dialog>
   {% if not custom_tools %}
-    <p class="text-[11px] text-secondary italic">No custom tools registered yet.</p>
+    <p class="ui-desc text-[11px] text-secondary italic">No custom tools registered yet.</p>
   {% else %}
     <div class="space-y-2">
       {% for tool in custom_tools %}
@@ -29,13 +78,32 @@
               <p class="text-[11px] text-secondary truncate font-mono" title="{{ tool.path }}">{{ tool.path }}</p>
             </div>
             <form method="post" action="/api/tools/custom-tools/{{ tool.id }}/delete" class="shrink-0"
-                  onsubmit="return asraConfirmSubmit(event, {title: 'Remove this custom tool?', message: 'Removes &quot;' + {{ tool.name | tojson }} + '&quot; from the registry -- the agent and its subagents will no longer be able to call it. The binary itself on disk is untouched.', confirmLabel: 'Remove'});">
-              <button type="submit" class="h-7 px-2.5 text-[11px] font-medium rounded bg-surface border border-default text-secondary hover:text-primary hover:bg-overlay transition-colors">Remove</button>
+                  onsubmit="return asraConfirmSubmit(event, {title: 'Remove this custom tool?', message: 'Removes &quot;' + {{ tool.name | tojson | forceescape }} + '&quot; from the registry -- the agent and its subagents will no longer be able to call it. The binary itself on disk is untouched.', confirmLabel: 'Remove'});">
+              {# Trash icon, inline SVG (never an emoji, per the project UI rule) -- same confirm flow as before. #}
+              <button type="submit" aria-label="Remove custom tool" title="Remove"
+                      class="h-7 w-7 inline-flex items-center justify-center rounded bg-surface border border-default text-secondary hover:text-severity-high hover:bg-overlay transition-colors">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true" class="w-3.5 h-3.5">
+                  <path d="M2.5 4h11M6.5 4V2.8h3V4M4 4l.6 9h6.8L12 4" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M6.5 6.5v4.5M9.5 6.5v4.5" stroke-width="1.3" stroke-linecap="round"/>
+                </svg>
+              </button>
             </form>
           </div>
           <form method="post" action="/api/tools/custom-tools/{{ tool.id }}/update" class="mt-2 space-y-2">
             <textarea name="description" rows="2" placeholder="What this tool does and how to call it -- shown to the model as its tool description."
                       class="w-full bg-surface border border-default rounded px-2.5 py-1.5 text-[11px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">{{ tool.description }}</textarea>
+            {# Per-tool availability -- which consumers get this tool (custom_tools_store.tool_scopes).
+               Unchecking all is a real "available to nobody"; these post with the Save below. #}
+            <div>
+              <span class="block text-[11px] text-secondary mb-1">Available to</span>
+              <div class="flex flex-wrap gap-x-4 gap-y-1">
+                {% for scope in custom_tool_scopes %}
+                  <label class="flex items-center gap-1.5 text-[11px] text-primary cursor-pointer select-none">
+                    <input type="checkbox" name="scopes" value="{{ scope }}" {{ "checked" if scope in tool.scopes else "" }}> {{ custom_tool_scope_labels[scope] }}
+                  </label>
+                {% endfor %}
+              </div>
+            </div>
             <div class="flex items-center gap-3 flex-wrap">
               <label class="text-[11px] text-secondary">
                 Category

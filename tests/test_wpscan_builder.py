@@ -67,6 +67,26 @@ def test_build_command_respects_model_choosing_no_update():
     assert "--no-update" in command
 
 
+def test_build_command_switches_to_no_update_when_session_already_updated_the_db():
+    """`_wpscan_skip_update` (agent/core.py's _run_tool_with_retry) is set once this session has
+    already paid for one real --update -- the local vulnerability database is global, not
+    per-host, so a 2nd/3rd/... WordPress host in the same scan must not pay it again."""
+    command = build_wpscan_command({"target": "http://example.com", "_wpscan_skip_update": True})
+    assert "--update" not in command
+    assert "--no-update" in command
+
+
+def test_build_command_explicit_model_update_choice_still_wins_over_the_skip_marker():
+    """Same "explicit model choice wins outright" discipline as every other default in this
+    file -- if the model deliberately asks for --update anyway, the skip marker must not silently
+    override it."""
+    command = build_wpscan_command({
+        "target": "http://example.com", "extra_args": ["--update"], "_wpscan_skip_update": True,
+    })
+    assert command.count("--update") == 1
+    assert "--no-update" not in command
+
+
 def test_build_command_appends_extra_args():
     command = build_wpscan_command({"target": "http://example.com", "extra_args": ["--enumerate", "p"]})
     assert "--enumerate" in command and "p" in command

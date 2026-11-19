@@ -976,6 +976,21 @@ def test_toolkit_session_scoped_routes_still_use_the_session_wrapper_not_standal
     assert f"/api/session/{session_id}/toolkit" in resp.text
 
 
+def test_site_map_tree_route_renders_a_stable_id_on_each_details_node(tmp_path, monkeypatch):
+    """Route-level smoke test for the Map tab's Site Tree sub-view (GET .../site-map-tree,
+    partials/site_map_tree.html) -- confirms the fix actually renders end-to-end (no Jinja error)
+    and that the id main.py's _build_site_map_tree now computes per node (a hash of that node's
+    own full host/path, not its sort position) really reaches the <details> tag. See
+    test_site_map_tree.py's own stability test for the pure-function regression this backs."""
+    _isolate(tmp_path, monkeypatch)
+    session_id = store.create_session("https://example.com")
+    _seed_entry(session_id, url="https://example.com/first")
+    client = TestClient(main.app)
+    resp = client.get(f"/api/session/{session_id}/site-map-tree")
+    assert resp.status_code == 200
+    assert 'id="site-tree-' in resp.text
+
+
 def test_parse_header_lines_skips_blank_and_malformed_lines():
     parsed = main._parse_header_lines("Host: example.com\n\nbad line no colon\nX-Test:  value with spaces  \n")
     assert parsed == {"Host": "example.com", "X-Test": "value with spaces"}

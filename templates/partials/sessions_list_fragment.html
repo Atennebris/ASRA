@@ -20,18 +20,23 @@
     {% endfor %}
   </div>
 
-  {# Two genuinely separate confirmations (static/js/confirm_dialog.js's asraConfirmTwoStep)
-     before this ever submits — deleting every project at once is too destructive for even the
-     usual single confirm every other delete action in this app uses. #}
-  <div class="flex items-center justify-between mb-3">
+  {# Delete-all is a nested gate (static/js/confirm_dialog.js's asraConfirmTwoStep): a plain
+     warning first, then a second warning that stays un-confirmable until the operator ticks an
+     acknowledgement box AND types the word DELETE -- deleting every project at once is too
+     destructive for even the usual single confirm every other delete action in this app uses.
+     The export button sits beside it: the cheap way to keep a copy before wiping everything. #}
+  <div class="flex items-center justify-between mb-3 gap-2">
     {{ privacy_toggle_button("projects-list") }}
-    <form id="delete-all-sessions-form" method="post" action="/api/sessions/delete-all" class="hidden"></form>
-    <button type="button"
-            onclick="asraConfirmTwoStep(
-              {title: 'Delete all projects?', message: 'This permanently deletes all {{ sessions | length }} project(s) and everything recorded in them — findings, logs, evidence. This cannot be undone.', confirmLabel: 'Continue'},
-              {title: 'Are you absolutely sure?', message: 'All {{ sessions | length }} project(s) will be deleted right now. There is no way to undo this.', confirmLabel: 'Yes, delete everything'}
-            ).then(function (ok) { if (ok) document.getElementById('delete-all-sessions-form').submit(); });"
-            class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-high/10 text-severity-high border border-severity-high/20 hover:bg-severity-high/20 h-7 px-2 text-[11px]">Delete all projects</button>
+    <div class="flex items-center gap-2">
+      {% include "partials/projects_transfer_buttons.html" %}
+      <form id="delete-all-sessions-form" method="post" action="/api/sessions/delete-all" class="hidden"></form>
+      <button type="button"
+              onclick="asraConfirmTwoStep(
+                {title: 'Delete all projects?', message: 'This permanently deletes all {{ sessions | length }} project(s) and everything recorded in them — findings, logs, evidence. This cannot be undone.', confirmLabel: 'Continue'},
+                {title: 'Final warning — this wipes everything', message: 'All {{ sessions | length }} project(s) will be deleted right now. There is no way to undo this.', confirmLabel: 'Delete everything', checkboxLabel: 'I understand all {{ sessions | length }} project(s) and their findings, logs and evidence will be permanently lost.', requireChecked: true, requireText: 'DELETE', textPrompt: 'Type DELETE (capital letters) to confirm'}
+              ).then(function (ok) { if (ok) document.getElementById('delete-all-sessions-form').submit(); });"
+              class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-severity-high/10 text-severity-high border border-severity-high/20 hover:bg-severity-high/20 h-7 px-2 text-[11px]">Delete all projects</button>
+    </div>
   </div>
 
   {# Placed here, right after the toggle button rendered above (not at the top of the {% if %}
@@ -83,6 +88,11 @@
            directly into the onsubmit="..." JS-source string here, which a project name containing
            a genuine apostrophe or quote (a real, plausible bug-bounty program name) would have
            broken out of, corrupting the handler or silently skipping the confirm entirely. #}
+        {# Quick single-project export with the shareable defaults (no debug logs, no custom headers);
+           the header's Export dialog is the one with options. #}
+        <a href="/api/projects/export?ids={{ s.session_id }}" download title="Export this project as a .zip"
+           data-export data-export-filename="asra_project_{{ s.session_id }}.zip" data-export-mime="application/zip"
+           class="inline-flex items-center justify-center gap-1.5 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-7 px-2 text-[11px]">Export</a>
         <form method="post" action="/api/session/{{ s.session_id }}/delete"
               data-project-name="{{ s.name }}" data-project-target="{{ s.target }}"
               onsubmit="return asraConfirmDeleteProject(event);">
@@ -95,4 +105,9 @@
 {% else %}
   {{ empty_state("No sessions yet.", "Start a scan to see it here.") }}
   <p class="text-center mt-2"><a href="/" class="text-accent hover:text-accent-hover text-sm underline">Start a scan</a></p>
+  {# Nothing to export yet, but this is exactly the machine someone imports onto. #}
+  <div class="flex items-center justify-center mt-3">
+    {% set with_export = false %}
+    {% include "partials/projects_transfer_buttons.html" %}
+  </div>
 {% endif %}

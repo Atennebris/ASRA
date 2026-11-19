@@ -40,7 +40,8 @@ _ENV_PATH = find_dotenv(usecwd=True) or str(Path(__file__).resolve().parent.pare
 
 
 def _load_flag(env_var: str) -> bool:
-    raw = dotenv_values(_ENV_PATH).get(env_var)
+    # interpolate=False: see agent/updater.py's load_update_check_on_startup -- same Settings-render cost.
+    raw = dotenv_values(_ENV_PATH, interpolate=False).get(env_var)
     if raw is None:
         return True
     return raw.strip().lower() in ("true", "1", "yes", "on")

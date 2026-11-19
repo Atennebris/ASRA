@@ -123,7 +123,12 @@ _ALLOWED_ANALYSIS_COMMANDS = {
     # when a valid warm cache resolves the address, the full `aaa` otherwise) -- see
     # _WARM_CACHEABLE_ANALYSES and the long design-history comment above this dict for why.
     "disassemble_function": "pdfj @ {address}",
-    "decompile_function": "e r2ghidra.pdg=true; pdgj @ {address}",
+    # `pdgj` IS r2ghidra's own decompile command (provided by the loaded core_ghidra plugin) -- it
+    # takes no enabling eval var. The old `e r2ghidra.pdg=true;` prefix set a config variable that
+    # does not exist, so every decompile printed a stderr line "variable 'r2ghidra.pdg' not found"
+    # (confirmed in a real session log) -- a pure no-op error that only added noise and risked
+    # polluting the parsed output. pdgj works on its own once the plugin is present.
+    "decompile_function": "pdgj @ {address}",
     "xrefs_to": "aaa; axtj @ {address}",
     # Read-only hex+ASCII dump (pxj -- same j-suffixed structured-JSON convention every other entry
     # above already uses). {length} defaults to 256 bytes when the model omits it -- enough to
@@ -428,10 +433,9 @@ _PERMISSION_DENIED_MARKERS = ("Permission denied", "Read-only file system")
 
 def retry_radare2_write_on_permission_denied(command: list[str], result: dict) -> list[str] | None:
     """ToolSpec.retry_command_on_result -- a deterministic, code-level fallback for a `-w` write
-    (hex_patch/hex_patch_asm) that failed with a plain OS-level permission error, same shape and
-    same reasoning as nmap's own retry_nmap_with_pn_if_host_seemed_down: the fix is already fully
-    determined by what actually went wrong, so there is nothing for the model to usefully reason
-    about -- let alone spend its one "corrected retry" chance on.
+    (hex_patch/hex_patch_asm) that failed with a plain OS-level permission error: the fix is
+    already fully determined by what actually went wrong, so there is nothing for the model to
+    usefully reason about -- let alone spend its one "corrected retry" chance on.
 
     Real, confirmed incident this fixes (Supratest_RE_a-usr_ff40fb): `wx 90 @ <addr>` against a
     real target under WSL2's /mnt/c/... drvfs mount failed twice, identically, with `Permission

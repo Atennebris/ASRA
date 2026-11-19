@@ -14,8 +14,8 @@
   <div class="relative flex items-start justify-between gap-4 py-3.5 border-b border-default mb-4 flex-wrap">
     <div class="min-w-0">
       <h1 class="text-[15px] font-semibold text-primary">Playbook</h1>
-      <p class="text-[11px] text-secondary mt-0.5 max-w-2xl">Cross-session exploitation techniques &amp; confirmed dead-ends — the accumulating edge that gets surfaced as a lead on similarly fingerprinted targets. Survives project deletion.</p>
-      <p class="text-[11px] text-secondary/70 mt-1.5 max-w-2xl leading-relaxed">
+      <p class="ui-desc text-[11px] text-secondary mt-0.5 max-w-2xl">Cross-session exploitation techniques &amp; confirmed dead-ends — the accumulating edge that gets surfaced as a lead on similarly fingerprinted targets. Survives project deletion.</p>
+      <p class="ui-desc text-[11px] text-secondary/70 mt-1.5 max-w-2xl leading-relaxed">
         Entries build up on their own — every confirmed exploit the agent lands, plus anything the chat saves with <code class="text-[10px]">record_technique</code>. You have <strong class="text-secondary">{{ total }}</strong> already.
         <strong class="text-secondary">Seed pack</strong> is a one-click, optional starter set of {{ 5 }} well-known <em>public</em> WAF/CDN-bypass patterns (built into ASRA, not fetched from anywhere) to prime an empty playbook — nothing you need to click if you already have your own. <strong class="text-secondary">Export</strong>/<strong class="text-secondary">Import</strong> back up or move the whole store as JSON.
       </p>
@@ -53,15 +53,38 @@
       <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>
       Add technique
     </button>
-    <a href="/api/playbook/export"
+    {# A reusable command/script/instruction-list attached to a technique, so a proven win reruns in
+       one action -- authored by hand here, first-class alongside agent-captured skills. #}
+    <button type="button" onclick="document.getElementById('playbook-skill-add').showModal()"
+            class="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 hover:bg-accent/20 px-3 py-1.5 text-[12px] text-accent transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      New skill
+    </button>
+    {# Confirm first, then let the operator choose where to save (File System Access API, falling
+       back to a normal Downloads download) -- static/js/playbook_skill.js's asraExportJson. The GET
+       route stays the data source; the save happens client-side. #}
+    <button type="button" onclick="window.asraExportJson('/api/playbook/export', 'asra_playbook.json')"
        class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
       <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12M8 11l4 4 4-4M4 21h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Export
-    </a>
+    </button>
     <button type="button" onclick="document.getElementById('playbook-import').showModal()"
             class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
       <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Import
+    </button>
+    {# Skill-only portable envelope (playbook_store.export_skills/import_skills) -- share just the
+       skills with another agent/machine. The whole-playbook Export above already carries every skill
+       inline too; these are for moving skills without the surrounding technique store. #}
+    <button type="button" onclick="window.asraExportJson('/api/playbook/skills/export', 'asra_skills.json')"
+       class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Export skills
+    </button>
+    <button type="button" onclick="document.getElementById('playbook-skill-import').showModal()"
+            class="inline-flex items-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 21V9M8 13l4-4 4 4M4 3h16" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Import skills
     </button>
     {% if total %}
       {# Real, direct operator ask: rename off "Remove duplicates" and stop irreversibly
@@ -133,6 +156,12 @@
         <option value="">All (reviewed + unreviewed)</option>
         <option value="unreviewed">Unreviewed only</option>
       </select>
+      {# Just the entries that carry an executable skill -- so the operator can actually find where
+         the saved skills live (main.py's _filter_techniques, skills_only). #}
+      <select name="skills_only" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        <option value="">Techniques + skills</option>
+        <option value="yes">Skills only</option>
+      </select>
       <select name="sort" class="bg-elevated border border-default rounded-md px-2 py-1.5 text-[11.5px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
         <option value="recent">Sort: Recently confirmed</option>
         <option value="rank">Sort: Highest rank</option>
@@ -163,7 +192,7 @@
     <form hx-post="/api/playbook/add" hx-target="#playbook-list" hx-swap="innerHTML"
           hx-on::after-request="document.getElementById('playbook-add').close(); this.reset();"
           class="p-4 space-y-3 overflow-y-auto asra-scroll min-h-0">
-      <p class="text-[11px] text-secondary">Add one technique you already know. Key it to the stack it applies to so it resurfaces on similar targets later. It ranks and surfaces exactly like an agent-captured one.</p>
+      <p class="ui-desc text-[11px] text-secondary">Add one technique you already know. Key it to the stack it applies to so it resurfaces on similar targets later. It ranks and surfaces exactly like an agent-captured one.</p>
       <label class="block">
         <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Technique <span class="text-severity-high">*</span></span>
         <textarea name="technique" rows="2" required placeholder="e.g. Bypass the WAF by double-URL-encoding the payload"
@@ -214,9 +243,105 @@
     </div>
     <form hx-post="/api/playbook/import" hx-target="#playbook-list" hx-swap="innerHTML"
           hx-on::after-request="document.getElementById('playbook-import').close(); this.reset();" class="p-4 space-y-3">
-      <p class="text-[11px] text-secondary">Paste a previously exported <code class="text-[10px]">asra_playbook.json</code>. Existing entries (matched by id) are left alone; new ones are merged in.</p>
+      <p class="ui-desc text-[11px] text-secondary">Paste a previously exported <code class="text-[10px]">asra_playbook.json</code>. Existing entries (matched by id) are left alone; new ones are merged in.</p>
       <textarea name="data" rows="8" placeholder='{ "..." : [ ... ] }' autocomplete="off"
                 class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      <div class="flex justify-end">
+        <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Merge in</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# New-skill dialog -- hand-author a reusable skill (command/script/instruction-list). No
+     `overflow-hidden` on the <dialog>, same native-<select>-in-dialog WebView2 bug the add-technique
+     dialog above documents. The interpreter picker only matters for a `script` kind (sh/python/
+     pwntools); a `command` runs a single registry-known binary, `instructions` is returned as text,
+     never executed. #}
+  <dialog id="playbook-skill-add" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg max-h-[90vh] flex flex-col backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default shrink-0">
+      <span class="text-[13px] font-semibold">New skill</span>
+      <button type="button" onclick="document.getElementById('playbook-skill-add').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <form hx-post="/api/playbook/add-skill" hx-target="#playbook-list" hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('playbook-skill-add').close(); this.reset();"
+          class="p-4 space-y-3 overflow-y-auto asra-scroll min-h-0">
+      <p class="ui-desc text-[11px] text-secondary">Add a reusable skill you already know. An operator-written body is trusted by default and runs sandboxed; it surfaces and reruns on similar targets exactly like an agent-captured one.</p>
+      <div class="flex gap-2">
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Kind</span>
+          <select name="kind" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <option value="instructions">Instructions — steps the agent follows (never executed)</option>
+            <option value="command">Command — one registry-known binary, sandboxed</option>
+            <option value="script">Script — sandboxed, via an interpreter</option>
+          </select>
+        </label>
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Interpreter <span class="text-secondary/60 normal-case">(script only)</span></span>
+          <select name="interpreter" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+            <option value="none">none</option>
+            <option value="sh">sh</option>
+            <option value="python">python</option>
+            <option value="pwntools">pwntools</option>
+          </select>
+        </label>
+      </div>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Body <span class="text-severity-high">*</span></span>
+        <textarea name="body" rows="5" required placeholder="The command, script, or step-by-step instructions. Use {{ '{{slots}}' }} for values supplied at run time (declare them below)."
+                  class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      </label>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Params <span class="text-secondary/60 normal-case">— comma-separated names, each a required {{ '{{slot}}' }}</span></span>
+        <input type="text" name="params" placeholder="target, port" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+      </label>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Technique <span class="text-secondary/60 normal-case">(optional — a label is derived from the body if blank)</span></span>
+        <textarea name="technique" rows="2" placeholder="e.g. Dump the users table via time-based blind SQLi"
+                  class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      </label>
+      <div class="flex gap-2">
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Tech keywords</span>
+          <input type="text" name="tech_keywords" placeholder="nginx, php" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Vuln class</span>
+          <input type="text" name="vuln_class" placeholder="sqli / xss / …" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+      </div>
+      <div class="flex gap-2">
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Target shape <span class="text-secondary/60 normal-case">(optional)</span></span>
+          <input type="text" name="target_shape" placeholder="web-app / binary / api" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+        <label class="flex-1">
+          <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">Mode <span class="text-secondary/60 normal-case">(optional)</span></span>
+          <input type="text" name="mode" placeholder="recon / exploit / re" class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[12px] text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+        </label>
+      </div>
+      <div class="flex justify-end pt-1">
+        <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Add skill</button>
+      </div>
+    </form>
+  </dialog>
+
+  {# Import-skills dialog -- paste a skills envelope, or upload the .json file. Every imported skill
+     lands unreviewed (a body authored elsewhere is untrusted provenance by default). #}
+  <dialog id="playbook-skill-import" class="bg-surface text-primary border border-default rounded-lg p-0 w-full max-w-lg backdrop:bg-black/50">
+    <div class="flex items-center justify-between px-4 h-12 border-b border-default">
+      <span class="text-[13px] font-semibold">Import skills</span>
+      <button type="button" onclick="document.getElementById('playbook-skill-import').close()" class="text-secondary hover:text-primary text-lg leading-none" aria-label="Close">&times;</button>
+    </div>
+    <form hx-post="/api/playbook/skills/import" hx-target="#playbook-list" hx-swap="innerHTML" hx-encoding="multipart/form-data"
+          hx-on::after-request="document.getElementById('playbook-skill-import').close(); this.reset();" class="p-4 space-y-3">
+      <p class="ui-desc text-[11px] text-secondary">Paste an exported <code class="text-[10px]">asra_skills.json</code> (or an agentskills-compatible envelope), or upload the file. Imported skills arrive <strong class="text-secondary">unreviewed</strong> until you trust them.</p>
+      <textarea name="data" rows="7" placeholder='{ "schema": "asra.skill/v1", "skills": [ … ] }' autocomplete="off"
+                class="w-full bg-elevated border border-default rounded px-2.5 py-1.5 text-[11px] font-mono text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20"></textarea>
+      <label class="block">
+        <span class="block text-[10px] font-semibold uppercase tracking-wider text-secondary mb-1">…or upload a file</span>
+        <input type="file" name="file" accept=".json,application/json"
+               class="w-full text-[11px] text-secondary file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:bg-elevated file:text-secondary file:text-[11px] hover:file:bg-overlay">
+      </label>
       <div class="flex justify-end">
         <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-accent hover:bg-accent-hover text-white px-3.5 py-1.5 text-sm font-medium">Merge in</button>
       </div>
@@ -258,7 +383,7 @@
     </div>
 
     <div class="p-3 border-b border-default shrink-0">
-      <p class="text-[11px] text-secondary leading-relaxed mb-2">Upload a source (PDF/epub/md/txt) or paste a link, then analyze it with your own configured LLM provider — extracted techniques land in the playbook as <strong class="text-secondary">unreviewed</strong>, separate from field-proven ones, until confirmed.</p>
+      <p class="ui-desc text-[11px] text-secondary leading-relaxed mb-2">Upload a source (PDF/epub/md/txt) or paste a link, then analyze it with your own configured LLM provider — extracted techniques land in the playbook as <strong class="text-secondary">unreviewed</strong>, separate from field-proven ones, until confirmed.</p>
       {# hx-sync -- see partials/library_sources.html's own comment on its self-poll trigger for
          the real race this coordinates against (an in-flight poll response landing after this
          one and silently reverting what it just did). #}
@@ -294,7 +419,7 @@
            httpx fetch, and read as narrower than what it really does. "Add from URL" matches
            "Upload"'s own action-first naming above and doesn't imply which fetch path was used. #}
         <button type="submit" class="w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-default bg-elevated hover:bg-overlay hover:border-accent px-3 py-1.5 text-[12px] text-secondary hover:text-primary transition-colors">Add from URL</button>
-        <p class="text-[10px] text-secondary/70 leading-relaxed">Tries a plain fetch first; if that's blocked or comes back empty (JS-rendered page), ASRA automatically retries through its own real browser automation — the source card shows "via browser" when that happened.</p>
+        <p class="ui-desc text-[10px] text-secondary/70 leading-relaxed">Tries a plain fetch first; if that's blocked or comes back empty (JS-rendered page), ASRA automatically retries through its own real browser automation — the source card shows "via browser" when that happened.</p>
       </form>
     </div>
 
@@ -334,7 +459,7 @@
           });
         </script>
       {% endif %}
-      <p class="text-[10px] text-secondary mt-1">Applies to every source's "Analyze" below. Only providers actually configured in Settings are listed.</p>
+      <p class="ui-desc text-[10px] text-secondary mt-1">Applies to every source's "Analyze" below. Only providers actually configured in Settings are listed.</p>
       {# This picker's own independent "Free models only" switch -- same per-picker treatment as
          every other model picker in the app (static/js/free_models_filter.js's shared primitives).
          Persisted (library_store.py's last_free_only) on every Analyze click, same "a toggle
@@ -406,4 +531,7 @@
       if (backdrop) backdrop.classList.toggle("hidden", !open);
     };
   </script>
+  {# Instant trust-badge flip for the per-skill "Trusted on/off" toggle (the real server toggle still
+     re-renders the list afterward) -- page-scoped, the skill cards only exist on /playbook. #}
+  <script src="{{ static_url('/static/js/playbook_skill.js') }}"></script>
 {% endblock %}

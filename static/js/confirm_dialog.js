@@ -10,6 +10,8 @@
   var PRIMARY_CLASSES = ["bg-accent", "hover:bg-accent-hover", "text-white"];
   var dialog, titleEl, messageEl, okBtn, cancelBtn;
   var checkboxRow, checkboxInput, checkboxLabelEl;
+  var textRow, textInput, textPromptEl;
+  var gate = { needChecked: false, needText: "" }; // what must be satisfied before Confirm enables
   var initialized = false;
   var current = null; // {resolve, result} for whichever confirmation is showing right now
   var queuedNext = null; // {opts, resolve} waiting for the CURRENT one to actually finish closing
@@ -39,6 +41,9 @@
     checkboxRow = document.getElementById("asra-confirm-checkbox-row");
     checkboxInput = document.getElementById("asra-confirm-checkbox");
     checkboxLabelEl = document.getElementById("asra-confirm-checkbox-label");
+    textRow = document.getElementById("asra-confirm-text-row");
+    textInput = document.getElementById("asra-confirm-text");
+    textPromptEl = document.getElementById("asra-confirm-text-prompt");
     if (!dialog || !titleEl || !messageEl || !okBtn || !cancelBtn) return false;
 
     okBtn.addEventListener("click", function () {
@@ -55,6 +60,8 @@
     // Fires for every way the dialog can close: Confirm, Cancel, Escape, or a backdrop click --
     // "result" already defaults to false (set in reallyShow), so anything that closes it without
     // going through the Confirm button resolves as Cancel automatically.
+    if (checkboxInput) checkboxInput.addEventListener("change", syncOkGate);
+    if (textInput) textInput.addEventListener("input", syncOkGate);
     dialog.addEventListener("close", function () {
       var finishing = current;
       current = null;
@@ -73,6 +80,16 @@
 
     initialized = true;
     return true;
+  }
+
+  // Confirm stays disabled until every gate the current call asked for is satisfied -- a ticked
+  // acknowledgement box (opts.requireChecked) and/or the exact word typed (opts.requireText).
+  // Compared case-sensitively and trimmed: typing the word is meant to be deliberate, but a stray
+  // trailing space from a paste shouldn't make it feel broken.
+  function syncOkGate() {
+    var checkedOk = !gate.needChecked || !!(checkboxInput && checkboxInput.checked);
+    var textOk = !gate.needText || !!(textInput && textInput.value.trim() === gate.needText);
+    okBtn.disabled = !(checkedOk && textOk);
   }
 
   function reallyShow(opts) {
@@ -97,12 +114,25 @@
         checkboxLabelEl.textContent = "";
       }
     }
+    gate.needChecked = !!(opts.requireChecked && opts.checkboxLabel);
+    gate.needText = opts.requireText || "";
+    if (textRow && textInput && textPromptEl) {
+      textRow.hidden = !gate.needText;
+      textInput.value = "";
+      textPromptEl.textContent = gate.needText ? (opts.textPrompt || ("Type " + gate.needText + " to confirm")) : "";
+    }
+    syncOkGate();
     return new Promise(function (resolve) {
-      current = { resolve: resolve, result: false, checked: false, hasCheckbox: !!opts.checkboxLabel };
+      // A gated confirmation is a plain yes/no to its caller: the checkbox there is a safeguard,
+      // not an opt-out the caller wants to read back, so it keeps the boolean resolve shape.
+      current = { resolve: resolve, result: false, checked: false, hasCheckbox: !!opts.checkboxLabel && !gate.needChecked };
       dialog.showModal();
+      if (gate.needText && textInput) textInput.focus();
     });
   }
 
+  // opts.requireChecked (with checkboxLabel) and opts.requireText (+ optional textPrompt) turn the
+  // dialog into a hard gate: Confirm stays disabled until the box is ticked / the word is typed.
   // opts.checkboxLabel (optional): shows a single opt-out checkbox above the buttons and changes
   // the resolved value from a plain boolean to {confirmed, checked} -- see the "close" listener
   // above. Callers that don't pass it are completely unaffected (still get a plain boolean).
@@ -135,7 +165,8 @@
 
   // Two genuinely separate confirmations, chained -- for an action too destructive for even the
   // usual single confirm (Projects tab's "Delete all"). The second dialog only ever opens once
-  // the first is confirmed; declining either resolves false.
+  // the first is confirmed; declining either resolves false. Pass requireChecked/requireText in
+  // secondOpts to make that second step a deliberate gate (tick + type a word), not one more click.
   window.asraConfirmTwoStep = function (firstOpts, secondOpts) {
     return window.asraConfirm(firstOpts).then(function (confirmed) {
       return confirmed ? window.asraConfirm(secondOpts) : false;

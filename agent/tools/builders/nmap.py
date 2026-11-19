@@ -19,7 +19,26 @@ _OS_GUESS_PATTERN = re.compile(r"^Aggressive OS guesses:\s*(?P<text>.+)$", re.MU
 
 def build_nmap_command(params: dict) -> list[str]:
     target = validate_target(params["target"])
-    command = ["nmap", "-F", "-sV", target]
+    # -Pn (skip host-discovery ping, assume the host is up and go straight to port scanning) used
+    # to only get added via a wasted-then-corrected retry cycle, discovered fresh on every single
+    # host: a first attempt without it routinely printed "Host seems down" (ICMP is blocked by
+    # nearly every cloud provider/CDN-fronted host on the public internet -- the NORM for a recon
+    # target, not a rare edge case) and got zero port-scan coverage, then a corrected retry added
+    # -Pn and actually scanned. Confirmed live (Telenor-Sweden-YesWeHack rescan session): this cost
+    # roughly 30+ extra seconds per host, on EVERY host, across a mass-subdomain recon sweep, for
+    # an outcome ("add -Pn") that's already known ahead of time rather than genuinely discovered.
+    # -Pn as the base default trades a slightly slower result against a host that's genuinely down
+    # (nmap probes its ports directly instead of a quick ping-fail) for never paying this tax on
+    # the overwhelmingly common case of a reachable host that merely blocks ICMP.
+    command = ["nmap", "-Pn", "-F", "-sV", target]
+    # Caller-supplied marker (agent/core.py's recon execute() closure) -- set once this exact
+    # host's OS is already confidently known, either carried over from an earlier rescan pass or
+    # recorded minutes earlier this same pass under one of its other DNS identities (its hostname
+    # vs. its own resolved IP). Redoing a ~30s raw-socket OS fingerprint for zero new information
+    # is exactly the other half of the same real incident -Pn above fixes. Skipping it here also
+    # means there's no reason to escalate via sudo at all -- that privilege exists solely for -O.
+    if params.get("_skip_os_detection"):
+        return command
     # -O (TCP/IP stack fingerprinting) needs raw sockets, which needs root — nmap hard-fails the
     # ENTIRE scan (not just OS detection) when asked for it without that privilege, so only add
     # the flag when this invocation can actually use it. --osscan-guess widens the match instead
@@ -35,39 +54,6 @@ def build_nmap_command(params: dict) -> list[str]:
         # existed, just without -O, never a hard failure.
         command = ["sudo", "-S", *command, "-O", "--osscan-guess"]
     return command
-
-
-_HOST_SEEMS_DOWN_MARKER = "Host seems down"
-
-
-def retry_nmap_with_pn_if_host_seemed_down(command: list[str], result: dict) -> list[str] | None:
-    """nmap's own default host-discovery ping is routinely blocked by a firewall/CDN (ICMP is
-    dropped by nearly every cloud provider/Cloudflare-fronted host) — when that happens nmap does
-    NOT fail (exit_code 0, a normal "ok" result), it silently skips ALL port scanning and prints
-    "Note: Host seems down. If it is really up, but blocking our ping probes, try -Pn". Confirmed
-    live: two real, independently-reachable hosts (one shared between two subdomains of the same
-    target, both had genuine successful http_request hits elsewhere in the same session)
-    got ZERO port-scan coverage this way, and the model correctly recognized the exact fix nmap's
-    own output was suggesting but had no way to act on it (no extra_args/flag passthrough exists in
-    nmap's schema at all). One silent, automatic retry with -Pn closes this without needing the
-    model to somehow special-case a "successful" nmap result. -Pn is inserted right after the real
-    executable token rather than at the end, since build_nmap_command appends -O/--osscan-guess
-    AFTER the target when running as root — the target is not reliably command[-1].
-
-    By the time this runs, agent/tools/runner.py's _run_subprocess has already overwritten
-    command[executable_index] with the tool's fully resolved path (a {TOOL}_PATH override or a
-    plain shutil.which result, e.g. "/usr/bin/nmap") for the real dispatch that already happened —
-    the literal "nmap" token build_nmap_command put there no longer exists in this list by retry
-    time, so it must be located the same way runner.py itself locates it: index 0, or index 2 right
-    after a ["sudo", "-S"] prefix (the same prefix build_nmap_command adds for a privileged
-    invocation via a saved sudo password) — never by searching for the bare name.
-    """
-    if "-Pn" in command:
-        return None  # already retried once this call, never loop further
-    if _HOST_SEEMS_DOWN_MARKER not in (result.get("stdout") or ""):
-        return None
-    nmap_index = 2 if command[:2] == ["sudo", "-S"] else 0
-    return [*command[:nmap_index + 1], "-Pn", *command[nmap_index + 1:]]
 
 
 def retry_nmap_without_os_detection_on_timeout(command: list[str]) -> list[str] | None:

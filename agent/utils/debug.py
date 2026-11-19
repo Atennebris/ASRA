@@ -19,6 +19,7 @@ Nothing here writes into this repo's own data/ directory anymore — debug outpu
 user reads (this session's own request, after `data/debug.log` growing forever in the app's own
 install folder was flagged as clutter), so it lives in Documents like project folders already did.
 """
+import contextlib
 import contextvars
 import logging
 import os
@@ -67,6 +68,10 @@ CATEGORY_COLORS: dict[str, str] = {
     # Python process/session exists (WSL distro discovery, waiting for the backend's port).
     "LIBRARY": "\033[38;5;141m",  # light purple — distinct from every other category, source
     # upload/normalization/LLM-extraction activity (agent/tools/library_store.py)
+    "PROFILE": "\033[38;5;215m",  # light orange/peach — distinct from every other category, the
+    # main-agent operator profile load/save (agent/operator_profile_store.py)
+    "SCHEDULER": "\033[38;5;49m",  # spring green — distinct from every other category, the
+    # unattended repeat-scan scheduler (agent/tools/schedule_store.py + main.py's worker loop)
 }
 _RESET = "\033[0m"
 _FALLBACK_COLOR = "\033[37m"  # white, for a category missing from CATEGORY_COLORS
@@ -93,8 +98,39 @@ current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 current_subagent_label: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_subagent_label", default=None)
 
 
+@contextlib.contextmanager
+def session_log_scope(session_id: str | None):
+    """Pins debug-log file routing to `session_id` for the duration of the block.
+
+    _SessionAwareFileHandler.emit routes every line purely by the ambient current_session_id
+    ContextVar. Code that logs ABOUT a known session but runs outside that session's own run scope
+    (the toolkit traffic proxy/racer/repeater, which live on long-running tasks and never set the
+    ContextVar themselves) would otherwise have its line filed under whatever session happened to
+    be current on that task -- so one engagement's captured traffic landed in another engagement's
+    project-folder debug.log, defeating the per-project trail. Wrapping the log emission in this
+    scope, keyed on the record's OWN session_id, guarantees the line goes where its content belongs.
+    A None session_id scopes to the global app log, matching an absent ContextVar."""
+    token = current_session_id.set(session_id)
+    try:
+        yield
+    finally:
+        current_session_id.reset(token)
+
+
 def is_debug_enabled() -> bool:
     return os.getenv("DEBUG", "false").strip().lower() in ("1", "true", "yes")
+
+
+def debug_log_polls() -> bool:
+    """Whether the recurring every-N-seconds UI poll traffic is logged like any other event.
+
+    The page polls a handful of partial routes (active-session, interactive-findings, the RE
+    triage tabs/control bar) roughly once a second each; with DEBUG on, every one of those used to
+    emit an htmx-request + htmx-response UI line AND a server-side `api:` line, several per second,
+    which buried the actual agent/tool/LLM activity the debug console exists to show. Off by default
+    so the log reads as real work; set DEBUG_LOG_POLLS=true to restore the firehose when diagnosing
+    the polling/htmx layer itself. A genuinely failing poll (htmx-error) is always logged regardless."""
+    return os.getenv("DEBUG_LOG_POLLS", "false").strip().lower() in ("1", "true", "yes")
 
 
 def _session_folder() -> Path | None:

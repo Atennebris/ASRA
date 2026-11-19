@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import difflib
 import fnmatch
 import ipaddress
 import json
@@ -63,6 +64,7 @@ from agent.llm_client import (
     ProviderConfig,
     ToolCallRequest,
     current_backoff_accumulator,
+    current_retry_progress_sink,
     describe_response_origin,
     get_fallback_chain,
     get_fallback_chain_enabled,
@@ -71,7 +73,10 @@ from agent.llm_client import (
     stamp_response_origin,
 )
 from agent.providers.models_dev import get_model_cost
+from agent.operator_profile_store import get_approval_severities, load_operator_profile
+from agent import reliability_settings
 from agent.settings import get_secondary_verification_provider, load_llm_settings
+from agent.verification_status import derive_verification_status
 from agent.prompts import (
     ANALYZE_PROMPT,
     CHAIN_PROMPT,
@@ -90,7 +95,22 @@ from agent.prompts import (
     REVERIFY_PROMPT,
     SKEPTICAL_VERIFICATION_PROMPT,
     VALIDATE_PROMPT,
+    condense_for_weak_model,
 )
+# build_re_triage_prompt/build_re_chat_prompt let the RE prompts adapt to the detected target
+# shape. Imported defensively: this working copy is routinely edited by several concurrent sessions
+# at once, so these may not be present in agent/prompts.py at the exact moment this module is
+# imported here. A hard `from agent.prompts import build_re_triage_prompt` would then break EVERY
+# running session's import of agent.core, not just this one -- the fallback keeps the static prompts
+# working until the real shape-aware builders land, and is a transparent no-op once they do.
+try:
+    from agent.prompts import build_re_chat_prompt, build_re_triage_prompt
+except ImportError:  # pragma: no cover -- only taken before the shape-aware builders exist
+    def build_re_triage_prompt(target_shape=None):
+        return RE_TRIAGE_PROMPT
+
+    def build_re_chat_prompt(target_shape=None):
+        return RE_CHAT_PROMPT
 from agent.tools.allowed_targets import authorize_exploit_targets, extract_hostname, is_target_allowed, is_target_out_of_scope
 from agent.tools.background_jobs import await_all_running_jobs, kill_all_running_jobs
 from agent.tools.browser_manager import get_browser_manager, interpret_browser_navigate_permanent_failure
@@ -101,7 +121,8 @@ from agent.tools.builders.binwalk import parse_binwalk_output
 from agent.tools.builders.qiling import parse_qiling_output
 from agent.tools.builders.adb import parse_adb_output
 from agent.tools.builders.dalfox import parse_dalfox_output
-from agent.tools.builders.validators import validate_scope_entry
+from agent.tools.builders.nikto import parse_nikto_output
+from agent.tools.builders.validators import coerce_arguments_to_schema, validate_scope_entry
 from agent.tools.builders.discovered import get_tool_help
 from agent.tools.builders.exploit import parse_exploit_output, parse_msf_module_search
 from agent.tools.builders.ffuf import interpret_ffuf_failure, parse_ffuf_output
@@ -116,6 +137,7 @@ from agent.tools.builders.nuclei import interpret_nuclei_failure, parse_nuclei_o
 from agent.tools.builders.osv_scanner import parse_osv_scanner_output
 from agent.tools.builders.radare2 import parse_radare2_output
 from agent.tools.builders.radiff2 import parse_radiff2_output
+from agent.tools.builders.re_target import RE_TARGET_TOOLSETS, describe_directory_target
 from agent.tools.builders.semgrep import parse_semgrep_output
 from agent.tools.builders.sigrok_cli import parse_sigrok_cli_output
 from agent.tools.builders.slither import parse_slither_output
@@ -129,7 +151,7 @@ from agent.tools.builders.wpscan import interpret_wpscan_timeout, parse_wpscan_o
 from agent.tools.cache import cache_get, cache_set
 from agent.tools.discovery import interpret_httpx_failure
 from agent.tools.js_fingerprint import run_js_fingerprint
-from agent.tools.native import _derive_plan_status, _VALID_SEVERITIES, classify_ip_role, geoip_lookup, interpret_arjun_crash, interpret_arjun_failure, interpret_github_code_search_permanent_failure, interpret_missing_identity, interpret_permanent_connection_refusal, interpret_ssl_cert_info_failure, register_discovered_credential, version_is_ruled_out
+from agent.tools.native import _derive_plan_status, _normalize_false_positive_reason, _VALID_SEVERITIES, classify_ip_role, geoip_lookup, interpret_arjun_crash, interpret_arjun_failure, interpret_github_code_search_permanent_failure, interpret_missing_identity, interpret_permanent_connection_refusal, interpret_ssl_cert_info_failure, register_discovered_credential, version_is_ruled_out
 from agent.tools.notifications import notify_high_severity_finding, notify_session_ended
 from agent.tools import playbook_store, tool_memory_store
 
@@ -250,6 +272,15 @@ _PROGRESS_RECORDING_TOOLS = frozenset(
     {"record_finding", "record_target_profile", "record_hypothesis", "resolve_hypothesis", "record_technique"}
 )
 
+# Substantive RE analysis tools whose SUCCESSFUL, non-duplicate output materially advances a triage
+# pass even when the model hasn't (yet) recorded a finding/hypothesis/profile fact for it -- a
+# decompile of a new function, a custom analysis script that actually ran. Counting one of these as
+# progress stops the no-progress stall guard from cutting a pass that IS doing real work but is
+# slow to record it, the exact "productive-but-silent pass gets cut with 'recorded nothing'"
+# complaint. Kept narrow and gated on a NON-duplicate signature (see the stall loop) so re-running
+# the identical call over and over still counts as spinning, not progress.
+_RE_ANALYSIS_PROGRESS_TOOLS = frozenset({"custom_re_script", "radare2", "ghidra"})
+
 # Tool-result fields that mean "a deterministic check in agent/tools/native.py already confirmed a
 # real vulnerability" (see http_request's detectors) — any one of these firing gets a loud hint
 # injected into the tool result, not just left for the model to maybe notice on its own.
@@ -290,6 +321,7 @@ _OUTPUT_PARSERS: dict[str, Callable[[str], object]] = {
     "nmap": parse_nmap_output,
     "nuclei": parse_nuclei_output,
     "dalfox": parse_dalfox_output,
+    "nikto": parse_nikto_output,
     "exploit": parse_exploit_output,
     "msf_module_search": parse_msf_module_search,
     "sqlmap": parse_sqlmap_output,
@@ -429,6 +461,11 @@ _FINDING_DEFAULTS = {
     # the underlying CVE record itself carried a real NVD/CIRCL CVSS vector -- None for a finding
     # with no CVSS data attached at all, never a fabricated placeholder.
     "cvss_vector": None,
+    # Where cvss_vector came from: "agent" (the model's own assessment of a confirmed finding, via
+    # record_finding) or "cve" (lifted from a CVE record by the cve_lookup auto-record path). Lets
+    # the UI distinguish an agent-assessed score from a borrowed CVE severity -- None whenever no
+    # vector is attached, or for an older session from before this field existed.
+    "cvss_source": None,
     # Set by record_finding's own optional "host" (main.py's Map tab attack-surface graph places a
     # finding on its host node by this field) -- None for a finding recorded before this field
     # existed, or one the model genuinely didn't tie to a specific host; renders as "unlocated"
@@ -1013,7 +1050,7 @@ def _toolkit_tool_extras() -> list[ToolSpec]:
     return [spec for spec in (get_tool(name) for name in names) if spec is not None]
 
 
-def _custom_tool_extras(category: str | None = None) -> list[ToolSpec]:
+def _custom_tool_extras(category: str | None = None, consumer: str | None = None) -> list[ToolSpec]:
     """Operator-registered "(custom)" tools (Settings -> Tools -> Custom tools,
     agent/tools/custom_tool_runtime.py) that are currently enabled -- appended to every phase's/
     subagent's own tool_specs, same unconditional-extras pattern _toolkit_tool_extras() just above
@@ -1033,7 +1070,7 @@ def _custom_tool_extras(category: str | None = None) -> list[ToolSpec]:
     "re"-only custom tool doesn't leak into an ordinary web-pentest phase, matching how
     get_tools_by_category itself already scopes everything else.
     """
-    specs = build_dynamic_toolspecs()
+    specs = build_dynamic_toolspecs(consumer)
     if category is None:
         return specs
     return [spec for spec in specs if category in categories_of(spec)]
@@ -1197,7 +1234,7 @@ async def _delegate_to_subagent_impl(arguments: dict) -> dict:
     # per-category assembly to filter against (unlike a phase's get_tools_by_category calls
     # below), so this never finds one on its own without this explicit append either (see
     # _custom_tool_extras' own docstring for why that's never automatic).
-    tool_specs += _custom_tool_extras()
+    tool_specs += _custom_tool_extras(consumer="subagent")
 
     llm = _initial_llm_for_subagent(session_id, profile)
     task_id = uuid.uuid4().hex[:12]
@@ -1432,6 +1469,36 @@ def _new_run_context(session: dict, session_id: str, provider_id: str | None) ->
     )
 
 
+def _make_llm_retry_progress_sink(ctx: "RunContext") -> Callable[[int, int, float], None]:
+    """A retry-progress sink (agent/llm_client.current_retry_progress_sink) that surfaces provider
+    retry/backoff activity to the operator, so a session sitting in a long 429/5xx backoff shows
+    "Reconnecting to provider ... retry N" instead of a frozen, dead-looking screen (the NVIDIA-503
+    freeze). Only acts on a real RETRY (attempt > 1) -- the first-attempt call fires on EVERY LLM
+    request and must stay write-free -- and writes via reload_merge_save because it runs on the LLM
+    worker thread, never touching ctx.session directly. The notice is deliberately NOT mirrored onto
+    ctx.session, so the next ordinary ctx.session save (every tool-call log) clears it again once the
+    call succeeds -- it lives only for the duration of the backoff the operator would otherwise stare
+    at. It also refreshes last_heartbeat_at so the stale-"processing" self-heal (main.py) can tell a
+    run that's merely waiting on a slow provider from one that was truly abandoned."""
+    def _sink(attempt: int, total_attempts: int, wait_seconds: float) -> None:
+        if attempt <= 1:
+            return
+        provider_id = getattr(ctx.llm, "provider_id", "?")
+        wait_clause = f", waiting {wait_seconds:.0f}s" if wait_seconds >= 1 else ""
+        notice = f"Reconnecting to LLM provider '{provider_id}' — retry {attempt} of {total_attempts}{wait_clause}…"
+
+        def _apply(fresh: dict) -> None:
+            fresh["llm_retry_notice"] = notice
+            fresh["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+
+        try:
+            _reload_merge_save(ctx.session_id, _apply)
+        except Exception:
+            logger.debug("core: session=%s could not persist LLM retry notice -- ignored", ctx.session_id, exc_info=True)
+
+    return _sink
+
+
 async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
     """The single choke point every LLM call in a session goes through — sub-phase conversations,
     1-step retry corrections, all of it. No cap here: loop/stall protection lives in
@@ -1549,6 +1616,15 @@ async def _llm_complete(ctx: RunContext, messages: list[dict], tools: list[dict]
             ctx.llm = fallback
 
     ctx.iteration_count += 1
+    # Liveness stamp consumed by main.py's stale-"processing" self-heal: set in-memory here (the
+    # next tool-call log save persists it) and refreshed on disk by the retry sink during any long
+    # provider backoff, so a run that's merely waiting is never mistaken for an abandoned one.
+    ctx.session["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    # Surface provider retry/backoff to the operator (task: a 503-backoff freeze looked dead). Set
+    # per call so the sink always reads THIS ctx; it propagates into the asyncio.to_thread worker
+    # the LLM runs in (ContextVars copy across to_thread). No reset token: each _llm_complete call
+    # overwrites it with its own, and it's bound to this session either way.
+    current_retry_progress_sink.set(_make_llm_retry_progress_sink(ctx))
     # ctx.subagent_name is only set on a delegated subagent's own RunContext (see RunContext's
     # docstring) — routing through _subagent_logger here, not just at delegation start/finish, is
     # what makes a subagent's own turns actually distinguishable in the debug console while
@@ -1723,6 +1799,174 @@ def _tool_to_openai_schema(spec: ToolSpec) -> dict:
     }
 
 
+# Upper bound on how many tools a weak/small model is offered at once. A long schema dump is both
+# the biggest token sink and a real source of wrong/confused tool-calls for such a model; env-
+# overridable so an operator can tune it without a code change. Only applied under the weak profile.
+_DEFAULT_WEAK_MODEL_MAX_TOOLS = 14
+
+
+def _weak_model_max_tools() -> int:
+    raw = reliability_settings.raw_setting("WEAK_MODEL_MAX_TOOLS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_WEAK_MODEL_MAX_TOOLS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.debug("core: invalid WEAK_MODEL_MAX_TOOLS=%r, using default %d", raw, _DEFAULT_WEAK_MODEL_MAX_TOOLS)
+        return _DEFAULT_WEAK_MODEL_MAX_TOOLS
+
+
+_DEFAULT_TOOL_NAME_FUZZY_CUTOFF = 0.8
+
+
+def _tool_arg_coercion_enabled() -> bool:
+    """Whether to coerce obvious argument type/shape slips toward each tool's schema before dispatch
+    (TOOL_ARG_COERCION, on by default). Off restores the exact pre-coercion behavior."""
+    return (reliability_settings.raw_setting("TOOL_ARG_COERCION") or "true").strip().lower() == "true"
+
+
+def _tool_name_fuzzy_match_enabled() -> bool:
+    """Whether an unknown tool name gets a 'did you mean X?' hint when it closely matches a real one
+    (TOOL_NAME_FUZZY_MATCH, on by default). Off restores the plain 'unknown tool' error."""
+    return (reliability_settings.raw_setting("TOOL_NAME_FUZZY_MATCH") or "true").strip().lower() == "true"
+
+
+def _tool_name_fuzzy_cutoff() -> float:
+    raw = reliability_settings.raw_setting("TOOL_NAME_FUZZY_CUTOFF")
+    if raw is None or not raw.strip():
+        return _DEFAULT_TOOL_NAME_FUZZY_CUTOFF
+    try:
+        return float(raw)
+    except ValueError:
+        logger.debug("core: invalid TOOL_NAME_FUZZY_CUTOFF=%r, using default %.2f", raw, _DEFAULT_TOOL_NAME_FUZZY_CUTOFF)
+        return _DEFAULT_TOOL_NAME_FUZZY_CUTOFF
+
+
+def _suggest_close_tool_name(name: str, available_names) -> str | None:
+    """Closest real tool name to a model's unknown one (difflib, stdlib -- no extra dependency), or
+    None when nothing is close enough. A hint only; the model still has to re-issue the call itself,
+    never a silent substitution."""
+    matches = difflib.get_close_matches(name, list(available_names), n=1, cutoff=_tool_name_fuzzy_cutoff())
+    return matches[0] if matches else None
+
+
+def _coerce_call_args(ctx: RunContext, phase: str, call: ToolCallRequest, spec: ToolSpec | None) -> dict:
+    """Coerce a tool call's arguments toward its schema when TOOL_ARG_COERCION is on, logging any
+    change. Used at every dispatch site -- the main loop AND the forced-final/terminal-repair paths --
+    so the call that produces a phase's final verdict gets the same cleanup as any other call."""
+    if spec is None or not _tool_arg_coercion_enabled():
+        return call.arguments
+    effective_args, coercion_notes = coerce_arguments_to_schema(
+        call.arguments, spec.parameters_schema or _GENERIC_DISCOVERED_SCHEMA
+    )
+    if coercion_notes:
+        _tools_logger.debug(
+            "core: session=%s %s phase: coerced %r arguments toward schema (%s)",
+            ctx.session_id, phase, call.name, "; ".join(coercion_notes),
+        )
+    return effective_args
+
+
+# Phase-quality signal: beyond the back-to-back-identical stall detector, a model that simply keeps
+# emitting DIFFERENT but still-invalid tool calls (unknown tool, schema violation, args rejected
+# before dispatch) is just as much a dead end -- it quietly burns the whole session budget while no
+# single call repeats often enough to trip the stall guard. These tune a sliding-window invalid-rate
+# that flags such a model to the operator once per phase, env-overridable, defaults under a later GUI.
+_DEFAULT_WEAK_SIGNAL_WINDOW = 10
+_DEFAULT_WEAK_SIGNAL_INVALID_RATE = 0.6
+
+
+def _weak_signal_enabled() -> bool:
+    """Whether to watch for a model producing a high rate of invalid tool calls and flag it once to
+    the operator (WEAK_SIGNAL_ENABLED, on by default). Off restores silent continuation."""
+    return (reliability_settings.raw_setting("WEAK_SIGNAL_ENABLED") or "true").strip().lower() == "true"
+
+
+def _weak_signal_window() -> int:
+    raw = reliability_settings.raw_setting("WEAK_SIGNAL_WINDOW")
+    if raw is None or not raw.strip():
+        return _DEFAULT_WEAK_SIGNAL_WINDOW
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.debug("core: invalid WEAK_SIGNAL_WINDOW=%r, using default %d", raw, _DEFAULT_WEAK_SIGNAL_WINDOW)
+        return _DEFAULT_WEAK_SIGNAL_WINDOW
+
+
+def _weak_signal_invalid_rate() -> float:
+    raw = reliability_settings.raw_setting("WEAK_SIGNAL_INVALID_RATE")
+    if raw is None or not raw.strip():
+        return _DEFAULT_WEAK_SIGNAL_INVALID_RATE
+    try:
+        rate = float(raw)
+    except ValueError:
+        logger.debug("core: invalid WEAK_SIGNAL_INVALID_RATE=%r, using default %.2f", raw, _DEFAULT_WEAK_SIGNAL_INVALID_RATE)
+        return _DEFAULT_WEAK_SIGNAL_INVALID_RATE
+    if not 0 < rate <= 1:
+        logger.debug("core: out-of-range WEAK_SIGNAL_INVALID_RATE=%r, using default %.2f", raw, _DEFAULT_WEAK_SIGNAL_INVALID_RATE)
+        return _DEFAULT_WEAK_SIGNAL_INVALID_RATE
+    return rate
+
+
+def _weak_model_verification_hint_enabled() -> bool:
+    """Whether to point out, once at session start, that a weak primary model with no secondary
+    verification provider configured would especially benefit from one (WEAK_MODEL_VERIFICATION_HINT,
+    on by default). Off restores no such hint. This only prints a recommendation -- it never enables
+    verification, which stays the operator's own opt-in (an extra paid LLM pass per finding)."""
+    return (reliability_settings.raw_setting("WEAK_MODEL_VERIFICATION_HINT") or "true").strip().lower() == "true"
+
+
+def _maybe_recommend_secondary_verification(ctx: RunContext, phase: str) -> None:
+    """At session start, if the primary model looks weak (its profile) and no secondary verification
+    provider is set, write one operator-facing recommendation to the live session log to enable one --
+    a second, stronger model independently re-checking findings is exactly what most offsets a weak
+    primary. Never enables anything and never touches the verification machinery: this is a hint only,
+    emitted once per run before the phase loop begins."""
+    if not _weak_model_verification_hint_enabled():
+        logger.debug("core: session=%s secondary-verification hint disabled (WEAK_MODEL_VERIFICATION_HINT off)", ctx.session_id)
+        return
+    if not getattr(ctx.llm, "weak_profile", False):
+        logger.debug("core: session=%s primary model not weak -- no secondary-verification hint", ctx.session_id)
+        return
+    if get_secondary_verification_provider() is not None:
+        logger.debug("core: session=%s secondary verification already configured -- no hint", ctx.session_id)
+        return
+    message = (
+        "Primary model looks weak or small and no secondary verification provider is configured. "
+        "Enabling one in Settings is especially useful here: a second, stronger model independently "
+        "re-checks each Critical/High finding instead of trusting one weak model's own blind spots."
+    )
+    logger.debug("core: session=%s raising secondary-verification recommendation (weak model, none configured)", ctx.session_id)
+    _append_log(ctx, phase, message, None, "warning", None)
+
+
+def _weak_signal_update(window: list[bool], invalid: bool, window_size: int) -> float | None:
+    """Record one real tool-call attempt's validity in the sliding window (capped at window_size,
+    oldest dropped) and return the current invalid rate once the window is full, else None. The only
+    side effect is the in-place window update, so the hot loop stays thin and this stays testable."""
+    window.append(invalid)
+    if len(window) > window_size:
+        del window[:-window_size]
+    if len(window) < window_size:
+        return None
+    return sum(window) / len(window)
+
+
+def _truncate_tools_for_weak_model(specs: list[ToolSpec], terminal_tool: str | None) -> list[ToolSpec]:
+    """Keep at most WEAK_MODEL_MAX_TOOLS of an already-priority-ordered spec list (plan-reordered
+    upstream, so the front is the most relevant for this turn), but never drop the phase's terminal
+    tool -- the one the model must call to end the phase -- even if it sits in the dropped tail."""
+    limit = _weak_model_max_tools()
+    if len(specs) <= limit:
+        return specs
+    kept = specs[:limit]
+    if terminal_tool and all(spec.name != terminal_tool for spec in kept):
+        terminal_spec = next((spec for spec in specs if spec.name == terminal_tool), None)
+        if terminal_spec is not None:
+            kept = kept[:-1] + [terminal_spec]
+    return kept
+
+
 def _parse_json_response(content: str | None) -> dict | None:
     if not content:
         return None
@@ -1812,7 +2056,8 @@ async def _repair_terminal_tool_reply(
         return None
     spec = specs_by_name[terminal_tool]
     dispatch_started = time.monotonic()
-    result = await execute_tool(spec, call.arguments) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, call.arguments)
+    effective_args = _coerce_call_args(ctx, phase, call, spec)
+    result = await execute_tool(spec, effective_args) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, effective_args)
     duration_ms = (time.monotonic() - dispatch_started) * 1000
     trace.append({"tool": call.name, "arguments": call.arguments, "result": result})
     _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result), describe_response_origin(response))
@@ -2374,13 +2619,34 @@ _HOST_DEAD_FAILURE_THRESHOLD_SINGLE_TOOL = 8
 _HOST_HEALTH_TRACKED_STATUSES = {"ok", "error", "timeout", "failed"}
 
 
+# An RE binary's function can be named either by radare2's symbolic label (fcn.140040d7c) or by its
+# bare address (0x140040d7c) -- the SAME function, two spellings the model mixes freely across
+# calls. Both collapse to a single canonical 0x<hex> key here so per-target bookkeeping (host_health)
+# doesn't track the one function twice. Real incident: a session's host_health held both
+# fcn.140040d7c and 0x140040d7c for one function, double-counting its outcomes.
+# Requires an explicit marker -- a radare2 label prefix (fcn./sym./loc.) OR a bare 0x -- so an
+# ordinary hex-looking hostname with neither (which could be a real host) is left untouched.
+_RE_FUNCTION_REF_RE = re.compile(r"^(?:(?:fcn\.|sym\.|loc\.)(?:0x)?|0x)([0-9a-fA-F]{3,})$")
+
+
+def _normalize_target_token(target: str) -> str:
+    match = _RE_FUNCTION_REF_RE.match(target)
+    if match is not None:
+        return f"0x{match.group(1).lower()}"
+    return target
+
+
 def _extract_target_host(arguments: dict) -> str | None:
     target = arguments.get("target")
     if isinstance(target, list):
         target = target[0] if target else None
     if not isinstance(target, str) or not target.strip():
         return None
-    return extract_hostname(target) or target.strip()
+    target = target.strip()
+    normalized = _normalize_target_token(target)
+    if normalized != target:
+        return normalized
+    return extract_hostname(target) or target
 
 
 def _dead_host_blocked(session: dict, arguments: dict) -> str | None:
@@ -3022,6 +3288,82 @@ def _model_visible_arguments(arguments: dict) -> dict:
     return {k: v for k, v in arguments.items() if not k.startswith("_")}
 
 
+def _dead_end_hint(result: dict, tool_name: str) -> dict:
+    """Adds a plain-language nudge directly onto a terminally-failed tool result, right next to
+    the failure itself -- this dict becomes `json.dumps(result)` straight into the model's own
+    next-turn tool-result message (see this module's own messages.append(...) call near the end of
+    the tool-dispatch loop), so this reaches the model in the exact same breath as the failure,
+    unlike a reminder sitting only in the system prompt thousands of tokens earlier. Real, confirmed
+    gap this fixes (CM-usr_b416f2): record_technique was called zero times across an entire
+    3.5-hour RE session despite a clear candidate (strace_run/wine totally broken for this target),
+    even with the system prompt's own playbook-reuse section already describing this exact trigger
+    in words -- a prompt instruction read once, long before the failure actually happens, is easy
+    to forget by the time it matters. A hint attached to the failure itself is much harder to miss.
+    Deliberately phrased as a conditional nudge ("if this is a confirmed dead end"), not a command
+    -- a single failed call is not by itself proof of a reusable fact, and this must never pressure
+    record_technique(worked=false) into firing on ordinary bad luck (a flaky network blip, a
+    one-off wrong argument) that doesn't actually generalize to future sessions.
+    """
+    return {
+        **result,
+        "playbook_hint": (
+            f"{tool_name} failed and was not retried further. If this is a CONFIRMED dead end for "
+            "this kind of target (not just unlucky timing) -- an approach that genuinely doesn't "
+            "work here -- call record_technique(worked=false) now so future sessions don't repeat it."
+        ),
+    }
+
+
+# Text a solved RE challenge's own output tends to print -- a flag, a "correct"/"congratulations"
+# banner, an "access granted". Deliberately specific phrases, not bare "ok"/"pass"/"win" words that
+# litter ordinary tool output, so this nudge only fires on a genuine solve signal, not noise.
+_SOLVE_MARKER_RE = re.compile(
+    r"flag\{|ctf\{|congratulation|\bcorrect\b|\bwell done\b|access granted|"
+    r"you (?:win|solved|got it)|\bunlocked\b|license (?:valid|accepted)|key (?:is )?(?:valid|accepted|correct)",
+    re.IGNORECASE,
+)
+# RE tools whose SUCCESSFUL output can carry a solve banner worth nudging on -- a script/emulation
+# run that actually executed the target, not a static-analysis read.
+_SOLVE_HINT_TOOLS = frozenset({"custom_re_script", "custom_exploit_run", "strace_run", "qiling_emulate"})
+
+
+def _result_text_blob(result: dict) -> str:
+    """Whatever human-readable text a tool result exposes (stdout/output/raw_output/result) joined
+    into one string for a cheap keyword scan -- never the giant parsed structures, just the fields a
+    solve banner would actually land in."""
+    parts: list[str] = []
+    for key in ("stdout", "output", "raw_output", "result", "note"):
+        value = result.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _solve_hint(result: dict, tool_name: str) -> dict:
+    """The SUCCESS-side counterpart to _dead_end_hint: when a tool result looks like it actually
+    SOLVED the challenge (a flag, a "correct"/"congratulations" banner), attach a nudge telling the
+    model to capture HOW -- record_finding AND record_technique(worked=true) -- so a future session
+    on a similar target reuses the solution instead of re-deriving it. Returns the result unchanged
+    when there's no solve signal, so it's safe to run over every tool result. Serves the north star:
+    the agent gets measurably smarter each session only if real wins are actually captured."""
+    if tool_name not in _SOLVE_HINT_TOOLS or result.get("status") != "ok":
+        return result
+    if not _SOLVE_MARKER_RE.search(_result_text_blob(result)):
+        return result
+    return {
+        **result,
+        "solve_hint": (
+            f"{tool_name} output looks like a SOLVE (a flag/success banner above). Capture it now so "
+            "it isn't lost: call record_finding with the concrete reproduction, AND "
+            "record_technique(worked=true) describing HOW you solved it. If the solve came from a "
+            "concrete command or script YOU ran here, also pass record_technique's `skill` (kind + "
+            "body + interpreter, with {{slots}} for the target-specific bits) so a future session "
+            "reruns it in one call via run_skill instead of re-deriving it -- but only from your own "
+            "command/script, never raw bytes pasted from the target's output."
+        ),
+    }
+
+
 async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict) -> dict:
     """1-Step Retry: runs a tool once; on a genuine failure, asks the model for exactly one
     corrected set of arguments and retries once more. A second failure is marked "failed" and
@@ -3067,6 +3409,19 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
                 f"real signal) actually shows a {required} technology token for this host."
             ),
         }
+
+    if spec.name == "wpscan":
+        # Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session):
+        # build_wpscan_command's own --update default (refreshes WPScan's LOCAL vulnerability
+        # database, a single global file, not a per-host resource) ran again on every single
+        # WordPress host a scan touched -- N hosts paid the full update cost N times in the same
+        # session for a database that was already current after the first one. One update per
+        # session is enough; agent/tools/builders/wpscan.py's own `_wpscan_skip_update` marker
+        # switches every call after the first to --no-update instead.
+        if ctx.session.get("_wpscan_db_updated"):
+            arguments = {**arguments, "_wpscan_skip_update": True}
+        else:
+            ctx.session["_wpscan_db_updated"] = True
 
     # Server-side-injected fields — never exposed in any tool's JSON schema, so the model can
     # neither see nor override them, and applied again below to the corrected retry call so a
@@ -3246,11 +3601,50 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
     # the main tool loop's own next turn still gets a fresh chance via native tool-calling, which
     # handles the escaping correctly (that's how this class of tool actually recovers today).
     if any(isinstance(v, str) and "\n" in v for v in model_visible_arguments.values()):
+        # The corrected retry is skipped either way (a plain-text JSON correction can't reliably
+        # re-escape a multi-line argument -- see this block's own comment above), but the REASON
+        # logged must match the ACTUAL failure. Only an original SCHEMA/parse violation
+        # (never_dispatched: build_command rejected the arguments before anything ran) is genuinely
+        # about escaping. The common case here is an ordinary runtime error on a tool that DID run
+        # (custom_re_script hitting BrokenPipeError / a read-only /tmp / a BadZipFile) -- claiming
+        # "can't escape this reliably" for that misled past log reviews into chasing an escaping bug
+        # that was never there, so log the tool's real error instead.
+        if original_never_dispatched:
+            _log_agent_debug(
+                ctx, "tool=%s failed (%s) on a schema violation with a multi-line argument -- "
+                "skipping the plain-text corrected retry (it can't escape this reliably), marking failed",
+                spec.name, result.get("status"),
+            )
+        else:
+            _log_agent_debug(
+                ctx, "tool=%s failed (%s): %s -- not retried (a plain-text corrected retry can't "
+                "re-escape its multi-line argument), marking failed",
+                spec.name, result.get("status"), _log_error(result),
+            )
+        failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
+        _track_host_health(ctx, arguments, failed_result)
+        _track_tool_memory(ctx, failed_result)
+        return failed_result
+    # Real, confirmed incident this fixes (CM-usr_b416f2): the correction call further below asked
+    # the model to "fix" a bare timeout -- {"status": "timeout", ...} carries no stdout/stderr/
+    # exit_code at all, nothing diagnostic for a correction to actually react to -- and it came back
+    # with trace_categories: ["syscall"], a value simultaneously the wrong TYPE (a list, not the
+    # required comma-separated string) and not even in the tool's own allowlist: objectively worse
+    # than leaving the field absent, which would have used the tool's own correct default. A guard
+    # further below used to catch this AFTER the fact (skip RE-DISPATCHING when the "corrected"
+    # arguments came back unchanged) -- but that still paid for the correction LLM call and still
+    # risked exactly this kind of hallucinated-worse-than-default value reaching a real retry.
+    # Skipping the correction call entirely for a bare timeout is strictly safer: every incident
+    # ever observed from asking it to react to one (nmap against a dead host, nuclei's make-believe
+    # "extra_headers" field, and now this) ends the same way -- either an unchanged, guaranteed-
+    # identical retry, or a changed-but-invalid one. Any OTHER retryable status ("error", with real
+    # stderr/exit_code to react to) still goes through the normal correction path below.
+    if result.get("status") == "timeout":
         _log_agent_debug(
-            ctx, "tool=%s failed (%s) with a multi-line argument -- skipping the plain-text "
-            "corrected retry (it can't escape this reliably), marking failed", spec.name, result.get("status"),
+            ctx, "tool=%s failed (timeout) -- no diagnostic signal for a correction call to react "
+            "to, marking failed without asking for one", spec.name,
         )
-        failed_result = {**result, "status": "failed"}
+        failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
         _track_host_health(ctx, arguments, failed_result)
         _track_tool_memory(ctx, failed_result)
         return failed_result
@@ -3319,7 +3713,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         corrected_arguments = corrected
     else:
         _log_agent_debug(ctx, "tool=%s retry correction unparsable even after a repair attempt, giving up", spec.name)
-        failed_result = {**result, "status": "failed"}
+        failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
         _track_host_health(ctx, arguments, failed_result)
         _track_tool_memory(ctx, failed_result)
         return failed_result
@@ -3338,57 +3732,16 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         _log_agent_debug(ctx, "tool=%s retry skipped, target=%r matches an out-of-scope entry", spec.name, retry_out_of_scope_hit)
         return {"status": "skipped", "tool": spec.name, "reason": f"target {retry_out_of_scope_hit!r} is explicitly out of scope for this project", "retried": True}
 
-    # Real, confirmed incident this fixes (midnight-usr_24ba7e): a bare "timeout" status
-    # (runner.py's own subprocess.TimeoutExpired path, {"status": "timeout", ...} with no stdout/
-    # stderr/exit_code at all -- unlike "error", there is nothing diagnostic here for a correction
-    # call to react to) against a genuinely unresponsive host got a correction reply with arguments
-    # BYTE-IDENTICAL to the ones that had just timed out (`{"target": "5.252.32.97"}` verbatim) --
-    # there was nothing to correct, nmap's own schema exposes only `target` (see
-    # retry_nmap_with_pn_if_host_seemed_down's own docstring), so the model had no lever to pull at
-    # all. Re-dispatching the identical command against the same dead host burned a second full
-    # TOOL_TIMEOUT_SECONDS (confirmed live: duration_ms=1237347, ~2x the real .env's
-    # TOOL_TIMEOUT_SECONDS=600) for a guaranteed-identical second timeout. Skip the re-dispatch (not
-    # the correction call itself -- a genuinely different corrected target/arguments is still worth
-    # running) whenever the original failure was a timeout AND the "corrected" arguments came back
-    # unchanged; any other retryable status (a real "error" with actual stderr to react to) or any
-    # real argument change still goes through the normal retry dispatch below.
-    #
-    # Real, confirmed incident this ALSO fixes (Live-Nation-HackerOne-usr_0f5c71): the plain
-    # `retry_arguments == arguments` comparison above missed the exact case it exists for when the
-    # model tacks on a field that isn't one of this tool's own real parameters at all (nuclei has no
-    # "extra_headers" param -- build_nuclei_command never reads it, only the server-injected
-    # "_extra_headers"). The correction prompt above truthfully tells the model nuclei's real
-    # parameter names (schema_hint), so a well-behaved correction correctly drops that make-believe
-    # field -- which made the dicts compare unequal even though the ACTUAL command that would be
-    # dispatched is byte-identical (confirmed live: both attempts' logged argv matched exactly, down
-    # to the injected -H header). The guard never fired, and nuclei re-ran the identical doomed scan
-    # against the same target/tags, burning a second full TOOL_TIMEOUT_SECONDS for nothing -- twice
-    # in one real session (www.royalarena.dk and www.ticketmaster.com, ~40 real minutes total with
-    # zero nuclei results). Comparing only the keys that are actually part of this tool's own
-    # parameters_schema (schema_properties, already computed above for the correction hint) ignores
-    # any such make-believe field on either side, so a cosmetic difference like this can no longer
-    # defeat a guard built specifically to catch "nothing that could affect the real command actually
-    # changed, don't re-run it." Falls back to comparing the full dicts for a schema-less discovered
-    # tool (schema_properties empty, e.g. httpx/whatweb) -- filtering by an empty schema would
-    # wrongly treat every such tool's retry as "unchanged", which is not this fix's job.
-    def _schema_relevant_only(args: dict) -> dict:
-        return {k: v for k, v in args.items() if k in schema_properties} if schema_properties else args
-
-    if result.get("status") == "timeout" and _schema_relevant_only(retry_arguments) == _schema_relevant_only(arguments):
-        _log_agent_debug(
-            ctx, "tool=%s retry arguments identical to the ones that just timed out — skipping a "
-            "second, guaranteed-identical timeout wait instead of re-dispatching", spec.name,
-        )
-        failed_result = {
-            **result,
-            "status": "failed",
-            "error": "1-Step Retry gave identical arguments after a bare timeout (nothing to correct) — not re-run to avoid a second, guaranteed-identical timeout wait",
-            "retried": True,
-        }
-        _track_host_health(ctx, retry_arguments, failed_result)
-        _track_tool_memory(ctx, failed_result)
-        return failed_result
-
+    # NOTE: a bare-timeout correction guard used to live here (real incidents it closed:
+    # midnight-usr_24ba7e's nmap-against-a-dead-host retry, and Live-Nation-HackerOne-usr_0f5c71's
+    # nuclei retry defeating a naive equality check via a make-believe "extra_headers" field) --
+    # removed as dead code once the earlier bare-timeout check above (this function, "no
+    # diagnostic signal for a correction call to react to") started returning BEFORE this point for
+    # every status=="timeout" case, which is the only status this guard ever fired for. Both
+    # incidents' lessons (never re-dispatch an unchanged/cosmetically-unchanged retry after a bare
+    # timeout; compare by the tool's real schema keys, not raw dict equality, when a correction
+    # is ever compared again for some other retryable status) still apply if a similar comparison
+    # is ever needed for "error" below -- see this function's own git history for the removed code.
     retry_result = _apply_output_parser(spec, await _dispatch_tool_interruptible(ctx, spec, retry_arguments), retry_arguments)
     if retry_result.get("status") in _RETRYABLE_STATUSES:
         original_retry_status = retry_result.get("status")
@@ -3401,6 +3754,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
             # _log_error's own fallback chain (error/stderr/reason) had nothing left to read.
             retry_result["error"] = f"retry attempt itself ended with status={original_retry_status!r}"
         retry_result["status"] = "failed"
+        retry_result = _dead_end_hint(retry_result, spec.name)
     else:
         _log_agent_debug(ctx, "tool=%s retry succeeded", spec.name)
     retry_result["retried"] = True
@@ -3784,6 +4138,16 @@ async def _run_llm_tool_loop_impl(
     LLM round-trip paid on top of nearly every finding evaluated. The free-text JSON path stays as
     a fallback for the rare turn where the model answers in prose instead of calling the tool.
     """
+    # A weak/small model is driven with a condensed, more directive form of the system prompt --
+    # the full strong-model-sized text both burns its small context and reads as less directive.
+    weak_profile = bool(getattr(ctx.llm, "weak_profile", False))
+    if weak_profile:
+        condensed_prompt = condense_for_weak_model(system_prompt)
+        _log_agent_debug(
+            ctx, "core: %s phase: weak-model profile active, condensed system prompt %d -> %d chars",
+            phase, len(system_prompt), len(condensed_prompt),
+        )
+        system_prompt = condensed_prompt
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": task_content},
@@ -3804,6 +4168,11 @@ async def _run_llm_tool_loop_impl(
     # succeeds, so a pass that keeps recording real state never trips it no matter how many calls it
     # takes; it only fires on a genuine record-nothing spin.
     calls_since_progress = 0
+    # Signatures of substantive RE analysis calls (see _RE_ANALYSIS_PROGRESS_TOOLS) already credited
+    # as progress this pass -- a NEW one (a decompile of a different function, a different analysis
+    # script) counts as real progress and resets the stall counter, but re-running the identical
+    # call does not, so spinning on one call still trips the guard.
+    credited_analysis_signatures: set[str] = set()
     # Only consulted when max_tool_calls is set -- counts every dispatched tool call across the
     # WHOLE pass (unlike recent_call_signatures' stall detection, which only cares about identical
     # back-to-back repeats). See max_tool_calls' own docstring on _run_llm_tool_loop for the real
@@ -3826,6 +4195,17 @@ async def _run_llm_tool_loop_impl(
     # declared-continuation branch below (_looks_like_a_declared_continuation) for the real
     # incident this guards against.
     continuation_reinforced = False
+    # Phase-quality signal state (see _weak_signal_*): a sliding window of whether each real tool-call
+    # attempt this phase was model-invalid, plus a one-shot latch so the operator is warned at most once.
+    weak_signal_window: list[bool] = []
+    weak_signal_emitted = False
+    # Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): this debug
+    # line used to print on literally every real tool-call attempt once the window filled, even
+    # while the rate stayed flat at a healthy 0% for an entire hour (169 identical lines) -- a
+    # human skimming debug.log for "why is this stuck" sees what looks like a retry loop and is
+    # actually just a quiet, correctly-inert health check. Logging only on an actual change keeps
+    # the signal (the rate moved, or crossed the threshold) without the noise.
+    last_logged_invalid_rate: float | None = None
 
     while True:
         elapsed = time.monotonic() - phase_started_at
@@ -3903,6 +4283,14 @@ async def _run_llm_tool_loop_impl(
         # tool_specs itself (the base list) never changes across turns, only which of its entries
         # get promoted/labeled, so this is cheap (a plain reorder over an already-small list).
         current_tool_specs = _apply_plan_recommendations(tool_specs, ctx.session, plan_phase) if plan_phase else tool_specs
+        if weak_profile:
+            trimmed = _truncate_tools_for_weak_model(current_tool_specs, terminal_tool)
+            if len(trimmed) != len(current_tool_specs):
+                _log_agent_debug(
+                    ctx, "core: %s phase: weak-model profile active, trimmed tool menu %d -> %d",
+                    phase, len(current_tool_specs), len(trimmed),
+                )
+            current_tool_specs = trimmed
         tools_schema = [_tool_to_openai_schema(spec) for spec in current_tool_specs]
         specs_by_name = {spec.name: spec for spec in current_tool_specs}
 
@@ -4098,6 +4486,11 @@ async def _run_llm_tool_loop_impl(
         for call_index, call in enumerate(response.tool_calls):
             signature = f"{call.name}:{json.dumps(call.arguments, sort_keys=True)}"
             duration_ms: float | None = None
+            # Phase-quality signal (see _weak_signal_*): only a real attempt -- one that reached tool
+            # resolution, not a batch-duplicate or a guard skip -- counts toward the window; invalid
+            # means a model-caused bad call (unknown tool / args rejected before dispatch / schema slip).
+            call_was_attempted = False
+            invalid_model_call = False
             if signature in batch_signatures:
                 result = {
                     "status": "skipped",
@@ -4128,24 +4521,62 @@ async def _run_llm_tool_loop_impl(
                         ),
                     }
                 else:
+                    call_was_attempted = True
                     spec = specs_by_name.get(call.name)
                     if spec is None:
-                        result = {"status": "error", "error": f"unknown tool {call.name!r}"}
+                        invalid_model_call = True
+                        error_text = f"unknown tool {call.name!r}"
+                        if _tool_name_fuzzy_match_enabled():
+                            suggestion = _suggest_close_tool_name(call.name, specs_by_name.keys())
+                            if suggestion:
+                                _tools_logger.debug(
+                                    "core: session=%s %s phase: unknown tool %r closely matches %r -- hinting",
+                                    ctx.session_id, phase, call.name, suggestion,
+                                )
+                                error_text = (
+                                    f"unknown tool {call.name!r} -- did you mean {suggestion!r}? If so, call that "
+                                    "exact tool name; otherwise use one of the tools you were given this turn."
+                                )
+                        result = {"status": "error", "error": error_text}
                     else:
                         dispatch_started = time.monotonic()
+                        effective_args = _coerce_call_args(ctx, phase, call, spec)
                         if execute_tool is not None:
-                            result = await execute_tool(spec, call.arguments)
+                            result = await execute_tool(spec, effective_args)
                         else:
-                            result = await _run_tool_with_retry(ctx, spec, call.arguments)
+                            result = await _run_tool_with_retry(ctx, spec, effective_args)
                         duration_ms = (time.monotonic() - dispatch_started) * 1000
                     if result.get("status") in ("failed", "error"):
                         failed_call_counts[signature] = failed_call_counts.get(signature, 0) + 1
                     if result.get("never_dispatched") or result.get("schema_violation_corrected"):
+                        invalid_model_call = True
                         # Counted whether or not the 1-Step Retry above went on to correct the call
                         # successfully -- see _MAX_SCHEMA_VIOLATIONS_PER_PHASE's own comment for why
                         # a per-violation correction that never carries forward into the model's own
                         # conversation still needs a phase-wide guard against repeating the mistake.
                         never_dispatched_counts[call.name] = never_dispatched_counts.get(call.name, 0) + 1
+
+                    # Phase-quality signal: track the invalid rate over a sliding window of real
+                    # attempts and warn the operator once if a struggling model is burning the budget.
+                    if _weak_signal_enabled() and call_was_attempted and not weak_signal_emitted:
+                        invalid_rate = _weak_signal_update(weak_signal_window, invalid_model_call, _weak_signal_window())
+                        if invalid_rate is not None:
+                            threshold = _weak_signal_invalid_rate()
+                            if invalid_rate != last_logged_invalid_rate:
+                                logger.debug(
+                                    "core: session=%s %s phase: invalid tool-call rate %.0f%% over last %d (threshold %.0f%%)",
+                                    ctx.session_id, phase, invalid_rate * 100, len(weak_signal_window), threshold * 100,
+                                )
+                                last_logged_invalid_rate = invalid_rate
+                            if invalid_rate >= threshold:
+                                weak_signal_emitted = True
+                                weak_signal_message = (
+                                    f"This model is producing an unusually high rate of invalid tool calls "
+                                    f"({invalid_rate * 100:.0f}% of the last {len(weak_signal_window)}) — it may be too "
+                                    "weak for this task; consider a stronger model or enabling secondary verification."
+                                )
+                                logger.debug("core: session=%s %s phase: weak-model signal raised — %s", ctx.session_id, phase, weak_signal_message)
+                                _append_log(ctx, phase, weak_signal_message, None, "warning", None)
 
             if terminal_tool is not None and call.name == terminal_tool and result.get("status") == "ok":
                 unresolved_task_ids = _unresolved_subagent_task_ids(trace)
@@ -4201,7 +4632,18 @@ async def _run_llm_tool_loop_impl(
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)[:_TOOL_RESULT_CHAR_LIMIT]})
 
             if progress_stall_threshold is not None:
-                if call.name in _PROGRESS_RECORDING_TOOLS and result.get("status") == "ok":
+                # A successful, not-yet-seen RE analysis call (decompile of a new function, a fresh
+                # custom script) is real forward progress even before the model records anything --
+                # credit it so a productive-but-silent pass isn't cut as "recorded nothing". Gated on
+                # a brand-new signature so re-running the identical call still counts as spinning.
+                is_fresh_analysis_progress = (
+                    call.name in _RE_ANALYSIS_PROGRESS_TOOLS
+                    and result.get("status") == "ok"
+                    and signature not in credited_analysis_signatures
+                )
+                if is_fresh_analysis_progress:
+                    credited_analysis_signatures.add(signature)
+                if (call.name in _PROGRESS_RECORDING_TOOLS and result.get("status") == "ok") or is_fresh_analysis_progress:
                     calls_since_progress = 0
                 else:
                     calls_since_progress += 1
@@ -4312,7 +4754,8 @@ async def _run_llm_tool_loop_impl(
         if call is not None:
             spec = specs_by_name.get(call.name)
             dispatch_started = time.monotonic()
-            result = await execute_tool(spec, call.arguments) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, call.arguments)
+            effective_args = _coerce_call_args(ctx, phase, call, spec)
+            result = await execute_tool(spec, effective_args) if execute_tool is not None else await _run_tool_with_retry(ctx, spec, effective_args)
             duration_ms = (time.monotonic() - dispatch_started) * 1000
             trace.append({"tool": call.name, "arguments": call.arguments, "result": result})
             _append_log(ctx, phase, response.content, _describe_command(call, result), _log_status(result), _log_error(result), duration_ms, _log_output(result), describe_response_origin(response))
@@ -4406,7 +4849,7 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
     _mark_phase_started(ctx.session, "recon")
     await _maybe_refresh_program_check(ctx)
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tools = get_tools_by_category("recon") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("recon")
+    tools = get_tools_by_category("recon") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("recon", "main_agent")
     # Two independent ways to turn subdomain enumeration on: a per-entry "*.example.com" marker
     # in the scope itself, or the New Project form's "Enumerate subdomains" checkbox (a
     # project-wide equivalent that doesn't need typing "*." on every entry — off by default,
@@ -4481,6 +4924,20 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
                         "real evidence, then nmap it."
                     ),
                 }
+            if isinstance(nmap_target, str) and nmap_target.strip():
+                # Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session):
+                # nmap's -O/--osscan-guess raw-socket OS fingerprint (~30s per host) ran again
+                # against a host whose OS was already confidently known -- either carried over
+                # from an earlier rescan pass (session["recon_result"]["os_guesses"] survives
+                # rescan_session's own carryover, main.py), or recorded minutes earlier this SAME
+                # pass under this host's other DNS identity (its hostname vs. its own resolved
+                # IP, the exact pair _host_dns_identities exists to collapse). Dropping the flag
+                # here is fully deterministic -- build_nmap_command's own `_skip_os_detection`
+                # handling needs no model judgment to act on it.
+                dns_map = ctx.session["recon_result"].get("dns_map", {})
+                os_guesses = ctx.session["recon_result"]["os_guesses"]
+                if _host_dns_identities(nmap_target.strip(), dns_map) & os_guesses.keys():
+                    arguments = {**arguments, "_skip_os_detection": True}
         result = await _run_tool_with_retry(ctx, spec, arguments)
         # A corrected 1-Step Retry can send a different target/domain than the one the model
         # originally called with — bookkeeping below must key off what actually ran, not the
@@ -4521,6 +4978,21 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
                 existing_targets.append(recorded)
                 save_session(ctx.session_id, ctx.session)
                 logger.debug("core: session=%s recon: recorded target host=%r", ctx.session_id, recorded.get("host"))
+                # Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session):
+                # the only code-driven call to _auto_delegate_recon_overflow used to fire once,
+                # after this WHOLE phase already returned -- on an hour-long recon the operator
+                # gave up on and interrupted before it naturally finished, that call never ran at
+                # all, so a subagent never got a chance to help even with hosts found in the
+                # first few minutes. Checking again after every genuinely new target instead lets
+                # a subagent start working a batch of already-discovered overflow hosts WHILE
+                # recon keeps scanning the rest, the moment enough of them exist, rather than only
+                # ever after the fact (or never, on interrupt -- see run_session's own try/except
+                # around this phase for that backstop). Already idempotent
+                # (session["auto_delegated_hosts"] excludes anything already handed off) and
+                # already cheap below threshold (an early-return length check, no subagent work
+                # actually starts) -- calling it this often adds no new risk of double-delegating
+                # or of slowing recon down.
+                await _auto_delegate_recon_overflow(ctx, target, ctx.session["recon_result"])
         elif spec.name == "dns_lookup" and result.get("status") == "ok" and result.get("ips"):
             domain = used_arguments.get("domain")
             if domain:
@@ -4543,6 +5015,15 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
             _apply_updated_plan(ctx, result["recorded"], "recon")
         elif spec.name == "record_hypothesis" and result.get("status") == "ok" and "recorded" in result:
             _persist_new_hypothesis(ctx, result["recorded"], "recon")
+            # Real, confirmed incident this fixes (the same "always and everywhere" gap this
+            # session's own nmap/wpscan fixes closed for overflow HOSTS, now for hypotheses):
+            # _auto_delegate_hypothesis_overflow used to only ever get checked once, at Analyze's
+            # own phase start -- a hypothesis recorded during a long (or interrupted, never-
+            # finished) Recon pass got zero chance at subagent help until Analyze began, which
+            # might be minutes later or, on an interrupt, never at all this pass. Already
+            # idempotent (session["auto_delegated_hypothesis_ids"]) and already cheap when
+            # nothing matches (a keyword-overlap check, no subagent work actually starts).
+            await _auto_delegate_hypothesis_overflow(ctx, target)
         return result
 
     # "target" can be a comma-separated scope (multiple URLs/hosts/IPs from the New Project
@@ -4595,6 +5076,7 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
         )
     task += _out_of_scope_task_addendum(ctx.session)
     task += _out_of_scope_notes_task_addendum(ctx.session)
+    task += _operator_profile_task_addendum()
     task += _custom_instructions_task_addendum(ctx.session)
     task += _goal_task_addendum(ctx.session)
     task += _program_url_task_addendum(ctx.session)
@@ -4608,6 +5090,7 @@ async def _run_recon(ctx: RunContext, target: str) -> dict:
     recon_result = ctx.session["recon_result"]
     logger.debug("core: session=%s recon phase found %d target(s)", ctx.session_id, len(recon_result["targets"]))
     _mark_phase_finished(ctx.session, "recon")
+    _finalize_phase_plan_on_normal_completion(ctx, "recon")
     return recon_result
 
 
@@ -4627,11 +5110,29 @@ _AUTO_DELEGATE_MAX_HOSTS = 10  # a bound on one subagent task's own scope, not a
 _AUTO_DELEGATE_TIMEOUT_PER_HOST_SECONDS = int(os.getenv("SUBAGENT_AUTO_OVERFLOW_TIMEOUT_PER_HOST_SECONDS", "300"))
 
 
+def _host_dns_identities(host: str, dns_map: dict) -> set[str]:
+    """Every known identity (the host itself, plus whichever of its resolved IP/hostname pair
+    dns_map (hostname -> resolved IP list, agent/core.py's _run_recon) records) for one host
+    string -- the same hostname<->IP equivalence the Recon tab template already relies on for its
+    own reverse lookup. Shared by `_dedupe_hosts_by_dns_identity` (a whole host LIST) and the
+    recon execute() closure's own single-host "is this one already known under another name"
+    check before letting nmap redo expensive OS fingerprinting.
+    """
+    identity = {host}
+    resolved_ips = dns_map.get(host)
+    if resolved_ips:
+        identity.update(resolved_ips)
+    else:
+        for hostname, ips in dns_map.items():
+            if host in ips:
+                identity.add(hostname)
+                break
+    return identity
+
+
 def _dedupe_hosts_by_dns_identity(hosts: list[str], dns_map: dict) -> list[str]:
     """Collapses a host list so a hostname and its own resolved IP never count as two DISTINCT
-    hosts, using the same dns_map (hostname -> resolved IP list, agent/core.py's _run_recon) the
-    Recon tab template already relies on for its own hostname<->IP reverse lookup. Keeps the
-    FIRST occurrence of each real, distinct host in `hosts`' own order.
+    hosts. Keeps the FIRST occurrence of each real, distinct host in `hosts`' own order.
 
     Real, confirmed incident this fixes: recon_result["targets"] can record the same physical host
     twice under two different identifiers (a hostname from a whatweb/httpx probe, its own resolved
@@ -4647,20 +5148,129 @@ def _dedupe_hosts_by_dns_identity(hosts: list[str], dns_map: dict) -> list[str]:
     claimed: set[str] = set()
     kept: list[str] = []
     for host in hosts:
-        identity = {host}
-        resolved_ips = dns_map.get(host)
-        if resolved_ips:
-            identity.update(resolved_ips)
-        else:
-            for hostname, ips in dns_map.items():
-                if host in ips:
-                    identity.add(hostname)
-                    break
+        identity = _host_dns_identities(host, dns_map)
         if identity & claimed:
             continue
         claimed.update(identity)
         kept.append(host)
     return kept
+
+
+def _score_profile_for_tools(profile: dict, relevant_tools: set[str]) -> tuple[bool, float, int]:
+    """(has_any_overlap, precision, overlap_count) -- ranked in exactly that order so a narrow
+    specialist whose own toolset is MOSTLY the tools this task needs beats a do-everything
+    generalist that merely happens to also list those same tools among hundreds of others it was
+    never built to focus on.
+
+    Real, confirmed incident this fixes (round 3): the previous (overlap_count, breadth) scoring
+    let raw overlap count alone decide -- and a generalist profile whose allowed_tools is a
+    near-total superset of every real specialist's own list can never score BELOW any specialist on
+    raw intersection size, by construction (every tool a specialist has, the generalist has too,
+    plus hundreds more). Confirmed live (Telenor-Sweden-YesWeHack rescan session): recon overflow's
+    relevant_tools={whatweb, ffuf, wayback_urls, ssl_cert_info} scored the generalist "Default_
+    Subagent_helper" overlap=4 (it lists literally every tool in the registry) against the actual
+    specialist "Recon-Scout" overlap=2 (it only has whatweb/wayback_urls, not ffuf/ssl_cert_info) --
+    the generalist won outright, every single time, across every auto-overflow delegation in that
+    session, with zero specialist ever actually getting picked despite several being enabled. This
+    silently defeated the entire point of round 2's fix (matching task to specialist) on any roster
+    that includes a broad do-everything profile alongside narrower ones -- exactly the common case.
+    Fixed by ranking on PRECISION (what fraction of this profile's own allowed_tools are actually
+    relevant to this task) ahead of raw overlap count: a 10-tool specialist matching 2 of them
+    (precision 0.2) now correctly outranks a 150-tool generalist matching 4 (precision 0.027) --
+    raw overlap only breaks a tie between two profiles that are equally precise."""
+    allowed = set(profile.get("allowed_tools") or [])
+    if not allowed:
+        return (False, 0.0, 0)
+    overlap = len(allowed & relevant_tools)
+    return (overlap > 0, overlap / len(allowed), overlap)
+
+
+def _best_matching_profile_overlap(profiles: list[dict], relevant_tools: set[str]) -> int:
+    """How many of relevant_tools the BEST-fitting enabled profile actually has. 0 means not one
+    enabled profile has any tool this specific task actually needs — i.e. picking among them would
+    just be the old breadth-only tie-break with nothing real behind the choice, which callers that
+    only want a genuine, named-specialist fit (see _auto_delegate_hypothesis_overflow) use to decide
+    whether to delegate at all rather than forcing a task onto an unrelated profile."""
+    if not relevant_tools:
+        return 0
+    return max(len(set(p.get("allowed_tools") or []) & relevant_tools) for p in profiles)
+
+
+def _pick_overflow_subagent_profile(profiles: list[dict], relevant_tools: set[str] | None = None) -> str:
+    """Picks which enabled Subagent profile an auto-overflow delegation (no model choice involved —
+    see the four _auto_delegate_*_overflow functions below) hands the task to.
+
+    Real, confirmed incident this fixes (round 1): every one of them used to take profiles[0]
+    unconditionally — whichever profile happens to sit first in data/subagent_profiles.json, an
+    accident of storage order with zero relationship to the task. Fixed by tie-breaking on the
+    widest allowed_tools list instead — deterministic, order-independent.
+
+    Real, confirmed gap this fixes (round 2): on a roster where the generalist profile already
+    happens to have the widest toolset, round 1's fix picked exactly the same profile the original
+    profiles[0] bug already happened to land on — nothing about WHICH profile got the work actually
+    changed for that session. `relevant_tools`, when given, is the real, fixed set of tool names
+    this specific task actually needs (e.g. a SQLi hypothesis's sqlmap/send_raw_request/
+    diff_requests) — the profile with the most genuine overlap wins, breadth only breaking a tie
+    between two profiles that are equally relevant. This is what lets a real, narrow, ENABLED
+    specialist (SQLi-Verifier, Secrets-Exposure, etc.) actually get picked for the task it was built
+    for, instead of breadth always winning regardless of fit. None/empty (a batch of several hosts
+    or lower-priority findings with no one obvious tool domain — the common case for the broad
+    recon/analyze overflow batches) falls back to the old breadth-only tie-break unchanged.
+
+    Real, confirmed gap this fixes (round 3): round 2's own "most genuine overlap wins" was still
+    raw overlap COUNT, which a wide generalist profile wins by construction against any specialist
+    (see _score_profile_for_tools' own docstring) — round 2 never actually changed which profile got
+    picked on a roster that has one. Fixed by ranking on relevance PRECISION instead; see that
+    function for the mechanics.
+    """
+    if relevant_tools:
+        return max(profiles, key=lambda p: _score_profile_for_tools(p, relevant_tools))["name"]
+    return max(profiles, key=lambda p: len(p.get("allowed_tools") or []))["name"]
+
+
+# Keyword -> tool-domain hints, so an auto-overflow batch or a single open hypothesis can be
+# matched to the enabled Subagent profile actually built for that kind of work (agent/tools/
+# subagent_store.py's _SEED_PROFILES), instead of always falling back to "whichever profile has
+# the most tools overall" even when a narrower specialist is the obviously better fit. Each
+# entry's tool names are exactly one seed specialist's own allowed_tools — kept in sync by hand on
+# purpose: these are fixed, well-known tool domains, not something worth deriving at runtime.
+_TASK_KEYWORD_TOOL_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("sql injection", "sqli", "sql error", "union select", "blind sql"),
+     ("sqlmap", "send_raw_request", "diff_requests", "intruder_run", "authenticated_request")),
+    (("xss", "cross-site script", "cross site script", "dom-based", "dom based", "reflected script"),
+     ("dalfox", "browser_navigate", "browser_snapshot", "browser_evaluate", "browser_fill", "browser_click", "send_raw_request")),
+    (("secret", "api key", "leaked key", "exposed credential", "hardcoded token",
+      "vulnerable dependency", "known cve", "outdated library", "dependency confusion"),
+     ("trufflehog", "js_bundle_graph", "osv_scanner", "github_code_search", "cloud_bucket_scan", "semgrep")),
+    (("default credential", "weak password", "brute force", "login bypass", "credential stuffing"),
+     ("ffuf", "arjun", "hydra_start", "web_login_bruteforce_start", "default_creds_check")),
+    (("buffer overflow", "binary", "memory corruption", "reverse engineering", "disassembl"),
+     ("radare2", "gdb", "ghidra", "frida_trace", "frida_ps", "qiling_emulate", "strace_run", "binwalk", "native_binary_metadata", "custom_re_script")),
+)
+
+
+def _relevant_tools_for_text(*texts: str) -> set[str]:
+    """Which of _TASK_KEYWORD_TOOL_HINTS' own tool domains this task's own text actually names —
+    the real, concrete stand-in for "read the task and match it to the right specialist by what
+    it's actually about", rather than always reaching for whichever profile merely lists the most
+    tools. Substring keywords, proportionate-not-airtight like _cors_qualifying_conflict's own
+    keyword gate — a missed/over-eager match just falls back to the old breadth-only tie-break
+    (_pick_overflow_subagent_profile's relevant_tools=None path), never a hard failure.
+
+    Real incident this exists because of: _pick_overflow_subagent_profile's round-1 fix (widest
+    allowed_tools) only fixed storage-order fragility — on a roster where the generalist already
+    happens to have the widest toolset, it landed on the exact same profile the original profiles[0]
+    bug already happened to pick, so nothing about WHICH profile did the work actually changed for
+    that session. This is the real task-to-specialist match: a SQLi hypothesis goes to an enabled
+    SQLi-Verifier, a leaked-secret finding goes to an enabled Secrets-Exposure, whenever one of
+    those narrower specialists is actually enabled — not "biggest toolset wins" regardless of fit.
+    """
+    haystack = " ".join(texts).lower()
+    relevant: set[str] = set()
+    for keywords, tools in _TASK_KEYWORD_TOOL_HINTS:
+        if any(keyword in haystack for keyword in keywords):
+            relevant.update(tools)
+    return relevant
 
 
 async def _auto_delegate_recon_overflow(ctx: RunContext, target: str, recon_result: dict) -> None:
@@ -4724,7 +5334,10 @@ async def _auto_delegate_recon_overflow(ctx: RunContext, target: str, recon_resu
         return
 
     batch = candidates[:_AUTO_DELEGATE_MAX_HOSTS]
-    profile_name = profiles[0]["name"]
+    # Fixed set, not keyword-derived -- the task text below always names exactly these four tools,
+    # so Recon-Scout (which has whatweb/wayback_urls, the closest built-in fit) outranks a profile
+    # that merely has more tools overall but none of the ones this specific sweep actually uses.
+    profile_name = _pick_overflow_subagent_profile(profiles, {"whatweb", "ffuf", "wayback_urls", "ssl_cert_info"})
     task_description = (
         f"Recon already confirmed these {len(batch)} secondary hosts are in scope but only got a "
         f"basic port/service scan, nothing deeper: {', '.join(batch)}\n\n"
@@ -5007,6 +5620,58 @@ def _phase_has_started(session: dict, phase_name: str) -> bool:
     that's already doing its own real work is.
     """
     return any(log.get("phase") == phase_name for log in session.get("logs", []))
+
+
+def _finalize_phase_plan_on_normal_completion(ctx: RunContext, phase_name: str) -> None:
+    """When a phase ends through its own normal control flow (never called from a crash/resume-skip
+    path — see _mark_phase_finished's own docstring for why that distinction matters), any task/
+    subtask the model's own update_plan reporting never marked "done" gets marked done here instead
+    of being left "pending" — which session_fragment.html's phase_concluded fallback would
+    otherwise render as a stark red "blocked" X (plan_status_icon), honestly but misleadingly, for a
+    phase that in fact ran its entire intended course and simply had its own tracking go stale.
+
+    Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): a recon phase
+    that ran 69 real, successful tool calls across 30 minutes, and the analyze phase after it, both
+    ended with every one of their own plan tasks/subtasks still "pending" — the ONE update_plan call
+    that would have marked real progress failed (a JSON double-encoding parse bug, since fixed) and
+    the model never tried again for the rest of either phase (the SAME "the model's own voluntary
+    reporting is unreliable" gap already documented for Exploit's own plan tracking, see
+    _sync_exploit_plan_from_findings — Recon/Analyze never got an equivalent safety net because,
+    unlike Exploit's one-task-per-finding structure, there's no equally simple ground truth to
+    re-derive their own task/subtask text FROM). The session completed successfully with real
+    findings; the Plan tab instead showed both phases as an almost unbroken wall of red "blocked" X
+    icons, giving a flatly false impression that the scan had failed when nothing had.
+
+    Deliberately narrow: only flips the status of the phase's OWN EXISTING tasks/subtasks (never
+    invents new ones, never touches a task/subtask the model already resolved as done/blocked) —
+    this is "the phase is over, honor what was already sketched instead of leaving it stuck
+    'pending' for no better reason than a dropped report," not a claim about what specific work
+    happened. Only ever called right alongside _mark_phase_finished at a phase's own normal
+    end-of-loop return — a phase that crashed mid-way and was skipped on resume never reaches this
+    call at all, so it stays honestly "blocked" via the template's existing fallback, exactly as
+    before this fix.
+    """
+    plan = ctx.session.get("plan") or {}
+    phase_entry = next((p for p in plan.get("phases", []) if p.get("phase") == phase_name), None)
+    if phase_entry is None:
+        return
+    changed = False
+    for task in phase_entry.get("tasks", []):
+        for subtask in task.get("subtasks", []):
+            if subtask.get("status") not in ("done", "blocked"):
+                subtask["status"] = "done"
+                changed = True
+        resolved_statuses = [st.get("status") for st in task.get("subtasks", [])]
+        new_task_status = _derive_plan_status(resolved_statuses) if resolved_statuses else "done"
+        if task.get("status") != new_task_status and task.get("status") not in ("done", "blocked"):
+            task["status"] = new_task_status
+            changed = True
+    if not changed:
+        return
+    phase_entry["status"] = _derive_plan_status([t.get("status") for t in phase_entry.get("tasks", [])])
+    plan["version"] = plan.get("version", 0) + 1
+    plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_session(ctx.session_id, ctx.session)
 
 
 def _apply_updated_plan(ctx: RunContext, recorded: dict, plan_phase: str) -> None:
@@ -5875,7 +6540,11 @@ async def _auto_delegate_analyze_overflow(ctx: RunContext, target: str, recon_re
     batch = hosts[1:1 + _AUTO_DELEGATE_ANALYZE_MAX_HOSTS]
     if not batch:
         return
-    profile_name = profiles[0]["name"]
+    # Same reasoning as recon overflow's own fixed set just above -- this task always probes with
+    # exactly this toolset, so the profile actually carrying them outranks one that's merely bigger.
+    profile_name = _pick_overflow_subagent_profile(
+        profiles, {"security_headers_audit", "http_request", "whatweb", "nuclei", "ssl_cert_info"},
+    )
     task_description = (
         f"The main agent is actively analyzing {hosts[0]} on {target} itself. While it does, "
         f"actively probe these {len(batch)} other confirmed in-scope host(s) for real "
@@ -6120,7 +6789,7 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     _mark_phase_started(ctx.session, "analyze")
     await _maybe_refresh_program_check(ctx)
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tools = get_tools_by_category("scan") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan")
+    tools = get_tools_by_category("scan") + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan", "main_agent")
     # See _run_recon's identical block for why update_plan (category="post_exploit") has to be
     # appended explicitly rather than picked up by get_tools_by_category — plan_phase="analyze" on
     # the _run_llm_tool_loop call below is what actually reorders tools, fresh every turn.
@@ -6168,6 +6837,7 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     # passes); a host only ever needs one client-side probe per session.
     ctx.session["recon_result"].setdefault("js_fingerprint_hosts_done", [])
     await _auto_delegate_analyze_overflow(ctx, target, recon_result)
+    await _auto_delegate_hypothesis_overflow(ctx, target)
 
     async def execute(spec: ToolSpec, arguments: dict) -> dict:
         result = await _run_tool_with_retry(ctx, spec, arguments)
@@ -6325,6 +6995,9 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
                         # _summarize_cve_record) -- never fabricated, None whenever the record
                         # carried no CVSS data at all.
                         "cvss_vector": info.get("cvss_vector"),
+                        # Borrowed from the CVE, not the agent's own assessment of a confirmed
+                        # finding -- "cve" only when a real vector actually came with the record.
+                        "cvss_source": "cve" if info.get("cvss_vector") else None,
                         "false_positive_reason": false_positive_reason,
                     }
                 )
@@ -6362,6 +7035,13 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
             _apply_updated_plan(ctx, result["recorded"], "analyze")
         elif spec.name == "record_hypothesis" and result.get("status") == "ok" and "recorded" in result:
             _persist_new_hypothesis(ctx, result["recorded"], "analyze")
+            # Same reasoning as _run_recon's own execute() -- Analyze is ONE long continuous
+            # conversation, and the phase-start call to this function (right above, before this
+            # closure is even defined) only ever sees hypotheses carried over from Recon. A
+            # hypothesis recorded partway through Analyze's own conversation used to wait until
+            # Exploit's own phase-start check to get its first delegation chance -- minutes later,
+            # or never if this pass gets interrupted first.
+            await _auto_delegate_hypothesis_overflow(ctx, target)
         elif spec.name == "resolve_hypothesis" and result.get("status") == "ok" and "resolved" in result:
             _resolve_hypothesis(ctx, result["resolved"], "analyze")
         else:
@@ -6384,6 +7064,7 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     task += _scope_rules_task_addendum(ctx.session)
     task += _out_of_scope_task_addendum(ctx.session)
     task += _out_of_scope_notes_task_addendum(ctx.session)
+    task += _operator_profile_task_addendum()
     task += _custom_instructions_task_addendum(ctx.session)
     task += _goal_task_addendum(ctx.session)
     task += _program_url_task_addendum(ctx.session)
@@ -6411,6 +7092,7 @@ async def _run_analyze(ctx: RunContext, target: str, recon_result: dict) -> list
     logger.debug("core: session=%s analyze phase found %d finding(s)", ctx.session_id, len(findings))
     await _run_detection_second_opinion(ctx, target, ctx.session["recon_result"])
     _mark_phase_finished(ctx.session, "analyze")
+    _finalize_phase_plan_on_normal_completion(ctx, "analyze")
     return findings
 
 
@@ -6638,7 +7320,7 @@ async def _run_reverify(ctx: RunContext) -> None:
     # get_tools_by_category(...) call queries) specifically so it can't leak into either of those —
     # it only ever reaches the model through this explicit list.
     subagent_tools, subagent_addendum = _subagent_delegation_extras(ctx.session)
-    tool_specs = get_tools_by_category("scan") + [get_tool("record_reverification_result")] + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan")
+    tool_specs = get_tools_by_category("scan") + [get_tool("record_reverification_result")] + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("scan", "main_agent")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs.append(update_plan_spec)
@@ -6710,6 +7392,7 @@ async def _run_reverify(ctx: RunContext) -> None:
         task += prior_history_note
         task += _out_of_scope_task_addendum(ctx.session)
         task += _out_of_scope_notes_task_addendum(ctx.session)
+        task += _operator_profile_task_addendum()
         task += _custom_instructions_task_addendum(ctx.session)
         task += _goal_task_addendum(ctx.session)
         task += _program_url_task_addendum(ctx.session)
@@ -6852,7 +7535,7 @@ async def _run_skeptical_verification(ctx: RunContext) -> None:
     base = (
         get_tools_by_category("recon") + get_tools_by_category("scan") + get_tools_by_category("exploit")
         + _toolkit_tool_extras()
-        + _custom_tool_extras("recon") + _custom_tool_extras("scan") + _custom_tool_extras("exploit")
+        + _custom_tool_extras("recon", "main_agent") + _custom_tool_extras("scan", "main_agent") + _custom_tool_extras("exploit", "main_agent")
     )
     tool_specs = list({spec.name: spec for spec in base}.values())
     record_result_spec = get_tool("record_skeptical_verification_result")
@@ -6970,6 +7653,14 @@ async def _run_skeptical_verification(ctx: RunContext) -> None:
                         "core: session=%s skeptical_verification: ENSEMBLE DISAGREEMENT on %r -- primary=%s secondary=%s",
                         ctx.session_id, title, result, secondary_result,
                     )
+        # The single derived verification status this finding ends the scan at -- the one value the
+        # UI badge/report now render, logged here (the final verification gate) so a debug trace can
+        # reconstruct each finding's resolved confidence tier without re-deriving it from the five
+        # separate fields that feed it.
+        logger.debug(
+            "core: session=%s skeptical_verification: %r resolved verify_status=%s",
+            ctx.session_id, title, derive_verification_status(finding).get("status"),
+        )
         save_session(ctx.session_id, ctx.session)
 
     _mark_phase_finished(ctx.session, "skeptical_verification")
@@ -7002,6 +7693,65 @@ def _exploit_priority_key(finding: dict) -> tuple[int, int]:
     else:
         qualifies_first = 2
     return (qualifies_first, _severity_key(finding))
+
+
+def _operator_profile_task_addendum() -> str:
+    """The operator's standing, cross-project profile for the MAIN agent
+    (agent/operator_profile_store.py) — applied to every project by default. Empty when nothing is
+    configured, so the agent then behaves exactly as it always has (same "nothing set -> no behavior
+    change" contract as custom_instructions/goal below).
+
+    Appended at the SAME call sites as _custom_instructions_task_addendum but strictly BEFORE it, so
+    a project's own one-off custom instructions read as the more-specific refinement layered on top
+    of this general profile, never the other way round: this is the general-layer personalization,
+    custom_instructions is the per-project override.
+    """
+    profile = load_operator_profile()
+    parts: list[str] = []
+
+    standing = (profile.get("standing_instructions") or "").strip()
+    if standing:
+        parts.append(
+            "Standing instructions/priorities (follow as real constraints, not suggestions):\n"
+            f"{standing}"
+        )
+
+    focus = (profile.get("focus_classes") or "").strip()
+    if focus:
+        # Prompt-level nudge only, never a hard filter — this project forbids deterministically
+        # fuzzy-matching a finding against free-text class text (see _exploit_priority_key), so this
+        # shapes the model's own ordering judgment rather than the code's ranking key.
+        parts.append(
+            "Vulnerability classes this operator cares about most — prioritize investigating these "
+            "first when time/attention is limited. A preference to shape your ORDER of work, not a "
+            "restriction: never ignore a clearly higher-impact finding just because it's not on this "
+            f"list.\n{focus}"
+        )
+
+    style = (profile.get("communication_style") or "").strip()
+    if style == "concise":
+        parts.append(
+            "Keep your live step-by-step narration in the chat/log brief and to the point — the "
+            "operator prefers less filler before a verdict. This is about your running commentary, "
+            "not the depth of the final report."
+        )
+    elif style == "detailed":
+        parts.append(
+            "Explain your reasoning and steps in more detail as you go — the operator prefers a "
+            "verbose, didactic running commentary. This is about your live narration, not the final "
+            "report."
+        )
+
+    if not parts:
+        return ""
+
+    logger.debug("core: operator profile applied to task message (%d section(s))", len(parts))
+    body = "\n\n".join(parts)
+    return (
+        "\n\nThe operator's standing profile for how they want you to work (their default across "
+        "every engagement; anything project-specific stated below overrides it where they conflict):"
+        f"\n{body}"
+    )
 
 
 def _custom_instructions_task_addendum(session: dict) -> str:
@@ -7447,6 +8197,22 @@ def _current_target_fingerprint(session: dict) -> tuple[frozenset[str], frozense
     return tech_keywords, _waf_vendors_from_protections(session)
 
 
+def _re_fingerprint(session: dict) -> frozenset[str]:
+    """The RE-mode equivalent of _current_target_fingerprint's tech half -- an RE session never
+    populates recon_result["technologies"] (that's a web-pentest shape), so its fingerprint comes
+    from session["target_profile"] (language/packer/platform/architecture, set by
+    record_target_profile / the auto-record above) plus the target's own filename. Keyed on the
+    target SHAPE/language this way, a technique that solved one crackme can resurface for the next
+    one built the same way. waf is always empty here (no WAF concept in RE)."""
+    profile_text = " ".join(
+        f"{fact.get('label', '')} {fact.get('value', '')}"
+        for fact in (session.get("target_profile") or [])
+    )
+    target_name = os.path.basename(str(session.get("target") or "").rstrip("/\\"))
+    shape = str(session.get("target_shape") or "")
+    return frozenset(_technology_keywords(f"{profile_text} {target_name} {shape}"))
+
+
 def _playbook_notes_path(session_id: str) -> Path | None:
     """The project-local half of the two-tier memory — None for a session with no real on-disk
     project folder (legacy pre-project-folder sessions, see get_session_folder's own docstring)."""
@@ -7499,6 +8265,66 @@ def _credit_tool_memory_for_finding(ctx: RunContext, finding: dict) -> None:
         logger.debug("core: session=%s _credit_tool_memory_for_finding failed, skipping this update", ctx.session_id, exc_info=True)
 
 
+def _capture_re_playbook_entry(ctx: RunContext, finding: dict) -> None:
+    """The reverse-engineering counterpart to _maybe_capture_playbook_entry's web path: captures a
+    solved/recorded RE finding into the cross-session playbook keyed by the target SHAPE/language
+    (_re_fingerprint), reusing the exact same playbook_store.record_technique / _embed_playbook_entries
+    / _notify_storage_reward machinery the web path uses. Keying on the shape (dotnet/pe32/crackme/
+    lua/upx, ...) is what lets a technique that cracked one target resurface for the next one built
+    the same way -- the whole point of RE having a learning loop at all. waf is always empty here."""
+    tech_keywords = _re_fingerprint(ctx.session)
+    if not tech_keywords:
+        _playbook_logger.debug(
+            "core: session=%s RE playbook capture skipped for finding=%r — no target-shape keywords to key on",
+            ctx.session_id, finding.get("title"),
+        )
+        return
+
+    fingerprint_key = _playbook_fingerprint_key(tech_keywords, frozenset())
+    now = datetime.now(timezone.utc).isoformat()
+    # RE findings don't carry the web shape's exploited/evidence/poc_command fields reliably -- pull
+    # the best available reproduction/evidence text from whichever field the RE record_finding path
+    # actually populated (reproduction_steps for a confirmed solve, else evidence/description).
+    evidence_text = str(finding.get("evidence") or finding.get("evidence_ref") or finding.get("description") or "")
+    poc_text = finding.get("poc_command") or finding.get("reproduction_steps")
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "technique": finding.get("title") or "",
+        "vuln_class": finding.get("exploitation_scenario") or finding.get("vuln_class"),
+        "payload_or_command": poc_text,
+        "cves": playbook_store.extract_cves(finding.get("title") or "", str(poc_text or ""), evidence_text, finding.get("description") or ""),
+        "evidence_ref": evidence_text[:500],
+        "tech_keywords": sorted(tech_keywords),
+        "waf_vendors": [],
+        "outcome": "worked",
+        "times_confirmed": 1,
+        "injected_count": 0,
+        "led_to_finding_count": 0,
+        "chained_from_ids": _playbook_chain_predecessor(ctx.session),
+        "last_seen": now,
+        "last_confirmed_at": now,
+        "source_session_ids": [ctx.session_id],
+        "source_type": "live",
+        "confidence": "confirmed",
+    }
+    recorded_id = playbook_store.record_technique(fingerprint_key, entry)
+    _track_playbook_chain(ctx.session, recorded_id)
+    if recorded_id:
+        _embed_playbook_entries(ctx.llm, [{**entry, "id": recorded_id}])
+    _notify_storage_reward(
+        ctx.session_id, kind="technique", label="New technique captured", delta=1,
+        total=playbook_store.count_techniques(), total_label="in playbook", detail=entry["technique"],
+    )
+    touched = ctx.session.setdefault("playbook_touched_keys", [])
+    if fingerprint_key not in touched:
+        touched.append(fingerprint_key)
+    _append_playbook_note(ctx.session_id, f"- {entry['technique']}: {entry['evidence_ref'][:200]}")
+    _playbook_logger.debug(
+        "core: session=%s RE playbook captured finding=%r under key=%r",
+        ctx.session_id, finding.get("title"), fingerprint_key,
+    )
+
+
 def _maybe_capture_playbook_entry(ctx: RunContext, finding: dict) -> None:
     """Called once a finding is genuinely proven (exploited=True with real evidence) — captures it
     into the cross-session playbook (agent/tools/playbook_store.py) keyed by its fingerprint, and
@@ -7509,6 +8335,13 @@ def _maybe_capture_playbook_entry(ctx: RunContext, finding: dict) -> None:
     poc_command/evidence structure to capture anyway.
     """
     if not _playbook_enabled():
+        return
+    # RE findings have no exploited/evidence web-pipeline shape -- a solved crackme is a "finding"
+    # in its own right. Captured on its own path, keyed by the target SHAPE/language, before the
+    # web-only gate below would reject it. Real incident: RE sessions never captured anything, so
+    # the learning loop stayed empty for RE no matter how many challenges were solved.
+    if ctx.session.get("mode") == "reverse_engineering":
+        _capture_re_playbook_entry(ctx, finding)
         return
     if not finding.get("exploited") or not finding.get("evidence"):
         return
@@ -7658,6 +8491,8 @@ def _re_playbook_technique_block(matches: list[dict]) -> str:
         line = f"- [{', '.join(flags)}] {m.get('technique')}"
         if m.get("payload_or_command"):
             line += f"\n    payload/command: {m['payload_or_command']}"
+        if isinstance(m.get("skill"), dict) and playbook_store.skill_enabled(m["skill"]):
+            line += f"\n    ready {m['skill'].get('kind', 'skill')} skill -- run_skill(technique_id=\"{m.get('id')}\")"
         lines.append(line)
     return "\n".join(lines)
 
@@ -7692,18 +8527,22 @@ def re_query_playbook(params: dict) -> dict:
     vec = _embed_playbook_query(llm, query) if llm is not None else None
     if vec is None and not tech:
         tech = frozenset(_technology_keywords(query))
-    matches = playbook_store.find_similar_techniques(set(tech), set(waf), 6, query_embedding=vec)
+    target_shape = (params.get("target_shape") or "").strip().lower() or None
+    matches = playbook_store.find_similar_techniques(set(tech), set(waf), 6, query_embedding=vec, target_shape=target_shape)
     search_mode = "semantic" if vec is not None else "keyword"
     return {
         "status": "ok",
         "search_mode": search_mode,
         "matches": [
             {
+                # The entry id so the model can reuse an attached skill via run_skill(technique_id=...).
+                "id": m.get("id"),
                 "technique": m.get("technique"),
                 "outcome": m.get("outcome", "worked"),
                 "payload_or_command": m.get("payload_or_command"),
                 "vuln_class": m.get("vuln_class"),
                 "times_confirmed": m.get("times_confirmed", 1),
+                "skill": {"kind": m["skill"].get("kind")} if isinstance(m.get("skill"), dict) and playbook_store.skill_enabled(m["skill"]) else None,
             }
             for m in matches
         ],
@@ -7730,7 +8569,8 @@ def re_playbook_strategy(params: dict) -> dict:
     vec = _embed_playbook_query(llm, query) if llm is not None else None
     if vec is None and not tech:
         tech = frozenset(_technology_keywords(query))
-    matches = playbook_store.find_similar_techniques(set(tech), set(waf), 8, query_embedding=vec)
+    target_shape = (params.get("target_shape") or "").strip().lower() or None
+    matches = playbook_store.find_similar_techniques(set(tech), set(waf), 8, query_embedding=vec, target_shape=target_shape)
     search_mode = "semantic" if vec is not None else "keyword"
     if not matches:
         return {
@@ -7783,6 +8623,7 @@ def re_record_technique(params: dict) -> dict:
 
     worked = params.get("worked", True)
     outcome = "worked" if worked else "failed"
+    target_shape = (params.get("target_shape") or "").strip().lower() or None
     key = playbook_store.make_fingerprint_key(tech_keywords, waf_vendors)
     now = datetime.now(timezone.utc).isoformat()
     entry = {
@@ -7794,6 +8635,10 @@ def re_record_technique(params: dict) -> dict:
         "evidence_ref": "",
         "tech_keywords": sorted(tech_keywords),
         "waf_vendors": sorted(waf_vendors),
+        # Cross-mode matching dimensions: an RE capture keyed by target shape (empty waf, thin tech
+        # tokens) is still retrievable via find_similar_techniques' own shape path.
+        "target_shape": target_shape,
+        "mode": "reverse",
         "outcome": outcome,
         "times_confirmed": 1,
         "injected_count": 0,
@@ -7808,13 +8653,65 @@ def re_record_technique(params: dict) -> dict:
     recorded_id = playbook_store.record_technique(key, entry)
     if llm is not None and recorded_id:
         _embed_playbook_entries(llm, [{**entry, "id": recorded_id}])
+    skill_note = _maybe_attach_captured_skill(params.get("skill"), recorded_id, session_id, target_shape, "reverse")
     total = playbook_store.count_techniques()
     logger.debug("core: session=%s re_record_technique outcome=%s key=%r total=%d", session_id, outcome, key, total)
     return {
         "status": "ok",
-        "confirmation": f"Saved a {'working technique' if worked else 'dead-end'} to the playbook -- {total} technique(s) stored now.",
+        "confirmation": f"Saved a {'working technique' if worked else 'dead-end'} to the playbook -- {total} technique(s) stored now.{skill_note}",
         "total_techniques": total,
     }
+
+
+def _maybe_attach_captured_skill(skill_param, technique_id, session_id, target_shape, mode) -> str:
+    """Builds and attaches a skill to a just-recorded technique when the model supplied one on the
+    same record_technique call (capture technique AND its reusable form in one action). Returns a
+    short suffix for the confirmation string, or "" when there's no skill to attach / it was
+    malformed. derived_from='agent_run': the body is something the agent itself constructed, never
+    raw bytes lifted from the target's output -- the anti-poisoning rule the run gate enforces."""
+    if not isinstance(skill_param, dict) or not technique_id:
+        return ""
+    skill = playbook_store.build_skill(
+        kind=str(skill_param.get("kind") or ""), body=str(skill_param.get("body") or ""),
+        params=skill_param.get("params"), interpreter=str(skill_param.get("interpreter") or "none"),
+        session_id=session_id, target_shape=target_shape, mode=mode, derived_from="agent_run",
+    )
+    if skill is None:
+        return ""
+    playbook_store.attach_skill(technique_id, skill)
+    logger.debug("core: session=%s attached %s skill to technique id=%s", session_id, skill["kind"], technique_id)
+    return f" A reusable {skill['kind']} skill was attached -- run it later with run_skill."
+
+
+def re_run_skill(params: dict) -> dict:
+    """run_skill for Reverse Engineering mode -- executes the skill attached to a playbook technique
+    (by that technique's id), reusing a proven win in one call instead of re-deriving it. A script
+    always runs sandboxed; a command may only invoke a registry-known binary; instructions are
+    returned as steps. All execution/safety gating lives in agent/tools/skill_runner.execute_skill,
+    the single shared path chat uses too. `_session_id` is server-injected."""
+    technique_id = (params.get("technique_id") or "").strip()
+    if not technique_id:
+        return {"status": "error", "error": "technique_id is required (the id of the playbook entry whose skill to run)"}
+    from agent.tools.skill_runner import execute_skill, execute_skill_chain
+    runner = execute_skill_chain if params.get("chain") else execute_skill
+    return runner(technique_id, params.get("params") or {}, params.get("_session_id"))
+
+
+def re_update_skill(params: dict) -> dict:
+    """update_skill for Reverse Engineering mode -- refines the body/params of a technique's skill
+    after reuse teaches a cleaner form (the self-improving-skill loop). Changing the body re-pins the
+    hash and drops any operator-trusted mark (the vouch was for the old bytes)."""
+    technique_id = (params.get("technique_id") or "").strip()
+    if not technique_id:
+        return {"status": "error", "error": "technique_id is required"}
+    body = params.get("body")
+    skill_params = params.get("params")
+    if body is None and skill_params is None:
+        return {"status": "error", "error": "supply a new body and/or params to update"}
+    ok = playbook_store.update_skill_body(technique_id, body=body, params=skill_params)
+    if not ok:
+        return {"status": "error", "error": f"no skill attached to technique id {technique_id!r}"}
+    return {"status": "ok", "confirmation": "Skill updated."}
 
 
 # category="re" so get_tools_by_category("re") -- already called by both run_re_triage and
@@ -7855,6 +8752,7 @@ register_tool(
                 "query": {"type": "string", "description": "What you're looking for, in plain language"},
                 "tech_keywords": {"type": "array", "items": {"type": "string"}, "description": "Optional: narrow to a stack, e.g. [\"rust\", \"pe32\"] or [\"solidity\", \"proxy\"]"},
                 "waf_vendors": {"type": "array", "items": {"type": "string"}, "description": "Optional, rarely relevant to RE work -- left over from this field's own web-pentest origin, only fill it if a genuinely comparable gate/protection applies here"},
+                "target_shape": {"type": "string", "description": "Optional: the target shape, e.g. pe_x86_64 / elf / jvm_bytecode / apk -- surfaces shape-tagged knowledge (incl. from study material) even when tech_keywords don't overlap"},
             },
             "required": ["query"],
         },
@@ -7885,6 +8783,7 @@ register_tool(
                 "query": {"type": "string", "description": "The target and goal, in plain language, e.g. 'Rust PE32+ crackme, want the serial-check algorithm'"},
                 "tech_keywords": {"type": "array", "items": {"type": "string"}, "description": "Optional: the target's own stack, e.g. [\"rust\", \"pe32\"]"},
                 "waf_vendors": {"type": "array", "items": {"type": "string"}, "description": "Optional, rarely relevant to RE work"},
+                "target_shape": {"type": "string", "description": "Optional: the target shape, e.g. pe_x86_64 / elf / jvm_bytecode / apk -- surfaces shape-tagged knowledge even when tech_keywords don't overlap"},
             },
             "required": ["query"],
         },
@@ -7920,9 +8819,75 @@ register_tool(
                 "tech_keywords": {"type": "array", "items": {"type": "string"}, "description": "The target shape it applies to, e.g. [\"rust\",\"pe32\",\"upx\"] or [\"solidity\",\"proxy\",\"reentrancy\"] -- used to key + retrieve it. Include at least one."},
                 "waf_vendors": {"type": "array", "items": {"type": "string"}, "description": "Rarely relevant to RE work -- left over from this field's own web-pentest origin, optional"},
                 "vuln_class": {"type": "string", "description": "Vulnerability/technique class, e.g. reentrancy / integer_overflow / anti_debug_bypass / packer_unwrap -- optional"},
+                "target_shape": {"type": "string", "description": "The binary/target shape this applies to, e.g. pe_x86_64 / elf / jvm_bytecode / apk / web -- lets it be retrieved cross-mode even when tech_keywords don't overlap. Optional but recommended."},
                 "worked": {"type": "boolean", "description": "true = it worked (a lead for next time); false = a confirmed dead-end (skip it next time). Defaults to true."},
+                "skill": {
+                    "type": "object",
+                    "description": "OPTIONAL reusable, executable form of this technique so a future session runs it in one call via run_skill. Only fill it from a command/script YOU actually constructed and ran here -- never raw bytes pasted out of the target's own output.",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["command", "script", "instructions"], "description": "command = one registry-tool invocation; script = a full script run sandboxed; instructions = ordered steps (not executed)"},
+                        "body": {"type": "string", "description": "The command template (with {{param}} slots), script source, or step list"},
+                        "interpreter": {"type": "string", "enum": ["sh", "python", "pwntools", "none"], "description": "For script kind: how to run body. 'none' for command/instructions."},
+                        "params": {"type": "array", "items": {"type": "object"}, "description": "Optional [{name, desc, required}] for the {{slots}} in body"},
+                    },
+                },
             },
             "required": ["technique"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="run_skill",
+        category="re",
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=re_run_skill,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Execute a reusable skill already stored on a playbook technique (by that technique's id, "
+            "as surfaced by query_playbook/playbook_strategy) -- reuse a proven win in one call instead "
+            "of re-deriving it. A script runs sandboxed; a command invokes a known tool; 'instructions' "
+            "are returned as steps for you to follow. Supply any {{param}} values in `params`."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "technique_id": {"type": "string", "description": "The id of the playbook technique whose attached skill to run"},
+                "params": {"type": "object", "description": "Values for the skill's {{param}} slots, e.g. {\"target\": \"./crackme\"}"},
+                "chain": {"type": "boolean", "description": "If true, replay the whole proven multi-step recipe (every skill along this technique's kill-chain, in order, stopping at the first failure) instead of just this one skill. Defaults to false."},
+            },
+            "required": ["technique_id"],
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="update_skill",
+        category="re",
+        tool_tier=1,
+        executable="",
+        build_command=None,
+        native_function=re_update_skill,
+        requires_allowed_target=False,
+        installed_by_default=True,
+        description=(
+            "Refine a technique's stored skill after reuse shows a cleaner/more general form -- the "
+            "self-improving loop. Pass a new body and/or params. Changing the body re-pins its safety "
+            "hash and resets any operator-trusted mark."
+        ),
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "technique_id": {"type": "string", "description": "The id of the playbook technique whose skill to update"},
+                "body": {"type": "string", "description": "New body (command template / script source / steps). Optional."},
+                "params": {"type": "array", "items": {"type": "object"}, "description": "New [{name, desc, required}] param specs. Optional."},
+            },
+            "required": ["technique_id"],
         },
     )
 )
@@ -7974,8 +8939,22 @@ def re_record_target_profile(params: dict) -> dict:
     if not value:
         return {"status": "error", "error": "value is required"}
     source = (params.get("source") or "tool").strip().lower()
-    if source not in ("tool", "operator"):
+    if source not in ("tool", "operator", "auto"):
         source = "tool"
+    recorded = _merge_target_profile_fact(session, label, value, source)
+    save_session(session_id, session)
+    return {"status": "ok", "recorded": recorded}
+
+
+def _merge_target_profile_fact(session: dict, label: str, value: str, source: str) -> dict:
+    """The actual append-or-update-in-place rule for one session["target_profile"] fact --
+    extracted out of re_record_target_profile above so apply_detected_target_profile below
+    (called from main.py's start_re, outside any tool dispatch) writes facts the exact same way
+    instead of a second, drifting copy of this merge logic. Does not save the session itself --
+    callers persist it on their own schedule (re_record_target_profile saves immediately after;
+    apply_detected_target_profile's own caller already saves once right after setting
+    session["target"], no reason to pay a second write there).
+    """
     profile = session.setdefault("target_profile", [])
     existing = next((fact for fact in profile if str(fact.get("label", "")).lower() == label.lower()), None)
     recorded = {"label": label, "value": value, "source": source}
@@ -7990,8 +8969,109 @@ def re_record_target_profile(params: dict) -> dict:
         existing.update(recorded)
     else:
         profile.append(recorded)
-    save_session(session_id, session)
-    return {"status": "ok", "recorded": recorded}
+    return recorded
+
+
+def apply_detected_target_profile(session: dict, detection: dict) -> None:
+    """Writes detect_target_shape()'s (agent/tools/builders/re_target.py) own zero-LLM-cost
+    findings into this session -- session["target_shape"] (read back by
+    _target_shape_task_addendum below) plus each detected fact via the exact same
+    _merge_target_profile_fact dedupe/update-in-place rule record_target_profile itself uses,
+    with source="auto" so the Target Profile panel's own badge (templates/macros/ui.html) can
+    show "Auto-detected" distinctly from an operator claim or a tool the model actually ran.
+    Called once, synchronously, from main.py's start_re right after clone_or_stage_re_target
+    resolves the real path -- mutates `session` in place and does not save it itself.
+    """
+    shape = detection.get("shape")
+    if shape:
+        session["target_shape"] = shape
+    for fact in detection.get("facts") or []:
+        label, value = fact.get("label"), fact.get("value")
+        if label and value:
+            _merge_target_profile_fact(session, str(label), str(value), "auto")
+
+
+# radare2 `iIj` (analysis="info") field -> (Target Profile label, value formatter). Only the
+# unambiguous, operator-meaningful facts -- the ones a human skims a Target Profile panel for --
+# are mapped; the dozens of other iIj fields (baddr, pcalign, ...) are deliberately left out as
+# noise. Booleans render as a short human phrase, never a bare True/False.
+_RADARE2_INFO_FACTS: tuple[tuple[str, str, Callable[[object], str | None]], ...] = (
+    ("compiler", "Compiler", lambda v: str(v).strip() or None),
+    ("lang", "Language", lambda v: str(v).strip() or None),
+    ("os", "Platform", lambda v: str(v).strip() or None),
+    ("static", "Linking", lambda v: ("static" if v else "dynamically linked") if isinstance(v, bool) else None),
+    ("stripped", "Symbols", lambda v: ("stripped" if v else "not stripped") if isinstance(v, bool) else None),
+)
+# iIj keys that, together, make a payload recognizable AS an info block (so a different radare2
+# command's JSON is never mistaken for one). At least two must be present.
+_RADARE2_INFO_MARKER_KEYS = ("arch", "bits", "bintype", "class", "compiler", "lang", "os", "endian")
+
+
+def _radare2_info_block(result: dict) -> dict | None:
+    """The flat iIj info object out of a radare2 tool result, or None when this result isn't an
+    info payload. parse_radare2_output (builders/radare2.py) wraps the parsed JSON as
+    result["parsed"]["result"]; some r2 builds nest the bin fields under a "bin" sub-object."""
+    parsed = result.get("parsed")
+    if not isinstance(parsed, dict):
+        return None
+    info = parsed.get("result", parsed)
+    if not isinstance(info, dict):
+        return None
+    if isinstance(info.get("bin"), dict):
+        info = {**info, **info["bin"]}
+    present = sum(1 for key in _RADARE2_INFO_MARKER_KEYS if key in info)
+    return info if present >= 2 else None
+
+
+def auto_record_target_profile_from_tool(session: dict, tool_name: str, result: dict) -> list[dict]:
+    """Deterministically turn a radare2 `info` (iIj) result into durable Target Profile facts,
+    WITHOUT relying on the model remembering to call record_target_profile for them -- so a triage
+    pass always leaves durable output even when the model just reads the info and moves on. Real
+    incident: three RE sessions did real analysis but recorded nothing durable, leaving every panel
+    empty ("useless triage").
+
+    Idempotent and non-clobbering: a label already present in session["target_profile"] (from ANY
+    source -- a prior auto-record, an operator claim, a deliberate tool call) is left untouched, so
+    re-running info adds nothing and an auto-derived guess never overwrites a more-informed fact.
+    Returns only the facts actually added this call. Importable at module level so the chat path
+    (agent/chat.py) can reuse it after its own radare2 calls.
+    """
+    if tool_name != "radare2":
+        return []
+    info = _radare2_info_block(result)
+    if info is None:
+        return []
+
+    derived: list[tuple[str, str]] = []
+    arch = str(info.get("arch") or "").strip()
+    bits = info.get("bits")
+    if arch:
+        derived.append(("Architecture", f"{arch} {bits}-bit" if isinstance(bits, int) and bits else arch))
+    # "Format" blends the container type and class for a single readable line (e.g. "elf (ELF64)").
+    bintype = str(info.get("bintype") or "").strip()
+    bin_class = str(info.get("class") or "").strip()
+    if bintype or bin_class:
+        derived.append(("Format", f"{bintype} ({bin_class})".strip() if bintype and bin_class else (bintype or bin_class)))
+    for key, label, formatter in _RADARE2_INFO_FACTS:
+        if key not in info:
+            continue
+        value = formatter(info[key])
+        if value:
+            derived.append((label, value))
+
+    existing_labels = {str(fact.get("label", "")).lower() for fact in (session.get("target_profile") or [])}
+    added: list[dict] = []
+    for label, value in derived:
+        if label.lower() in existing_labels:
+            continue
+        added.append(_merge_target_profile_fact(session, label, value, "auto"))
+        existing_labels.add(label.lower())
+    if added:
+        logger.debug(
+            "core: auto-recorded %d target-profile fact(s) from radare2 info: %s",
+            len(added), ", ".join(f"{f['label']}={f['value']}" for f in added),
+        )
+    return added
 
 
 register_tool(
@@ -8114,13 +9194,12 @@ def _playbook_task_addendum(session: dict, finding: dict | None = None, track_in
         tech_keywords = frozenset(_technology_keywords(" ".join(technologies)))
         waf_vendors = _waf_vendors_from_protections(session)
         if not tech_keywords and session.get("mode") == "reverse_engineering":
-            profile_text = " ".join(
-                f"{fact.get('label', '')} {fact.get('value', '')}"
-                for fact in (session.get("target_profile") or [])
-            )
-            target_name = os.path.basename(str(session.get("target") or "").rstrip("/\\"))
-            tech_keywords = frozenset(_technology_keywords(f"{profile_text} {target_name}"))
-    if not tech_keywords:
+            tech_keywords = _re_fingerprint(session)
+    # Cross-mode: a reverse/agentic target keyed by shape (empty waf, thin tech tokens) can still
+    # surface shape-tagged library/RE knowledge even when no tech keyword overlaps -- so don't bail
+    # on empty tech_keywords when a target_shape is known.
+    target_shape = session.get("target_shape") or None
+    if not tech_keywords and not target_shape:
         return ""
 
     query_vuln_class = finding.get("exploitation_scenario") if finding else None
@@ -8132,7 +9211,7 @@ def _playbook_task_addendum(session: dict, finding: dict | None = None, track_in
     query_embedding = _embed_playbook_query(llm, query_text) if llm is not None else None
     matches = playbook_store.find_similar_techniques(
         set(tech_keywords), set(waf_vendors), _playbook_max_injected_entries(),
-        vuln_class=query_vuln_class, query_embedding=query_embedding,
+        vuln_class=query_vuln_class, query_embedding=query_embedding, target_shape=target_shape,
     )
     if not matches:
         return ""
@@ -8157,6 +9236,11 @@ def _playbook_task_addendum(session: dict, finding: dict | None = None, track_in
         # surface it so the model adapts the proven payload to THIS target instead of re-deriving it.
         if match.get("payload_template"):
             line += f" [reusable template: {match['payload_template']}]"
+        # A stored, executable skill -- surface its technique id so the model reuses it in one call
+        # via run_skill (sandbox-gated) instead of re-deriving the technique by hand.
+        if isinstance(match.get("skill"), dict) and playbook_store.skill_enabled(match["skill"]):
+            skill_kind = match["skill"].get("kind", "skill")
+            line += f" [READY {skill_kind} SKILL — run_skill(technique_id=\"{match.get('id')}\")]"
         # Library-extracted, not yet reviewed (agent/tools/library_store.py) -- surfaced as its OWN
         # third bucket below, never counted as "seen Nx before" (it hasn't been -- an LLM's own
         # reading of a document isn't a confirmed use), and never silently folded into worked_lines
@@ -8394,6 +9478,28 @@ def _warn_if_scope_rules_went_unused(session: dict) -> None:
     )
 
 
+def _exploit_requires_approval(severity: object, approval_severities: set[str] | None = None) -> bool:
+    """Whether exploiting a finding of this severity needs a human approval click. True when the
+    global EXPLOIT_REQUIRE_APPROVAL switch is on (forces ALL attempts, unchanged), OR the operator's
+    profile lists this severity as one to personally confirm (agent/operator_profile_store.py's
+    approval_severities -- a per-severity gate that ADDS to, never loosens, the global switch).
+
+    A finding with no/unknown severity (the synthetic "hypothesis verification"/"chaining pass"
+    gates) errs toward asking ONLY when the operator has opted into tiered gating at all -- otherwise
+    it stays on today's behavior (gated only by the global switch). Empty tiers + switch off ->
+    False, exactly as before this field existed.
+    """
+    if os.getenv("EXPLOIT_REQUIRE_APPROVAL", "false").strip().lower() == "true":
+        return True
+    tiers = get_approval_severities() if approval_severities is None else approval_severities
+    if not tiers:
+        return False
+    sev = str(severity or "").strip().lower()
+    if sev not in _SEVERITY_RANK:
+        return True  # severity-less/synthetic exploit attempt + operator opted into gating -> ask
+    return sev in tiers
+
+
 def _record_approval(ctx: RunContext, finding: dict, outcome: str) -> None:
     ctx.session.setdefault("approvals", []).append(
         {
@@ -8413,19 +9519,32 @@ async def _await_exploit_approval(ctx: RunContext, finding: dict) -> bool:
     trail Export Proof relies on to show whether exploitation was a deliberate human decision or the
     autonomous default.
 
-    EXPLOIT_REQUIRE_APPROVAL (.env, default false) gates whether this wait happens at all: an
-    unattended/autonomous run has nobody watching for the UI prompt, so the default is to record an
-    "auto_approved" outcome and return immediately without ever pausing the session. Set it to true
-    to get the interactive human-in-the-loop gate back.
+    Whether this wait happens at all is decided by _exploit_requires_approval(severity): the global
+    EXPLOIT_REQUIRE_APPROVAL switch (default false -> all auto-approved, an unattended run never sits
+    blocked on a click nobody will make) PLUS the operator profile's own per-severity approval tiers
+    (agent/operator_profile_store.py's approval_severities), which can ask for a click on just the
+    high-severity findings while leaving the rest autonomous. The tiers ADD gating, never remove it.
+    When no tiers are configured, behavior is exactly as before: governed by the global switch alone.
     """
     if ctx.session.get("exploit_approved"):
         return True
 
-    if os.getenv("EXPLOIT_REQUIRE_APPROVAL", "false").strip().lower() != "true":
-        ctx.session["exploit_approved"] = True
+    tiered = get_approval_severities()
+    if not _exploit_requires_approval(finding.get("severity"), tiered):
         _record_approval(ctx, finding, "auto_approved")
+        # "Approve once -> unlock the whole session" (the session-wide flag) only holds in pure-
+        # autonomous mode (no per-severity tiers). With tiers configured, a lower-severity auto-
+        # approve must NOT set that flag, or a higher-severity finding the operator chose to gate
+        # would be silently skipped after it -- there the flag is set ONLY by a real human approval
+        # below. Pure-autonomous mode keeps setting it so later findings short-circuit without re-
+        # recording, exactly as before.
+        if not tiered:
+            ctx.session["exploit_approved"] = True
         save_session(ctx.session_id, ctx.session)
-        logger.debug("core: session=%s exploit auto-approved (EXPLOIT_REQUIRE_APPROVAL=false)", ctx.session_id)
+        logger.debug(
+            "core: session=%s exploit auto-approved (severity=%r, approval tiers=%s)",
+            ctx.session_id, finding.get("severity"), sorted(tiered),
+        )
         return True
 
     ctx.session["status"] = "awaiting_approval"
@@ -8553,6 +9672,7 @@ async def _run_exploit_for_finding(
     )
     task += _out_of_scope_task_addendum(ctx.session)
     task += _out_of_scope_notes_task_addendum(ctx.session)
+    task += _operator_profile_task_addendum()
     task += _custom_instructions_task_addendum(ctx.session)
     task += _goal_task_addendum(ctx.session)
     task += _program_url_task_addendum(ctx.session)
@@ -8577,9 +9697,9 @@ async def _run_exploit_for_finding(
     tool_specs = exploit_tools
     if deep_dive:
         exploit_names = {spec.name for spec in exploit_tools}
-        tool_specs = exploit_tools + [spec for spec in get_tools_by_category("scan") if spec.name not in exploit_names] + _custom_tool_extras("scan")
+        tool_specs = exploit_tools + [spec for spec in get_tools_by_category("scan") if spec.name not in exploit_names] + _custom_tool_extras("scan", "main_agent")
         task += DEEP_DIVE_ADDENDUM
-    tool_specs = tool_specs + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit")
+    tool_specs = tool_specs + subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit", "main_agent")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs = tool_specs + [update_plan_spec]
@@ -8769,8 +9889,9 @@ def _apply_corrected_false_positive_reason(finding: dict, corrected_false_positi
     all, so proof_report.html's "Likely false positive" banner never rendered for them even though
     Exploit itself had already, independently concluded they weren't real.
     """
-    if isinstance(corrected_false_positive_reason, str) and corrected_false_positive_reason.strip() and not finding.get("false_positive_reason"):
-        finding["false_positive_reason"] = corrected_false_positive_reason.strip()
+    normalized = _normalize_false_positive_reason(corrected_false_positive_reason)
+    if normalized and not finding.get("false_positive_reason"):
+        finding["false_positive_reason"] = normalized
 
 
 def _apply_remediation_advice(finding: dict, remediation_advice) -> None:
@@ -8858,7 +9979,12 @@ async def _auto_delegate_exploit_overflow(ctx: RunContext, target: str, findings
     # last -- never the front, which the main agent is about to start on itself immediately.
     batch = candidates[-_AUTO_DELEGATE_EXPLOIT_MAX_FINDINGS:]
     batch_titles = [f.get("title") or "Untitled finding" for f in batch]
-    profile_name = profiles[0]["name"]
+    # Unlike recon/analyze overflow's own fixed tool sets, this batch's actual subject matter
+    # varies finding to finding -- derive it from what the findings themselves are actually about
+    # (SQLi, XSS, leaked secrets, ...) so a real matching specialist outranks the generalist
+    # whenever one is enabled and actually fits; falls back to breadth-only when nothing matches.
+    relevant_tools = _relevant_tools_for_text(*(f"{f.get('title', '')} {f.get('description', '')}" for f in batch))
+    profile_name = _pick_overflow_subagent_profile(profiles, relevant_tools)
     findings_block = "\n\n".join(
         f"- {f.get('title')} ({f.get('severity', 'Unknown')}): {f.get('description') or 'no description recorded'}"
         for f in batch
@@ -8897,6 +10023,81 @@ async def _auto_delegate_exploit_overflow(ctx: RunContext, target: str, findings
         )
 
 
+_AUTO_DELEGATE_HYPOTHESIS_TIMEOUT_SECONDS = int(os.getenv("SUBAGENT_AUTO_HYPOTHESIS_TIMEOUT_SECONDS", "600"))
+
+
+async def _auto_delegate_hypothesis_overflow(ctx: RunContext, target: str) -> None:
+    """Deterministic auto-delegation of a single open hypothesis to whichever enabled Subagent
+    profile is a genuine, keyword-confirmed fit for it (_relevant_tools_for_text) -- e.g. a SQLi
+    hypothesis to an enabled SQLi-Verifier, a leaked-secret lead to an enabled Secrets-Exposure --
+    while the main agent keeps working the rest of the phase itself.
+
+    This is the direct answer to the real gap the other three _auto_delegate_*_overflow functions
+    don't close: their own fix (picking the widest allowed_tools list over profiles[0]'s storage-
+    order accident) still only ever reaches for "most generally capable", so on a roster where the
+    generalist already happens to have the widest toolset, nothing about WHICH profile does the
+    work actually changes. Those three stay as-is on purpose -- they batch broad, unscoped work
+    (several hosts/findings at once) that a narrow specialist is the wrong shape for, by that
+    specialist's own stated design (seed_profile's docstring: "your task names ONE endpoint/
+    parameter and ONE hypothesis"). A hypothesis is exactly that one-named-thing shape, so this is
+    the one auto-overflow case where routing to a real, narrow, matching specialist makes sense
+    instead of defaulting to breadth.
+
+    Only delegates when some enabled profile's allowed_tools genuinely overlaps the hypothesis's
+    own keyword-matched domain (_best_matching_profile_overlap(...) > 0) -- never forces a
+    hypothesis onto an unrelated profile just because one happens to be enabled; a hypothesis that
+    doesn't match any known domain, or where no enabled profile fits it, is left for the main
+    agent's own normal resolve_hypothesis flow exactly as before this function existed.
+
+    Tracks delegated ids in session["auto_delegated_hypothesis_ids"] so a resumed phase never
+    redelegates the same hypothesis twice, and skips anything no longer "unconfirmed" -- the main
+    agent, or an earlier delegation's own result once drained, may already have resolved it by the
+    time this runs again.
+    """
+    profiles = get_enabled_profiles(ctx.session.get("enabled_subagent_ids"))
+    if not profiles:
+        return
+
+    already_delegated = ctx.session.setdefault("auto_delegated_hypothesis_ids", [])
+    for hypothesis in ctx.session.get("hypotheses", []):
+        if hypothesis.get("status") != "unconfirmed" or hypothesis.get("id") in already_delegated:
+            continue
+        relevant_tools = _relevant_tools_for_text(hypothesis.get("text") or "", hypothesis.get("evidence") or "")
+        if _best_matching_profile_overlap(profiles, relevant_tools) == 0:
+            continue  # nothing enabled genuinely fits THIS one -- leave it to the main agent itself
+
+        profile_name = _pick_overflow_subagent_profile(profiles, relevant_tools)
+        task_description = (
+            f"Investigate this ONE specific hypothesis about {target}, recorded but not yet "
+            f"confirmed or ruled out:\n\n\"{hypothesis['text']}\""
+            + (f"\n\nEvidence so far: {hypothesis['evidence']}" if hypothesis.get("evidence") else "")
+            + "\n\nConfirm OR disprove it with real requests/evidence -- never just trust a tool's "
+            "own 'success' output on its own. Report concretely what you found and whether it held "
+            "up; the main agent has no recording tools available to you here, so put every real "
+            "fact in your summary. Do not assume it's real just because it was worth checking."
+        )
+        result = await _delegate_to_subagent_impl({
+            "subagent_name": profile_name,
+            "task_description": task_description,
+            "_session_id": ctx.session_id,
+            "_session": ctx.session,
+            "_triggered_by": "auto_overflow",
+            "_timeout_seconds": _AUTO_DELEGATE_HYPOTHESIS_TIMEOUT_SECONDS,
+        })
+        if result.get("status") == "ok":
+            already_delegated.append(hypothesis["id"])
+            save_session(ctx.session_id, ctx.session)
+            _subagent_logger.debug(
+                "core: session=%s auto-delegated hypothesis id=%s to subagent=%r task=%s",
+                ctx.session_id, hypothesis["id"], profile_name, result.get("task_id"),
+            )
+        else:
+            _subagent_logger.debug(
+                "core: session=%s auto-delegation of hypothesis id=%s did not start: %s",
+                ctx.session_id, hypothesis["id"], result.get("reason") or result.get("error"),
+            )
+
+
 async def _run_exploit(ctx: RunContext, target: str) -> None:
     findings = ctx.session["findings"]
     if os.getenv("ENABLE_EXPLOIT", "true").lower() != "true":
@@ -8918,6 +10119,7 @@ async def _run_exploit(ctx: RunContext, target: str) -> None:
         _mark_phase_finished(ctx.session, "exploit")
         return
     await _auto_delegate_exploit_overflow(ctx, target, findings)
+    await _auto_delegate_hypothesis_overflow(ctx, target)
     # A plain "for finding in sorted(...)" can't react to a deep_dive request that arrives
     # mid-phase (the finding-detail modal's Deep dive button, for a session that's already live)
     # — remaining is a real mutable work queue instead, checked for a reorder before every pop,
@@ -9724,32 +10926,54 @@ def _re_triage_max_tool_calls() -> int:
     return int(os.getenv("RE_TRIAGE_MAX_TOOL_CALLS", str(_DEFAULT_RE_TRIAGE_MAX_TOOL_CALLS)))
 
 
-def _re_triage_end_reason_message(stop_reason: str | None) -> str | None:
+def _re_triage_recorded_summary(session: dict) -> str:
+    """A short "recorded N findings, M leads, K target-profile facts" phrase for the parts that
+    actually have durable output -- empty when nothing was recorded. Lets a safeguard-stopped pass
+    honestly report what it DID capture instead of a blanket "may be incomplete / recorded nothing"
+    that now undersells it (with deterministic auto-record + hypotheses wired in, a safeguard stop
+    usually still left real output behind)."""
+    parts = []
+    findings = len(session.get("findings") or [])
+    if findings:
+        parts.append(f"{findings} finding{'s' if findings != 1 else ''}")
+    leads = len([h for h in (session.get("hypotheses") or []) if h.get("status") not in ("ruled_out",)])
+    if leads:
+        parts.append(f"{leads} open lead{'s' if leads != 1 else ''}")
+    facts = len(session.get("target_profile") or [])
+    if facts:
+        parts.append(f"{facts} target-profile fact{'s' if facts != 1 else ''}")
+    return ", ".join(parts)
+
+
+def _re_triage_end_reason_message(stop_reason: str | None, session: dict | None = None) -> str | None:
     """Translate the loop's internal stop_reason into a short, operator-facing note for the control
     bar. None (a natural, model-decided finish) stays None -- nothing to explain. Everything else is
-    a SAFEGUARD stop, so the operator learns the pass was cut short (and may be incomplete) rather
-    than reading a bare "completed" as proof it fully finished."""
+    a SAFEGUARD stop, so the operator learns the pass was cut short rather than reading a bare
+    "completed" as proof it fully finished -- but, when the pass DID record durable output before the
+    safeguard fired, the note says so instead of implying nothing useful happened."""
     if not stop_reason:
         return None
+    recorded = _re_triage_recorded_summary(session) if session is not None else ""
+    # When the pass DID leave durable output, say exactly what (findings/leads/profile facts) instead
+    # of a blanket "may be incomplete" that now undersells it. Only when it genuinely recorded
+    # nothing does the old "may be incomplete" wording still apply.
+    tail = (
+        f" It still recorded {recorded}, kept on the Findings/Target Profile tabs. Re-scan continues where it left off."
+        if recorded
+        else " — it may be incomplete. Re-scan continues where it left off."
+    )
     if "wall-clock backstop" in stop_reason:
-        return "hit its time limit before finishing on its own — it may be incomplete. Re-scan continues where it left off."
+        return f"hit its time limit before finishing on its own{tail}"
     if "call budget" in stop_reason:
-        return "reached its tool-call budget before finishing on its own — see the Logs/Triage view for a summary of what it found so far. Re-scan continues where it left off."
+        return f"reached its tool-call budget before finishing on its own{tail}"
     if "without recording" in stop_reason or "in a row" in stop_reason:
-        return "stopped early after a run of tool calls that recorded nothing new — it may be incomplete. Re-scan continues where it left off."
-    return "stopped on a safeguard before finishing on its own — it may be incomplete. Re-scan continues where it left off."
+        return f"stopped early after a run of tool calls that recorded nothing new{tail}"
+    return f"stopped on a safeguard before finishing on its own{tail}"
 
 
-# The magic-byte signatures that make a file a compiled executable a binary tool (radare2/gdb/
-# qiling_emulate) can actually load -- PE ("MZ"), ELF, and the four Mach-O variants (32/64-bit,
-# each in either endianness). Kept as raw bytes so _re_directory_target_hint below can sniff a
-# file's real first bytes instead of trusting an extension a crackme may well not have.
-_EXECUTABLE_MAGIC_PREFIXES = (
-    b"MZ",                       # PE / DOS (.exe/.dll)
-    b"\x7fELF",                  # ELF
-    b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",  # Mach-O 32/64 big-endian
-    b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # Mach-O 32/64 little-endian
-)
+# Moved to agent/tools/builders/re_target.py (_EXECUTABLE_MAGIC_PREFIXES) once detect_target_shape
+# needed the exact same magic-byte sniff -- one shared source of truth, imported back here, not a
+# second independently-maintained copy.
 
 
 def _re_directory_target_hint(target: str) -> str:
@@ -9765,41 +10989,77 @@ def _re_directory_target_hint(target: str) -> str:
     including a weak one that would otherwise waste its whole budget rediscovering this -- starts
     from solid ground.
     """
-    try:
-        if not os.path.isdir(target):
-            return ""
-        entries = sorted(os.listdir(target))
-    except OSError as exc:
-        logger.debug("run_re_triage: could not list directory target %r: %s", target, exc)
+    desc = describe_directory_target(target)
+    if not desc or not desc["entries"]:
         return ""
+    entries = desc["entries"]
 
-    executables: list[str] = []
-    for name in entries:
-        full = os.path.join(target, name)
-        if not os.path.isfile(full):
-            continue
-        try:
-            with open(full, "rb") as handle:
-                head = handle.read(4)
-        except OSError:
-            continue
-        if any(head.startswith(prefix) for prefix in _EXECUTABLE_MAGIC_PREFIXES):
-            executables.append(name)
-
-    if not entries:
-        return ""
-    listing = ", ".join(entries[:50]) + (" ..." if len(entries) > 50 else "")
+    # Each entry carries its identified type now (crackme.jar (Java/JVM archive)), so the model sees
+    # WHAT every file is, not just a bare name -- the "see any file type in the folder" requirement,
+    # not only the ones that sniff as a native executable.
+    listing = ", ".join(f"{e['name']} ({e['type']})" for e in entries[:50]) + (" ..." if len(entries) > 50 else "")
+    first_name = entries[0]["name"]
     hint = (
         f"\n\nNote: the target is a DIRECTORY, not a single file. Its contents are: {listing}. "
         "Point your tools at a specific file inside it (e.g. "
-        f"{os.path.join(target, entries[0])}), never at the directory path itself -- radare2/gdb/"
+        f"{os.path.join(target, first_name)}), never at the directory path itself -- radare2/gdb/"
         "qiling_emulate cannot analyze a directory and will just return empty results."
     )
+    executables = [e["name"] for e in entries if e.get("loadable_executable")]
     if executables:
         exec_paths = ", ".join(os.path.join(target, name) for name in executables)
         hint += f" Loadable executable(s) detected inside (by file signature): {exec_paths}."
-    logger.debug("run_re_triage: directory target %r -> %d entries, executables=%r", target, len(entries), executables)
+    elif desc["primary_artifact"]:
+        # No radare2-loadable native binary, but a real analysis target is inside anyway (a .jar,
+        # .apk, .wasm, ...) -- name it and its type so the model starts there instead of asking.
+        hint += (
+            f" Primary analyzable artifact detected inside: "
+            f"{os.path.join(target, desc['primary_artifact'])} ({desc['primary_artifact_type']})."
+        )
+    logger.debug("run_re_triage: directory target %r -> %d entries, executables=%r, primary=%r",
+                 target, len(entries), executables, desc["primary_artifact"])
     return hint
+
+
+def _target_shape_task_addendum(session: dict) -> str:
+    """Surfaces detect_target_shape()'s (agent/tools/builders/re_target.py) own zero-LLM-cost
+    findings -- session["target_shape"] plus the source="auto" facts apply_detected_target_profile
+    already wrote into session["target_profile"] at project-creation time -- directly in the
+    triage task text. Real, confirmed gap this closes: the OTHER place target_profile reaches the
+    task text (is_resume's own "already established" block, a few dozen lines above in
+    run_re_triage) only fires on a RESUMED pass -- a fresh, first-ever triage run never saw any of
+    it, even though these facts are already sitting on the session the instant Start is clicked.
+    Runs unconditionally (resumed or not) for exactly that reason, not folded into the is_resume
+    branch above.
+
+    This is a head start, not a replacement for RE_TRIAGE_PROMPT's own Step 1/Step 2 judgment --
+    an ambiguous/unusual target still falls back to the model reasoning it out from scratch
+    (detect_target_shape's own "unknown"/"unknown_directory"/"unknown_binary_blob"/"multi_target"
+    shapes have no RE_TARGET_TOOLSETS entry at all, so this function adds nothing for them beyond
+    whatever facts (if any) were still established).
+    """
+    shape = session.get("target_shape")
+    auto_facts = [f for f in (session.get("target_profile") or []) if f.get("source") == "auto"]
+    lines = []
+    if auto_facts:
+        facts_text = "; ".join(f"{f.get('label')}: {f.get('value')}" for f in auto_facts)
+        lines.append(f"Already established automatically, before this pass even started (no need to re-derive): {facts_text}.")
+    toolset = RE_TARGET_TOOLSETS.get(shape) if shape else None
+    if toolset:
+        primary = ", ".join(toolset.get("primary_tools") or [])
+        also = ", ".join(toolset.get("also_available") or [])
+        line = f"Detected target shape: {shape}."
+        if primary:
+            line += f" Suggested first tool(s): {primary}."
+        if also:
+            line += f" Also available if useful: {also}."
+        lines.append(line)
+        note = toolset.get("note")
+        if note:
+            lines.append(note)
+    if not lines:
+        return ""
+    return "\n\n" + " ".join(lines)
 
 
 # memscan_* (agent/tools/memscan_manager.py) is category="re", genuinely offered by a bare
@@ -9858,11 +11118,18 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
     # own comment: they need a human in the loop between scans, which a bounded autonomous pass
     # like this one can never provide.
     tools = [spec for spec in get_tools_by_category("re") if spec.name not in _MEMSCAN_TOOL_NAMES]
-    for extra_name in ("record_finding", "background_job_check"):
+    # record_hypothesis/resolve_hypothesis are category="post_exploit" (the main Agent pipeline's
+    # own hypothesis tools), so the bare category="re" sweep above never offers them -- yet
+    # RE_TRIAGE_PROMPT tells the model to call record_hypothesis to park an open lead, and the
+    # resume logic reads session["hypotheses"]. Without these appended here the model simply could
+    # not record a hypothesis during triage, one half of why triage left nothing durable behind.
+    # Their GLOBAL category is deliberately left alone (that's another module's file, and changing
+    # it would leak them into the web pipeline) -- only this one toolset gets them.
+    for extra_name in ("record_finding", "background_job_check", "record_hypothesis", "resolve_hypothesis"):
         extra_spec = get_tool(extra_name)
         if extra_spec is not None:
             tools.append(extra_spec)
-    tools += _custom_tool_extras("re")
+    tools += _custom_tool_extras("re", "reverse")
 
     session_context_token = current_session_id.set(session_id)
     stopped = False
@@ -9874,7 +11141,18 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
                 if conflict_result is not None:
                     return conflict_result
                 logger.debug("core: session=%s re_triage: recorded finding title=%r", ctx.session_id, result["recorded"].get("title"))
-            return result
+            elif spec.name == "record_hypothesis" and result.get("status") == "ok" and "recorded" in result:
+                _persist_new_hypothesis(ctx, result["recorded"], "re_triage")
+            elif spec.name == "resolve_hypothesis" and result.get("status") == "ok" and "resolved" in result:
+                _resolve_hypothesis(ctx, result["resolved"], "re_triage")
+            # Deterministic target-profile capture: a radare2 `info` call records the obvious facts
+            # (arch/format/compiler/lang/static/stripped) WITHOUT depending on the model choosing to
+            # call record_target_profile, so triage always leaves durable output. Mutates ctx.session
+            # in place; the tool loop's own _append_log save persists it. Idempotent/dedup inside.
+            auto_record_target_profile_from_tool(ctx.session, spec.name, result)
+            # Success-side nudge: if this result looks like a solve, tell the model to capture HOW
+            # (record_finding + record_technique) so the win isn't lost. No-op otherwise.
+            return _solve_hint(result, spec.name)
 
         task = f"Target: {session['target']}\nRun the baseline triage pass described in your system prompt."
         if is_resume:
@@ -9900,6 +11178,8 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
                     task += "\n\nOpen leads already noted (verify/build on these, don't rediscover them): " + "; ".join(hypothesis_texts)
                 task += "\n\nDon't redo the same analysis unless something looks incomplete or wrong — continue with whatever's left."
         task += _re_directory_target_hint(session["target"])
+        task += _target_shape_task_addendum(session)
+        task += _operator_profile_task_addendum()
         task += _custom_instructions_task_addendum(session)
         task += _scope_rules_task_addendum(session)
         task += _goal_task_addendum(session)
@@ -9914,7 +11194,7 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
         # early, before Step 1 has even run.
         task += _playbook_task_addendum(session, llm=ctx.llm)
 
-        system_prompt = RE_TRIAGE_PROMPT + _re_experience_level_addendum(session)
+        system_prompt = build_re_triage_prompt(session.get("target_shape")) + _re_experience_level_addendum(session)
         await _run_llm_tool_loop(
             ctx, system_prompt, task, tools, "re_triage", execute_tool=execute, expect_json_final=False,
             wallclock_limit_seconds=_re_triage_wallclock_seconds(),
@@ -9954,7 +11234,7 @@ async def run_re_triage(session_id: str, provider_id: str | None = None, is_resu
             # exactly like a pass that genuinely finished on its own -- that indistinguishability is
             # the real "completed, but 0 results and I don't understand why" complaint. None here
             # means a clean, natural finish; the control bar phrases the rest.
-            session["triage_end_reason"] = _re_triage_end_reason_message(ctx.last_stop_reason)
+            session["triage_end_reason"] = _re_triage_end_reason_message(ctx.last_stop_reason, session)
             if ctx.last_stop_reason:
                 logger.debug("run_re_triage: session=%s hit safeguard end-reason: %s", session_id, ctx.last_stop_reason)
         # Reload-merge-save (_reload_merge_save above), not a blind save_session(session_id, session)
@@ -10031,7 +11311,7 @@ async def run_re_reverify(session_id: str, finding_titles: list[str] | None = No
     job_check_tool = get_tool("background_job_check")
     if job_check_tool is not None:
         tools = [*tools, job_check_tool]
-    tools += _custom_tool_extras("re")
+    tools += _custom_tool_extras("re", "reverse")
 
     session_context_token = current_session_id.set(session_id)
     stopped = False
@@ -10056,9 +11336,10 @@ async def run_re_reverify(session_id: str, finding_titles: list[str] | None = No
                 "address/offset, in order — not a description of what you personally did. This "
                 "becomes the finding's own reproduction guide, not just an internal note."
             )
+            task += _operator_profile_task_addendum()
             try:
                 verdict, _trace = await _run_llm_tool_loop(
-                    ctx, RE_CHAT_PROMPT, task, tools, "re_reverify",
+                    ctx, build_re_chat_prompt(session.get("target_shape")), task, tools, "re_reverify",
                     execute_tool=execute, terminal_tool="record_reverification_result",
                 )
             finally:
@@ -10179,7 +11460,7 @@ def _hypothesis_verification_tool_specs() -> list[ToolSpec]:
     """
     base = (
         get_tools_by_category("recon") + get_tools_by_category("scan") + get_tools_by_category("exploit")
-        + _custom_tool_extras("recon") + _custom_tool_extras("scan") + _custom_tool_extras("exploit")
+        + _custom_tool_extras("recon", "main_agent") + _custom_tool_extras("scan", "main_agent") + _custom_tool_extras("exploit", "main_agent")
     )
     deduped = list({spec.name: spec for spec in base}.values())
     for name in ("record_finding", "record_hypothesis", "resolve_hypothesis"):
@@ -10361,6 +11642,7 @@ async def run_hypothesis_verification(
             f"- {hypothesis['text']}" + (f" (evidence so far: {hypothesis['evidence']})" if hypothesis.get("evidence") else "") + "\n\n"
             f"Existing findings from this scan (don't duplicate one of these):\n{json.dumps(existing_findings_summary)}"
         )
+        task += _operator_profile_task_addendum()
         task += _custom_instructions_task_addendum(ctx.session)
         task += _goal_task_addendum(ctx.session)
         task += _program_url_task_addendum(ctx.session)
@@ -10798,6 +12080,32 @@ async def _run_chain_pass(ctx: RunContext, hop_index: int) -> dict | None:
             if result.get("status") == "ok" and "recorded" in result:
                 _apply_updated_plan(ctx, result["recorded"], "exploit")
             return result
+        if spec.name == "record_chain_result" and arguments.get("action") == "chain_confirmed":
+            # Deterministic pre-check record_chain_result's own native validator can't do itself (its
+            # docstring: "it has no access to the findings list itself to check the title actually
+            # exists"). Real, confirmed incident this closes: a model discovered a real CVE via
+            # cve_lookup, never called record_finding for it, then tried to chain it by title anyway
+            # — rejected correctly, but only on the generic "must list at least the two findings"
+            # shape error, so it spent ~10 minutes/12 retries before "solving" it by substituting a
+            # CONFIRMED HYPOTHESIS's own title/evidence in place of the missing finding instead of
+            # actually recording one — a loophole because the native validator can't tell a
+            # finding's title from a hypothesis's. This check only accepts a REAL finding title,
+            # closing that loophole, and names exactly which title is missing instead of a generic
+            # shape complaint.
+            real_titles = {f.get("title") for f in ctx.session["findings"]}
+            unmatched = [t for t in (arguments.get("finding_titles") or []) if t not in real_titles]
+            if unmatched:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"finding_titles names {unmatched!r}, which is not the exact title of any "
+                        "finding recorded THIS SESSION yet (a hypothesis's title/evidence does not "
+                        "count, even a confirmed one). If this is a vulnerability you just "
+                        "discovered, call record_finding for it FIRST with its real evidence_ref, "
+                        "then retry record_chain_result naming its real, newly-recorded title."
+                    ),
+                }
+            return await _run_tool_with_retry(ctx, spec, arguments)
         if not spec.requires_allowed_target:
             return await _run_tool_with_retry(ctx, spec, arguments)
         # Same allowlist/approval gate every exploit tool call goes through — approval is
@@ -10855,7 +12163,7 @@ async def _run_chain_pass(ctx: RunContext, hop_index: int) -> dict | None:
     record_chain_result_spec = get_tool("record_chain_result")
     if record_chain_result_spec is not None:
         tool_specs.append(record_chain_result_spec)
-    tool_specs += subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit")
+    tool_specs += subagent_tools + _toolkit_tool_extras() + _custom_tool_extras("exploit", "main_agent")
     update_plan_spec = get_tool("update_plan")
     if update_plan_spec is not None:
         tool_specs.append(update_plan_spec)
@@ -11084,6 +12392,7 @@ async def _run_hypothesis_resolution_gate(ctx: RunContext) -> None:
         f"Open hypotheses to resolve, every one, before this scan is considered done:\n{json.dumps(hypotheses_summary)}\n\n"
         f"Existing findings from this scan (don't duplicate one of these):\n{json.dumps(existing_findings_summary)}"
     )
+    task += _operator_profile_task_addendum()
     task += _custom_instructions_task_addendum(ctx.session)
     task += _goal_task_addendum(ctx.session)
     task += _program_url_task_addendum(ctx.session)
@@ -11434,6 +12743,9 @@ async def run_session(
     # sharing this same process never inherits a stale value.
     session_context_token = current_session_id.set(session_id)
     try:
+        # Before the pipeline loop (so it fires once per run, not once per time-budget pass): if this
+        # run's model looks weak and no second-opinion provider is set, recommend enabling one.
+        _maybe_recommend_secondary_verification(ctx, entry_point)
         # Runs the whole recon->analyze->exploit->chain->validate->hypothesis-gate->skeptical-
         # verification pipeline once per iteration -- normally exactly once (the loop's own
         # continuation check at the bottom breaks out immediately when session["time_budget_seconds"]
@@ -11445,7 +12757,21 @@ async def run_session(
         # instant the first pass finds something".
         while True:
             if entry_point == "recon":
-                recon_result = await _run_recon(ctx, target)
+                try:
+                    recon_result = await _run_recon(ctx, target)
+                except (SessionStopRequested, asyncio.CancelledError):
+                    # Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan
+                    # session): _run_recon never returning (an operator Interrupt mid-phase, not
+                    # a crash) used to skip the overflow-delegation call below unconditionally,
+                    # every single time -- SessionStopRequested propagates straight past it to
+                    # this loop's own top-level handler. _run_recon writes
+                    # ctx.session["recon_result"] incrementally as it goes (its own os_guesses/
+                    # existing_targets bookkeeping), so whatever it found before the interrupt is
+                    # already there to hand off -- this is only a backstop for whatever the
+                    # phase's own mid-phase delegation (see _run_recon's record_target handling)
+                    # hadn't yet caught at the exact moment Stop was clicked.
+                    await _auto_delegate_recon_overflow(ctx, target, ctx.session.get("recon_result") or {"targets": []})
+                    raise
                 await _auto_delegate_recon_overflow(ctx, target, recon_result)
             else:
                 recon_result = session.get("recon_result") or {"targets": []}

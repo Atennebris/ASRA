@@ -11,14 +11,26 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(subagent_store, "SUBAGENT_STORE_PATH", tmp_path / "profiles.json")
 
 
-def test_load_subagent_profiles_seeds_one_default_disabled_profile_when_file_is_missing(tmp_path, monkeypatch):
+def test_load_subagent_profiles_seeds_the_full_disabled_roster_when_file_is_missing(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     store = subagent_store.load_subagent_profiles()
-    assert len(store["profiles"]) == 1
-    assert store["profiles"][0]["enabled"] is False
-    assert store["profiles"][0]["name"] == "Default Subagent"
+    # The original generic default PLUS the built-in specialist fleet, every one disabled.
+    assert len(store["profiles"]) == len(subagent_store._SEED_PROFILES)
+    assert all(p["enabled"] is False for p in store["profiles"])
+    names = {p["name"] for p in store["profiles"]}
+    assert "Default Subagent" in names
+    assert {"Recon-Scout", "SQLi-Verifier", "RE-Binary", "Reporter"} <= names
     # Seeding is in-memory only until a real change happens -- nothing written yet.
     assert not subagent_store.SUBAGENT_STORE_PATH.exists()
+
+
+def test_load_subagent_profiles_returns_fresh_copies_not_the_module_constant(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    first = subagent_store.load_subagent_profiles()["profiles"]
+    first[0]["name"] = "mutated"
+    # A caller mutating a returned profile must never corrupt the seed every later load depends on.
+    second = subagent_store.load_subagent_profiles()["profiles"]
+    assert second[0]["name"] == "Default Subagent"
 
 
 def test_load_subagent_profiles_treats_corrupt_json_as_the_default_seed(tmp_path, monkeypatch):
@@ -26,8 +38,8 @@ def test_load_subagent_profiles_treats_corrupt_json_as_the_default_seed(tmp_path
     subagent_store.SUBAGENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     subagent_store.SUBAGENT_STORE_PATH.write_text("{not valid json", encoding="utf-8")
     store = subagent_store.load_subagent_profiles()
-    assert len(store["profiles"]) == 1
-    assert store["profiles"][0]["id"] == "default"
+    assert len(store["profiles"]) == len(subagent_store._SEED_PROFILES)
+    assert any(p["id"] == "default" for p in store["profiles"])
 
 
 def test_load_subagent_profiles_treats_a_non_object_json_as_the_default_seed(tmp_path, monkeypatch):
@@ -35,7 +47,50 @@ def test_load_subagent_profiles_treats_a_non_object_json_as_the_default_seed(tmp
     subagent_store.SUBAGENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     subagent_store.SUBAGENT_STORE_PATH.write_text("[1, 2, 3]", encoding="utf-8")
     store = subagent_store.load_subagent_profiles()
-    assert len(store["profiles"]) == 1
+    assert len(store["profiles"]) == len(subagent_store._SEED_PROFILES)
+
+
+def test_seed_specialists_use_only_real_registered_tool_names():
+    # A profile naming a tool that isn't registered yields an empty, useless capability hint for
+    # the delegating model (_profile_capability_hint falls back) -- the exact bug the fleet must not
+    # ship. Every seed tool name must resolve in the real registry.
+    from agent.tools.registry import get_tool
+    for profile in subagent_store._SEED_PROFILES:
+        for tool_name in profile["allowed_tools"]:
+            assert get_tool(tool_name) is not None, f"{profile['name']}: unknown tool {tool_name!r}"
+
+
+def test_no_seed_profile_uses_a_tool_disallowed_for_subagents():
+    # A subagent-disallowed tool (record_finding, the phase-terminal recording tools, ...) is
+    # stripped from any subagent's toolset at delegation time and never offered as a checkbox, so
+    # seeding one just inflates a profile's tool badge with options the editor can never show -- the
+    # exact Reporter bug this guards against.
+    for profile in subagent_store._SEED_PROFILES:
+        offending = set(profile["allowed_tools"]) & subagent_store._SUBAGENT_DISALLOWED_TOOLS
+        assert not offending, f"{profile['name']}: seeds subagent-disallowed tool(s) {offending}"
+
+
+def test_migration_scrubs_disallowed_tools_from_an_existing_profile(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    # A profile persisted with a disallowed tool (the shape the first Reporter seed wrote to disk).
+    _write_store(tmp_path, [{"id": "seed-reporter", "name": "Reporter", "enabled": False,
+                             "allowed_tools": ["record_finding", "record_chain_result", "update_plan"],
+                             "instructions": "", "provider": None, "model": None,
+                             "icon": "wrench", "icon_color": "#fbbf24"}])
+
+    subagent_store.ensure_builtin_specialists_migrated()
+
+    reporter = next(p for p in subagent_store.load_subagent_profiles()["profiles"]
+                    if p["id"] == "seed-reporter")
+    # The disallowed record_* tools are gone; the one genuinely usable tool is kept.
+    assert reporter["allowed_tools"] == ["update_plan"]
+
+
+def test_seed_profiles_all_use_valid_icons():
+    from agent.tools.subagent_icons import is_valid_icon, is_valid_color
+    for profile in subagent_store._SEED_PROFILES:
+        assert is_valid_icon(profile["icon"]), f"{profile['name']}: bad icon {profile['icon']!r}"
+        assert is_valid_color(profile["icon_color"]), f"{profile['name']}: bad color"
 
 
 def test_add_profile_persists_a_real_new_profile(tmp_path, monkeypatch):
@@ -46,8 +101,9 @@ def test_add_profile_persists_a_real_new_profile(tmp_path, monkeypatch):
     )
 
     on_disk = json.loads(subagent_store.SUBAGENT_STORE_PATH.read_text(encoding="utf-8"))
-    # add_profile starts from the seeded default (still present), plus the new one.
-    assert len(on_disk["profiles"]) == 2
+    # add_profile starts from the seeded roster (still present), plus the new one.
+    assert len(on_disk["profiles"]) == len(subagent_store._SEED_PROFILES) + 1
+    assert any(p["name"] == "Default Subagent" for p in on_disk["profiles"])
     new_profile = next(p for p in on_disk["profiles"] if p["name"] == "OSINT-разведчик")
     assert new_profile["enabled"] is False
     assert new_profile["allowed_tools"] == ["dns_lookup", "subfinder"]
@@ -235,3 +291,66 @@ def test_import_profiles_rejects_malformed_shapes_without_raising(tmp_path, monk
     assert subagent_store.import_profiles({}) == 0
     assert subagent_store.import_profiles({"profiles": "not-a-list"}) == 0
     assert subagent_store.import_profiles("not-a-dict-at-all") == 0
+
+
+def _write_store(tmp_path, profiles, **extra):
+    import json as _json
+    payload = {"profiles": profiles, **extra}
+    subagent_store.SUBAGENT_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    subagent_store.SUBAGENT_STORE_PATH.write_text(_json.dumps(payload), encoding="utf-8")
+
+
+def test_migration_adds_fleet_to_a_pre_fleet_store_once_then_is_a_noop(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    # A store that predates the fleet -- only the old generic default, no version marker.
+    _write_store(tmp_path, [{"id": "default", "name": "Default Subagent", "enabled": False,
+                             "allowed_tools": [], "instructions": "", "provider": None,
+                             "model": None, "icon": "robot", "icon_color": "#60a5fa"}])
+
+    added = subagent_store.ensure_builtin_specialists_migrated()
+    assert added == len(subagent_store._SEED_PROFILES) - 1  # every specialist, default already there
+    names = {p["name"] for p in subagent_store.load_subagent_profiles()["profiles"]}
+    assert "Recon-Scout" in names and "RE-Binary" in names
+    # Migrated specialists land disabled, like every seeded/imported profile.
+    assert all(p["enabled"] is False for p in subagent_store.load_subagent_profiles()["profiles"])
+
+    # Second run does nothing -- the marker is now current.
+    assert subagent_store.ensure_builtin_specialists_migrated() == 0
+
+
+def test_migration_does_not_resurrect_a_deleted_builtin(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _write_store(tmp_path, [{"id": "default", "name": "Default Subagent", "enabled": False,
+                             "allowed_tools": [], "instructions": "", "provider": None,
+                             "model": None, "icon": "robot", "icon_color": "#60a5fa"}])
+    subagent_store.ensure_builtin_specialists_migrated()
+
+    # Operator deletes a specialist AFTER the one-time migration already ran.
+    reporter_id = next(p["id"] for p in subagent_store._SEED_PROFILES if p["name"] == "Reporter")
+    subagent_store.delete_profile(reporter_id)
+
+    # A later startup migration must NOT bring it back (marker already current).
+    subagent_store.ensure_builtin_specialists_migrated()
+    names = {p["name"] for p in subagent_store.load_subagent_profiles()["profiles"]}
+    assert "Reporter" not in names
+
+
+def test_migration_is_a_noop_when_no_store_file_exists(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    assert subagent_store.ensure_builtin_specialists_migrated() == 0
+    assert not subagent_store.SUBAGENT_STORE_PATH.exists()
+
+
+def test_restore_builtin_specialists_readds_a_deleted_one_ignoring_the_marker(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _write_store(tmp_path, [{"id": "default", "name": "Default Subagent", "enabled": False,
+                             "allowed_tools": [], "instructions": "", "provider": None,
+                             "model": None, "icon": "robot", "icon_color": "#60a5fa"}])
+    subagent_store.ensure_builtin_specialists_migrated()
+    reporter_id = next(p["id"] for p in subagent_store._SEED_PROFILES if p["name"] == "Reporter")
+    subagent_store.delete_profile(reporter_id)
+
+    # Explicit operator "restore" brings it back even though the version marker is current.
+    added = subagent_store.restore_builtin_specialists()
+    assert added == 1
+    assert "Reporter" in {p["name"] for p in subagent_store.load_subagent_profiles()["profiles"]}

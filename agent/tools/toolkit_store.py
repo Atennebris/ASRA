@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Literal
 
 from agent.tools import passive_detectors
+from agent.utils.debug import session_log_scope
 from agent.utils.logger import get_logger
 from projects.paths import resolve_global_app_dir
 from sessions.store import get_session_folder
@@ -215,26 +216,30 @@ def append_traffic_entry(entry: dict) -> bool:
     project folder yet -- e.g. a legacy pre-project-folder session -- matching agent/utils/debug.py's
     own _session_folder() graceful-degrade convention rather than raising."""
     session_id = entry["session_id"]
-    path = _traffic_path(session_id)
-    if path is None:
-        logger.debug("append_traffic_entry: no project folder for session=%s, skipping", session_id)
-        return False
-
-    line = json.dumps(entry, ensure_ascii=False)
-    with _lock_for(path):
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError as exc:
-            logger.debug("append_traffic_entry: write failed for session=%s (%s)", session_id, exc)
+    # This runs on the long-lived toolkit proxy/racer task, which never sets current_session_id
+    # itself -- so route every diagnostic line here by the entry's OWN session, not whatever session
+    # happened to be ambient, otherwise one engagement's captured traffic lands in another's log.
+    with session_log_scope(session_id):
+        path = _traffic_path(session_id)
+        if path is None:
+            logger.debug("append_traffic_entry: no project folder for session=%s, skipping", session_id)
             return False
 
-    logger.debug(
-        "append_traffic_entry: session=%s method=%s url=%s status=%s source=%s flags=%s",
-        session_id, entry["method"], entry["url"], entry["response_status"], entry["source"], entry.get("flags") or [],
-    )
-    return True
+        line = json.dumps(entry, ensure_ascii=False)
+        with _lock_for(path):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError as exc:
+                logger.debug("append_traffic_entry: write failed for session=%s (%s)", session_id, exc)
+                return False
+
+        logger.debug(
+            "append_traffic_entry: session=%s method=%s url=%s status=%s source=%s flags=%s",
+            session_id, entry["method"], entry["url"], entry["response_status"], entry["source"], entry.get("flags") or [],
+        )
+        return True
 
 
 def traffic_file_mtime_ns(session_id: str | None) -> int | None:

@@ -13,7 +13,7 @@
        resuming a paused/interrupted scan requires restoring one of them. Neither is true -- rotation
        to the newest {{ project_backup_max_count }} is the whole design (agent/tools/project_backup.py's
        PROJECT_BACKUP_MAX_COUNT), and a resume just reopens the live session.json, no restore needed. #}
-    <p class="text-secondary italic">Auto-backup keeps the newest {{ project_backup_max_count }} snapshots (older ones
+    <p class="text-secondary italic ui-desc">Auto-backup keeps the newest {{ project_backup_max_count }} snapshots (older ones
       are deleted automatically) -- this is disaster recovery, not how you resume: continuing a paused
       or interrupted scan already picks up from the live session.json on its own, with nothing to
       restore. Only use Restore here to roll this project's files back to an earlier point in time.</p>
@@ -43,7 +43,7 @@
         {% endfor %}
       </div>
     {% else %}
-      <p class="text-secondary italic">No backups yet.</p>
+      <p class="text-secondary italic ui-desc">No backups yet.</p>
     {% endif %}
   </div>
 </details>

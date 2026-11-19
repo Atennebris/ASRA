@@ -130,3 +130,117 @@ def test_stage_refuses_without_published_checksum(monkeypatch, tmp_path):
 
     assert result["ok"] is False
     assert "unverifiable" in result["message"].lower()
+
+
+def test_stage_refuses_when_content_length_declares_more_than_the_cap(monkeypatch, tmp_path):
+    """Real-world equivalent this guards against: a compromised/misbehaving download host sending
+    back a huge body -- refused from the declared Content-Length alone, before a single byte of
+    the oversized body is written to disk."""
+    monkeypatch.setenv("ASRA_DESKTOP_VERSION", "0.2.0")
+    monkeypatch.setenv("ASRA_DESKTOP_PLATFORM", "windows")
+    monkeypatch.setattr(desktop_update, "_MAX_DOWNLOAD_BYTES", 10)
+
+    def oversized_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("asra-desktop-windows-x64.exe"):
+            return httpx.Response(200, content=_ASSET_BYTES, headers={"content-length": "999999999"})
+        return _default_handler(request)
+
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(oversized_handler))
+    monkeypatch.setattr(desktop_update, "_STAGING_DIR", tmp_path / "staging")
+
+    status = desktop_update.check_for_desktop_update()
+    result = desktop_update.stage_desktop_update(status)
+
+    assert result["ok"] is False
+    assert "larger than expected" in result["message"]
+    assert not (tmp_path / "staging").exists() or not list((tmp_path / "staging").iterdir())
+
+
+def test_stage_aborts_mid_download_once_the_running_total_passes_the_cap_even_without_a_header(monkeypatch, tmp_path):
+    """The Content-Length check above only catches an HONEST header -- a missing or lied-about one
+    must not bypass the cap, so the running total is checked again on every chunk while streaming."""
+    monkeypatch.setenv("ASRA_DESKTOP_VERSION", "0.2.0")
+    monkeypatch.setenv("ASRA_DESKTOP_PLATFORM", "windows")
+    monkeypatch.setattr(desktop_update, "_MAX_DOWNLOAD_BYTES", 10)  # _ASSET_BYTES is 29 bytes
+
+    def no_length_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("asra-desktop-windows-x64.exe"):
+            # httpx.Response auto-fills a correct Content-Length from `content=` -- overridden
+            # here to simulate a missing/untrustworthy one, so this test actually exercises the
+            # running-total check, not the (separately tested) upfront header check.
+            return httpx.Response(200, content=_ASSET_BYTES, headers={"content-length": ""})
+        return _default_handler(request)
+
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(no_length_handler))
+    monkeypatch.setattr(desktop_update, "_STAGING_DIR", tmp_path / "staging")
+
+    status = desktop_update.check_for_desktop_update()
+    result = desktop_update.stage_desktop_update(status)
+
+    assert result["ok"] is False
+    assert "cap" in result["message"]
+    assert not (tmp_path / "staging" / "asra-desktop-windows-x64.exe.part").exists()
+
+
+def test_stage_refuses_a_second_concurrent_call_while_one_is_already_in_progress(monkeypatch, tmp_path):
+    """Real race this guards against: main.py's api_desktop_update_stage (the card's own manual
+    button) and _desktop_follow_up (fired automatically right after a project-code update) both
+    call stage_desktop_update, writing to the exact same per-platform staged path -- two FastAPI
+    sync routes can genuinely run on different threadpool threads at once."""
+    monkeypatch.setenv("ASRA_DESKTOP_VERSION", "0.2.0")
+    monkeypatch.setenv("ASRA_DESKTOP_PLATFORM", "windows")
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(_default_handler))
+    monkeypatch.setattr(desktop_update, "_STAGING_DIR", tmp_path / "staging")
+
+    status = desktop_update.check_for_desktop_update()
+    assert desktop_update._stage_lock.acquire(blocking=False)
+    try:
+        result = desktop_update.stage_desktop_update(status)
+    finally:
+        desktop_update._stage_lock.release()
+
+    assert result["ok"] is False
+    assert "already in progress" in result["message"]
+
+
+def _check_on(monkeypatch, platform_name, machine):
+    monkeypatch.setenv("ASRA_DESKTOP_VERSION", "0.2.0")
+    monkeypatch.setenv("ASRA_DESKTOP_PLATFORM", platform_name)
+    monkeypatch.setattr(desktop_update.host_platform, "machine", lambda: machine)
+    monkeypatch.setattr(httpx, "Client", _mock_httpx_client(_default_handler))
+    return desktop_update.check_for_desktop_update()
+
+
+def test_linux_x86_64_gets_the_linux_asset(monkeypatch):
+    status = _check_on(monkeypatch, "linux", "x86_64")
+    assert status.error is None
+    assert status.asset_name == "asra-desktop-linux-x64"
+    assert status.available is True
+
+
+def test_linux_arm_is_refused_instead_of_getting_an_x64_binary(monkeypatch):
+    status = _check_on(monkeypatch, "linux", "aarch64")
+    assert status.available is False
+    assert "aarch64" in status.error and "build it from source" in status.error
+    assert status.download_url == ""
+
+
+def test_macos_apple_silicon_gets_the_arm64_asset(monkeypatch):
+    status = _check_on(monkeypatch, "macos", "arm64")
+    assert status.error is None
+    assert status.asset_name == "asra-desktop-macos-arm64"
+
+
+def test_macos_intel_is_refused(monkeypatch):
+    status = _check_on(monkeypatch, "macos", "x86_64")
+    assert status.available is False
+    assert "x86_64" in status.error
+
+
+def test_windows_is_not_gated_on_cpu_architecture(monkeypatch):
+    # x64 build also runs on ARM64 Windows through its own emulation layer.
+    status = _check_on(monkeypatch, "windows", "arm64")
+    assert status.error is None
+    assert status.asset_name == "asra-desktop-windows-x64.exe"

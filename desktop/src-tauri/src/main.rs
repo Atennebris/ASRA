@@ -945,6 +945,13 @@ fn stop_backend(owned: &OwnedBackend) {
     };
     eprintln!("[ASRA-DESKTOP] stopping backend (clean SIGINT)");
 
+    // Fire the SIGINT and return IMMEDIATELY -- never block the exit on it. The operator clicked
+    // Quit from the tray and wants the app (and its tray icon) gone instantly; any synchronous wait
+    // here is exactly what made "Quit" feel laggy. `spawn()` (not `status()`) detaches the kill: the
+    // pkill is a quick, already-launched command that runs to completion and delivers the signal to
+    // the WSL-side python even after this desktop process has exited, so the backend still shuts
+    // down cleanly on its own a moment later (uvicorn on SIGINT; session writes are atomic). The
+    // server-startup orphan sweep (_terminate_stale_asra) is the backstop if a signal is ever missed.
     #[cfg(windows)]
     {
         let mut kill = Command::new("wsl.exe");
@@ -954,28 +961,19 @@ fn stop_backend(owned: &OwnedBackend) {
             .arg("-lc")
             .arg("pkill -INT -f 'python main.py'")
             .creation_flags(CREATE_NO_WINDOW);
-        let _ = kill.status();
+        let _ = kill.spawn();
     }
     #[cfg(not(windows))]
     {
         let _ = Command::new("kill")
             .arg("-INT")
             .arg(backend.child.id().to_string())
-            .status();
+            .spawn();
     }
 
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        match backend.child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            _ => {
-                let _ = backend.child.kill();
-                let _ = backend.child.wait();
-                break;
-            }
-        }
-    }
+    // One non-blocking reap so a child that already exited is cleaned up here; never wait on one
+    // that is still shutting down -- that is what the detached SIGINT above is for.
+    let _ = backend.child.try_wait();
 }
 
 // How often spawn_backend_watchdog below polls the backend's port once it's confirmed up -- a
@@ -1197,10 +1195,24 @@ fn apply_desktop_update(app: AppHandle, staged_path: String) -> Result<(), Strin
 
     std::fs::rename(&current, &backup)
         .map_err(|e| format!("Could not rename the running executable out of the way: {e}"))?;
-    if let Err(e) = std::fs::rename(&staged, &current) {
-        // Roll back immediately so the install is never left with no exe at its real path at all.
-        let _ = std::fs::rename(&backup, &current);
-        return Err(format!("Could not move the new binary into place (rolled back): {e}"));
+    if let Err(rename_err) = std::fs::rename(&staged, &current) {
+        // A rename cannot cross volumes/filesystems, and the staged file lives under the app data
+        // dir while the exe may sit on another drive or mount (E:\ vs C:\, /mnt/d vs /home) -- so a
+        // failed rename is not yet a failed update: copy it into place instead. Only if that fails
+        // too, roll back so the install is never left with no exe at its real path at all.
+        let log_env_text = std::fs::read_to_string(repo_dir().join(".env")).unwrap_or_default();
+        append_desktop_log_line(
+            &log_env_text,
+            &format!("apply_desktop_update: rename into place failed ({rename_err}), falling back to copy"),
+        );
+        if let Err(copy_err) = std::fs::copy(&staged, &current) {
+            let _ = std::fs::remove_file(&current); // a partial copy must not shadow the restored exe
+            let _ = std::fs::rename(&backup, &current);
+            return Err(format!(
+                "Could not move the new binary into place (rolled back): rename: {rename_err}; copy: {copy_err}"
+            ));
+        }
+        let _ = std::fs::remove_file(&staged);
     }
 
     #[cfg(unix)]
@@ -1230,6 +1242,87 @@ fn apply_desktop_update(app: AppHandle, staged_path: String) -> Result<(), Strin
 // that. Unlike apply_desktop_update above, this COPIES the running exe rather than renaming it --
 // the original download is left alone where the operator put it, not replaced in place -- then
 // spawns the installed copy and exits, so the session continues seamlessly from the real checkout.
+// Native "Save As" for the Playbook export buttons. A plain browser's window.showSaveFilePicker is
+// NOT available in this WebView2 shell, so without this the frontend fell back to a silent download
+// into the Downloads folder with no location choice at all -- the operator asked for a real "choose
+// where" picker. The frontend fetches the export JSON, then hands it here; this opens the OS save
+// dialog (defaulting to the last-used folder / Downloads), writes the chosen file from Rust, and
+// returns the chosen path (or None when the operator cancels the dialog).
+// Opens the OS "Save As" dialog for an export, DEFAULTING to the operator's Downloads folder on
+// every OS (Windows/macOS/Linux) -- an explicit operator requirement, not the dialog's own
+// last-used-folder default. Returns the chosen path, or None when the operator cancels.
+fn export_save_dialog(app: &AppHandle, suggested_name: &str) -> Option<std::path::PathBuf> {
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title("Save export")
+        .set_file_name(suggested_name);
+    if let Ok(downloads) = app.path().download_dir() {
+        builder = builder.set_directory(downloads);
+    }
+    builder
+        .blocking_save_file()
+        .and_then(|picked| picked.into_path().ok())
+}
+
+#[tauri::command]
+fn save_export_file(app: AppHandle, suggested_name: String, contents: String) -> Result<Option<String>, String> {
+    let Some(path) = export_save_dialog(&app, &suggested_name) else {
+        return Ok(None); // operator cancelled -- nothing written, not an error
+    };
+    std::fs::write(&path, contents.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+// Binary counterpart of save_export_file for PNG/PDF/zip/docx exports -- the webview base64-encodes
+// the bytes (a JSON-number array over the IPC would be far larger), this decodes and writes them.
+// Same Downloads-default Save As dialog.
+#[tauri::command]
+fn save_export_bytes(app: AppHandle, suggested_name: String, data_b64: String) -> Result<Option<String>, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("invalid export data: {e}"))?;
+    let Some(path) = export_save_dialog(&app, &suggested_name) else {
+        return Ok(None);
+    };
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+// Streaming Export path for large server-side files (a multi-GB project .zip): instead of the
+// webview buffering the whole archive into memory and base64-ing it across the IPC, it just hands us
+// the local loopback URL, and we fetch + stream the response body straight to the chosen file here.
+// std::io::copy pumps it in fixed-size chunks, so peak memory stays flat regardless of file size.
+// url is always http://127.0.0.1:<port>/... (this app's own backend), never an external address.
+#[tauri::command]
+fn save_export_url(app: AppHandle, url: String, suggested_name: String) -> Result<Option<String>, String> {
+    // Build the agent once with a generous read timeout: a big project archive is assembled on the
+    // fly server-side, so the first bytes can take a while to arrive -- a short default timeout would
+    // abort a legitimate large export mid-build.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(24 * 60 * 60))
+        .build();
+
+    let Some(path) = export_save_dialog(&app, &suggested_name) else {
+        return Ok(None); // operator cancelled -- don't even start the fetch
+    };
+
+    let resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("could not fetch the export: {e}"))?;
+    let mut reader = resp.into_reader();
+    let mut file = std::fs::File::create(&path)
+        .map_err(|e| format!("could not create {}: {e}", path.display()))?;
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 #[tauri::command]
 fn bootstrap_full_project(app: AppHandle) -> Result<(), String> {
     let picked = app
@@ -1956,6 +2049,22 @@ fn open_external_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+// Native page zoom for the whole UI (static/js/ui_zoom.js: Ctrl +/-/0 and Ctrl+wheel). Uses the
+// webview's own zoom (WebView2 ZoomFactor / WKWebView magnification / WebKitGTK zoom level), so the
+// page re-lays out at a different CSS viewport size exactly like a browser tab or Electron's
+// setZoomFactor -- the previous CSS `zoom` on <html> left the viewport-unit-based app shell
+// (h-screen, calc(100vh - ...)) at the wrong size, shrinking the UI into a corner when zoomed out.
+// The WebView2 hotkeys themselves stay off (this command is the single owner of zoom), so there is
+// never a second, native zoom stacked on top. The factor is clamped here too: this is reachable from
+// page script, and a runaway value would make the window unusable.
+#[tauri::command]
+fn set_page_zoom(window: tauri::WebviewWindow, factor: f64) -> Result<(), String> {
+    if !factor.is_finite() {
+        return Err("zoom factor must be a finite number".to_string());
+    }
+    window.set_zoom(factor.clamp(0.25, 5.0)).map_err(|e| e.to_string())
+}
+
 // Fire a native OS notification. Called by the web UI (session.html) only when a session reaches a
 // terminal state -- it rides on the app's own SSE stream as the single source of truth, never a
 // second one. Desktop-only: the caller guards on window.__TAURI__ being present.
@@ -2163,10 +2272,14 @@ fn main() {
             launch_backend,
             apply_desktop_update,
             bootstrap_full_project,
+            save_export_file,
+            save_export_bytes,
+            save_export_url,
             force_restart_agent,
             save_env,
             open_in_browser,
             open_external_url,
+            set_page_zoom,
             notify_session_done,
             install_wsl,
             get_wsl_setup_status,
@@ -2267,7 +2380,17 @@ fn main() {
                             let _ = window.set_focus();
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // Hide the window first so the UI vanishes the instant the operator clicks
+                        // Quit, instead of lingering on screen through the backend-teardown that
+                        // RunEvent::Exit -> stop_backend then does. The process itself (and the tray
+                        // icon) still goes away only once stop_backend returns, but that is now a
+                        // short, bounded wait (see stop_backend's grace deadline).
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;

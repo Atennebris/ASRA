@@ -12,6 +12,7 @@ treats it as an opaque string, it doesn't know how it was built.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -119,6 +120,10 @@ def build_embedding_text(entry: dict) -> str:
         str(entry.get("payload_or_command") or ""),
         " ".join(entry.get("tech_keywords") or []),
         " ".join(entry.get("waf_vendors") or []),
+        # Target shape + mode so a reverse-engineering/agentic capture (whose tech tokens are thin and
+        # whose waf set is empty) is still matched by MEANING across sessions, not left second-class.
+        str(entry.get("target_shape") or ""),
+        str(entry.get("mode") or ""),
     ]
     return " ".join(p for p in parts if p).strip()
 
@@ -425,7 +430,7 @@ def _confidence_score(entry: dict) -> float:
 
 def _relevance_score(
     query_tech: set[str], query_waf: set[str], query_vuln_class: str | None,
-    key_tech: set[str], key_waf: set[str], entry: dict,
+    key_tech: set[str], key_waf: set[str], entry: dict, query_shape: str | None = None,
 ) -> float:
     """Weighted similarity of one stored entry to the current target (0.0 == not a candidate).
     Replaces the old "overlap COUNT, exact key first" ranking, which surfaced too little: an entry
@@ -445,10 +450,19 @@ def _relevance_score(
     """
     union = query_tech | key_tech
     jaccard = len(query_tech & key_tech) / len(union) if union else 0.0
-    if jaccard == 0.0:
+    q_shape = (query_shape or "").strip().lower()
+    entry_shape = str(entry.get("target_shape") or "").strip().lower()
+    shape_match = bool(q_shape) and entry_shape == q_shape
+    # Candidacy floor: shared tech OR same target shape. The shape path is what lets reverse-
+    # engineering / binary knowledge (empty waf set, thin tech tokens) surface at all -- without it a
+    # jaccard of 0 killed every such entry no matter how perfectly the shapes lined up.
+    if jaccard == 0.0 and not shape_match:
         return 0.0
 
     score = jaccard * 3.0
+    # A shared target shape is reusable knowledge the way a shared WAF is -- weight it the same.
+    if shape_match:
+        score += 2.0
     if query_waf and key_waf and (query_waf & key_waf):
         score += 2.0
     if query_vuln_class and entry.get("vuln_class") and str(entry["vuln_class"]).lower() == query_vuln_class.lower():
@@ -536,11 +550,13 @@ def import_seed_pack() -> int:
 
 def add_manual_technique(technique: str, payload_or_command: str = "", tech_keywords: list[str] | None = None,
                          waf_vendors: list[str] | None = None, vuln_class: str = "", worked: bool = True,
-                         cves: str = "") -> str | None:
+                         cves: str = "", target_shape: str = "", mode: str = "") -> str | None:
     """Builds and records a single operator-authored technique -- the Playbook manager's own "add"
     action (main.py). Same entry shape (attribution counters, chain refs, keying) as an
     agent/chat-captured one, so a hand-added technique ranks and surfaces exactly like the rest.
-    Returns the new entry's id, or None if the technique text was empty."""
+    target_shape/mode let a hand-added RE/agentic technique carry the same cross-mode matching
+    dimensions a captured one does. Returns the new entry's id, or None if the technique text was
+    empty."""
     technique = (technique or "").strip()
     if not technique:
         return None
@@ -557,6 +573,8 @@ def add_manual_technique(technique: str, payload_or_command: str = "", tech_keyw
         "evidence_ref": "",
         "tech_keywords": tech,
         "waf_vendors": waf,
+        "target_shape": (target_shape or "").strip().lower() or None,
+        "mode": (mode or "").strip().lower() or None,
         "outcome": "worked" if worked else "failed",
         "times_confirmed": 1,
         "injected_count": 0,
@@ -612,6 +630,13 @@ def list_all_techniques() -> list[dict]:
                 # the same thing it always implicitly was, never a silent behavior change.
                 "source_type": entry.get("source_type") or "live",
                 "confidence": entry.get("confidence") or "confirmed",
+                # Normalized like source_type/confidence above so pre-skill entries read cleanly.
+                "target_shape": entry.get("target_shape") or None,
+                "mode": entry.get("mode") or None,
+                "skill": entry.get("skill"),
+                "skill_success_rate": skill_success_rate(entry["skill"]) if entry.get("skill") else None,
+                "skill_tampered": skill_body_tampered(entry["skill"]) if entry.get("skill") else False,
+                "skill_enabled": skill_enabled(entry["skill"]) if entry.get("skill") else None,
             })
     out.sort(key=lambda e: e.get("last_seen", ""), reverse=True)
     return out
@@ -698,6 +723,343 @@ def delete_technique(technique_id: str) -> bool:
     return False
 
 
+# --- Skill artifacts -----------------------------------------------------------------------------
+# A technique records WHAT worked; a skill records a reusable, EXECUTABLE form of it -- a
+# parameterized command, a script the agent itself ran, or an ordered instruction list -- so a later
+# session reuses the win in a couple of calls instead of re-deriving it. One skill per technique
+# entry, addressed by that entry's own id (same id space as update_technique/delete_technique).
+#
+# Security posture (this is the whole reason the shape is what it is): a skill's body is EXECUTED
+# later, sometimes without a human in the loop, by an agent whose job is chewing on hostile targets.
+# So a skill body may only ever be something the agent itself constructed/ran or the operator typed
+# (`derived_from`), never raw bytes lifted out of a target's output -- that is the skill-poisoning /
+# indirect-injection vector. body_sha256 pins the exact reviewed bytes; a later mismatch means the
+# body was changed out-of-band and execution must refuse until it's re-vetted. run_skill (agent/
+# core.py, agent/chat.py) additionally always routes a script through agent/tools/sandbox.py.
+_VALID_SKILL_KINDS = frozenset({"command", "script", "instructions"})
+_VALID_SKILL_INTERPRETERS = frozenset({"sh", "python", "pwntools", "none"})
+# "library" = a skill distilled from operator-ingested study material (a book/article/writeup). It is
+# untrusted-by-default provenance exactly like "import" -- the document's author is not this agent --
+# so it starts trust="unreviewed" and is sandbox-gated, but it is a recognized, runnable origin.
+_VALID_SKILL_DERIVED_FROM = frozenset({"agent_run", "operator", "import", "library"})
+
+
+def skill_body_hash(body: str) -> str:
+    """The pin over a skill body's exact bytes -- recomputed on every edit, checked before every
+    execution so a body changed out-of-band (hand-edited store, tampered import) is caught."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_skill_params(params) -> list[dict]:
+    """Coerces a params spec into [{name, desc, required}] -- tolerant of a bare list of names or
+    half-filled dicts (a model-authored skill won't always supply every field)."""
+    out: list[dict] = []
+    for p in params or []:
+        if isinstance(p, str):
+            name = p.strip()
+            if name:
+                out.append({"name": name, "desc": "", "required": True})
+        elif isinstance(p, dict) and str(p.get("name", "")).strip():
+            out.append({
+                "name": str(p["name"]).strip(),
+                "desc": str(p.get("desc", "") or ""),
+                "required": bool(p.get("required", True)),
+            })
+    return out
+
+
+def build_skill(kind: str, body: str, params=None, interpreter: str = "none",
+                session_id: str | None = None, target_shape: str | None = None,
+                mode: str | None = None, derived_from: str = "agent_run") -> dict | None:
+    """Builds a normalized skill artifact, or None if it isn't well-formed enough to be worth storing
+    (unknown kind / empty body). Starts trust='unreviewed' and runs=0 -- a freshly-minted skill has
+    proven nothing yet; the self-improvement counters and the distillation pass earn it trust over
+    real reuse, not on the strength of having been captured once."""
+    body = (body or "").strip()
+    if kind not in _VALID_SKILL_KINDS or not body:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "kind": kind,
+        "body": body,
+        "params": _normalize_skill_params(params),
+        "interpreter": interpreter if interpreter in _VALID_SKILL_INTERPRETERS else "none",
+        "provenance": {
+            "session_id": session_id or "",
+            "target_shape": target_shape or "",
+            "mode": mode or "",
+            "derived_from": derived_from if derived_from in _VALID_SKILL_DERIVED_FROM else "agent_run",
+            "created_at": now,
+        },
+        "trust": "unreviewed",
+        "body_sha256": skill_body_hash(body),
+        "runs": 0,
+        "run_successes": 0,
+        # Operator on/off switch -- a disabled skill stays stored (and keeps its history) but is never
+        # run and never surfaced as a lead, so an operator can shelve one they don't want right now
+        # without deleting it. Absent on a legacy skill == enabled (see skill_enabled()).
+        "enabled": True,
+    }
+
+
+def skill_enabled(skill: dict) -> bool:
+    """Whether a skill is switched on -- default True so a skill stored before this field existed
+    keeps behaving exactly as it did (enabled), never silently going dark."""
+    return bool((skill or {}).get("enabled", True))
+
+
+def _find_entry_by_id(store: dict, technique_id: str) -> tuple[str | None, dict | None]:
+    """(key, entry) for a technique id, or (None, None) -- the one place the "scan every key for an
+    id" walk lives, shared by every skill mutator below so they don't each re-open that loop."""
+    for key, entries in store.items():
+        for entry in entries:
+            if entry.get("id") == technique_id:
+                return key, entry
+    return None, None
+
+
+def attach_skill(technique_id: str, skill: dict) -> bool:
+    """Attaches (or replaces) a skill on an existing technique entry. Returns True if the technique
+    was found. Replacing is deliberate: a technique has at most one skill -- a better capture of the
+    same win supersedes the old one rather than piling up near-duplicates."""
+    if not skill:
+        return False
+    store = load_playbook_store()
+    _key, entry = _find_entry_by_id(store, technique_id)
+    if entry is None:
+        return False
+    entry["skill"] = skill
+    _write_playbook_store(store)
+    logger.debug("playbook: attached %s skill to technique id=%s", skill.get("kind"), technique_id)
+    return True
+
+
+def get_technique_skill(technique_id: str) -> dict | None:
+    """The skill attached to a technique, or None -- what run_skill loads before executing."""
+    _key, entry = _find_entry_by_id(load_playbook_store(), technique_id)
+    return (entry or {}).get("skill")
+
+
+def chain_skill_sequence(technique_id: str) -> list[dict]:
+    """The ordered [{technique_id, technique, kind}] of skills along this technique's kill-chain
+    (root -> ... -> this), skipping chain steps that carry no skill -- what run_skill_chain replays to
+    automate a proven multi-step recipe in one action. Reuses the same chain walk the recipe UI uses
+    (_chain_ordered), so a chain shown as a 'Recipe' and a chain that can be RUN never diverge."""
+    store = load_playbook_store()
+    by_id = {e.get("id"): e for entries in store.values() for e in entries}
+    out: list[dict] = []
+    for entry in _chain_ordered(by_id, technique_id):
+        skill = entry.get("skill")
+        if isinstance(skill, dict):
+            out.append({"technique_id": entry.get("id"), "technique": entry.get("technique"), "kind": skill.get("kind")})
+    return out
+
+
+def skill_body_tampered(skill: dict) -> bool:
+    """Whether a skill's stored body no longer matches its pinned hash -- the execution gate: a
+    tampered/out-of-band-edited body must not run until re-vetted. A skill with no hash recorded
+    (legacy/hand-added) is treated as tampered so it can never silently auto-run unvetted."""
+    if not skill:
+        return True
+    pinned = skill.get("body_sha256")
+    return not pinned or pinned != skill_body_hash(skill.get("body", ""))
+
+
+def skill_success_rate(skill: dict) -> float | None:
+    """run_successes / runs, or None before the skill has ever run -- the self-improvement signal the
+    distillation pass and the UI read (distinct from the technique's own injected/led attribution,
+    which is about being SURFACED, not about EXECUTING cleanly)."""
+    runs = int((skill or {}).get("runs", 0) or 0)
+    if runs <= 0:
+        return None
+    return int(skill.get("run_successes", 0) or 0) / runs
+
+
+def bump_skill_run(technique_id: str, success: bool) -> None:
+    """Records one execution of a technique's skill (runs +1, run_successes +1 on success) -- the
+    feedback loop that lets a skill earn trust over real reuse or get flagged as it degrades."""
+    store = load_playbook_store()
+    _key, entry = _find_entry_by_id(store, technique_id)
+    skill = (entry or {}).get("skill")
+    if not skill:
+        return
+    skill["runs"] = int(skill.get("runs", 0) or 0) + 1
+    if success:
+        skill["run_successes"] = int(skill.get("run_successes", 0) or 0) + 1
+    _write_playbook_store(store)
+    logger.debug("playbook: bumped skill run id=%s success=%s (runs=%d)", technique_id, success, skill["runs"])
+
+
+def set_skill_enabled(technique_id: str, enabled: bool) -> bool:
+    """Operator's on/off toggle (Playbook UI). A disabled skill is never run (run_skill refuses it)
+    and never surfaced as a lead, but it keeps its body/history so it can be switched back on."""
+    store = load_playbook_store()
+    _key, entry = _find_entry_by_id(store, technique_id)
+    skill = (entry or {}).get("skill")
+    if not skill:
+        return False
+    skill["enabled"] = bool(enabled)
+    _write_playbook_store(store)
+    logger.debug("playbook: set skill enabled id=%s -> %s", technique_id, skill["enabled"])
+    return True
+
+
+def set_skill_trust(technique_id: str, trusted: bool) -> bool:
+    """Operator's manual trust toggle (Playbook UI). trust is advisory metadata for ranking/UI -- it
+    does NOT gate execution (sandbox + hash + provenance do), so flipping it can never make an
+    unsafe body run; it marks a skill the operator has personally vouched for."""
+    store = load_playbook_store()
+    _key, entry = _find_entry_by_id(store, technique_id)
+    skill = (entry or {}).get("skill")
+    if not skill:
+        return False
+    skill["trust"] = "operator_trusted" if trusted else "unreviewed"
+    _write_playbook_store(store)
+    logger.debug("playbook: set skill trust id=%s -> %s", technique_id, skill["trust"])
+    return True
+
+
+def update_skill_body(technique_id: str, body: str | None = None, params=None) -> bool:
+    """Self-improvement edit (the update_skill tool / the UI's own edit): rewrites the body and/or
+    params, re-pins the hash, and resets trust to 'unreviewed' when the body actually changed -- an
+    operator's earlier vouch was for the OLD bytes, not these. Returns True if a skill was found."""
+    store = load_playbook_store()
+    _key, entry = _find_entry_by_id(store, technique_id)
+    skill = (entry or {}).get("skill")
+    if not skill:
+        return False
+    if body is not None:
+        new_body = body.strip()
+        if new_body and new_body != skill.get("body"):
+            skill["body"] = new_body
+            skill["body_sha256"] = skill_body_hash(new_body)
+            skill["trust"] = "unreviewed"
+    if params is not None:
+        skill["params"] = _normalize_skill_params(params)
+    _write_playbook_store(store)
+    logger.debug("playbook: updated skill body/params id=%s", technique_id)
+    return True
+
+
+def list_all_skills() -> list[dict]:
+    """Every technique that carries a skill, flattened with the fields the UI/export need (technique
+    id+text, the skill, its success rate, tamper flag) -- read-only, newest technique first."""
+    out: list[dict] = []
+    for entry in sorted(
+        (e for entries in load_playbook_store().values() for e in entries if e.get("skill")),
+        key=lambda e: e.get("last_seen", ""), reverse=True,
+    ):
+        skill = entry["skill"]
+        out.append({
+            "technique_id": entry.get("id"),
+            "technique": entry.get("technique"),
+            "skill": skill,
+            "success_rate": skill_success_rate(skill),
+            "tampered": skill_body_tampered(skill),
+            "enabled": skill_enabled(skill),
+        })
+    return out
+
+
+def add_manual_skill(*, kind: str, body: str, technique: str = "", params=None, interpreter: str = "none",
+                     tech_keywords: list[str] | None = None, waf_vendors: list[str] | None = None,
+                     vuln_class: str = "", target_shape: str = "", mode: str = "", trusted: bool = True) -> str | None:
+    """Operator-authored skill (Playbook UI's own "New skill" form) -- creates its backing technique
+    entry AND attaches the skill in one step, marked derived_from='operator' and, by default,
+    operator_trusted (a human wrote it). This is the "add a skill to ASRA by hand, like any other
+    agent" path: the result is immediately first-class -- the agent auto-surfaces and (sandboxed)
+    runs it across every mode via find_similar_techniques exactly like a captured skill, and it
+    exports to other agents via export_skills. Returns the backing technique id, or None if the
+    body/technique text is empty.
+
+    An operator-written body is trusted provenance by definition, so it is NOT subject to the
+    "body must come from the agent's own run" rule that guards auto-captured skills -- that rule
+    exists to block target-controlled bytes, which a human-typed body is not."""
+    skill = build_skill(
+        kind=kind, body=body, params=params, interpreter=interpreter,
+        target_shape=target_shape, mode=mode, derived_from="operator",
+    )
+    if skill is None:
+        return None
+    technique_text = (technique or "").strip() or f"Operator skill ({kind}): {body.strip().splitlines()[0][:80]}"
+    tid = add_manual_technique(
+        technique=technique_text, tech_keywords=tech_keywords, waf_vendors=waf_vendors,
+        vuln_class=vuln_class, worked=True, target_shape=target_shape, mode=mode,
+    )
+    if tid is None:
+        return None
+    if trusted:
+        skill["trust"] = "operator_trusted"
+    attach_skill(tid, skill)
+    logger.debug("playbook: operator added manual %s skill on technique id=%s", kind, tid)
+    return tid
+
+
+# Portable skill envelope -- a documented, agent-agnostic schema (agentskills.io-style) so a skill
+# made in ASRA can be carried to another agent and vice versa. Bumped if the shape ever changes.
+SKILL_EXPORT_SCHEMA = "asra.skill/v1"
+
+
+def export_skills() -> dict:
+    """Every stored skill as a portable envelope for sharing/backup. Carries the backing technique's
+    text + matching dimensions (tech/waf/shape/mode) so an import reconstructs a first-class entry,
+    not an orphan body. Provenance travels too, but an import never trusts it (see import_skills)."""
+    store = load_playbook_store()
+    by_id = {e.get("id"): e for entries in store.values() for e in entries}
+    skills = []
+    for item in list_all_skills():
+        entry = by_id.get(item["technique_id"]) or {}
+        skill = item["skill"]
+        skills.append({
+            "technique": entry.get("technique") or "",
+            "kind": skill.get("kind"),
+            "body": skill.get("body"),
+            "params": skill.get("params") or [],
+            "interpreter": skill.get("interpreter") or "none",
+            "tech_keywords": entry.get("tech_keywords") or [],
+            "waf_vendors": entry.get("waf_vendors") or [],
+            "vuln_class": entry.get("vuln_class") or "",
+            "target_shape": entry.get("target_shape") or "",
+            "mode": entry.get("mode") or "",
+            "provenance": skill.get("provenance") or {},
+        })
+    return {"schema": SKILL_EXPORT_SCHEMA, "skills": skills}
+
+
+def import_skills(payload: dict, source_label: str = "import") -> int:
+    """Merges an export_skills() envelope (or a compatible one from another agent) into the store.
+    Every imported skill lands derived_from='import' and trust='unreviewed' -- a body authored
+    somewhere else is exactly the untrusted-provenance case the security model exists for, so it is
+    never auto-trusted and its hash is re-pinned locally. Malformed entries are skipped, never
+    raised (an operator's upload must not be able to crash the app). Returns how many were added."""
+    if not isinstance(payload, dict):
+        return 0
+    added = 0
+    for item in payload.get("skills") or []:
+        if not isinstance(item, dict):
+            continue
+        skill = build_skill(
+            kind=str(item.get("kind") or ""), body=str(item.get("body") or ""),
+            params=item.get("params"), interpreter=str(item.get("interpreter") or "none"),
+            target_shape=str(item.get("target_shape") or ""), mode=str(item.get("mode") or ""),
+            derived_from="import",
+        )
+        if skill is None:
+            continue
+        technique_text = str(item.get("technique") or "").strip() or f"Imported skill ({skill['kind']})"
+        tid = add_manual_technique(
+            technique=technique_text, tech_keywords=item.get("tech_keywords"),
+            waf_vendors=item.get("waf_vendors"), vuln_class=str(item.get("vuln_class") or ""),
+            worked=True, target_shape=str(item.get("target_shape") or ""), mode=str(item.get("mode") or ""),
+        )
+        if tid is None:
+            continue
+        attach_skill(tid, skill)
+        added += 1
+    logger.debug("playbook: imported %d skill(s) from %s", added, source_label)
+    return added
+
+
 def mark_reviewed(technique_id: str, confirmed: bool) -> bool:
     """The manual half of reviewing a library-extracted entry (Playbook UI's own "Confirm"/
     "Reject" buttons on an unreviewed card) -- the other, automatic half lives in
@@ -771,10 +1133,30 @@ def import_entries(incoming: dict, source_label: str = "import") -> int:
             if entry.get("id") in existing_ids:
                 continue
             entry.setdefault("source_session_ids", [source_label])
+            # A whole-playbook export (the existing quick export/import the operator already uses to
+            # pass a playbook between machines/colleagues) now carries skills inline -- that IS the
+            # "add someone else's skills easily" path, but a skill body authored elsewhere is
+            # untrusted provenance: re-pin its hash locally, drop any foreign operator_trusted mark,
+            # and stamp derived_from='import' so it can never silently auto-run on a foreign vouch.
+            if isinstance(entry.get("skill"), dict):
+                _sanitize_imported_skill(entry["skill"])
             record_technique(key, entry)
             added += 1
     logger.debug("playbook: imported %d entr(y/ies) from %s", added, source_label)
     return added
+
+
+def _sanitize_imported_skill(skill: dict) -> None:
+    """In-place: makes a skill that arrived from outside this machine safe to store -- trust reset to
+    'unreviewed', body hash re-pinned to the actual bytes received, provenance marked
+    derived_from='import'. Shared by import_entries (whole-playbook import) and import_skills."""
+    skill["trust"] = "unreviewed"
+    skill["body_sha256"] = skill_body_hash(skill.get("body", ""))
+    prov = skill.get("provenance")
+    if not isinstance(prov, dict):
+        prov = {}
+    prov["derived_from"] = "import"
+    skill["provenance"] = prov
 
 
 def dedupe_all_techniques() -> int:
@@ -947,7 +1329,7 @@ def prune_low_value(min_injections: int) -> int:
     return removed
 
 
-def find_similar_techniques(tech_keywords: set[str], waf_vendors: set[str], limit: int, vuln_class: str | None = None, query_embedding: list[float] | None = None) -> list[dict]:
+def find_similar_techniques(tech_keywords: set[str], waf_vendors: set[str], limit: int, vuln_class: str | None = None, query_embedding: list[float] | None = None, target_shape: str | None = None) -> list[dict]:
     """Every stored entry scored against the current target and ranked by (score, recency), top
     `limit` returned. HYBRID: the keyword score (_relevance_score -- partial stack overlap, shared
     WAF, matching vuln class, confidence) PLUS, when query_embedding is supplied, a semantic score
@@ -960,7 +1342,7 @@ def find_similar_techniques(tech_keywords: set[str], waf_vendors: set[str], limi
     """
     if limit <= 0:
         return []
-    if not tech_keywords and query_embedding is None:
+    if not tech_keywords and query_embedding is None and not target_shape:
         return []
     store = load_playbook_store()
     embeddings = load_embeddings() if query_embedding is not None else {}
@@ -973,7 +1355,10 @@ def find_similar_techniques(tech_keywords: set[str], waf_vendors: set[str], limi
         except (json.JSONDecodeError, AttributeError, TypeError):
             continue
         for entry in entries:
-            keyword_score = _relevance_score(tech_keywords, waf_vendors, vuln_class, key_tech, key_waf, entry) if tech_keywords else 0.0
+            keyword_score = (
+                _relevance_score(tech_keywords, waf_vendors, vuln_class, key_tech, key_waf, entry, target_shape)
+                if (tech_keywords or target_shape) else 0.0
+            )
             semantic_score = 0.0
             if query_embedding is not None:
                 vec = embeddings.get(entry.get("id"))

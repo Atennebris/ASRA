@@ -78,12 +78,14 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket as socket_module
 import subprocess
 import time
 from pathlib import Path
 
+from agent.tools.builders.re_target import identify_file_type
 from agent.tools.builders.validators import validate_safe_value
 from agent.tools.custom_tools_root import resolve_via_custom_root
 from agent.tools.re_evidence import evidence_result
@@ -132,6 +134,60 @@ _SERVER_IDLE_TIMEOUT_SECONDS = int(os.getenv("GHIDRA_SERVER_IDLE_TIMEOUT_SECONDS
 # proof a server is actually alive and responsive -- a stale socket left over from a killed/crashed
 # server, or across an ASRA restart, is a real, common case, not a hypothetical one.
 _PING_TIMEOUT_SECONDS = 3
+
+# Read-only ghidra modes whose result is a pure function of the (unchanged) binary plus the
+# request -- safe to serve from cache. The write/mutating modes (set_address_name,
+# annotate_native_function, fix_no_return_flags, fix_mips_soft_float) are deliberately excluded:
+# they change the program database, so their own results aren't cacheable AND running one must
+# invalidate any cached reads of that same project (see _invalidate_project_cache).
+_CACHEABLE_MODES = frozenset({
+    "info", "functions", "decompile_function", "disassemble_function", "xrefs_to", "cfg",
+    "pcode_def_use", "value_flow", "inspect_native_data_type",
+})
+
+# Per-(project, mode, normalized target) result cache, process-lifetime ("for the session"). The
+# persistent server already stays resident per (file, mtime), but a repeat decompile_function of
+# the SAME address still pays a fresh ~42s decompile every call -- this serves the identical result
+# instantly instead, the same dedup radare2 already gets (agent/tools/runner.py's result cache,
+# keyed on the input file's mtime). The key here embeds _project_key_for (which itself embeds the
+# file's mtime), so an edited binary never hits a stale entry: it gets a brand-new key, a fresh
+# server, and a cold cache automatically.
+_result_cache: dict[str, dict] = {}
+
+# r2/ghidra all refer to one address several ways -- 0x401000, 4198400 would be distinct strings,
+# and "fcn.00401000" is just a label for 0x401000. Only the provably-numeric forms are collapsed;
+# a real function name is case-sensitive and left verbatim, since a wrong collapse would serve the
+# WRONG function's cached result (a correctness bug), whereas a missed collapse only costs a
+# recompute.
+_FCN_HEX_RE = re.compile(r"[0-9a-f]+")
+
+
+def _normalized_target(target: str) -> str:
+    t = target.strip()
+    if not t:
+        return ""
+    body = t[4:] if t.lower().startswith("fcn.") else t
+    bl = body.lower()
+    try:
+        if bl.startswith("0x"):
+            return hex(int(bl, 16))
+        if t.lower().startswith("fcn.") and _FCN_HEX_RE.fullmatch(bl):
+            return hex(int(bl, 16))
+    except ValueError:
+        pass
+    return t
+
+
+def _invalidate_project_cache(project_key: str) -> None:
+    """Drop every cached read for one project -- called after a write/mutating mode runs, because
+    renaming a function / annotating / fixing flags changes the program database and therefore
+    what a later decompile/disassemble of that same project would return."""
+    prefix = f"{project_key}:"
+    stale = [k for k in _result_cache if k.startswith(prefix)]
+    for k in stale:
+        del _result_cache[k]
+    if stale:
+        logger.debug("ghidra: invalidated %d cached result(s) for project_key=%s after a write mode", len(stale), project_key)
 
 
 def _resolve_analyzeheadless() -> str | None:
@@ -225,6 +281,16 @@ def _ping_server(socket_path: Path) -> bool:
         return False
 
 
+def _read_stderr_tail(stderr_log_path: Path, max_chars: int = 1500) -> str:
+    """Best-effort tail of the server's captured stderr, for an early-exit error message. Never
+    raises -- a failure reading it must not mask the real startup failure being reported."""
+    try:
+        text = stderr_log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:].strip()
+
+
 def _start_server(executable: str, project_dir: Path, gpr_exists: bool, program_name: str, file_path: str, socket_path: Path) -> None:
     action_args = ["-process", program_name, "-noanalysis"] if gpr_exists else ["-import", file_path]
     command = [
@@ -237,21 +303,44 @@ def _start_server(executable: str, project_dir: Path, gpr_exists: bool, program_
         "ghidra: starting server project_dir=%s reused_project=%s command=%s",
         project_dir, gpr_exists, command,
     )
+    # Capture the child's stderr to a file in the native scratch dir (socket_path.parent IS that
+    # dir) instead of discarding it -- when analyzeHeadless exits early the real reason lives only
+    # in its stderr, and a silently-dropped stream is exactly what made a confirmed "server exited
+    # early" failure undiagnosable (empty stderr_preview in the session log). Append mode so a reused
+    # native dir never truncates a prior run's trace. The parent's own handle is closed right after
+    # the spawn -- the detached child has already inherited its own copy of the fd.
+    stderr_log_path = socket_path.parent / "server.stderr.log"
+    try:
+        stderr_sink = open(stderr_log_path, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        stderr_sink = None
+
     # A real detached background process -- deliberately outlives this one Python call, serving
     # every future call against the same project until its own idle timeout or a shutdown request.
     # start_new_session=True keeps it from being killed by a signal sent to ASRA's own process
     # group (e.g. Ctrl-C in the terminal ASRA itself runs in).
-    proc = subprocess.Popen(
-        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=(stderr_sink if stderr_sink is not None else subprocess.DEVNULL),
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        if stderr_sink is not None:
+            stderr_sink.close()
 
     deadline = time.monotonic() + _SERVER_START_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if _ping_server(socket_path):
             return
         if proc.poll() is not None:
-            raise RuntimeError(f"the Ghidra server process exited early (exit code {proc.returncode}) before becoming ready")
+            message = f"the Ghidra server process exited early (exit code {proc.returncode}) before becoming ready"
+            tail = _read_stderr_tail(stderr_log_path)
+            if tail:
+                message += f": {tail}"
+            raise RuntimeError(message)
         time.sleep(0.5)
     raise TimeoutError(f"the Ghidra server did not become ready within {_SERVER_START_TIMEOUT_SECONDS}s")
 
@@ -313,6 +402,48 @@ def _send_request(socket_path: Path, request: dict) -> dict:
     return json.loads(response)
 
 
+# Ghidra's analyzeHeadless only decompiles NATIVE binaries (PE/ELF/Mach-O/COFF/raw). Pointed at a
+# JVM/archive/mobile container it imports that container as JAVA bytecode (or not at all), the
+# postScript finds no native program at a radare2 address, and analyzeHeadless exits cleanly (code 0)
+# before the decompiler socket ever binds -- surfacing only as a generic "server exited early" that
+# invites a pointless retry loop. Rejecting these positively-identified containers up front turns
+# that dead end into one clear, actionable verdict (point the operator at jadx / extract first).
+_REJECTED_CONTAINER_EXTENSIONS = frozenset({
+    ".jar", ".war", ".ear", ".dex", ".class", ".apk", ".ipa", ".zip", ".asar", ".wasm", ".jsc",
+})
+_CONTAINER_ZIP_MAGIC = b"PK\x03\x04"
+_CONTAINER_DEX_MAGIC = b"dex\n"
+_CONTAINER_WASM_MAGIC = b"\x00asm"
+# Shared with a Mach-O universal ("fat") binary, which Ghidra CAN load -- so this magic only means
+# JVM bytecode when the extension also says so, never on its own.
+_CONTAINER_JAVA_CLASS_MAGIC = b"\xca\xfe\xba\xbe"
+
+
+def _rejected_container_reason(path_obj: Path) -> str | None:
+    """Positively identifies a JVM/archive/mobile container Ghidra cannot decompile, returning a
+    short reason for the rejection or None to let the file through. Deliberately conservative: a
+    normal native binary and an unknown/raw blob (both of which Ghidra CAN import) are never
+    rejected -- only the explicitly enumerated containers are. A Mach-O universal binary shares the
+    Java-class magic bytes, so those bytes count as JVM bytecode only for a `.class` extension."""
+    suffix = path_obj.suffix.lower()
+    if suffix in _REJECTED_CONTAINER_EXTENSIONS:
+        return f"container extension {suffix}"
+    try:
+        with open(path_obj, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return None
+    if head.startswith(_CONTAINER_ZIP_MAGIC):
+        return "ZIP-based container magic"
+    if head.startswith(_CONTAINER_DEX_MAGIC):
+        return "Dalvik DEX magic"
+    if head.startswith(_CONTAINER_WASM_MAGIC):
+        return "WebAssembly magic"
+    if suffix == ".class" and head.startswith(_CONTAINER_JAVA_CLASS_MAGIC):
+        return "Java class magic"
+    return None
+
+
 def run_ghidra(params: dict) -> dict:
     file_path = validate_safe_value(str(params["file_path"]).strip())
     path_obj = Path(file_path)
@@ -320,6 +451,21 @@ def run_ghidra(params: dict) -> dict:
         raise ValueError(f"file_path is a directory, not a binary: {file_path!r}")
     if not path_obj.is_file():
         raise ValueError(f"file_path does not exist: {file_path!r}")
+
+    container_reason = _rejected_container_reason(path_obj)
+    if container_reason is not None:
+        detected_type = identify_file_type(path_obj)
+        message = (
+            f"Ghidra decompiles native binaries (PE/ELF/Mach-O); this file is a {detected_type}. "
+            "For JVM bytecode (.jar/.war/.dex/.class) use the `jadx` tool instead. If it is a "
+            "container with an embedded native binary (e.g. a JGuard-wrapped DLL), run the "
+            "`extract_embedded_binary` tool first and point Ghidra at the extracted native file."
+        )
+        logger.debug(
+            "ghidra: rejected non-native target file_path=%s detected_type=%s (%s)",
+            file_path, detected_type, container_reason,
+        )
+        return {"status": "unsupported_target", "tool": "ghidra", "detected_type": detected_type, "error": message}
 
     mode = params.get("mode", "info")
     if mode not in _VALID_MODES:
@@ -349,6 +495,14 @@ def run_ghidra(params: dict) -> dict:
         return {"status": "tool_unavailable", "tool": "ghidra"}
 
     key = _project_key_for(file_path)
+    cache_key = f"{key}:{mode}:{_normalized_target(target)}"
+    # Served before even pinging the server: a cache hit needs no round trip, and never risks
+    # spinning a fresh server back up just to answer something already known (a read that arrives
+    # after the resident server idle-timed out would otherwise pay a full cold start for nothing).
+    if mode in _CACHEABLE_MODES and cache_key in _result_cache:
+        logger.debug("ghidra: served mode=%s target=%r from cache (key=%s)", mode, target, cache_key)
+        return {**_result_cache[cache_key], "from_cache": True}
+
     project_dir = _project_dir_for(key)
     native_dir = _native_scratch_dir_for(key)
     gpr_path = project_dir / f"{_PROJECT_NAME}.gpr"
@@ -378,5 +532,13 @@ def run_ghidra(params: dict) -> dict:
         logger.debug("ghidra: server reported a request-level error: %s", error)
         return {"status": "error", "tool": "ghidra", "error": error}
 
+    result = {"status": "ok", "tool": "ghidra", **evidence_result(raw.get("observed", {}), unknown=raw.get("unknown", {}))}
+    if mode in _CACHEABLE_MODES:
+        _result_cache[cache_key] = result
+        logger.debug("ghidra: cached result mode=%s target=%r (cache now holds %d entries)", mode, target, len(_result_cache))
+    else:
+        # A write/mutating mode just changed the program database -- any cached read of this same
+        # project is now potentially stale, so drop them all rather than serve an outdated decompile.
+        _invalidate_project_cache(key)
     logger.debug("ghidra: finished mode=%s status=ok", mode)
-    return {"status": "ok", "tool": "ghidra", **evidence_result(raw.get("observed", {}), unknown=raw.get("unknown", {}))}
+    return result

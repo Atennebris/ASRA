@@ -321,3 +321,98 @@ def test_run_session_actually_auto_delegates_after_a_real_recon_phase(tmp_path, 
     # splitting off -- proof the operator's own "subagent delegation must work on every phase, not
     # just one" requirement holds end-to-end, not just in each phase's own isolated unit tests.
     assert len(saved.get("subagent_tasks") or {}) == 2
+
+
+# --- mid-phase delegation: fires WHILE recon is still running, not only after it returns --------
+
+
+def test_mid_phase_delegation_fires_before_recon_itself_finishes(tmp_path, monkeypatch):
+    """Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): the only
+    code-driven call to this function used to run once, AFTER the whole recon phase returned -- on
+    a slow (not hung) recon the operator gives up on and interrupts before that point, zero
+    subagent help ever happens even for hosts found in the first few minutes. _run_recon's own
+    record_target handling now calls this function again every time a genuinely new target is
+    recorded, so a subagent can start on an already-discovered overflow batch WHILE recon keeps
+    working through the rest. Proven here by checking state is already populated DURING the
+    phase -- on the very next LLM turn after the 4th (threshold-reaching) host, not merely
+    non-empty by the time the whole phase eventually ends (a plain end-to-end check couldn't tell
+    the two apart, since both call sites are the same idempotent function)."""
+    _isolate(tmp_path, monkeypatch)
+    _enable_profile()
+    monkeypatch.setattr("agent.core.get_provider", lambda provider, model: _ImmediatelyReportsLLM())
+    hosts = [f"h{i}.example.com" for i in range(4)]  # exactly the threshold
+    _allow_all(["example.com", *hosts])
+    session = {
+        "session_id": "usr_mid_phase_delegation", "target": "example.com", "status": "processing",
+        "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+    }
+    observed = {}
+
+    class _RecordingLLM:
+        provider_id = "test-main-provider"
+        model = "test-model"
+        context_limit = None
+
+        def __init__(self):
+            self._script = [("record_target", {"host": h, "port": 443, "service": "https"}) for h in hosts]
+            self.calls_made = 0
+
+        def complete(self, messages, tools=None, stop_check=None):
+            self.calls_made += 1
+            if self.calls_made == 5 and "subagent_tasks_before_phase_ends" not in observed:
+                # One turn AFTER the 4th (threshold-reaching) record_target call already
+                # happened and was fully processed -- delegation must already have fired by now,
+                # not only once this whole phase eventually returns.
+                observed["subagent_tasks_before_phase_ends"] = len(session.get("subagent_tasks") or {})
+            if self._script:
+                name, args = self._script.pop(0)
+                return LLMResponse(content=None, tool_calls=[ToolCallRequest(id=f"c{self.calls_made}", name=name, arguments=args)])
+            return LLMResponse(content="done", tool_calls=[])
+
+    from agent.core import _run_recon, RunContext as _RC
+    ctx = _RC(llm=_RecordingLLM(), session=session, session_id=session["session_id"])
+
+    _run(_run_recon(ctx, "example.com"))
+
+    assert observed["subagent_tasks_before_phase_ends"] == 1
+
+
+# --- interrupt backstop: a last chance to delegate when the phase stops without returning --------
+
+
+def test_interrupted_recon_still_gets_a_last_chance_to_delegate_overflow_hosts(tmp_path, monkeypatch):
+    """Direct test of run_session's own try/except around _run_recon (agent/core.py) -- a
+    defensive backstop for whatever _run_recon's own mid-phase delegation (the test above) hadn't
+    yet caught at the exact moment _run_recon stopped without returning at all. In today's code
+    the mid-phase hook above already handles the common case (it fires after every new target, so
+    an interrupt landing between hosts is already covered) -- this monkeypatches _run_recon itself
+    to simulate the shape of an interrupt directly: it writes partial recon_result data (exactly
+    like the real function does incrementally) then raises SessionStopRequested without returning,
+    proving the overflow-delegation call below it in run_session's while-loop still gets a chance
+    to run on whatever was found, rather than being skipped outright the way it used to be.
+    """
+    _isolate(tmp_path, monkeypatch)
+    _enable_profile()
+    hosts = [f"h{i}.example.com" for i in range(4)]
+    _allow_all(["example.com", *hosts])
+    session_id = "usr_interrupted_recon_still_delegates"
+    store.save_session(session_id, {
+        "session_id": session_id, "target": "example.com", "status": "processing",
+        "logs": [], "findings": [], "approvals": [], "chat": {"summary": "", "messages": []},
+    })
+
+    async def _fake_run_recon(ctx, target):
+        ctx.session["recon_result"] = {
+            "targets": [{"host": h, "port": 443, "service": "https"} for h in hosts],
+            "cves": [], "dns_map": {}, "os_guesses": {},
+        }
+        raise core.SessionStopRequested()
+
+    monkeypatch.setattr(core, "_run_recon", _fake_run_recon)
+    monkeypatch.setattr(core, "get_provider", lambda provider=None, model=None: _ImmediatelyReportsLLM())
+
+    _run(run_session(session_id))
+
+    saved = store.load_session(session_id)
+    assert saved["status"] == "interrupted"
+    assert len(saved.get("auto_delegated_hosts") or []) == 4

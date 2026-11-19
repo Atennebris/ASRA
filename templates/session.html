@@ -57,6 +57,9 @@
        The block itself lives in its own partial so htmx can re-poll it live while a pass runs --
        see re_control_bar.html for why a static version left a stale Stop button hanging. #}
     {% include "partials/re_control_bar.html" %}
+    {# Lets the operator re-tune the agent's persona/tone (novice/hobbyist/professional) mid-project,
+       not only at creation -- see the partial's own comment for why it reads live on the next turn. #}
+    {% include "partials/re_experience_level_control.html" %}
   {% endif %}
   {# Defined BEFORE the chat panel include below, so chat_panel.html's own setChatCollapsed sees
      this hook the moment it loads and delegates to it (its collapse arrow reveals the Findings split
@@ -231,7 +234,7 @@
             <div class="text-center px-6">
               <svg class="w-6 h-6 mx-auto text-secondary/60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></svg>
               <p class="text-[12px] font-medium text-secondary mt-2">Reserved</p>
-              <p class="text-[10.5px] text-secondary/70 mt-1">More lands here soon.</p>
+              <p class="ui-desc text-[10.5px] text-secondary/70 mt-1">More lands here soon.</p>
             </div>
           </section>
         {% endif %}

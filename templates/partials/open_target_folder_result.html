@@ -16,7 +16,7 @@
         <code class="text-[10.5px] text-primary flex-1 truncate" title="{{ r.path }}">{{ r.path }}</code>
         {{ copy_button(r.path) }}
       </div>
-      <p class="text-[10px] text-secondary/70">Opening this directly isn't safe from inside WSL2 — paste the path into File Explorer's address bar instead.</p>
+      <p class="text-[10px] text-secondary/70 ui-desc">Opening this directly isn't safe from inside WSL2 — paste the path into File Explorer's address bar instead.</p>
     {% else %}
       <p class="text-[11px] text-severity-high">{{ r.message }}</p>
     {% endif %}

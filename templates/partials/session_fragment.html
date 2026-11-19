@@ -4,7 +4,7 @@
    Swapped in via hx-swap="morph" (Idiomorph, base.html), not innerHTML — stable id attributes
    on repeated elements (log entries, finding cards) below are what let it match "this node
    already exists, leave it alone" instead of destroying/recreating everything on every update. #}
-{% from "macros/ui.html" import button, badge, scenario_badge, bounty_badge, exploited_badge, false_positive_badge, possible_duplicate_badge, unconfirmed_target_badge, carried_over_badge, pending_reverify_badge, status_badge, section_label, empty_state, plan_status_icon, hypothesis_status_badge, disclosure_summary, toggle_switch, chat_ref, tool_timeline_list, copy_button, target_type_badges, credential_source_badge, masked_identity_field, llm_origin %}
+{% from "macros/ui.html" import button, badge, scenario_badge, bounty_badge, exploited_badge, false_positive_badge, possible_duplicate_badge, unconfirmed_target_badge, carried_over_badge, pending_reverify_badge, verify_status_badge, status_badge, section_label, empty_state, plan_status_icon, hypothesis_status_badge, disclosure_summary, toggle_switch, chat_ref, tool_timeline_list, copy_button, target_type_badges, credential_source_badge, masked_identity_field, llm_origin %}
 {% from "macros/tech_icons.html" import tech_icon %}
 
 {# Shared by the main Logs list, the Analyze/Exploit tab logs, and the Subagent log section
@@ -75,6 +75,13 @@
   <p class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-0.5">{{ target_type_badges(session.target) }}</p>
   {% if project_folder %}{% include "partials/project_backups.html" %}{% endif %}
   <p class="text-sm mt-1"><span class="text-secondary">Status:</span> {{ status_badge(session.status, session.logs[-1].phase if session.logs else none) }}</p>
+  {# llm_retry_notice is written by agent/core.py's LLM retry-progress sink during a provider
+     backoff (e.g. a 503). This fragment already re-renders live, so surfacing it turns a frozen
+     "processing" screen into visible "reconnecting to provider" activity instead of a dead-looking
+     stall. Shown only while still processing (the next normal save clears the notice). #}
+  {% if session.status == "processing" and session.llm_retry_notice %}
+  <p class="text-[11px] text-severity-medium mt-0.5">{{ session.llm_retry_notice }}</p>
+  {% endif %}
   {# Total time of the whole session (agent/core.py's started_at/finished_at) — spans any
      interruption + resume in between, only freezing once the scan actually reaches "completed".
      Still-running (no finished_at yet): data-live-duration + data-started-at hand this off to
@@ -216,6 +223,69 @@
 
   <section data-tab="overview">
     {{ section_label("Overview") }}
+
+    {# Live Target Overview (agent/target_overview.py) -- the consolidated "what we know right now"
+       read: surface, stack/fingerprint, findings broken down by their derived verification
+       status, open hypotheses, and an honest knowledge boundary. A pure aggregation of the session
+       recomputed on every render (no stored blob to drift, DRY), living inside #session-content so
+       the SSE morph keeps it current as facts arrive -- no reload, no tab switch. Rendered only once
+       there's something to show, so a brand-new project isn't topped with an empty shell. #}
+    {% set ov = target_overview(session) %}
+    {% if ov.has_data %}
+      <div class="mb-4 bg-surface border border-default rounded-lg p-3">
+        <p class="text-sm font-semibold text-primary mb-2 flex items-center gap-1.5">
+          <svg class="w-4 h-4 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="0.6" fill="currentColor" stroke="none"/></svg>
+          What we know about this target so far
+        </p>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+          <div class="bg-elevated border border-default rounded p-2">
+            <p class="text-[10px] uppercase tracking-wide text-secondary">Surface</p>
+            <p class="text-sm text-primary"><span class="tabular-nums font-semibold">{{ ov.surface.host_count }}</span> host{{ "" if ov.surface.host_count == 1 else "s" }}</p>
+            <p class="text-[10px] text-secondary">{{ ov.surface.port_count }} open port{{ "" if ov.surface.port_count == 1 else "s" }}</p>
+          </div>
+          <div class="bg-elevated border border-default rounded p-2">
+            <p class="text-[10px] uppercase tracking-wide text-secondary">Findings</p>
+            <p class="text-sm text-primary"><span class="tabular-nums font-semibold">{{ ov.findings.total }}</span> total</p>
+            <p class="text-[10px] text-secondary">{{ ov.findings.exploited }} exploited</p>
+          </div>
+          <div class="bg-elevated border border-default rounded p-2">
+            <p class="text-[10px] uppercase tracking-wide text-secondary">Confidence</p>
+            <p class="text-[11px] text-status-online">{{ ov.knowledge.verified_findings }} verified</p>
+            <p class="text-[11px] text-secondary">{{ ov.knowledge.inferred_findings }} unconfirmed{% if ov.knowledge.disputed_findings %} &middot; <span class="text-severity-high">{{ ov.knowledge.disputed_findings }} disputed</span>{% endif %}</p>
+          </div>
+          <div class="bg-elevated border border-default rounded p-2">
+            <p class="text-[10px] uppercase tracking-wide text-secondary">Hypotheses</p>
+            <p class="text-sm text-primary"><span class="tabular-nums font-semibold">{{ ov.hypotheses.open }}</span> open</p>
+            <p class="text-[10px] text-secondary">{{ ov.hypotheses.confirmed }} confirmed &middot; {{ ov.hypotheses.ruled_out }} ruled out</p>
+          </div>
+        </div>
+        {% if ov.surface.hosts.shown %}
+          <p class="text-[11px] text-secondary mb-1">Hosts: <span class="text-primary">{{ ov.surface.hosts.shown | join(", ") }}</span>{% if ov.surface.hosts.more %} <span class="text-secondary">+{{ ov.surface.hosts.more }} more</span>{% endif %}</p>
+        {% endif %}
+        {% if ov.stack.technologies.shown %}
+          <p class="text-[11px] text-secondary mb-1">Stack: <span class="text-primary">{{ ov.stack.technologies.shown | join(", ") }}</span>{% if ov.stack.technologies.more %} <span class="text-secondary">+{{ ov.stack.technologies.more }} more</span>{% endif %}</p>
+        {% endif %}
+        {% if ov.stack.protections.shown %}
+          <p class="text-[11px] text-secondary mb-1">Protections: <span class="text-primary">{{ ov.stack.protections.shown | join(", ") }}</span>{% if ov.stack.protections.more %} <span class="text-secondary">+{{ ov.stack.protections.more }} more</span>{% endif %}</p>
+        {% endif %}
+        {% if ov.stack.os_guesses.shown %}
+          <p class="text-[11px] text-secondary mb-1">OS: <span class="text-primary">{{ ov.stack.os_guesses.shown | join(", ") }}</span></p>
+        {% endif %}
+        {% if ov.profile_facts %}
+          <p class="text-[11px] text-secondary mb-1">Profile: {% for f in ov.profile_facts[:6] %}<span class="text-primary">{{ f.label }}={{ f.value }}</span>{{ "; " if not loop.last }}{% endfor %}</p>
+        {% endif %}
+        {# Honest knowledge boundary -- what's measured vs suspected vs flagged, so an empty field
+           never reads as "no risk here". #}
+        <p class="text-[10px] text-secondary/70 mt-2 italic">Known edge: {{ ov.knowledge.verified_findings }} verified, {{ ov.knowledge.inferred_findings }} still unconfirmed, {{ ov.knowledge.open_hypotheses }} open question{{ "" if ov.knowledge.open_hypotheses == 1 else "s" }}{% if ov.knowledge.disputed_findings %}, {{ ov.knowledge.disputed_findings }} needing a human call{% endif %}.</p>
+      </div>
+    {% endif %}
+
+    {# Unattended repeat-scan schedule for this project -- lives here in Overview, updates live in
+       place via its own hx-post (no reload). See agent/tools/schedule_store.py + the scheduler
+       worker loop in main.py. #}
+    {% with session_id = session.session_id, schedule = get_schedule(session.session_id), min_interval_seconds = scheduler_min_interval_seconds(), scheduler_enabled = scheduler_enabled %}
+      {% include "partials/schedule_control.html" %}
+    {% endwith %}
 
     {# Start — the New Project form's "Create" button (main.py's start_scan) only creates the
        project now, status="created"; this is the deliberate second step, shown only for a project
@@ -405,7 +475,7 @@
     <form method="post" action="/api/session/{{ session.session_id }}/continue-deeper" class="mb-2">
       {{ button("Continue — dig deeper", variant="primary", type="submit") }}
     </form>
-    <p class="text-[11px] text-secondary mb-4">Re-verifies every finding found so far and keeps investigating for more, using everything already known about this target as context.</p>
+    <p class="text-[11px] text-secondary mb-4 ui-desc">Re-verifies every finding found so far and keeps investigating for more, using everything already known about this target as context.</p>
     {% endif %}
 
     {# Two genuinely different re-audit choices, picked via base.html's #asra-rescan-modal (opened
@@ -460,7 +530,7 @@
           </form>
         </div>
       {% else %}
-        <p class="text-[11px] text-secondary mb-2">No bug-bounty program linked to this project yet. When set, the agent can browse the program page and check its own Hacktivity feed for likely duplicates on its own initiative.</p>
+        <p class="text-[11px] text-secondary mb-2 ui-desc">No bug-bounty program linked to this project yet. When set, the agent can browse the program page and check its own Hacktivity feed for likely duplicates on its own initiative.</p>
       {% endif %}
       <form hx-post="/api/session/{{ session.session_id }}/program-url" hx-target="#session-content" hx-swap="outerHTML" hx-disabled-elt="this" class="flex items-center gap-2">
         <input type="text" name="program_url" value="{{ session.program_url or '' }}" placeholder="https://hackerone.com/your-program" autocomplete="off"
@@ -815,7 +885,7 @@
      recorded server-side but never rendered anywhere. #}
   <section data-tab="hypotheses">
     {{ section_label("Hypotheses") }}
-    <p class="text-[11px] text-secondary mb-3">
+    <p class="text-[11px] text-secondary mb-3 ui-desc">
       A suspicion worth checking — yours or the agent's own. Every one listed here must be
       confirmed or ruled out with a real check before the scan is considered fully done.
     </p>
@@ -1125,7 +1195,7 @@
       {% if dead_hosts %}
         <div class="mb-3 bg-elevated border border-default rounded-lg p-2.5">
           <p class="text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Unreachable ({{ dead_hosts | length }})</p>
-          <p class="text-[11px] text-secondary mb-2">Checked, never once responded — no further real attempts were spent on these.</p>
+          <p class="text-[11px] text-secondary mb-2 ui-desc">Checked, never once responded — no further real attempts were spent on these.</p>
           <ul class="space-y-1">
             {% for host, health in dead_hosts %}
               <li class="text-[11px] text-secondary break-words">
@@ -1764,9 +1834,14 @@
           <button type="button" data-findings-clear-filters class="hidden ml-auto text-[11px] text-accent hover:underline whitespace-nowrap">Clear filters</button>
         </div>
       {% endif %}
+      {# Built once here, not per-card: maps a finding title to its most recent reverify verdict so
+         verify_status() can fold a rescan's confirmed_present/fixed/inconclusive into each card's
+         single derived status without re-scanning reverification_history for every finding. #}
+      {% set reverify_outcomes = latest_reverify_outcome_by_title(session.reverification_history) %}
       <ul class="space-y-3 mb-4">
         {% for finding in session.findings %}
           {% set dialog_id = "finding-dialog-" ~ loop.index0 %}
+          {% set finding_verify = verify_status(finding, reverify_outcomes.get(finding.title)) %}
           {% set finding_cves = (finding.title ~ " " ~ (finding.description or "")) | extract_cves %}
           <li id="finding-{{ loop.index0 }}" class="finding-card relative" data-finding-row
               data-severity="{{ finding.severity | lower }}"
@@ -1790,6 +1865,7 @@
                  the outcome straight off the closed card instead of having to open every single
                  one. Same badges/colors the detail dialog already uses, just surfaced here too. #}
               <div class="flex flex-wrap items-center gap-1 mt-1">
+                {{ verify_status_badge(finding_verify) }}
                 {{ exploited_badge(finding) }}
                 {{ bounty_badge(finding.qualifies_for_bounty) }}
                 {{ false_positive_badge(finding.false_positive_reason) }}
@@ -1828,7 +1904,7 @@
     {% elif session.status == "failed" %}
       {{ empty_state("Scan stopped before finding anything.", "See the error in Logs above — not the same as a clean \"no vulnerabilities\" result.") }}
     {% else %}
-      <p class="text-sm text-secondary italic mb-4">No findings yet.</p>
+      <p class="text-sm text-secondary italic mb-4 ui-desc">No findings yet.</p>
     {% endif %}
 
     {# Every carried-over finding from a rescanned project's prior scan, all three outcomes
@@ -1907,9 +1983,20 @@
                  class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border text-severity-medium border-severity-medium/40 bg-severity-medium/10 hover:bg-severity-medium/20">{{ cve }}</a>
             {% endfor %}
             <span class="text-[11px] text-secondary">Verification: {{ finding.verification }}</span>
-            <span class="text-[11px] text-secondary">&middot; {% if finding.exploited %}Exploited{% elif finding.exploit_outcome and finding.exploit_outcome != "exploit_attempted" %}Not attempted{% else %}Not exploited{% endif %}</span>
+            {# One derived exploit-axis state (agent/verification_status.py), shared with the card
+               badge and detail box below -- so this meta line can't say "Not exploited" while the
+               badge says "Not exploitable" for the same finding again. Suppressed entirely for the
+               "none" state (Exploit never reached this finding yet) rather than claiming
+               "Not exploited" for a finding no exploit pass ever looked at. #}
+            {% set ex_state = finding | exploit_state %}
+            {% if ex_state != "none" %}<span class="text-[11px] text-secondary">&middot; {{ EXPLOIT_STATUS_LABELS[ex_state] }}</span>{% endif %}
             {% if finding.found_at %}<span class="text-[11px] text-secondary">&middot; Found {{ finding.found_at | human_dt }}</span>{% endif %}
-            {% if finding.cvss_vector %}<span class="text-[11px] text-secondary font-mono">&middot; {{ finding.cvss_vector }}</span>{% endif %}
+            {% if finding.cvss_vector %}
+              {% set cvss = cvss_score(finding.cvss_vector) %}
+              <span class="text-[11px] text-secondary">&middot;
+                {% if cvss and cvss.score is not none %}CVSS {{ "%.1f"|format(cvss.score) }} {{ cvss.severity }}{% else %}CVSS{% endif %}{% if finding.cvss_source == "agent" %} (agent-assessed){% elif finding.cvss_source == "cve" %} (from CVE){% endif %}
+                <span class="font-mono">{{ finding.cvss_vector }}</span></span>
+            {% endif %}
           </div>
 
           {% if finding.original_title %}
@@ -1926,15 +2013,19 @@
           {# Verdict first, technical detail after — a pentester deciding whether a finding is
              worth their time (or, for a real success, what to actually DO with it right now)
              needs that answer immediately, not buried under a wall of raw evidence/reproduction
-             text they have to read through first just to reach it. Exactly one of these two blocks
+             text they have to read through first just to reach it. At most one of these blocks
              ever shows. Real operator complaint the "exploited" branch fixes: a successfully
-             exploited finding's own card used to look visually identical to an unexploitable one
+             exploited finding's own card used to look visually identical to a non-exploited one
              — just more raw evidence text, no distinction, no short answer to "what did I actually
              get and what do I do with it" — easy to skim past and miss entirely next to the
-             deliberately muted yellow "not exploitable" block. #}
-          {% if finding.exploited %}
+             deliberately muted yellow "not exploited" block. #}
+          {# Branches on the one shared exploit-axis state (ex_state, set above) and the shared
+             EXPLOIT_STATUS_LABELS, so the box can't label a state differently from the card badge
+             or meta line. The per-state color still lives here (red success / gray skip / yellow
+             attempted-but-unproven). #}
+          {% if ex_state == "exploited" %}
             <div class="rounded border-2 border-severity-critical bg-severity-critical/10 px-2.5 py-2 mb-2">
-              <p class="text-[11px] font-bold uppercase tracking-wide text-severity-critical">&#9873; Exploited — access confirmed</p>
+              <p class="text-[11px] font-bold uppercase tracking-wide text-severity-critical">&#9873; {{ EXPLOIT_STATUS_LABELS["exploited"] }} — access confirmed</p>
               {% if finding.extracted_artifact %}
                 <p class="text-sm font-bold text-primary break-words mt-1 font-mono">{{ finding.extracted_artifact }}</p>
               {% endif %}
@@ -1944,18 +2035,17 @@
                 <div class="text-[11px] font-semibold text-secondary mt-1 chat-markdown">{{ finding.advisory_note | render_chat_markdown }}</div>
               {% endif %}
             </div>
-          {% elif finding.advisory_note and finding.exploit_outcome and finding.exploit_outcome != "exploit_attempted" %}
-            {# No real exploit tool ever ran against this finding (no suitable tool in the
-               registry, needs manual verification, an operator/scope skip) — a neutral "not
-               attempted" block, distinct from the yellow "not exploitable" one below, so this
-               doesn't read as a real disproven test. #}
+          {% elif ex_state == "not_attempted" and finding.advisory_note %}
+            {# A skip: no suitable tool in the registry, needs manual verification, an operator/scope
+               decision — a neutral block, distinct from the yellow attempted-but-unproven one below,
+               so this doesn't read as a real disproven test. #}
             <div class="rounded border border-dashed border-severity-unknown/50 bg-severity-unknown/5 px-2 py-1.5 mb-2">
-              <p class="text-[11px] font-semibold text-severity-unknown">&#9675; Not attempted</p>
+              <p class="text-[11px] font-semibold text-severity-unknown">&#9675; {{ EXPLOIT_STATUS_LABELS["not_attempted"] }}</p>
               <div class="text-[11px] break-words text-secondary mt-0.5 chat-markdown">{{ finding.advisory_note | render_chat_markdown }}</div>
             </div>
-          {% elif finding.advisory_note %}
+          {% elif ex_state == "not_exploited" and finding.advisory_note %}
             <div class="rounded border border-severity-medium/40 bg-severity-medium/10 px-2 py-1.5 mb-2">
-              <p class="text-[11px] font-semibold text-severity-medium">Not exploitable</p>
+              <p class="text-[11px] font-semibold text-severity-medium">{{ EXPLOIT_STATUS_LABELS["not_exploited"] }}</p>
               <div class="text-[11px] break-words text-secondary mt-0.5 chat-markdown">{{ finding.advisory_note | render_chat_markdown }}</div>
             </div>
           {% endif %}
@@ -1990,6 +2080,28 @@
           {% elif finding.skeptical_verification == "inconclusive" %}
             <p class="text-[11px] break-words text-secondary mb-2 italic">&#8635; Skeptical verification could not confirm or refute this independently:</p>
             <div class="text-[11px] break-words text-secondary mb-2 italic chat-markdown">{{ finding.skeptical_verification_note | render_chat_markdown }}</div>
+          {% endif %}
+
+          {# Cross-provider ensemble second opinion (agent/core.py's _run_skeptical_verification,
+             only when Settings' secondary verification provider is configured). The disagreement
+             flag used to be computed onto the finding and then shown NOWHERE -- surfaced here so a
+             split verdict between two genuinely independent providers is visible on the finding
+             itself, not buried in a debug log. #}
+          {% if finding.ensemble_secondary_verdict %}
+            {% if finding.ensemble_disagreement %}
+              <div class="rounded border-2 border-severity-high bg-severity-high/10 px-2.5 py-2 mb-2">
+                <p class="text-[11px] font-bold uppercase tracking-wide text-severity-high flex items-center gap-1">
+                  <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M8 2l6 11H2z" stroke-linejoin="round"/><path d="M8 6.5v3" stroke-linecap="round"/><circle cx="8" cy="11.3" r="0.45" fill="currentColor" stroke="none"/></svg>
+                  Two independent providers disagree
+                </p>
+                <p class="text-[11px] text-secondary mt-0.5">Primary verdict: <strong>{{ finding.skeptical_verification or "—" }}</strong> &middot; Second opinion{% if finding.ensemble_secondary_provider %} ({{ finding.ensemble_secondary_provider }}){% endif %}: <strong>{{ finding.ensemble_secondary_verdict }}</strong>. Worth a human call before trusting this either way.</p>
+                {% if finding.ensemble_secondary_note %}
+                  <div class="text-[11px] break-words text-secondary mt-0.5 chat-markdown">{{ finding.ensemble_secondary_note | render_chat_markdown }}</div>
+                {% endif %}
+              </div>
+            {% else %}
+              <p class="text-[11px] text-secondary mb-2">Second opinion{% if finding.ensemble_secondary_provider %} ({{ finding.ensemble_secondary_provider }}){% endif %}: <strong>{{ finding.ensemble_secondary_verdict }}</strong>.</p>
+            {% endif %}
           {% endif %}
 
           {% if finding.technology %}
@@ -2184,7 +2296,7 @@
        narrower lens the Chain tab already takes on chain_attempts. #}
     {% set session_techniques = list_session_techniques(session.session_id) %}
     {% if session_techniques %}
-      <p class="text-[11px] text-secondary mb-2">Pulled from the cross-session Playbook, filtered to entries this session actually captured or re-confirmed.</p>
+      <p class="text-[11px] text-secondary mb-2 ui-desc">Pulled from the cross-session Playbook, filtered to entries this session actually captured or re-confirmed.</p>
       <div class="space-y-2">
         {% for entry in session_techniques %}
           <div class="bg-elevated border border-default rounded-lg p-3">
@@ -2458,7 +2570,7 @@
     {% if session.missing_capabilities %}
       <div class="bg-surface border border-default rounded-lg p-3 mb-4">
         {{ section_label("Blocked — missing capability") }}
-        <p class="text-[11px] text-secondary mb-2">The agent needed something not installed on this machine. Install it from Settings &rarr; Optional interpreters/compilers, then retry below.</p>
+        <p class="text-[11px] text-secondary mb-2 ui-desc">The agent needed something not installed on this machine. Install it from Settings &rarr; Optional interpreters/compilers, then retry below.</p>
         <div class="space-y-1.5">
           {% for cap in session.missing_capabilities %}
             <div class="bg-elevated border border-default rounded-lg px-2.5 py-2">
@@ -2583,7 +2695,7 @@
             Qualifying findings — verified &amp; ready to report ({{ qualifying_hits | length }})
           </h3>
         </div>
-        <p class="text-[11px] text-secondary mb-2">
+        <p class="text-[11px] text-secondary mb-2 ui-desc">
           Matched against this project's own Qualifying vulnerabilities scope rules and actively
           verified — click one for the full reproduction detail. Also included in Export.
         </p>
@@ -2623,7 +2735,9 @@
          any globally-scoped JS function that could go stale across this fragment's own SSE
          re-renders (every handler here is self-contained, referencing only this same form's own
          session-scoped element ids). #}
-      <form method="get" action="/api/session/{{ session.session_id }}/export" class="mt-2 flex items-center gap-2 flex-wrap">
+      <form method="get" action="/api/session/{{ session.session_id }}/export"
+            data-export data-export-filename-base="asra_report_{{ session.session_id }}" data-export-ext-from="format"
+            class="mt-2 flex items-center gap-2 flex-wrap">
         <label class="text-[11px] text-secondary" for="export-format-{{ session.session_id }}">Format</label>
         <select id="export-format-{{ session.session_id }}"
                 onchange="document.getElementById('export-word-variant-{{ session.session_id }}').hidden = (this.value !== 'word'); document.getElementById('export-format-value-{{ session.session_id }}').value = (this.value === 'word' ? document.getElementById('export-word-variant-{{ session.session_id }}').value : this.value);"
@@ -2658,7 +2772,7 @@
     {% if session.status == "completed" and (session.findings or (session.recon_result and session.recon_result.targets) or session.logs) %}
       <div class="mt-4 bg-surface border border-default rounded-lg p-3" data-diagram-builder data-session-id="{{ session.session_id }}">
         {{ section_label("Diagram builder") }}
-        <p class="text-[11px] text-secondary mb-3">
+        <p class="text-[11px] text-secondary mb-3 ui-desc">
           Build a custom chart from this session's own recorded data — pick a data source, a metric,
           a chart type, and whether to show counts or percentages. Optionally compare a second metric
           side by side.

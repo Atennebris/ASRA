@@ -68,18 +68,27 @@ _DEFAULT_CONTEXT_LIMIT_TOKENS = 128_000
 _PROMPT_RESERVE_FRACTION = 0.25
 _MIN_CHUNK_CHARS = 4_000
 
-# Safety ceiling on how many chunks (= sequential LLM calls) ONE analysis run is allowed to make.
-# Real, confirmed gap this closes: chunk count scales with document size / the CHOSEN model's own
-# context window, with no cap of its own -- the exact same source (a real 1MB+ PDF, confirmed
-# live) is ~2 chunks against a large-context model but could be hundreds against a small-context
-# one, an unbounded number of real LLM calls (time + cost) the operator's own model choice alone
-# controls with no backstop. The chunk estimate shown before Analyze already lets an operator see
-# this coming and pick a bigger-context model instead -- this is the backstop for when they don't
-# (or click through anyway), not the primary defense. Env-overridable, never hardcoded past this
-# one default. 0 = unlimited (same convention as PLAYBOOK_PRUNE_MIN_INJECTIONS/
-# THREAT_INTEL_TTL_SECONDS elsewhere in .env.example) -- shown to the operator as the infinity
-# symbol rather than a number that would falsely imply a real ceiling exists.
-_MAX_CHUNKS = int(os.environ.get("LIBRARY_MAX_CHUNKS", "60"))
+# A chunk packed to 75% of a big model's whole context window turns a 300-page book into a handful
+# of enormous chunks -- one LLM pass per chunk then has to find every technique buried in tens of
+# thousands of tokens at once, and recall drops. Capping each chunk to a denser target instead
+# splits long sources into many smaller, more focused passes (better recall) while keeping the
+# per-source chunk count bounded by _MAX_CHUNKS. The cap only ever lowers the context-derived
+# budget, never raises it past what the chosen model can actually hold. Env-overridable;
+# 0 = no cap (fall back to the pure context-window budget), same convention as _MAX_CHUNKS below.
+_CHUNK_TARGET_TOKENS = int(os.environ.get("LIBRARY_CHUNK_TARGET_TOKENS", "6000"))
+
+# Budget on how many chunks (= sequential LLM calls) ONE analysis run makes. This is NOT a hard
+# reject anymore: a source that would exceed the budget is still analyzed, but its chunks are
+# EVENLY SAMPLED across the whole document (_cap_chunks_covering) so a long book is covered end to
+# end within the budget instead of either (a) being refused outright -- the old behavior, which with
+# the denser LIBRARY_CHUNK_TARGET_TOKENS chunking made large sources error out constantly and extract
+# nothing -- or (b) only ever reading its first N chunks and never its later chapters. The chunk
+# estimate shown before Analyze already lets an operator see the real count and pick a bigger-context
+# model; this budget is what keeps "click Analyze on a 1000-page PDF" from turning into an unbounded
+# number of real LLM calls, while still learning something from every part of it. Env-overridable;
+# 0 = unlimited (no sampling, one call per chunk however many that is) -- shown to the operator as the
+# infinity symbol rather than a number that would falsely imply a real ceiling.
+_MAX_CHUNKS = int(os.environ.get("LIBRARY_MAX_CHUNKS", "120"))
 
 # Real, confirmed gap this closes: start_analysis had no cap of its own on how many analyses could
 # run AT ONCE -- clicking Analyze on every card in the panel fired that many fully independent,
@@ -224,6 +233,13 @@ def reconcile_orphaned_analyses() -> int:
         if entry.get("status") == "analyzing":
             entry["status"] = "error"
             entry["error"] = "Interrupted — the server restarted mid-analysis. Click Analyze again."
+            fixed += 1
+        elif entry.get("status") == "queued":
+            # The in-memory queue didn't survive the restart -- flip a stranded "queued" source back
+            # to "normalized" (ready to analyze) so it's re-startable, never stuck waiting on a drain
+            # that will never come.
+            entry["status"] = "normalized"
+            entry["error"] = None
             fixed += 1
     if fixed:
         _write_sources(data)
@@ -397,6 +413,9 @@ def _create_source(
         "char_count": 0,
         "chunks_total": None,
         "chunks_done": 0,
+        # When a source is bigger than the analysis call budget, its chunks are sampled evenly across
+        # the whole document; this holds the pre-sampling chunk count so the card can show coverage.
+        "coverage_total": None,
         "ingested_count": 0,
         "provider_id": None,
         "model": None,
@@ -477,14 +496,31 @@ def _detect_format_from_response(url: str, content_type: str) -> str:
     return "html"
 
 
+# A real browser's own request headers. httpx's default User-Agent is "python-httpx/x.y", which a
+# great many news/security sites bot-block with an instant 403 (confirmed live: informat.ro returned
+# 403 to the bare client but 200 the moment a browser UA + Accept headers were sent -- the same for
+# many Cloudflare/Akamai-fronted article sites). Sending a plausible browser fingerprint lets the
+# cheap httpx path succeed on everything except sites that additionally run a JS challenge, which
+# fall through to the real-browser fallback below.
+_BROWSER_LIKE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 def _fetch_via_httpx(url: str) -> tuple[bytes, str] | None:
     """Plain HTTP GET -- the fast, cheap path that covers the overwhelming majority of real
-    articles/writeups/PDFs. Returns (data, content_type), or None on any failure (bad status,
-    connection error, exceeding _URL_MAX_BYTES)."""
+    articles/writeups/PDFs. Sends browser-like headers (_BROWSER_LIKE_HEADERS) so a UA-filtering
+    site doesn't 403 the bare python-httpx client. Returns (data, content_type), or None on any
+    failure (bad status, connection error, exceeding _URL_MAX_BYTES)."""
     import httpx
 
     try:
-        with httpx.Client(timeout=_URL_FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        with httpx.Client(timeout=_URL_FETCH_TIMEOUT_SECONDS, follow_redirects=True, headers=_BROWSER_LIKE_HEADERS) as client:
             with client.stream("GET", url) as resp:
                 resp.raise_for_status()
                 content_type = resp.headers.get("content-type", "")
@@ -513,33 +549,42 @@ _MIN_HTML_CHARS_BEFORE_BROWSER_FALLBACK = 200
 def _fetch_via_browser(url: str) -> bytes | None:
     """Fallback for exactly the case a plain GET can't handle: a JS-rendered page (nothing real in
     the initial HTML until client-side JS runs) or a site that blocks/challenges non-browser
-    requests. Reuses ASRA's own browser automation (agent/tools/browser_manager.py) -- the SAME
-    real, Playwright-driven Chromium the agent itself drives during a live session -- in a short-
-    lived one-off session created and torn down within this one call, never left running.
-    Synchronous on purpose (asyncio.run): add_source_from_url runs inside a worker thread (main.py's
-    own asyncio.to_thread call), which has no event loop of its own to await into -- a fresh one is
-    created just for this call and closes when it returns. Returns the fully-rendered page's own
-    HTML, or None if navigation fails (including this manager's existing loopback/link-local guard,
-    which applies here exactly as it does to the agent's own use of the same browser)."""
-    import uuid as _uuid
-    from agent.tools.browser_manager import get_browser_manager
+    requests. Launches its OWN isolated, short-lived headless Chromium via Playwright and tears it
+    fully down within this one call.
 
-    session_id = f"library-{_uuid.uuid4().hex[:12]}"
-
+    Deliberately NOT the shared browser_manager singleton (agent/tools/browser_manager.py), which the
+    live agent also uses: Playwright objects are bound to the event loop they were created on, and
+    add_source_from_url runs in a worker thread with no loop of its own, so this uses asyncio.run()
+    -- a fresh loop per call that closes when it returns. Routing the shared singleton through those
+    throwaway loops left it bound to an already-closed loop after the first browser-fallback URL, so
+    every later URL that needed the browser hung or errored AND the agent's own shared browser could
+    be corrupted mid-session (confirmed operator report: 'after some links the engine dies'). A
+    self-contained browser per call has no shared state to corrupt and no cross-loop binding to
+    break. Returns the fully-rendered page's own HTML, or None on any failure."""
     async def _run() -> bytes | None:
-        manager = get_browser_manager()
-        try:
-            nav = await manager.navigate(session_id, url, wait_until="networkidle")
-            if nav.get("status") != "ok":
-                logger.debug("library: browser fallback navigate failed url=%r (%s)", url, nav.get("error"))
-                return None
-            result = await manager.evaluate(session_id, "document.documentElement.outerHTML")
-            html = result.get("eval_result")
-            if not isinstance(html, str) or not html.strip():
-                return None
-            return html.encode("utf-8")
-        finally:
-            await manager.close_session(session_id)
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                    )
+                )
+                page = await context.new_page()
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=_URL_FETCH_TIMEOUT_SECONDS * 1000)
+                except Exception as nav_exc:
+                    # networkidle can time out on a page that keeps a long-poll/socket open even
+                    # though the real content already rendered -- fall back to whatever's loaded.
+                    logger.debug("library: browser fallback networkidle wait failed url=%r (%s) -- reading current content", url, nav_exc)
+                html = await page.content()
+                if not isinstance(html, str) or not html.strip():
+                    return None
+                return html.encode("utf-8")
+            finally:
+                await browser.close()
 
     try:
         return asyncio.run(_run())
@@ -597,6 +642,10 @@ def add_source_from_url(url: str, title: str = "", author: str = "") -> str | No
 def _chunk_char_budget(context_limit: int | None) -> int:
     limit_tokens = context_limit or _DEFAULT_CONTEXT_LIMIT_TOKENS
     usable_tokens = int(limit_tokens * (1 - _PROMPT_RESERVE_FRACTION))
+    # Cap the context-derived budget to a denser per-chunk target so a long document splits into
+    # many focused passes instead of a few huge ones -- never raised above what the model can hold.
+    if _CHUNK_TARGET_TOKENS > 0:
+        usable_tokens = min(usable_tokens, _CHUNK_TARGET_TOKENS)
     return max(_MIN_CHUNK_CHARS, usable_tokens * _CHARS_PER_TOKEN)
 
 
@@ -630,6 +679,23 @@ def _split_into_chunks(text: str, chunk_chars: int) -> list[str]:
     return chunks
 
 
+def _cap_chunks_covering(chunks: list[str]) -> list[str]:
+    """Bounds an analysis to _MAX_CHUNKS LLM calls while still covering the WHOLE document. When a
+    source splits into more chunks than the budget, this evenly samples _MAX_CHUNKS of them spanning
+    the full text (first and last always included) rather than taking only the first N -- so a long
+    book's later chapters get learned from too, not just its opening. Under the budget (the common
+    case) the chunks are returned unchanged. _MAX_CHUNKS <= 0 disables the budget (no sampling)."""
+    total = len(chunks)
+    if _MAX_CHUNKS <= 0 or total <= _MAX_CHUNKS:
+        return chunks
+    n = _MAX_CHUNKS
+    if n == 1:
+        return [chunks[0]]
+    # Evenly spaced indices across [0, total-1], both ends inclusive; dedup keeps it <= n.
+    idxs = sorted({round(i * (total - 1) / (n - 1)) for i in range(n)})
+    return [chunks[i] for i in idxs]
+
+
 def estimate_chunk_count(source_id: str, provider_id: str, model: str) -> int:
     """How many LLM calls a real analysis run would make -- shown to the operator BEFORE they
     click Analyze, so a 100+ page book never turns into a surprise number of calls."""
@@ -645,8 +711,11 @@ def estimate_chunk_count(source_id: str, provider_id: str, model: str) -> int:
         logger.debug("library: estimate_chunk_count couldn't resolve provider=%s model=%s (%s) -- using default budget", provider_id, model, exc)
         context_limit = None
     text = text_path.read_text(encoding="utf-8", errors="replace")
+    # The RAW chunk count (before the coverage budget). The route decides how to present it: when it
+    # exceeds the budget the source isn't refused, it's sampled to cover the whole document within
+    # the budget's number of LLM calls -- the route shows that instead of an "over the limit" warning.
     count = len(_split_into_chunks(text, _chunk_char_budget(context_limit)))
-    logger.debug("library: estimate_chunk_count source=%s provider=%s model=%s context_limit=%s -> %d/%s chunks", source_id, provider_id, model, context_limit, count, _limit_label(_MAX_CHUNKS))
+    logger.debug("library: estimate_chunk_count source=%s provider=%s model=%s context_limit=%s -> %d chunks (budget %s)", source_id, provider_id, model, context_limit, count, _limit_label(_MAX_CHUNKS))
     return count
 
 
@@ -666,6 +735,28 @@ def _parse_json_loose(text: str | None):
         return None
 
 
+def _candidate_has_substance(candidate: dict) -> bool:
+    """Drops pure theory an extraction pass still returned with a technique name but nothing to act
+    on (a chapter intro, a "WAFs can be bypassed" aside). A candidate earns ingestion only if it
+    carries something concrete: a real payload/command, an ordered recipe, a transcribed skill body,
+    a named CVE, OR a concrete vuln_class paired with a tech stack (enough to retrieve and reason
+    about even without a literal payload). Everything else is reading-material prose, not a
+    playbook-worthy technique."""
+    if str(candidate.get("payload_or_command") or "").strip():
+        return True
+    recipe = candidate.get("recipe")
+    if isinstance(recipe, list) and any(str(step).strip() for step in recipe):
+        return True
+    skill = candidate.get("skill")
+    if isinstance(skill, dict) and str(skill.get("body") or "").strip():
+        return True
+    if any(str(cve).strip() for cve in (candidate.get("cves") or [])):
+        return True
+    vuln_class = str(candidate.get("vuln_class") or "").strip()
+    tech_keywords = [str(t).strip() for t in (candidate.get("tech_keywords") or []) if str(t).strip()]
+    return bool(vuln_class and tech_keywords)
+
+
 async def _extract_from_chunk(llm, chunk: str) -> list[dict]:
     try:
         response = await asyncio.to_thread(
@@ -682,14 +773,23 @@ async def _extract_from_chunk(llm, chunk: str) -> list[dict]:
     parsed = _parse_json_loose(response.content)
     if not isinstance(parsed, list):
         return []
-    return [e for e in parsed if isinstance(e, dict) and str(e.get("technique") or "").strip()]
+    return [
+        e for e in parsed
+        if isinstance(e, dict) and str(e.get("technique") or "").strip() and _candidate_has_substance(e)
+    ]
 
 
-async def _merge_candidates(llm, candidates: list[dict]) -> list[dict]:
-    """One extra LLM pass over every chunk's raw candidates from the SAME source -- collapses
-    near-duplicates (the same technique explained once, then referenced again later in the
-    book). Best-effort: any failure here just leaves the un-merged candidate list as-is, same
-    failure-safe shape as agent/core.py's own _run_playbook_distillation_pass."""
+# A whole book's worth of candidates in one merge prompt blows the model's context the same way an
+# uncapped chunk does -- batch the merge pass so each call sees a bounded slice. Cross-batch
+# duplicates survive (a technique in batch 1 and batch 3 won't be collapsed), an acceptable cost:
+# the merge pass is a best-effort tidy, not a correctness guarantee, and _MERGE_BATCH_SIZE is large
+# enough that a realistic source stays one batch and behaves exactly as the old single pass did.
+_MERGE_BATCH_SIZE = int(os.environ.get("LIBRARY_MERGE_BATCH_SIZE", "40"))
+
+
+async def _merge_batch(llm, candidates: list[dict]) -> list[dict]:
+    """One merge LLM pass over a bounded slice of candidates -- best-effort: any failure leaves this
+    slice un-merged, same failure-safe shape as agent/core.py's own _run_playbook_distillation_pass."""
     try:
         response = await asyncio.to_thread(
             llm.complete,
@@ -709,11 +809,61 @@ async def _merge_candidates(llm, candidates: list[dict]) -> list[dict]:
     return merged or candidates
 
 
+async def _merge_candidates(llm, candidates: list[dict]) -> list[dict]:
+    """Collapses near-duplicate candidates from the SAME source (the same technique explained once,
+    then referenced again later in the book). Chunked into bounded batches so a large book doesn't
+    hand the model one giant merge prompt -- for any realistic source (<= _MERGE_BATCH_SIZE
+    candidates) this is exactly one pass, identical to the original single-pass behavior."""
+    if _MERGE_BATCH_SIZE <= 0 or len(candidates) <= _MERGE_BATCH_SIZE:
+        return await _merge_batch(llm, candidates)
+    merged: list[dict] = []
+    for start in range(0, len(candidates), _MERGE_BATCH_SIZE):
+        merged.extend(await _merge_batch(llm, candidates[start:start + _MERGE_BATCH_SIZE]))
+    logger.debug("library: merge pass batched %d candidate(s) into %d batch(es)", len(candidates), -(-len(candidates) // _MERGE_BATCH_SIZE))
+    return merged
+
+
+# The target shapes / modes the extraction prompt is allowed to classify a technique into -- a
+# whitelist so a stray free-text value the model invents doesn't pollute the store's own cross-mode
+# shape matching (playbook_store.find_similar_techniques reads these). Mirrors the enum spelled out
+# in LIBRARY_EXTRACTION_PROMPT; anything else normalizes to None (unclassified).
+_VALID_TARGET_SHAPES = frozenset({"web", "pe_x86_64", "elf", "jvm_bytecode", "apk", "reverse", "agentic"})
+_VALID_MODES = frozenset({"web", "reverse", "interactive", "agentic"})
+
+
+def _normalize_enum(value, allowed: frozenset) -> str | None:
+    token = str(value or "").strip().lower()
+    return token if token in allowed else None
+
+
+def _skill_from_candidate(candidate: dict, target_shape: str | None, mode: str | None) -> dict | None:
+    """Builds a normalized, UNTRUSTED skill from a candidate's `skill` sub-object -- but ONLY when
+    the extraction pass actually classified a kind+interpreter and transcribed a concrete body. The
+    body is the document author's text, not this agent's, so it goes in via build_skill(derived_from=
+    "library") which forces trust="unreviewed" and pins the hash; execution stays sandbox-gated
+    elsewhere. Pure-prose chunks carry skill=null and get nothing attached. Returns the skill dict,
+    or None when there's no well-formed concrete skill to capture."""
+    raw = candidate.get("skill")
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind") or "").strip().lower()
+    interpreter = str(raw.get("interpreter") or "none").strip().lower()
+    body = str(raw.get("body") or "").strip()
+    if not kind or not body:
+        return None
+    return playbook_store.build_skill(
+        kind=kind, body=body, params=raw.get("params"), interpreter=interpreter,
+        target_shape=target_shape, mode=mode, derived_from="library",
+    )
+
+
 def _ingest_candidate(source: dict, candidate: dict) -> bool:
     """Deterministic write of one extracted candidate into the playbook -- the ONLY thing that
     ever touches the real store on this path, never the LLM directly. Mirrors the entry shape
     every other capture path (agent/core.py, agent/chat.py) already builds, but stamped
-    source_type="extracted"/confidence="unreviewed" instead of "live"/"confirmed"."""
+    source_type="extracted"/confidence="unreviewed" instead of "live"/"confirmed". When the
+    candidate also carries a concrete, transcribed skill, that skill is attached to the recorded
+    technique as untrusted/unreviewed material (see _skill_from_candidate)."""
     from agent.core import _technology_keywords  # same private cross-module reuse agent/chat.py already does for this exact helper
 
     technique = str(candidate.get("technique") or "").strip()
@@ -730,6 +880,8 @@ def _ingest_candidate(source: dict, candidate: dict) -> bool:
         return False
     waf_vendors = {str(w).strip().lower() for w in (candidate.get("waf_vendors") or []) if str(w).strip()}
     payload = str(candidate.get("payload_or_command") or "").strip() or None
+    target_shape = _normalize_enum(candidate.get("target_shape"), _VALID_TARGET_SHAPES)
+    mode = _normalize_enum(candidate.get("mode"), _VALID_MODES)
     now = datetime.now(timezone.utc).isoformat()
     source_ref = candidate.get("source_ref")
     entry = {
@@ -741,6 +893,11 @@ def _ingest_candidate(source: dict, candidate: dict) -> bool:
         "evidence_ref": "",
         "tech_keywords": sorted(tech_keywords),
         "waf_vendors": sorted(waf_vendors),
+        # Cross-mode shape matching (playbook_store.find_similar_techniques) can only fire when the
+        # entry actually carries where it applies -- a reverse/agentic technique whose tech tokens
+        # are thin is otherwise invisible to a differently-shaped query.
+        "target_shape": target_shape,
+        "mode": mode,
         # What the source presents as working -- "failed"/dead-end knowledge isn't really what a
         # book teaches, and this is unreviewed either way until a human or a real field use says so.
         "outcome": "worked",
@@ -761,7 +918,16 @@ def _ingest_candidate(source: dict, candidate: dict) -> bool:
     }
     key = playbook_store.make_fingerprint_key(tech_keywords, waf_vendors)
     recorded_id = playbook_store.record_technique(key, entry)
-    return bool(recorded_id)
+    if not recorded_id:
+        return False
+
+    skill = _skill_from_candidate(candidate, target_shape, mode)
+    if skill is not None:
+        if playbook_store.attach_skill(recorded_id, skill):
+            logger.debug("library: attached %s skill to extracted technique id=%s", skill.get("kind"), recorded_id)
+        else:
+            logger.debug("library: skill build/attach skipped for technique id=%s (no target entry)", recorded_id)
+    return True
 
 
 def _prepare_analysis(source_id: str, provider_id: str, model: str) -> tuple[Any, list[str]] | None:
@@ -803,16 +969,17 @@ def _prepare_analysis(source_id: str, provider_id: str, model: str) -> tuple[Any
         _update_source(source_id, status="error", error="nothing to analyze")
         logger.debug("library: analysis aborted source=%s -- nothing to analyze", source_id)
         return None
-    if _MAX_CHUNKS > 0 and len(chunks) > _MAX_CHUNKS:
-        logger.debug("library: analysis refused source=%s chunks=%d exceeds _MAX_CHUNKS=%d", source_id, len(chunks), _MAX_CHUNKS)
-        _update_source(
-            source_id, status="error",
-            error=f"would take {len(chunks)} chunks (LLM calls), over the {_MAX_CHUNKS}-chunk safety limit -- pick a provider/model with a bigger context window",
-        )
-        return None
+    raw_count = len(chunks)
+    chunks = _cap_chunks_covering(chunks)
+    coverage_total = raw_count if len(chunks) < raw_count else None
+    if coverage_total is not None:
+        logger.debug("library: source=%s split into %d chunks -- covering %d evenly across the whole document (budget %d)", source_id, raw_count, len(chunks), _MAX_CHUNKS)
 
     _update_source(
         source_id, status="analyzing", chunks_total=len(chunks), chunks_done=0,
+        # When the source was bigger than the call budget, this is the pre-sampling chunk count so the
+        # card can show "covering N of M sections"; None when every chunk is analyzed.
+        coverage_total=coverage_total,
         provider_id=provider_id, model=model, error=None,
         # Real, direct operator ask: the chunk progress bar alone can only ever show 0% then 100%
         # for the overwhelmingly common case (a single-chunk source -- see _chunk_char_budget's
@@ -839,6 +1006,20 @@ async def _run_analysis(source_id: str, provider_id: str, model: str) -> None:
         return
     llm, chunks = prepared
     await _run_analysis_chunks(source_id, llm, chunks)
+
+
+async def _refresh_threat_intel_after_ingest(source_id: str, ingested: int) -> None:
+    """Freshly-extracted techniques may name CVEs the store has never enriched -- stamp KEV/EPSS/
+    PoC signals onto them so scoring and the UI can read them without a network hop later. Runs only
+    when something was actually ingested, off the event loop, and fully wrapped: the threat-intel
+    endpoints being slow or down never fails (nor delays the terminal status of) the analysis."""
+    if not ingested:
+        return
+    try:
+        updated = await asyncio.to_thread(playbook_store.refresh_threat_intel)
+        logger.debug("library: threat-intel refresh after source=%s stamped %d technique(s)", source_id, updated)
+    except Exception as exc:
+        logger.debug("library: threat-intel refresh after source=%s failed (%s) -- extraction still saved", source_id, exc)
 
 
 async def _run_analysis_chunks(source_id: str, llm: Any, chunks: list[str]) -> None:
@@ -899,6 +1080,7 @@ async def _run_analysis_chunks(source_id: str, llm: Any, chunks: list[str]) -> N
             error=f"Stopped by operator after {done}/{len(chunks)} chunk(s) — {ingested} technique(s) already extracted were kept. Click Analyze to run it again from the start.",
         )
         logger.debug("library: analysis stopped source=%s ingested=%d/%d candidate(s) before stopping", source_id, ingested, len(candidates))
+        await _refresh_threat_intel_after_ingest(source_id, ingested)
         return
 
     _update_source(
@@ -906,6 +1088,9 @@ async def _run_analysis_chunks(source_id: str, llm: Any, chunks: list[str]) -> N
         analyzed_at=datetime.now(timezone.utc).isoformat(),
     )
     logger.debug("library: analysis finished source=%s ingested=%d/%d candidate(s)", source_id, ingested, len(candidates))
+    # Done AFTER the terminal status is written so the "analyzed -- N extracted" card the operator is
+    # polling for never waits on a (possibly slow, possibly offline) threat-intel refresh.
+    await _refresh_threat_intel_after_ingest(source_id, ingested)
 
 
 def start_analysis(source_id: str, provider_id: str, model: str, free_only: bool = False) -> str:
@@ -918,33 +1103,81 @@ def start_analysis(source_id: str, provider_id: str, model: str, free_only: bool
     it that source's own status blocks the Analyze button from ever rendering again at all (see
     that function's own docstring for the real incident this fixes).
 
-    Returns "" on success, or a short human-readable reason it refused to start (surfaced to the
-    operator by main.py's own route) -- capped at _MAX_CONCURRENT_ANALYSES real analyses running
-    in THIS process at once (a real, confirmed gap: nothing used to stop clicking Analyze on every
-    card in the panel from firing that many fully independent, fully concurrent real LLM-call
-    sequences with no coordination between them at all)."""
+    Returns "" on success (started OR queued), or a short human-readable reason only when the source
+    genuinely isn't analyzable (wrong status). The concurrency budget (_MAX_CONCURRENT_ANALYSES) is
+    NOT an error anymore: when every slot is busy the source is QUEUED and started automatically the
+    moment a slot frees (_drain_analysis_queue), so an artificial limit degrades gracefully instead
+    of stalling the operator with a refusal -- the same principle as the chunk budget, which samples
+    to cover a big document rather than refusing it."""
     source = get_source(source_id)
     if source is None or source.get("status") not in ("normalized", "analyzed", "error", "stopped"):
         logger.debug("library: start_analysis refused source=%s -- status=%r not analyzable", source_id, source.get("status") if source else None)
         return "this source isn't ready to be analyzed right now"
-    running = count_running_analyses()
-    if _MAX_CONCURRENT_ANALYSES > 0 and running >= _MAX_CONCURRENT_ANALYSES:
-        logger.debug("library: start_analysis refused source=%s -- %d/%d concurrent analyses already running", source_id, running, _MAX_CONCURRENT_ANALYSES)
-        return f"{running} analysis run(s) already in progress (limit {_MAX_CONCURRENT_ANALYSES}) -- wait for one to finish first"
-
-    # Prepared SYNCHRONOUSLY, before this function returns, not inside the background task --
-    # see _prepare_analysis's own docstring for the real "needs 2 clicks" bug this fixes.
-    prepared = _prepare_analysis(source_id, provider_id, model)
-    if prepared is None:
-        return ""
-    llm, chunks = prepared
 
     save_last_analysis_llm(provider_id, model, free_only)
-    task = asyncio.create_task(_run_analysis_chunks(source_id, llm, chunks))
-    _RUNNING_ANALYSES[source_id] = task
-    task.add_done_callback(lambda _t, sid=source_id: _RUNNING_ANALYSES.pop(sid, None))
+    running = count_running_analyses()
+    if _MAX_CONCURRENT_ANALYSES > 0 and running >= _MAX_CONCURRENT_ANALYSES:
+        _update_source(
+            source_id, status="queued", error=None,
+            queued_provider_id=provider_id, queued_model=model,
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        logger.debug("library: queued source=%s -- %d/%d slots busy, will start when one frees", source_id, running, _MAX_CONCURRENT_ANALYSES)
+        return ""
+
+    _start_prepared_analysis(source_id, provider_id, model)
     logger.debug("library: start_analysis accepted source=%s provider=%s model=%s (%d/%s running)", source_id, provider_id, model, running + 1, _limit_label(_MAX_CONCURRENT_ANALYSES))
     return ""
+
+
+def _start_prepared_analysis(source_id: str, provider_id: str, model: str) -> bool:
+    """Prepares (synchronously, status -> analyzing) and fires the background analysis task for one
+    source. Shared by start_analysis and the queue drain. Returns False if preparation failed (which
+    already recorded an error status on the source), True once the task is running. The done-callback
+    both frees the in-memory slot AND drains the queue, so a finished analysis pulls the next queued
+    one in with no operator action."""
+    prepared = _prepare_analysis(source_id, provider_id, model)
+    if prepared is None:
+        return False
+    llm, chunks = prepared
+    task = asyncio.create_task(_run_analysis_chunks(source_id, llm, chunks))
+    _RUNNING_ANALYSES[source_id] = task
+
+    def _done(_task, sid=source_id):
+        _RUNNING_ANALYSES.pop(sid, None)
+        try:
+            _drain_analysis_queue()
+        except Exception as exc:  # a drain failure must never break the finished task's cleanup
+            logger.debug("library: queue drain after source=%s failed (%s)", sid, exc)
+
+    task.add_done_callback(_done)
+    return True
+
+
+def _drain_analysis_queue() -> None:
+    """Starts queued analyses (oldest first) while a concurrency slot is free. Called whenever a
+    running analysis finishes; safe to call anytime. Each queued source carries the provider/model it
+    was queued with. A source that can't actually start (its prepare fails) is moved off 'queued' by
+    _prepare_analysis's own error write, so this loop can never spin on it."""
+    while _MAX_CONCURRENT_ANALYSES <= 0 or count_running_analyses() < _MAX_CONCURRENT_ANALYSES:
+        data = load_sources()
+        queued = sorted(
+            ((sid, e) for sid, e in data.items() if e.get("status") == "queued"),
+            key=lambda kv: kv[1].get("queued_at") or "",
+        )
+        if not queued:
+            return
+        sid, entry = queued[0]
+        provider_id = entry.get("queued_provider_id") or entry.get("provider_id")
+        model = entry.get("queued_model") or entry.get("model")
+        if not provider_id or not model:
+            _update_source(sid, status="error", error="queued analysis lost its provider/model — click Analyze again")
+            continue
+        logger.debug("library: draining queue -- starting source=%s", sid)
+        if not _start_prepared_analysis(sid, provider_id, model) and (get_source(sid) or {}).get("status") == "queued":
+            # prepare returned False without recording an error (shouldn't happen) -- fail safe so the
+            # loop can't pick this same source forever.
+            _update_source(sid, status="error", error="could not start queued analysis")
 
 
 def stop_analysis(source_id: str) -> bool:
@@ -957,12 +1190,19 @@ def stop_analysis(source_id: str) -> bool:
     real running task was found and a cancel request was actually sent to it, False if nothing is
     running for this source (already finished, already stopped, or never started)."""
     task = _RUNNING_ANALYSES.get(source_id)
-    if task is None or task.done():
-        logger.debug("library: stop_analysis found nothing running for source=%s", source_id)
-        return False
-    task.cancel()
-    logger.debug("library: stop requested source=%s", source_id)
-    return True
+    if task is not None and not task.done():
+        task.cancel()
+        logger.debug("library: stop requested source=%s", source_id)
+        return True
+    # Not running -- but it may be QUEUED (waiting for a slot, no task yet). Dequeue it back to a
+    # ready state so Stop works on a queued card too, not just a running one.
+    source = get_source(source_id)
+    if source is not None and source.get("status") == "queued":
+        _update_source(source_id, status="normalized", error=None, queued_provider_id=None, queued_model=None, queued_at=None)
+        logger.debug("library: dequeued source=%s before it started", source_id)
+        return True
+    logger.debug("library: stop_analysis found nothing running/queued for source=%s", source_id)
+    return False
 
 
 def count_running_analyses() -> int:

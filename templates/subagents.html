@@ -98,6 +98,26 @@
             <span class="min-w-0 truncate font-mono text-[12px] {{ 'text-secondary' if always_on else 'text-primary' }}">{{ tool_name }}</span>
           </label>
         {% endfor %}
+        {# Installed tools a subagent can never actually use (main.py's _SUBAGENT_UNOFFERABLE_TOOLS):
+           shown rather than hidden, in the SAME system-locked treatment report_subagent_result above
+           already uses (disabled switch, greyed, cursor-default) -- these just lock OFF instead of
+           ON. The description shows in the floating tooltip like every other row; the native title
+           explains WHY it can't be enabled. A disabled checkbox never submits, so rendering these
+           can't add them to allowed_tools. #}
+        {% for tool_name in blocked_tools %}
+          {% set description = tool_descriptions.get(tool_name, "") %}
+          {% set reason = tool_block_reasons.get(tool_name, "") %}
+          {% set domain = tool_domains.get(tool_name) %}
+          <label class="group flex items-center gap-2.5 rounded-md px-2 py-1.5 cursor-default"
+                 title="{{ description }}{% if description and reason %} — {% endif %}{{ reason }}"
+                 {% if domain %}data-tool-domain="{{ domain }}"{% endif %}>
+            {{ toggle_switch(field_prefix, value=tool_name, checked=false, disabled=true) }}
+            {% if domain %}
+              <span class="asra-domain-dot shrink-0" style="background-color: {{ domain_colors[domain] }}"></span>
+            {% endif %}
+            <span class="min-w-0 truncate font-mono text-[12px] text-secondary">{{ tool_name }}</span>
+          </label>
+        {% endfor %}
       </div>
     </div>
   </div>
@@ -126,7 +146,7 @@
   <div class="block">
     <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Allowed tools</span>
     {{ tool_checklist("allowed_tools", profile.allowed_tools if profile else [], tool_grid) }}
-    <span class="block text-[11px] text-secondary mt-1.5">Only tools actually installed on this machine are listed. Leave every switch off to give this subagent no tools at all.</span>
+    <span class="ui-desc block text-[11px] text-secondary mt-1.5">Only tools actually installed on this machine are listed. A few are shown greyed-out and can't be switched on — hover one to see why a subagent can't use it. Leave every switch off to give this subagent no tools at all.</span>
   </div>
 
   <label class="block max-w-sm">
@@ -177,7 +197,7 @@
         });
       </script>
     {% endif %}
-    <span class="block text-[11px] text-secondary mt-1.5">Only providers with a key configured in Settings are listed. Pick a provider to see its real models — no typing.</span>
+    <span class="ui-desc block text-[11px] text-secondary mt-1.5">Only providers with a key configured in Settings are listed. Pick a provider to see its real models — no typing.</span>
     {# This subagent's own, independent "Free models only" switch -- real, confirmed operator
        complaint this fixes: ASRA's own sibling Reserve providers chain already has one per row
        (settings.html), and a subagent's own picker needs exactly the same, not a shared global
@@ -296,7 +316,7 @@
 
   <section class="bg-surface border border-default rounded-xl p-5 mb-6">
     {{ section_label("What subagents do") }}
-    <p class="text-[12px] leading-relaxed text-secondary mb-5 max-w-3xl">
+    <p class="ui-desc text-[12px] leading-relaxed text-secondary mb-5 max-w-3xl">
       A subagent is a pre-configured worker with its own name, allowed tools, instructions, and
       (optionally) its own LLM provider. While a scan is running, the main agent can hand off a
       bounded, self-contained sub-task to an enabled subagent and keep working on something more

@@ -32,9 +32,24 @@ def test_build_command_uses_the_default_wordlist_when_none_given(monkeypatch):
     assert command[command.index("-w") + 1] == "/usr/share/wordlists/ffuf/common.txt"
 
 
-def test_build_command_honors_a_model_supplied_wordlist():
-    command = build_ffuf_command({"target": "https://example.com", "wordlist": "/tmp/my-list.txt"})
-    assert command[command.index("-w") + 1] == "/tmp/my-list.txt"
+def test_build_command_honors_a_model_supplied_wordlist_that_exists(tmp_path):
+    real_wordlist = tmp_path / "my-list.txt"
+    real_wordlist.write_text("admin\nbackup\n")
+    command = build_ffuf_command({"target": "https://example.com", "wordlist": str(real_wordlist)})
+    assert command[command.index("-w") + 1] == str(real_wordlist)
+
+
+def test_build_command_falls_back_when_model_supplied_wordlist_does_not_exist(monkeypatch):
+    """Real, confirmed incident this fixes (Telenor-Sweden-YesWeHack rescan session): the model
+    guessed a plausible-but-not-installed SecLists/dirb-style path (/usr/share/wordlists/dirb/
+    common.txt) on 9 SEPARATE, independent ffuf calls in one subagent task -- each one failed
+    against the real filesystem, got corrected, succeeded, and the next independent call repeated
+    the identical mistake from scratch. A path that doesn't exist on disk must never reach the real
+    ffuf invocation -- fall back to the guaranteed-installed default instead of letting the command
+    run against a path already known to be missing."""
+    monkeypatch.delenv("FFUF_WORDLIST_PATH", raising=False)
+    command = build_ffuf_command({"target": "https://example.com", "wordlist": "/usr/share/wordlists/dirb/common.txt"})
+    assert command[command.index("-w") + 1] == "/usr/share/wordlists/ffuf/common.txt"
 
 
 def test_build_command_honors_the_env_default_wordlist(monkeypatch):

@@ -241,9 +241,18 @@ def test_retry_prefers_the_wrapped_arguments_shape_when_both_are_plausible():
 
 
 def test_retry_that_fails_again_with_no_error_text_gets_a_synthesized_reason():
+    """The FIRST attempt is a real "error" (not a bare timeout -- see the bare-timeout-skip tests
+    further below for that case, which never reaches a second dispatch at all) so the correction
+    call actually gets attempted; the RETRY itself then ends in a retryable-but-textless status --
+    the exact shape a real second timeout produces (status="timeout", exit_code=None, error=None)
+    -- to confirm the synthesized-reason fallback still fires for whatever status the retry ends
+    in."""
+    calls = []
+
     def native_function(args: dict) -> dict:
-        # Both attempts end in a retryable status with no error text at all -- the exact shape a
-        # real second timeout produces (status="timeout", exit_code=None, error=None).
+        calls.append(dict(args))
+        if len(calls) == 1:
+            return {"status": "error", "error": "domain is required"}
         return {"status": "timeout"}
 
     llm = _ScriptedCorrectionLLM(json.dumps({"arguments": {"domain": "example.com"}}))
@@ -253,6 +262,7 @@ def test_retry_that_fails_again_with_no_error_text_gets_a_synthesized_reason():
 
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "x"}))
 
+    assert len(calls) == 2
     assert result["status"] == "failed"
     assert result["error"]
     assert "timeout" in result["error"]
@@ -297,22 +307,43 @@ def test_retry_repairs_a_truncated_correction_reply_instead_of_giving_up(tmp_pat
     assert result["used_arguments"]["domain"] == "example.com"
 
 
-def test_retry_skips_a_second_dispatch_when_timeout_correction_repeats_identical_arguments():
-    """Real, confirmed incident this fixes (midnight-usr_24ba7e): nmap timed out against a
-    genuinely unresponsive host (TOOL_TIMEOUT_SECONDS=600 in the real .env), and the correction
-    call replied with arguments byte-identical to the ones that had just timed out (confirmed live:
-    `{"arguments": {"target": "5.252.32.97"}}` -- nmap's own schema exposes only "target", nothing
-    else for the model to correct). Re-dispatching burned a second full subprocess timeout for a
-    guaranteed-identical result -- duration_ms=1237347 (~2x TOOL_TIMEOUT_SECONDS) for zero benefit,
-    then repeated again on the next resume a day later against the same host."""
+class _CountingCorrectionLLM:
+    """Same scripted-reply shape as _ScriptedCorrectionLLM, but counts real .complete() calls --
+    used to prove the correction call is never even ASKED for a bare timeout, not just that its
+    reply gets ignored."""
+    provider_id = "test-provider"
+    model = "test-model"
+    context_limit = None
+
+    def __init__(self, correction_content: str):
+        self._correction_content = correction_content
+        self.calls_made = 0
+
+    def complete(self, messages, tools=None, stop_check=None):
+        self.calls_made += 1
+        return LLMResponse(content=self._correction_content, tool_calls=[])
+
+
+def test_bare_timeout_never_asks_for_a_correction_or_redispatches():
+    """Real, confirmed incident this fixes (CM-usr_b416f2): the correction call used to be asked
+    to "fix" a bare timeout -- {"status": "timeout"} carries no stdout/stderr/exit_code at all,
+    nothing diagnostic for a correction to actually react to -- and came back with
+    trace_categories: ["syscall"] for strace_run, a value simultaneously the wrong TYPE (a list,
+    not the required comma-separated string) and not even in the tool's own allowlist: objectively
+    worse than the tool's own default. A post-hoc guard used to catch this only AFTER paying for
+    that correction call and risking exactly this kind of hallucinated-worse-than-default value
+    (the real incidents it closed -- midnight-usr_24ba7e's nmap-against-a-dead-host retry, and
+    Live-Nation-HackerOne-usr_0f5c71's nuclei retry defeating a naive equality check via a
+    make-believe field -- are preserved here as the reason a bare timeout is now never even asked
+    about at all, for any tool, regardless of what a correction might have proposed)."""
     calls = []
 
     def native_function(args: dict) -> dict:
         calls.append(dict(args))
         return {"status": "timeout"}
 
-    llm = _ScriptedCorrectionLLM(json.dumps({"arguments": {"target": "5.252.32.97"}}))
-    session = {"session_id": "usr_identical_timeout_retry_test", "logs": []}
+    llm = _CountingCorrectionLLM(json.dumps({"arguments": {"target": "5.252.32.97"}}))
+    session = {"session_id": "usr_bare_timeout_skip_test", "logs": []}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = ToolSpec(
         name="slow_scan_test_tool", category="recon", tool_tier=1, executable="", build_command=None,
@@ -321,71 +352,26 @@ def test_retry_skips_a_second_dispatch_when_timeout_correction_repeats_identical
 
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "5.252.32.97"}))
 
-    assert len(calls) == 1  # the retry was never actually re-dispatched
+    assert len(calls) == 1  # never re-dispatched
+    assert llm.calls_made == 0  # never even asked for a correction
     assert result["status"] == "failed"
-    assert result["retried"] is True
-    assert "identical" in result["error"]
+    assert "playbook_hint" in result  # see _dead_end_hint's own docstring
 
 
-def test_retry_skips_a_second_dispatch_when_only_a_non_schema_field_differs():
-    """Real, confirmed incident this fixes (Live-Nation-HackerOne-usr_0f5c71): nuclei timed out
-    (TOOL_TIMEOUT_SECONDS=600) with the model's own call carrying a made-up field ("extra_headers")
-    that isn't one of nuclei's real parameters at all (only "target"/"tags") -- the correction
-    prompt truthfully tells the model nuclei's real parameter names, so a well-behaved correction
-    correctly drops that make-believe field. That made the two dicts compare unequal at the plain
-    `retry_arguments == arguments` check even though the ACTUAL command built from either one is
-    identical, so the identical-timeout guard never fired and nuclei re-ran the same doomed scan,
-    burning a second full timeout for nothing -- twice in one real session. Restricting the
-    comparison to the tool's own declared parameters_schema keys must still catch this."""
-    calls = []
-
+def test_bare_timeout_skip_needs_no_llm_at_all():
+    """Stronger version of the test above: ctx.llm=None (nothing to call even if the code tried)
+    proves this path never touches the correction mechanism, independent of what any LLM would
+    have replied."""
     def native_function(args: dict) -> dict:
-        calls.append(dict(args))
         return {"status": "timeout"}
 
-    # The correction drops "extra_headers" (not a real nuclei-shaped parameter) while leaving
-    # target/tags untouched -- exactly what a schema-informed correction is supposed to do.
-    llm = _ScriptedCorrectionLLM(json.dumps({"arguments": {"target": "http://example.com", "tags": "cve"}}))
-    session = {"session_id": "usr_non_schema_field_retry_test", "logs": []}
-    ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
-    spec = ToolSpec(
-        name="slow_scan_test_tool", category="scan", tool_tier=1, executable="", build_command=None,
-        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
-        parameters_schema={"type": "object", "properties": {"target": {"type": "string"}, "tags": {"type": "string"}}},
-    )
+    session = {"session_id": "usr_bare_timeout_no_llm_test", "logs": []}
+    ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
+    spec = _make_tool(native_function)
 
-    result = _run(_run_tool_with_retry(
-        ctx, spec, {"target": "http://example.com", "tags": "cve", "extra_headers": '["X-Foo: bar"]'},
-    ))
+    result = _run(_run_tool_with_retry(ctx, spec, {"domain": "x"}))
 
-    assert len(calls) == 1  # the retry was never actually re-dispatched
     assert result["status"] == "failed"
-    assert result["retried"] is True
-
-
-def test_retry_still_dispatches_when_timeout_correction_gives_different_arguments():
-    """Regression guard for the fix above: a corrected retry with genuinely different arguments
-    must still run normally after a timeout -- only a byte-identical correction is skipped."""
-    calls = []
-
-    def native_function(args: dict) -> dict:
-        calls.append(dict(args))
-        if len(calls) == 1:
-            return {"status": "timeout"}
-        return {"status": "ok"}
-
-    llm = _ScriptedCorrectionLLM(json.dumps({"arguments": {"target": "other-host.example.com"}}))
-    session = {"session_id": "usr_different_timeout_retry_test", "logs": []}
-    ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
-    spec = ToolSpec(
-        name="slow_scan_test_tool", category="recon", tool_tier=1, executable="", build_command=None,
-        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
-    )
-
-    result = _run(_run_tool_with_retry(ctx, spec, {"target": "5.252.32.97"}))
-
-    assert len(calls) == 2  # a real, different correction still gets dispatched
-    assert result["status"] == "ok"
 
 
 def test_run_tool_with_retry_injects_session_id_for_custom_re_script():
@@ -457,6 +443,9 @@ def test_retry_that_fails_again_with_real_error_text_keeps_it_unchanged():
 
     assert result["status"] == "failed"
     assert result["error"] == "connection refused"
+    # _dead_end_hint's own nudge -- a terminally-failed retry is a candidate for record_technique,
+    # surfaced directly in the result the model reads next, not just in the system prompt.
+    assert "playbook_hint" in result
 
 
 # --- used_arguments must never carry the injected _session through to the operator/model ---

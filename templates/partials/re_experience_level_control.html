@@ -1,0 +1,37 @@
+{# In-session control to change session["re_experience_level"] (novice/hobbyist/professional) while
+   a Reverse Engineering project is open -- the same persona/tone dial the New Project form sets at
+   creation (partials/new_project_form.html), now adjustable mid-engagement. agent/core.py's
+   _re_experience_level_addendum reads this field FRESH from the session on every chat/triage turn
+   (agent/chat.py reloads the session per turn before building the system prompt), so a change here
+   takes effect on the NEXT turn with no agent-loop restart -- persisting it IS the whole mechanism.
+
+   Guarded to RE mode by its single include site (session.html's reverse_engineering block), so no
+   mode check is needed in this markup. Kept OUTSIDE re_control_bar.html on purpose: that bar swaps
+   itself via a 3s poll while a pass runs, which would needlessly re-create this picker mid-click.
+
+   Live visual feedback (CLAUDE.md "Live visual feedback" rule): these are real <input type="radio">
+   elements reusing .np-re-level-card, whose selected state is driven purely by CSS
+   (.np-re-level-card:has(input:checked), themes.css) -- clicking a card checks its radio and the
+   browser restyles it the same frame, with zero network dependency and no onchange handler needed.
+   The hx-post (hx-swap="none") only persists the pick; its response body carries nothing to render.
+   The existing debug_events.js delegated change-listener logs the pick under the UI category. #}
+<div class="mb-4 text-left" id="re-experience-level-control">
+  <span class="block text-xs font-medium text-secondary mb-1">Experience level</span>
+  <div class="grid grid-cols-3 gap-2">
+    {% set _re_level = session.re_experience_level|default('hobbyist') %}
+    {% for level, label, desc in [
+      ("novice", "Novice", "More proactive — suggests techniques and next steps"),
+      ("hobbyist", "Hobbyist", "Neutral — balanced explanation and detail"),
+      ("professional", "Professional", "Terse, technical, no hand-holding"),
+    ] %}
+      <label class="np-re-level-card flex flex-col items-center text-center gap-1 rounded border border-default bg-surface px-2 py-2 cursor-pointer transition-colors">
+        <input type="radio" name="re_experience_level" value="{{ level }}" class="sr-only"
+               {% if _re_level == level %}checked{% endif %}
+               hx-post="/api/session/{{ session.session_id }}/re-experience-level"
+               hx-trigger="change" hx-swap="none">
+        <span class="text-[12px] font-semibold text-primary">{{ label }}</span>
+        <span class="text-[10px] text-secondary leading-snug ui-desc">{{ desc }}</span>
+      </label>
+    {% endfor %}
+  </div>
+</div>

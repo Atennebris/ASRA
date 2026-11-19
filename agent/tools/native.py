@@ -4237,6 +4237,37 @@ _VALID_BOUNTY_RELEVANCE = {"qualifying", "non_qualifying", "unclear"}
 # functions only validate/normalize the model's input; they know nothing about sessions. ---
 
 
+_FALSE_POSITIVE_REASON_NULL_PREFIXES = ("none", "n/a", "na", "null", "nil")
+
+
+def _normalize_false_positive_reason(raw) -> str | None:
+    """false_positive_reason means "the reason this finding IS a (likely) false positive" -- every
+    consumer (proof_report / report_export's "Likely false positive" banner, interactive_findings'
+    muted severity badge) treats ANY non-empty value as "this finding is a false positive". A weaker
+    model routinely fills the field with a "no-reason" sentinel instead, e.g. "None - finding is
+    real and verified" -- a truthy string that says the exact OPPOSITE, so the finding got muted and
+    banner-flagged as a false positive while its own text insisted it was real. Collapse those to
+    None so only a genuine false-positive reason ever trips that treatment. A real reason never
+    opens with "None -"/"N/A:" etc, so this can't swallow a substantive one."""
+    if not isinstance(raw, str):
+        return raw if raw else None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    for prefix in _FALSE_POSITIVE_REASON_NULL_PREFIXES:
+        if lowered == prefix:
+            return None
+        # "none" / "n/a" followed (after optional space) by a separator (dash, en/em-dash, colon,
+        # '.') then anything is the model negating the field in prose rather than giving a real
+        # reason -- treat as empty. lstrip first so "None - ..." matches as readily as "None- ...".
+        if lowered.startswith(prefix):
+            rest = lowered[len(prefix):].lstrip()
+            if rest[:1] in ("-", "–", "—", ":", ".", ")"):
+                return None
+    return stripped
+
+
 def record_finding(params: dict) -> dict:
     # Errors are collected across every field and returned together, not one-at-a-time --
     # a model that gets back only the first bad field re-submits and routinely trips the next
@@ -4335,7 +4366,7 @@ def record_finding(params: dict) -> dict:
         # for audit trail (due diligence was done) rather than silently dropped, but flagged
         # distinctly in the UI (templates/macros/ui.html's false_positive_badge) so a human
         # skimming findings knows not to spend time chasing or submitting it.
-        "false_positive_reason": params.get("false_positive_reason"),
+        "false_positive_reason": _normalize_false_positive_reason(params.get("false_positive_reason")),
     }
     if exploited is not None:
         recorded["exploited"] = exploited
@@ -4351,6 +4382,9 @@ def record_finding(params: dict) -> dict:
         recorded["discovery_tool"] = discovery_tool
     if cvss_vector:
         recorded["cvss_vector"] = cvss_vector
+        # The model assessed this itself -- distinct from a vector borrowed from a CVE record
+        # (agent/core.py's cve_lookup auto-record stamps "cve"), so the UI can say which it is.
+        recorded["cvss_source"] = "agent"
     host = params.get("host")
     if host:
         recorded["host"] = host
@@ -4471,9 +4505,22 @@ def record_chain_result(params: dict) -> dict:
     impact_scenario = params.get("impact_scenario")
     if action == "chain_confirmed":
         if not isinstance(finding_titles, list) or len(finding_titles) < 2:
-            return {"status": "error", "error": "finding_titles must list at least the two findings being chained, by their real title"}
+            return {
+                "status": "error",
+                "error": "finding_titles must list at least the two findings being chained, by their real title. "
+                "If one side of this chain is a vulnerability you just discovered (e.g. a CVE turned up by "
+                "cve_lookup against a confirmed technology+version) and it isn't in your findings list yet, call "
+                "record_finding for it FIRST — it is available in this same tool list — then name its real, "
+                "newly-recorded title here. Do not try to chain a title that was never actually recorded.",
+            }
         if not isinstance(evidence_quotes, list) or len(evidence_quotes) < 2:
-            return {"status": "error", "error": "evidence_quotes must quote the real evidence_ref/evidence value of each finding named in finding_titles — not a paraphrase"}
+            return {
+                "status": "error",
+                "error": "evidence_quotes must quote the real evidence_ref/evidence value of each finding named in "
+                "finding_titles — not a paraphrase. A finding you just created with record_finding this same pass "
+                "has its own evidence_ref/evidence from that call — quote that, not a restatement of your reasoning. "
+                "If you have not actually called record_finding for one of these titles yet, do that first.",
+            }
         if not tool_call_proof:
             return {
                 "status": "error",
@@ -4893,6 +4940,43 @@ def update_plan(params: dict) -> dict:
                         f"a native JSON array/object, not a string. Original value: {preview!r}"
                     ),
                 }
+    elif isinstance(phases_raw, list) and len(phases_raw) == 1 and isinstance(phases_raw[0], str):
+        # A sibling of the double-encoding above, not just a string this time -- confirmed live
+        # (Telenor-Sweden-YesWeHack rescan session): the model wrapped the SAME JSON-encoded phases
+        # array as the lone element of a one-item list, {"phases": ['[{"phase": "recon", ...}]']},
+        # instead of making the top-level "phases" value itself a string. isinstance(phases_raw,
+        # list) was already true (non-empty), so this used to sail past the type check below and
+        # fail later, inside the per-entry loop, with a confusing "each phase entry must be an
+        # object, got '[{...}]'" -- costing a full extra correction round-trip (9384 and 6835
+        # completion tokens across two separate occurrences in that one session) the model could
+        # have skipped entirely with the same tolerant recovery already applied to the plain-string
+        # shape. Same json.loads() attempt, scoped to this one-element-list wrapper specifically so
+        # a genuinely multi-entry list (the normal, correct shape) is never touched by this branch.
+        #
+        # Confirmed live (rev-game.ru session, usr_450dea): the wrapped string itself can ALSO be
+        # truncated (the model's own output cut off mid-argument), the exact same shape the bare-
+        # string branch above already repairs via _attempt_json_truncation_repair -- but this branch
+        # used to only ever try a plain json.loads(), so a truncated-AND-wrapped phases value fell
+        # straight through to the generic "each phase entry must be an object, got '[{...'" error
+        # below instead of self-healing, costing the same avoidable extra round-trip the bare-string
+        # branch was already built to prevent.
+        try:
+            unwrapped = json.loads(phases_raw[0])
+        except (json.JSONDecodeError, TypeError):
+            repaired = _attempt_json_truncation_repair(phases_raw[0])
+            if repaired is not None:
+                try:
+                    unwrapped = json.loads(repaired)
+                except json.JSONDecodeError:
+                    unwrapped = None
+            else:
+                unwrapped = None
+            if unwrapped is not None:
+                phases_raw = unwrapped
+                phases_was_json_encoded_string = True
+        else:
+            phases_raw = unwrapped
+            phases_was_json_encoded_string = True
     if not isinstance(phases_raw, list) or not phases_raw:
         return {"status": "error", "error": "phases is required and must be a non-empty list"}
 
@@ -4926,7 +5010,20 @@ def update_plan(params: dict) -> dict:
 
             subtasks: list[dict] = []
             for subtask_entry in subtasks_raw:
-                if not isinstance(subtask_entry, dict) or not subtask_entry.get("text"):
+                if not isinstance(subtask_entry, dict):
+                    return {"status": "error", "error": f"each subtask of {task_entry['text']!r} needs a non-empty 'text'"}
+                # Tolerate the common real-world key aliases models reach for instead of 'text'
+                # ('step'/'description'/'name') -- same "accept a real-world variant rather than
+                # failing the whole call" spirit as the status fallback just below. A weaker model
+                # reliably emitted {'step': ...} here, and each rejection burned a full (slow)
+                # correction round-trip that regenerated the same mistake.
+                if not subtask_entry.get("text"):
+                    for alias in ("step", "description", "name"):
+                        aliased = subtask_entry.get(alias)
+                        if isinstance(aliased, str) and aliased.strip():
+                            subtask_entry["text"] = aliased
+                            break
+                if not subtask_entry.get("text"):
                     return {"status": "error", "error": f"each subtask of {task_entry['text']!r} needs a non-empty 'text'"}
                 status = subtask_entry.get("status") or "pending"
                 if status not in _VALID_PLAN_TASK_STATUSES:

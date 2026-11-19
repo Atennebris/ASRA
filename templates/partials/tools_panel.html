@@ -3,7 +3,7 @@
    tab panel (settings.html); the route/context that used to feed the standalone page now feeds this
    same partial via GET /settings (main.py's get_settings merges in _grouped_tools_context +
    nuclei_packs alongside every other tab's own context). #}
-<p class="text-[11px] text-secondary mb-4">
+<p class="text-[11px] text-secondary mb-4 ui-desc">
   Every tool ASRA's registry knows about, and whether it's actually installed on this machine
   right now — the same live check the agent itself makes before running one. Grouped by what
   it's actually for (this is what the Subagents tab's own colored dots draw from too), then by
@@ -34,7 +34,7 @@
             class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-elevated text-primary border border-default hover:bg-overlay h-8 px-4 text-[12px]">
       Install (heavy)
     </button>
-    <span class="text-[11px] text-secondary">Check whether the external arsenal is installed, and add what's missing in one click. "Heavy" is a separate, larger, slower set of RE tools (Ghidra, &hellip;) kept out of the fast base install.</span>
+    <span class="text-[11px] text-secondary ui-desc">Check whether the external arsenal is installed, and add what's missing in one click. "Heavy" is a separate, larger, slower set of RE tools (Ghidra, &hellip;) kept out of the fast base install.</span>
   </div>
   <div id="arsenal-output" class="empty:hidden mt-3"></div>
 </div>
@@ -77,7 +77,7 @@
    own, this is only extra third-party packs an operator opts into. #}
 <div class="bg-elevated border border-default rounded-lg p-4 mb-6">
   <p class="text-[13px] font-semibold text-primary mb-1">Nuclei template packs</p>
-  <p class="text-[11px] text-secondary mb-3 max-w-[46rem]">
+  <p class="text-[11px] text-secondary mb-3 max-w-[46rem] ui-desc">
     Optional, extra template sources beyond nuclei's own official set (which nuclei keeps current
     on every run by itself — no action needed for that). Each pack is fetched straight from its
     own GitHub repo via nuclei's built-in <code class="font-mono">-t github/&lt;repo&gt;</code>
@@ -173,7 +173,7 @@
             <h2 class="text-[13px] font-semibold text-primary">{{ section.label }}</h2>
             <span class="text-[10.5px] text-secondary">{{ (section.native | length) + (section.external | length) }} tools</span>
           </div>
-          <p class="text-[10.5px] text-secondary mb-3 leading-relaxed max-w-[52rem]">{{ section.description }}</p>
+          <p class="text-[10.5px] text-secondary mb-3 leading-relaxed max-w-[52rem] ui-desc">{{ section.description }}</p>
           {% if section.native %}
             <div class="mb-3" data-tier-block data-tier="native">
               <span class="block text-[10.5px] font-semibold uppercase tracking-wider text-secondary mb-1.5">Native — ships with ASRA</span>

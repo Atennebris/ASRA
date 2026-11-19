@@ -42,6 +42,30 @@ def test_two_entries_sharing_a_path_prefix_share_the_same_tree_nodes():
     assert {c["name"] for c in api_node["children"]} == {"users", "orders"}
 
 
+def test_a_hosts_node_id_stays_the_same_even_when_a_new_host_shifts_its_sort_position():
+    """Real, confirmed bug this guards against: the Map tab's Site Tree is fully rebuilt and
+    re-sorted alphabetically from scratch on every 4s poll (main.py's get_site_map_tree), so as
+    soon as a new host appears mid-scan (constant, the longer a scan runs), every sibling after it
+    shifts position in the list. The template's <details> elements used to carry no id at all, so
+    Idiomorph (templates/base.html) had nothing to match an existing, operator-expanded node
+    against once its position shifted -- it rendered a "new" node at the server's default
+    open/closed state instead, which read live as "the tree keeps closing/jumping itself". The fix
+    hashes each node's own full host/path instead of its sort position, so the SAME host keeps the
+    SAME id no matter what gets inserted before it alphabetically."""
+    before = main._build_site_map_tree([{"id": "1", "method": "GET", "url": "https://zzz.com/x", "response_status": 200}])["in_scope"]
+    zzz_id_before = before[0]["id"]
+
+    after = main._build_site_map_tree([
+        {"id": "1", "method": "GET", "url": "https://zzz.com/x", "response_status": 200},
+        {"id": "2", "method": "GET", "url": "https://aaa.com/y", "response_status": 200},
+    ])["in_scope"]
+    # aaa.com now sorts before zzz.com -- confirming the shift this test is actually about happened.
+    assert [h["name"] for h in after] == ["aaa.com", "zzz.com"]
+    zzz_id_after = after[1]["id"]
+
+    assert zzz_id_after == zzz_id_before
+
+
 def test_root_path_entry_becomes_a_leaf_directly_on_the_host_node():
     entries = [{"id": "1", "method": "GET", "url": "https://example.com/", "response_status": 200}]
     tree = main._build_site_map_tree(entries)["in_scope"]

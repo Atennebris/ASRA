@@ -27,6 +27,10 @@ LOG_CATEGORIES: set[str] = {
     # has a real, matching entry for the "[asra.DESKTOP]" lines that file writes directly
     "LIBRARY",  # knowledge-library source upload/normalization/LLM-extraction pipeline —
     # agent/tools/library_store.py
+    "PROFILE",  # operator profile for the MAIN agent (standing cross-project style/priorities) —
+    # agent/operator_profile_store.py + agent/core.py's _operator_profile_task_addendum
+    "SCHEDULER",  # unattended repeat-scan scheduler — agent/tools/schedule_store.py +
+    # main.py's _scheduler_worker_loop (which projects are due, what got enqueued, recon reused)
 }
 
 _configured: set[str] = set()

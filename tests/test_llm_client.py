@@ -5,6 +5,8 @@ httpx directly, not the openai SDK client (see that function's own docstring for
 confirmed reason), so its own tests mock at the httpx.Client/MockTransport level instead, same
 pattern tests/test_web_fetch.py already uses for its own raw-httpx-based tool.
 """
+import json
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,6 +23,7 @@ from agent.llm_client import (
     PROVIDER_REGISTRY,
     _call_with_backoff,
     _create_completion_with_backoff,
+    _extract_envelope_tool_calls,
     _extract_prompt_tool_calls,
     _inject_tool_instructions,
     _is_retryable,
@@ -501,6 +504,22 @@ def test_inject_tool_instructions_inserts_new_system_message_when_none_exists():
     assert result[1] == {"role": "user", "content": "task"}
 
 
+def test_inject_tool_instructions_carries_one_fully_filled_wrapper_example():
+    """Prompt-path models reproduce the <tool_call> wrapper far more reliably from a concrete sample
+    than from the format spec alone -- so the instructions must carry exactly one worked example
+    whose body is valid JSON with name+arguments, and only one regardless of how many tools exist."""
+    tools = [
+        {"function": {"name": "alpha", "parameters": {}}},
+        {"function": {"name": "beta", "parameters": {}}},
+    ]
+    content = _inject_tool_instructions([{"role": "user", "content": "task"}], tools=tools)[0]["content"]
+    example_bodies = re.findall(r'<tool_call>(\{.*?\})</tool_call>', content)
+    # The spec line uses placeholders (<tool name>) and is not valid JSON; the worked example is.
+    parsed = [json.loads(body) for body in example_bodies if '"name"' in body and "<tool name>" not in body]
+    assert len(parsed) == 1, f"expected exactly one worked example, got {len(parsed)}"
+    assert parsed[0]["name"] and isinstance(parsed[0]["arguments"], dict) and parsed[0]["arguments"]
+
+
 # --- get_provider(): resolution/validation logic, no network (models_dev mocked out) ---
 
 
@@ -878,7 +897,8 @@ def _make_provider(**overrides):
         model=config.model_default,
     )
     kwargs.update(overrides)
-    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": True, "context_limit": 128000}):
+    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": True, "context_limit": 128000}), \
+            patch("agent.llm_client.is_model_free", return_value=False):
         return OpenAICompatProvider(**kwargs)
 
 
@@ -1033,6 +1053,188 @@ def test_complete_native_bad_request_falls_back_to_prompt_based():
     assert mock_create.call_count == 2
     assert result.content == "plain text reply, no tool_call block"
     assert provider._tool_mode == "prompt"
+
+
+# --- tool-call temperature (low-variance sampling for tool-call turns) ---------------------------
+
+
+def _make_prompt_mode_provider(**overrides):
+    config = PROVIDER_REGISTRY["opencode-zen"]
+    kwargs = dict(
+        provider_id="opencode-zen", models_dev_id=config.models_dev_id,
+        base_url=config.base_url_default, api_key="", model=config.model_default,
+    )
+    kwargs.update(overrides)
+    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": False, "context_limit": 8000}):
+        return OpenAICompatProvider(**kwargs)
+
+
+def _temperature_bad_request_error():
+    request = SimpleNamespace(method="POST", url="https://example.test/v1/chat/completions")
+    response = SimpleNamespace(status_code=400, headers={}, request=request)
+    return openai.BadRequestError(
+        "Unsupported parameter: 'temperature' is not supported with this model",
+        response=response, body=None,
+    )
+
+
+def test_complete_native_sends_tool_call_temperature_when_tools_present(monkeypatch):
+    monkeypatch.delenv("LLM_TOOL_CALL_TEMPERATURE", raising=False)
+    provider = _make_provider()
+    fake = _fake_response("ok")
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_args.kwargs["temperature"] == 0.2
+
+
+def test_complete_native_reads_the_env_override_for_tool_call_temperature(monkeypatch):
+    monkeypatch.setenv("LLM_TOOL_CALL_TEMPERATURE", "0.5")
+    provider = _make_provider()
+    fake = _fake_response("ok")
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_args.kwargs["temperature"] == 0.5
+
+
+def test_complete_native_omits_temperature_on_a_plain_text_turn(monkeypatch):
+    monkeypatch.delenv("LLM_TOOL_CALL_TEMPERATURE", raising=False)
+    provider = _make_provider()
+    fake = _fake_response("ok")
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        provider.complete([{"role": "user", "content": "hi"}])
+
+    assert "temperature" not in mock_create.call_args.kwargs
+
+
+def test_complete_prompt_based_sends_tool_call_temperature(monkeypatch):
+    monkeypatch.delenv("LLM_TOOL_CALL_TEMPERATURE", raising=False)
+    provider = _make_prompt_mode_provider()
+    fake = _fake_response("no tool call")
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_args.kwargs["temperature"] == 0.2
+
+
+def test_temperature_rejection_drops_the_param_and_retries_without_it(monkeypatch):
+    """A provider that 400s specifically on the temperature param must degrade to its own default
+    (retry once without temperature) rather than fail the call -- and the 400 must NOT be mistaken
+    for a native-tool-calling rejection, so tool mode stays native."""
+    monkeypatch.delenv("LLM_TOOL_CALL_TEMPERATURE", raising=False)
+    provider = _make_provider()
+    fake = _fake_response("ok")
+
+    with patch.object(
+        provider._client.chat.completions, "create", side_effect=[_temperature_bad_request_error(), fake]
+    ) as mock_create:
+        result = provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_count == 2
+    assert "temperature" in mock_create.call_args_list[0].kwargs
+    assert "temperature" not in mock_create.call_args_list[1].kwargs
+    assert provider._tool_temperature_supported is False
+    assert provider._tool_mode == "native"
+    assert result.content == "ok"
+
+
+# --- LLM_STRUCTURED_OUTPUT: opt-in json_object envelope for prompt mode ---------------------------
+
+
+def _response_format_bad_request_error():
+    request = SimpleNamespace(method="POST", url="https://example.test/v1/chat/completions")
+    response = SimpleNamespace(status_code=400, headers={}, request=request)
+    return openai.BadRequestError(
+        "response_format is not supported by this model", response=response, body=None,
+    )
+
+
+def test_structured_output_off_by_default_keeps_tag_format(monkeypatch):
+    monkeypatch.delenv("LLM_STRUCTURED_OUTPUT", raising=False)
+    provider = _make_prompt_mode_provider()
+    assert provider._structured_output_enabled is False
+    fake = _fake_response('<tool_call>{"name": "x", "arguments": {}}</tool_call>')
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        result = provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert "response_format" not in mock_create.call_args.kwargs
+    assert "<tool_call>" in mock_create.call_args.kwargs["messages"][0]["content"]
+    assert result.tool_calls[0].name == "x"
+
+
+def test_structured_output_on_sends_json_object_and_envelope_instructions(monkeypatch):
+    monkeypatch.setenv("LLM_STRUCTURED_OUTPUT", "true")
+    provider = _make_prompt_mode_provider()
+    assert provider._structured_output_enabled is True
+    fake = _fake_response('{"message": null, "tool_call": {"name": "x", "arguments": {"a": 1}}}')
+
+    with patch.object(provider._client.chat.completions, "create", return_value=fake) as mock_create:
+        result = provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_args.kwargs["response_format"] == {"type": "json_object"}
+    sent_system = mock_create.call_args.kwargs["messages"][0]["content"]
+    assert "JSON" in sent_system  # json_object mode (and Qwen) needs the word present
+    assert '"tool_call"' in sent_system
+    assert "<tool_call>" not in sent_system
+    assert result.tool_calls[0].name == "x"
+    assert result.tool_calls[0].arguments == {"a": 1}
+
+
+def test_structured_output_rejection_falls_back_to_tag_format(monkeypatch):
+    """A provider that 400s on response_format must drop structured output, rebuild the prompt in the
+    plain tag format (no response_format), and retry once -- degrading to today's behavior."""
+    monkeypatch.setenv("LLM_STRUCTURED_OUTPUT", "true")
+    provider = _make_prompt_mode_provider()
+    fake = _fake_response('<tool_call>{"name": "x", "arguments": {}}</tool_call>')
+
+    with patch.object(
+        provider._client.chat.completions, "create",
+        side_effect=[_response_format_bad_request_error(), fake],
+    ) as mock_create:
+        result = provider.complete([{"role": "user", "content": "hi"}], tools=[{"function": {"name": "x", "parameters": {}}}])
+
+    assert mock_create.call_count == 2
+    assert "response_format" in mock_create.call_args_list[0].kwargs
+    assert '"tool_call"' in mock_create.call_args_list[0].kwargs["messages"][0]["content"]
+    assert "response_format" not in mock_create.call_args_list[1].kwargs
+    assert "<tool_call>" in mock_create.call_args_list[1].kwargs["messages"][0]["content"]
+    assert provider._structured_output_supported is False
+    assert result.tool_calls[0].name == "x"
+
+
+def test_extract_envelope_parses_message_and_tool_call():
+    content, calls = _extract_envelope_tool_calls('{"message": "hi", "tool_call": {"name": "scan", "arguments": {"t": "x"}}}')
+    assert content == "hi"
+    assert len(calls) == 1 and calls[0].name == "scan" and calls[0].arguments == {"t": "x"}
+
+
+def test_extract_envelope_message_only_is_plain_text():
+    content, calls = _extract_envelope_tool_calls('{"message": "just text", "tool_call": null}')
+    assert content == "just text"
+    assert calls == []
+
+
+def test_extract_envelope_accepts_a_bare_tool_call_object():
+    content, calls = _extract_envelope_tool_calls('{"name": "scan", "arguments": {"t": "x"}}')
+    assert calls and calls[0].name == "scan" and calls[0].arguments == {"t": "x"}
+
+
+def test_extract_envelope_tolerates_non_json_and_degrades_to_tag_parser():
+    raw = 'thinking... <tool_call>{"name": "scan", "arguments": {}}</tool_call>'
+    _content, calls = _extract_envelope_tool_calls(raw)
+    assert calls and calls[0].name == "scan"
+
+
+def test_extract_envelope_tolerates_unrelated_json_as_plain_text():
+    content, calls = _extract_envelope_tool_calls('{"foo": "bar"}')
+    assert calls == []
+    assert content == '{"foo": "bar"}'
 
 
 def test_complete_omits_auth_header_when_no_api_key():
@@ -1196,3 +1398,50 @@ def test_fetch_local_model_ids_empty_on_connection_error(monkeypatch):
     result = llm_client._fetch_local_model_ids("http://127.0.0.1:1234/v1", "")
 
     assert result == []
+
+
+# --- Weak-model profile (agent/core.py shrinks prompt/tool menu when this is True) ----------------
+
+
+def test_weak_profile_true_when_no_native_tool_calling(monkeypatch):
+    monkeypatch.delenv("WEAK_MODEL_MODE", raising=False)
+    weak, reasons = llm_client._compute_weak_profile("prompt", 128000, False)
+    assert weak is True
+    assert any("native" in r for r in reasons)
+
+
+def test_weak_profile_true_when_context_limit_below_threshold(monkeypatch):
+    monkeypatch.delenv("WEAK_MODEL_MODE", raising=False)
+    monkeypatch.setenv("WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD", "16384")
+    weak, reasons = llm_client._compute_weak_profile("native", 8000, False)
+    assert weak is True
+    assert any("context_limit" in r for r in reasons)
+
+
+def test_weak_profile_free_model_alone_is_not_a_trigger(monkeypatch):
+    monkeypatch.delenv("WEAK_MODEL_MODE", raising=False)
+    weak, reasons = llm_client._compute_weak_profile("native", 128000, True)
+    assert weak is False  # free is a contributing reason, never a trigger on its own
+    assert any("free model" in r for r in reasons)
+
+
+def test_weak_profile_mode_on_and_off_force_the_decision(monkeypatch):
+    monkeypatch.setenv("WEAK_MODEL_MODE", "on")
+    weak_on, _ = llm_client._compute_weak_profile("native", 128000, False)
+    assert weak_on is True
+    monkeypatch.setenv("WEAK_MODEL_MODE", "off")
+    weak_off, _ = llm_client._compute_weak_profile("prompt", 1000, True)
+    assert weak_off is False
+
+
+def test_provider_exposes_weak_profile_attribute(monkeypatch):
+    monkeypatch.delenv("WEAK_MODEL_MODE", raising=False)
+    config = PROVIDER_REGISTRY["opencode-zen"]
+    with patch("agent.llm_client.get_model_capabilities", return_value={"tool_call": False, "context_limit": 8000}), \
+            patch("agent.llm_client.is_model_free", return_value=None):
+        provider = OpenAICompatProvider(
+            provider_id="opencode-zen", models_dev_id=config.models_dev_id,
+            base_url=config.base_url_default, api_key="", model=config.model_default,
+        )
+    assert provider.weak_profile is True
+    assert isinstance(provider.weak_profile_reasons, list)

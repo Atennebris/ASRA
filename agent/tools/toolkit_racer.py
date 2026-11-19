@@ -37,6 +37,7 @@ from urllib.parse import urlsplit
 
 from agent.tools import toolkit_store
 from agent.tools.toolkit_repeater import send_raw_request
+from agent.utils.debug import session_log_scope
 from agent.utils.logger import get_logger
 
 logger = get_logger("TOOLKIT")
@@ -244,10 +245,11 @@ async def run_last_byte_race(
         key = str(r["response_status"])
         status_counts[key] = status_counts.get(key, 0) + 1
 
-    logger.debug(
-        "toolkit_racer: session=%s run=%s strategy=last_byte requests=%d ok=%d status_counts=%s",
-        session_id, run_id, request_count, len(ok_results), status_counts,
-    )
+    with session_log_scope(session_id):
+        logger.debug(
+            "toolkit_racer: session=%s run=%s strategy=last_byte requests=%d ok=%d status_counts=%s",
+            session_id, run_id, request_count, len(ok_results), status_counts,
+        )
     return {
         "status": "ok", "run_id": run_id, "strategy": "last_byte", "requests": request_count,
         "ok": len(ok_results), "errors": request_count - len(ok_results),
@@ -282,10 +284,11 @@ async def run_sequential_race(
         key = str(r["response_status"])
         status_counts[key] = status_counts.get(key, 0) + 1
 
-    logger.debug(
-        "toolkit_racer: session=%s run=%s strategy=sequential requests=%d ok=%d status_counts=%s",
-        session_id, run_id, request_count, len(ok_results), status_counts,
-    )
+    with session_log_scope(session_id):
+        logger.debug(
+            "toolkit_racer: session=%s run=%s strategy=sequential requests=%d ok=%d status_counts=%s",
+            session_id, run_id, request_count, len(ok_results), status_counts,
+        )
     return {
         "status": "ok", "run_id": run_id, "strategy": "sequential", "requests": request_count,
         "ok": len(ok_results), "errors": request_count - len(ok_results),

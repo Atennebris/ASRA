@@ -39,6 +39,63 @@ def test_add_route_registers_and_redirects(tmp_path, monkeypatch):
     assert records[0]["requires_target"] is True  # safe default
 
 
+def test_manual_add_persists_description_category_and_scopes(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+
+    resp = client.post("/api/tools/custom-tools/add", follow_redirects=False, data={
+        "manual": "1", "name": "mytool", "path": "/opt/a/mytool",
+        "description": "typed by hand", "category": "recon", "requires_target": "true",
+        "scopes": ["main_agent", "subagent"],
+    })
+
+    assert resp.status_code == 303
+    record = custom_tools_store.load_custom_tools()[0]
+    assert record["description"] == "typed by hand"
+    assert record["category"] == "recon"
+    assert record["requires_target"] is True
+    assert record["scopes"] == ["main_agent", "subagent"]
+
+
+def test_manual_add_duplicate_name_does_not_500(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    custom_tools_store.add_custom_tool(name="dup", path="/a/dup", description="", requires_target=False, category="recon")
+    client = TestClient(main.app)
+
+    resp = client.post("/api/tools/custom-tools/add", follow_redirects=False, data={
+        "manual": "1", "name": "dup", "path": "/b/dup", "description": "x", "category": "recon",
+    })
+
+    assert resp.status_code == 303  # graceful redirect, not a 500
+    assert len(custom_tools_store.load_custom_tools()) == 1  # the original is untouched
+
+
+def test_update_route_persists_scopes(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    record = custom_tools_store.add_custom_tool(name="mytool", path="/a/mytool", description="", requires_target=False, category="recon")
+    client = TestClient(main.app)
+
+    resp = client.post(f"/api/tools/custom-tools/{record['id']}/update", follow_redirects=False, data={
+        "description": "d", "category": "recon", "scopes": ["chat"],
+    })
+
+    assert resp.status_code == 303
+    assert custom_tools_store.get_custom_tool(record["id"])["scopes"] == ["chat"]
+
+
+def test_settings_renders_scope_toggles_and_add_dialog(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    custom_tools_store.add_custom_tool(name="mytool", path="/a/mytool", description="d", requires_target=False, category="recon")
+    client = TestClient(main.app)
+
+    resp = client.get("/settings")
+
+    assert resp.status_code == 200
+    assert "Add custom tool" in resp.text
+    assert "Available to" in resp.text
+    assert "Main agent" in resp.text and "Subagents" in resp.text
+
+
 def test_toggle_route_persists_and_returns_no_content(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     record = custom_tools_store.add_custom_tool(name="mytool", path="/opt/a/mytool", description="", requires_target=True, category="recon")

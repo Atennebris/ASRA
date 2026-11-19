@@ -69,8 +69,8 @@
   {% if query_active %}
     <p class="text-sm text-secondary italic py-4">No matches for this filter{{ " in the portion of history scanned" if query_truncated else "" }}.</p>
   {% elif session_id %}
-    <p class="text-sm text-secondary italic py-4">No traffic captured yet — navigate the agent's browser (browser_navigate, or let the agent browse during Recon) and requests will appear here.</p>
+    <p class="text-sm text-secondary italic py-4 ui-desc">No traffic captured yet — navigate the agent's browser (browser_navigate, or let the agent browse during Recon) and requests will appear here.</p>
   {% else %}
-    <p class="text-sm text-secondary italic py-4">No traffic yet — anything sent from Repeater or Intruder on this page shows up here.</p>
+    <p class="text-sm text-secondary italic py-4 ui-desc">No traffic yet — anything sent from Repeater or Intruder on this page shows up here.</p>
   {% endif %}
 {% endif %}

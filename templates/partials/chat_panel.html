@@ -151,7 +151,7 @@
        the icon-only button had none of, same pattern settings.html's own Test buttons already use
        via textContent, adapted here since this button has no text to swap. #}
     <button type="button" id="chat-compact-btn" title="Compact history (/compact)" aria-label="Compact chat history"
-            hx-post="/api/session/{{ session.session_id }}/chat/compact" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+            hx-post="/api/session/{{ session.session_id }}/chat/compact" hx-target="#chat-stream" hx-swap="morph:innerHTML" data-no-progress-bar
             hx-disabled-elt="this"
             hx-on::before-request="this.querySelector('svg').classList.add('hidden'); this.querySelector('.asra-spinner').classList.remove('hidden')"
             hx-on::after-request="this.querySelector('svg').classList.remove('hidden'); this.querySelector('.asra-spinner').classList.add('hidden')"
@@ -162,18 +162,19 @@
       </svg>
       <span class="asra-spinner hidden"></span>
     </button>
-    {# Quick Chat (mode="standalone") ONLY -- a real project (agent/interactive/reverse_engineering)
-       already picked which Subagents it can see once, up front, in its own New Project form
-       (partials/new_project_form.html's subagent_project_checklist()); showing this same picker
-       again in that project's own chat sidebar would just be a second, redundant control over the
-       exact same already-made choice. Quick Chat has no New Project form of its own at all -- this
-       is the ONLY place it can ever be set, which is exactly why it needs to live here, live,
-       inside the chat itself, rather than in Settings (which subagents exist/are enabled changes
-       day to day, so an operator needs this one click away, not buried in a settings tab). Also
-       requires delegation to actually be reachable at all for standalone (chat_settings.json's
-       subagents_enabled toggle, Settings -> Chat -- see agent/chat.py's _chat_tool_specs) and at
-       least one globally-enabled profile to pick from. #}
-    {% if session.mode == "standalone" and get_enabled_subagent_profiles() and chat_subagents_delegation_enabled() %}
+    {# Every session mode, not just Quick Chat (mode="standalone") -- a real project's own New
+       Project form (partials/new_project_form.html's subagent_project_checklist()) only ever picks
+       session["enabled_subagent_ids"] ONCE, at creation time, so a Subagent profile added/enabled
+       AFTER that project already exists has no way to ever reach it otherwise: the exact same
+       session-id-generic route (main.py's save_session_enabled_subagents) this button already
+       posts to for Quick Chat. Real incident this fixes: an operator who narrowed a project's
+       picker at creation time (unchecked some profiles) had no way at all, short of editing
+       session.json by hand, to later grant that same project a specialist created afterward --
+       which subagents exist/are enabled changes day to day, same reasoning Quick Chat's version of
+       this button already existed for. Also requires delegation to actually be reachable at all
+       (chat_settings.json's subagents_enabled toggle, Settings -> Chat -- see agent/chat.py's
+       _chat_tool_specs) and at least one globally-enabled profile to pick from. #}
+    {% if get_enabled_subagent_profiles() and chat_subagents_delegation_enabled() %}
     <button type="button" id="chat-subagents-btn" title="Subagents for this chat" aria-label="Subagents for this chat"
             hx-get="/api/session/{{ session.session_id }}/subagents-panel" hx-target="#chat-subagents-picker-content" hx-swap="innerHTML"
             hx-on::after-request="if(event.detail.successful) document.getElementById('chat-subagents-picker').showModal()"
@@ -218,7 +219,12 @@
     {% include "partials/chat_messages.html" %}
   </div>
 
-  <form id="chat-form" hx-post="/api/session/{{ session.session_id }}/chat" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+  {# data-no-progress-bar: a message send is NOT a page load — it posts the operator's message, gets
+     back the messages fragment with its own inline "thinking…" indicator, and the real reply streams
+     in over #chat-stream's SSE. The page-wide top loading bar (static/js/progress_bar.js) on top of
+     that read as "the page is reloading" on every single send, which this chat deliberately is not —
+     same local-feedback opt-out the chat tab switch already uses. #}
+  <form id="chat-form" hx-post="/api/session/{{ session.session_id }}/chat" hx-target="#chat-stream" hx-swap="morph:innerHTML" data-no-progress-bar
         hx-disabled-elt="this" hx-on::before-request="var el = this.querySelector('#chat-input'); el.value = ''; el.classList.remove('chat-input-token-active'); el.style.height = 'auto';"
         class="border-t border-default p-3 space-y-2 shrink-0">
     <div class="flex gap-2">
@@ -354,7 +360,7 @@
       </div>
       <button type="submit" class="inline-flex items-center justify-center gap-2 rounded font-medium transition-colors duration-150 bg-accent hover:bg-accent-hover text-white h-9 px-3 text-sm shrink-0">Send</button>
     </div>
-    <p class="text-[10px] text-secondary">Only providers with a key configured in Settings are listed. Leave blank to use the main agent's own provider.</p>
+    <p class="ui-desc text-[10px] text-secondary">Only providers with a key configured in Settings are listed. Leave blank to use the main agent's own provider.</p>
   </form>
 </div>
 

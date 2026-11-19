@@ -244,11 +244,11 @@
            here (there IS no scan/findings behind it), so it gets its own empty-state copy instead
            of inheriting the project-chat one. #}
         <p class="text-sm font-medium text-primary mt-3">Ask anything</p>
-        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">A security question,
+        <p class="ui-desc text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">A security question,
           how something works, or a quick lookup &mdash; not tied to any project.</p>
       {% else %}
         <p class="text-sm font-medium text-primary mt-3">Ask about this session</p>
-        <p class="text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">Findings, progress, or a hint like &ldquo;skip the CORS finding&rdquo; or &ldquo;focus on redirects&rdquo; &mdash;
+        <p class="ui-desc text-[11px] text-secondary mt-1.5 leading-relaxed max-w-[16rem]">Findings, progress, or a hint like &ldquo;skip the CORS finding&rdquo; or &ldquo;focus on redirects&rdquo; &mdash;
           available any time, even while the scan is still running.</p>
       {% endif %}
     </div>
@@ -285,7 +285,28 @@
   {% set last_msg = chat_messages[-1] if chat_messages else none %}
   {% set last_seg = (last_msg.get("segments") or [])[-1] if last_msg and last_msg.get("segments") else none %}
   {% set tool_in_flight = last_seg is not none and last_seg.type == "tool_call" and not last_seg.done %}
+  {# The live, still-streaming partial reply (main.py's _render_chat_messages passes it from
+     agent/chat.py's in-memory draft registry). default("", true) because a full page load via
+     session.html's {% include %} renders this template without ever setting the variable, and there
+     is no active stream then anyway. #}
+  {% set live_draft = stream_draft | default("", true) %}
   {% if thread.get("pending") %}
+    {% if live_draft and not tool_in_flight %}
+      {# Token-by-token typing bubble -- styled exactly like a finished assistant text bubble above,
+         with a blinking caret, so the reply reads as it writes itself instead of popping in whole at
+         the end. Cleared the instant the real, persisted text segment lands (agent/chat.py), which
+         then renders in the message loop above in its place. #}
+      <div class="flex gap-2.5 justify-start">
+        {{ agent_avatar() }}
+        <div class="flex flex-col gap-1.5 min-w-0 max-w-[82%] items-start">
+          <div class="max-w-full px-3.5 py-2 text-sm text-left break-words chat-markdown shadow-sm border bg-elevated text-primary border-default rounded-2xl rounded-bl-md">{{ live_draft | render_chat_markdown }}<span class="inline-block w-[2px] h-4 ml-0.5 align-text-bottom bg-accent/70 animate-pulse" aria-hidden="true"></span></div>
+          <button type="button" title="Stop this chat turn" aria-label="Stop"
+                  hx-post="/api/session/{{ session.session_id }}/chat/stop" hx-target="#chat-stream" hx-swap="morph:innerHTML"
+                  hx-vals='{"thread_id": "{{ thread.id }}"}'
+                  class="text-[11px] font-medium text-secondary hover:text-severity-high underline underline-offset-2">Stop</button>
+        </div>
+      </div>
+    {% else %}
     <div class="flex gap-2.5 justify-start">
       {{ agent_avatar() }}
       <div class="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-2xl rounded-bl-md bg-elevated border border-default text-secondary shadow-sm">
@@ -303,5 +324,6 @@
                 class="{{ 'ml-1' if not tool_in_flight else '' }} text-[11px] font-medium text-secondary hover:text-severity-high underline underline-offset-2">Stop</button>
       </div>
     </div>
+    {% endif %}
   {% endif %}
 </div>

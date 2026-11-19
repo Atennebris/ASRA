@@ -287,7 +287,11 @@
       {% endif %}
       <p>{{ finding.description }}</p>
       <p><strong>Verification:</strong> {{ finding.verification }}</p>
-      {% if finding.cvss_vector %}<p><strong>CVSS:</strong> <code>{{ finding.cvss_vector }}</code></p>{% endif %}
+      {% if finding.cvss_vector %}
+        {% set cvss = cvss_score(finding.cvss_vector) %}
+        <p><strong>CVSS:</strong>
+          {% if cvss and cvss.score is not none %}{{ "%.1f"|format(cvss.score) }} ({{ cvss.severity }}) {% endif %}<code>{{ finding.cvss_vector }}</code>{% if finding.cvss_source == "agent" %} — assessed by the agent on the confirmed finding{% elif finding.cvss_source == "cve" %} — from the CVE record{% endif %}</p>
+      {% endif %}
       {# agent/core.py's _run_skeptical_verification -- a blind, independent second opinion run
          once at the very end of the scan on every "verified" finding. Shown here for the exact
          same reason session_fragment.html shows it: a "refuted"/"inconclusive" verdict means this
@@ -300,20 +304,33 @@
       {% elif finding.skeptical_verification == "inconclusive" %}
         <p class="skeptical-inconclusive">&#8635; Skeptical verification could not confirm or refute this independently: {{ finding.skeptical_verification_note }}</p>
       {% endif %}
+      {# Cross-provider ensemble disagreement -- same confirmed gap session_fragment.html closes: the
+         split-verdict signal was computed onto the finding and shown nowhere. A submission reader
+         must see when two independent providers disagreed about a finding, not have it silently
+         dropped from the formal report. #}
+      {% if finding.ensemble_disagreement %}
+        <p class="skeptical-refuted">&#9888; <strong>Two independent providers disagree:</strong>
+          primary verdict <strong>{{ finding.skeptical_verification or "—" }}</strong>, second opinion
+          {% if finding.ensemble_secondary_provider %}({{ finding.ensemble_secondary_provider }}) {% endif %}
+          <strong>{{ finding.ensemble_secondary_verdict }}</strong>.
+          {% if finding.ensemble_secondary_note %}{{ finding.ensemble_secondary_note }}{% endif %}</p>
+      {% endif %}
       <p><strong>Exploited:</strong> {{ finding.exploited }}</p>
-      {% if finding.exploited and (finding.extracted_artifact or finding.artifact_usage_hint) %}
+      {# Same derived exploit-axis state + shared labels as the live UI (agent/verification_status.py)
+         so this downloadable report never contradicts what the operator saw on the card. #}
+      {% set ex_state = finding | exploit_state %}
+      {% if ex_state == "exploited" and (finding.extracted_artifact or finding.artifact_usage_hint) %}
         {# Verdict first, technical detail after — see session_fragment.html's identical note. #}
-        <p class="exploited-note"><strong>Exploited — access confirmed.</strong>
+        <p class="exploited-note"><strong>{{ EXPLOIT_STATUS_LABELS["exploited"] }} — access confirmed.</strong>
           {% if finding.extracted_artifact %}<code>{{ finding.extracted_artifact }}</code>{% endif %}
           {% if finding.artifact_usage_hint %}{{ finding.artifact_usage_hint }}{% endif %}
         </p>
-      {% elif not finding.exploited and finding.advisory_note and finding.exploit_outcome and finding.exploit_outcome != "exploit_attempted" %}
-        {# No real exploit tool ever ran against this finding — distinct from a genuine negative
-           test below, since "not exploitable" overclaims certainty a skip (no suitable tool,
-           needs manual verification, an operator/scope decision) never actually established. #}
-        <p class="not-attempted-note"><strong>Not attempted:</strong> {{ finding.advisory_note }}</p>
-      {% elif not finding.exploited and finding.advisory_note %}
-        <p class="not-exploitable-note"><strong>Not exploitable:</strong> {{ finding.advisory_note }}</p>
+      {% elif ex_state == "not_attempted" and finding.advisory_note %}
+        {# A skip (no suitable tool, needs manual verification, an operator/scope decision) — not a
+           disproof, so it must not read like one. #}
+        <p class="not-attempted-note"><strong>{{ EXPLOIT_STATUS_LABELS["not_attempted"] }}:</strong> {{ finding.advisory_note }}</p>
+      {% elif ex_state == "not_exploited" and finding.advisory_note %}
+        <p class="not-exploitable-note"><strong>{{ EXPLOIT_STATUS_LABELS["not_exploited"] }}:</strong> {{ finding.advisory_note }}</p>
       {% endif %}
       {% if finding.remediation_advice and not finding.false_positive_reason %}
         <p class="remediation-note">&#10003; <strong>How to fix:</strong> {{ finding.remediation_advice }}</p>

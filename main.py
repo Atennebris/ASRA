@@ -6,6 +6,10 @@ validation and template rendering.
 """
 from __future__ import annotations
 
+# Must be the first import -- see agent/utils/_startup_timer.py's own docstring for why this one
+# line lives in its own module instead of an inline assignment here.
+from agent.utils._startup_timer import IMPORT_START_TIME
+
 import asyncio
 import copy
 import hashlib
@@ -18,6 +22,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -27,8 +32,9 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from fastapi.templating import Jinja2Templates
 
 import ipaddress
@@ -39,11 +45,12 @@ import markdown
 import markupsafe
 from markupsafe import Markup
 
-from agent import desktop_update, public_ip, updater
+from agent import desktop_update, public_ip, reliability_settings, updater
 from agent import settings_transfer
 from agent.chat import (
     _find_thread,
     _get_active_thread,
+    get_chat_stream_draft,
     append_pending_chat_message,
     save_chat_picker,
     cancel_queued_chat_message,
@@ -62,6 +69,7 @@ from agent.core import (
     VALID_ENTRY_POINTS,
     _WHATWEB_WAF_CDN_PLUGIN_NAMES,
     _embed_playbook_entries,
+    apply_detected_target_profile,
     compute_efficiency_score,
     compute_llm_usage_summary,
     compute_portfolio_summary,
@@ -86,6 +94,14 @@ from agent.core import (
     set_re_stop_intent,
     time_budget_deadline_epoch,
 )
+from agent.verification_status import (
+    EXPLOIT_STATUS_LABELS,
+    derive_exploit_status,
+    derive_verification_status,
+    latest_reverify_outcome_by_title,
+)
+from agent.cvss_score import cvss_base_score
+from agent.target_overview import build_target_overview
 from agent.tools.background_jobs import reconcile_orphaned_background_jobs
 from agent.tools.browser_manager import get_browser_manager
 from agent.tools.memscan_manager import shutdown_all as shutdown_memscan_sessions
@@ -110,10 +126,12 @@ from agent.tools.custom_tools_root import (
 )
 from agent.tools.custom_tools_store import (
     CUSTOM_TOOL_CATEGORIES,
+    CUSTOM_TOOL_SCOPES,
     add_custom_tool,
     load_custom_tools,
     remove_custom_tool,
     set_custom_tool_enabled,
+    tool_scopes,
     update_custom_tool,
 )
 from agent.tools.dork_engine import SEARCH_ENGINES as DORK_SEARCH_ENGINES
@@ -122,9 +140,9 @@ from agent.tools.dork_engine import build_dork_result, list_dork_categories
 from agent.tools.llm_test_job import cancel_test, start_test, test_status
 from agent.tools.toolkit_settings_store import BOOL_KEYS as TOOLKIT_AGENT_SETTINGS_FIELDS
 from agent.tools.toolkit_settings_store import load_toolkit_agent_settings, save_toolkit_agent_settings
-from agent.tools import fleet_store
+from agent.tools import fleet_store, schedule_store
 from agent.tools import subagent_icons
-from agent.tools.subagent_store import add_profile, delete_profile, get_enabled_profiles, import_profiles, load_subagent_profiles, update_profile
+from agent.tools.subagent_store import add_profile, delete_profile, ensure_builtin_specialists_migrated, get_enabled_profiles, import_profiles, load_subagent_profiles, update_profile
 from agent.tools.subagent_tasks import reconcile_orphaned_subagent_tasks
 from agent.tools import terminal_manager
 from agent.tools import terminal_settings
@@ -258,6 +276,7 @@ from agent.settings import (
     get_added_providers,
     get_free_models_only,
     get_secondary_verification_provider,
+    get_ui_descriptions_hidden,
     is_provider_enabled,
     load_llm_settings,
     remove_provider_from_list,
@@ -266,7 +285,9 @@ from agent.settings import (
     save_secondary_verification_provider,
     set_free_models_only,
     set_provider_enabled,
+    set_ui_descriptions_hidden,
 )
+from agent.operator_profile_store import load_operator_profile, save_operator_profile
 from agent.providers.models_dev import is_model_free
 from agent.tools.allowed_targets import _matches_scope_entries, authorize_exploit_targets
 from agent.tools.builders.validators import classify_target_type, expand_target_alternation, validate_scope_entry
@@ -279,7 +300,7 @@ from agent.tools.native import (
 )
 from agent.utils import lazy_openai
 from agent.utils import crash_diagnostics
-from agent.utils.debug import current_session_id, is_debug_enabled
+from agent.utils.debug import current_session_id, debug_log_polls, is_debug_enabled
 from agent.utils.logger import get_logger
 from agent.utils.static_url import make_static_url
 from agent.utils.report_export import (
@@ -292,6 +313,7 @@ from agent.utils.report_export import (
     render_txt,
     render_zip,
 )
+from sessions import transfer as projects_transfer
 from sessions.store import (
     create_session,
     delete_all_sessions,
@@ -306,7 +328,7 @@ from sessions.store import (
     reset_plan_for_new_pass,
     save_session,
 )
-from agent.tools.builders.re_target import check_re_target, clone_or_stage_re_target
+from agent.tools.builders.re_target import check_re_target, clone_or_stage_re_target, detect_target_shape
 
 logger = get_logger("API")
 
@@ -401,6 +423,73 @@ async def _fleet_worker_loop() -> None:
         await asyncio.sleep(_FLEET_POLL_INTERVAL_SECONDS)
 
 
+_scheduler_logger = get_logger("SCHEDULER")
+_SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").strip().lower() == "true"
+_SCHEDULER_POLL_INTERVAL_SECONDS = float(os.getenv("SCHEDULER_POLL_INTERVAL_SECONDS", "60"))
+
+
+async def _scheduler_worker_loop() -> None:
+    """Runs for the server's whole lifetime (started in _lifespan, cancelled on shutdown, same shape
+    as _fleet_worker_loop). The one place unattended repeat scans actually fire: each poll, any
+    project whose schedule is due (agent/tools/schedule_store.py) gets an in-place pass PREPARED
+    (reusing its prior recon via _prepare_in_place_pass, never re-scanning from scratch) and handed
+    to the SAME fleet queue a manual Start uses -- so repeat runs respect the one
+    FLEET_MAX_CONCURRENT_SESSIONS cap instead of this becoming a second, uncapped parallel runner.
+
+    Off entirely when SCHEDULER_ENABLED=false (the per-project schedules stay saved, just nothing
+    auto-fires). A project that's currently live/queued/prepared is skipped this tick rather than
+    stacked on top of itself -- it becomes due again on the next interval once idle.
+    """
+    if not _SCHEDULER_ENABLED:
+        _scheduler_logger.debug("scheduler: disabled (SCHEDULER_ENABLED=false) -- no unattended repeat runs")
+        return
+    while True:
+        try:
+            _run_due_schedules()
+        except Exception:
+            # One bad tick (a transient file-lock hiccup, a single unreadable project) must never
+            # kill the loop for every other scheduled project -- the next tick just tries again.
+            _scheduler_logger.debug("scheduler: tick failed", exc_info=True)
+        await asyncio.sleep(_SCHEDULER_POLL_INTERVAL_SECONDS)
+
+
+def _run_due_schedules() -> None:
+    """One scheduler tick, factored out of the loop so it's unit-testable without an event loop.
+    Every due, idle project gets its recon reused (via _prepare_in_place_pass) and is handed to the
+    fleet queue; a project that's live/queued/prepared is left for the next tick, and a schedule
+    whose project is gone is dropped. All operations here are synchronous file/state work."""
+    due = schedule_store.due_session_ids()
+    if not due:
+        return
+    summaries = {s["session_id"]: s for s in list_session_summaries()}
+    for session_id in due:
+        summary = summaries.get(session_id)
+        if summary is None:
+            # The project folder is gone -- drop the stale schedule so it stops being checked.
+            schedule_store.delete_schedule(session_id)
+            _scheduler_logger.debug("scheduler: session=%s has no project anymore -- schedule removed", session_id)
+            continue
+        status = summary.get("status")
+        if status in _ORPHANABLE_STATUSES or status in ("pending", "created"):
+            # Already running, queued-to-start, or a prepared-but-unstarted pass -- never stack a
+            # second run on top; it becomes due again next interval once idle.
+            continue
+        session = load_session(session_id)
+        if session is None:
+            schedule_store.delete_schedule(session_id)
+            continue
+        # Reuse the prior recon/findings/hypotheses (this is the SAME session) and only re-verify +
+        # dig the delta -- the whole point vs a blind re-scan from zero.
+        _prepare_in_place_pass(session)
+        save_session(session_id, session)
+        fleet_store.enqueue_session(session_id)
+        schedule_store.mark_triggered(session_id)
+        _scheduler_logger.debug(
+            "scheduler: session=%s due -> prepared in-place pass (reused prior recon) + enqueued to fleet",
+            session_id,
+        )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Server startup/shutdown, replacing the two deprecated @app.on_event handlers FastAPI now
@@ -411,15 +500,31 @@ async def _lifespan(_app: FastAPI):
     finally blocks) already handles a session's own context the moment ITS run ends; this covers
     everything still open when the server itself goes down, so a graceful shutdown never leaves an
     orphaned browser/proxy process behind (invisible to session.json-based orphan recovery)."""
+    # Diagnostic for the same real incident _IMPORT_START_TIME's own comment above names -- logs
+    # the actual split between "importing main.py's whole module graph" and each synchronous
+    # recovery sweep below, instead of leaving a slow cold launch as an unexplained black box. Best-
+    # effort only: never let a timing measurement itself be the thing that takes down startup.
+    _lifespan_start = time.time()
+    logger.debug("_lifespan: module import graph took %.2fs before startup began", _lifespan_start - IMPORT_START_TIME)
     # Read BEFORE this run's own first heartbeat overwrites it -- see crash_diagnostics' own
     # docstring for the real incident (an unexplained silent stop) this detects on the next boot.
     crash_diagnostics.check_previous_run_and_log()
     crash_diagnostics.write_heartbeat()
     heartbeat_task = asyncio.create_task(crash_diagnostics.heartbeat_loop())
     _startup_progress("Recovering any interrupted sessions...")
+    _step_start = time.time()
     _mark_orphaned_sessions_interrupted()
+    logger.debug("_lifespan: _mark_orphaned_sessions_interrupted took %.2fs", time.time() - _step_start)
+    _step_start = time.time()
     _reconcile_orphaned_chat_threads_sweep()
+    logger.debug("_lifespan: _reconcile_orphaned_chat_threads_sweep took %.2fs", time.time() - _step_start)
+    _step_start = time.time()
     library_store.reconcile_orphaned_analyses()
+    logger.debug("_lifespan: library_store.reconcile_orphaned_analyses took %.2fs", time.time() - _step_start)
+    # Give stores created before the built-in specialist fleet existed that fleet too, once.
+    _step_start = time.time()
+    ensure_builtin_specialists_migrated()
+    logger.debug("_lifespan: ensure_builtin_specialists_migrated took %.2fs", time.time() - _step_start)
     # Quiet background update check at startup (git fetch is network I/O -> off the event loop, and
     # never blocks the server coming up). Result is cached for the Settings page + sidebar indicator.
     # Settings -> Updates' own "Check for updates at startup" switch (agent/updater.py) owns this --
@@ -449,6 +554,10 @@ async def _lifespan(_app: FastAPI):
     # Same long-lived shape as fleet_worker_task just above -- auto_backup_worker_loop no-ops
     # immediately and returns if PROJECT_AUTO_BACKUP_ENABLED=false, so this is always safe to start.
     backup_worker_task = asyncio.create_task(auto_backup_worker_loop())
+    # Same long-lived shape -- no-ops and returns immediately if SCHEDULER_ENABLED=false, so always
+    # safe to start. Drives unattended repeat scans (agent/tools/schedule_store.py).
+    scheduler_worker_task = asyncio.create_task(_scheduler_worker_loop())
+    logger.debug("_lifespan: total synchronous startup work took %.2fs (before module import, see above)", time.time() - _lifespan_start)
     _startup_progress(f"Ready — open http://127.0.0.1:{os.getenv('PORT', '8000')}")
     yield
     # First, before anything else below gets a chance to hang/raise: if the process dies partway
@@ -459,6 +568,7 @@ async def _lifespan(_app: FastAPI):
     heartbeat_task.cancel()
     fleet_worker_task.cancel()
     backup_worker_task.cancel()
+    scheduler_worker_task.cancel()
     await get_browser_manager().shutdown()
     # Same backstop as the browser_manager line above, for memscan_*'s own live scanmem processes
     # (agent/tools/memscan_manager.py) -- plain sync cleanup, no await needed.
@@ -561,6 +671,11 @@ _SOURCE_MTIME_AT_STARTUP = os.path.getmtime(__file__)
 
 # How often the SSE stream re-reads the session file and checks whether it changed.
 _SSE_POLL_INTERVAL_SECONDS = 1.0
+# The chat panel polls faster than the scan stream: a conversation reply (and its tool-card
+# pending->done transitions) should feel live, like a real chat app, not lag up to a full second
+# behind the moment the background turn actually wrote it. Cheap for a single-operator local tool —
+# only an actual content-hash change triggers a re-render; between changes it is one hash + a sleep.
+_CHAT_SSE_POLL_INTERVAL_SECONDS = 0.3
 
 # Settings' provider picker needs these — Jinja globals, not per-route context, since they're
 # static config (PROVIDER_REGISTRY itself never changes at runtime), not per-request state.
@@ -610,6 +725,7 @@ templates.env.globals["llm_provider_default"] = os.getenv("LLM_PROVIDER", DEFAUL
 # decide whether to even load static/js/debug_events.js's click/htmx tracking at all, so there's
 # zero extra network traffic from it in normal, non-debug use.
 templates.env.globals["debug_enabled"] = is_debug_enabled()
+templates.env.globals["debug_log_polls"] = debug_log_polls()
 # Unlike the static values above, this is registered as the CALLABLE itself, not its result — the
 # New Project form (templates/partials/new_project_form.html) is {% include %}'d straight into
 # base.html's own always-present modal, reachable from every page, so there's no single route
@@ -648,6 +764,40 @@ templates.env.globals["load_sound_settings"] = load_sound_settings
 # whatever page it's on (chat panel, Library, subagent profiles), not just settings.html, the same
 # reasoning load_sound_settings right above already follows for its own page-wide JS watchers.
 templates.env.globals["get_free_models_only"] = get_free_models_only
+# Callable (not a startup value like debug_enabled): base.html reads it per render so the
+# Customization toggle takes effect on the very next page without a server restart.
+templates.env.globals["ui_descriptions_hidden"] = get_ui_descriptions_hidden
+# Callable, read per render (same reasoning as ui_descriptions_hidden above): the Operator Profile
+# tab's <section> is always present in settings.html's DOM (CSS display:none hides inactive tabs),
+# so every settings.html render -- not just GET /settings -- needs this available, and a global
+# callable gives that for free without spreading a context key into each of the ~dozen render sites.
+templates.env.globals["operator_profile"] = load_operator_profile
+# The single derived verification-confidence status for a finding (agent/verification_status.py),
+# computed on read from the fields already on the finding -- never a stored second source of truth.
+# verify_status(finding, reverify_outcome) returns the one status + context trail the badge/report
+# render; latest_reverify_outcome_by_title(history) is built once per render so a card can pass in
+# its finding's own last reverify verdict without an O(n^2) re-scan of the history per finding.
+templates.env.globals["verify_status"] = derive_verification_status
+templates.env.globals["latest_reverify_outcome_by_title"] = latest_reverify_outcome_by_title
+# The exploit-outcome axis (did a real exploit succeed), separate from verify_status's confidence
+# tier. One derived state key + one label map (agent/verification_status.py) shared by the card
+# badge, detail box, meta line and report exports, so "Not exploited"/"Not exploitable" can't drift
+# apart across those surfaces again.
+templates.env.filters["exploit_state"] = derive_exploit_status
+templates.env.globals["EXPLOIT_STATUS_LABELS"] = EXPLOIT_STATUS_LABELS
+# Turns a finding's raw CVSS vector into a base score + severity ("9.8 Critical") for display --
+# v3.0/3.1 scored offline, v4.0 shown without a fabricated number (agent/cvss_score.py). Returns
+# None for a finding with no vector, so templates guard on the result.
+templates.env.globals["cvss_score"] = cvss_base_score
+# The live Target Overview card's data (agent/target_overview.py) -- a pure aggregation of the
+# session (surface, stack, findings-by-derived-status, hypotheses, knowledge boundaries), recomputed
+# on every render so the SSE morph keeps it current with no stored blob to drift.
+templates.env.globals["target_overview"] = build_target_overview
+# Per-project repeat-scan schedule, for the Overview tab's own schedule control
+# (templates/partials/schedule_control.html + agent/tools/schedule_store.py).
+templates.env.globals["get_schedule"] = schedule_store.get_schedule
+templates.env.globals["scheduler_min_interval_seconds"] = schedule_store.min_interval_seconds
+templates.env.globals["scheduler_enabled"] = _SCHEDULER_ENABLED
 # Project-icon pools -- shared by the New Project picker (macros/project_icons.html's icon_picker)
 # and sessions/store.py's own random default, one source of truth (projects/icons.py).
 templates.env.globals["PROJECT_ICON_NAMES"] = project_icons.ICON_NAMES
@@ -1670,6 +1820,10 @@ def _build_attack_surface_graph(session: dict) -> dict:
         if edge is not None:
             edge["notes"] = rel.get("evidence") or ""
             edge["at"] = rel.get("recorded_at")
+            # Proven live: record_host_relationship's tool contract required a real tool call +
+            # evidence behind this pivot the moment it was recorded. Drawn solid in the Map, vs the
+            # reasoned/chain-derived pivots below -- "proven" must look different from "inferred".
+            edge["verification"] = "verified"
 
     # attack_path, reconstructed half: one edge per real pivot a Chain pass actually reasoned
     # through (session["chain_attempts"], agent/core.py's _persist_chain_attempt) -- the
@@ -1697,6 +1851,12 @@ def _build_attack_surface_graph(session: dict) -> dict:
             if edge is not None:
                 edge["notes"] = note
                 edge["at"] = attempt.get("ran_at")
+                # Reconstructed from a Chain pass's own reasoning, not an evidence-backed assertion
+                # -- a weaker signal than a record_host_relationship pivot (which, added first above,
+                # wins add_edge's dedup for the same pair). Drawn dashed so the Map never shows an
+                # inferred hop as if it were a proven one. setdefault: never downgrade a "verified"
+                # edge this same pair may already have earned above.
+                edge.setdefault("verification", "reasoned")
 
     # Manual (operator-authored) edges -- unlike auto edges above, these carry real free-text
     # metadata (what's actually flowing between the two nodes, how much, how often) because that's
@@ -1889,14 +2049,25 @@ def _build_site_map_tree(entries: list[dict], scope_entries: list[str] | None = 
         seen_urls.add(url)
         add_leaf(url, confirmed=False)
 
-    def finalize(node: dict) -> dict:
+    def finalize(node: dict, parent_path: str) -> dict:
+        # A stable id, independent of sort position -- real, confirmed operator complaint: this
+        # tree is fully rebuilt and re-sorted from scratch on every 4s poll (get_site_map_tree
+        # above), and as soon as a new host/path segment appears mid-scan (constant, the longer a
+        # scan runs) the alphabetical sort shifts every sibling after it. Idiomorph has no `id` to
+        # match an existing <details> against across that shift, so it treats a shifted node as
+        # brand-new and renders it at its server-decided default open/closed state, discarding
+        # whatever the operator had just manually expanded/collapsed -- indistinguishable from "the
+        # tree keeps closing/jumping itself". Hashing the node's own full path (not its sort
+        # position) gives Idiomorph something to match on regardless of where the node now sits.
+        own_path = f"{parent_path}/{node['name']}"
         return {
             "name": node["name"],
-            "children": sorted((finalize(c) for c in node["children"].values()), key=lambda c: c["name"]),
+            "id": hashlib.sha1(own_path.encode()).hexdigest()[:12],
+            "children": sorted((finalize(c, own_path) for c in node["children"].values()), key=lambda c: c["name"]),
             "leaves": node["leaves"],
         }
 
-    finalized = sorted((finalize(h) for h in hosts.values()), key=lambda h: h["name"])
+    finalized = sorted((finalize(h, "") for h in hosts.values()), key=lambda h: h["name"])
     if not scope_entries:
         return {"in_scope": finalized, "other": []}
     in_scope, other = [], []
@@ -2168,7 +2339,13 @@ def _render_chat_messages(request: Request, session: dict, flash: str | None = N
     later live SSE push naturally replaces it with the real, durable state.
     """
     thread = _get_active_thread(session)
-    return templates.env.get_template("partials/chat_messages.html").render({"request": request, "session": session, "thread": thread, "flash": flash})
+    # The live, still-streaming partial reply for this thread (agent/chat.py's in-memory registry),
+    # or "" when nothing is streaming -- chat_messages.html renders it as a typing bubble so the
+    # reply types out token-by-token instead of only appearing once the whole turn finishes.
+    stream_draft = get_chat_stream_draft(session["session_id"], thread["id"]) if thread else ""
+    return templates.env.get_template("partials/chat_messages.html").render(
+        {"request": request, "session": session, "thread": thread, "flash": flash, "stream_draft": stream_draft}
+    )
 
 
 def _index_context(*, error: str | None = None, target: str = "", name: str = "") -> dict:
@@ -2306,6 +2483,72 @@ def _mark_orphaned_sessions_interrupted() -> None:
             "api: marked orphaned session interrupted session_id=%s resumable_from=%s",
             session_id, data["resumable_from"],
         )
+
+
+# A "processing" session whose run was abandoned mid-flight -- the operator's Stop landing during a
+# provider retry-backoff and the run never reaching its own status-writing finally is the confirmed
+# case -- would otherwise stay "processing" forever until the next server restart's orphan-sweep.
+# This heals it WITHOUT a restart, the moment its own page is next loaded/polled, but only once its
+# heartbeat (agent/core.py stamps last_heartbeat_at every LLM turn and refreshes it through long
+# backoffs) has gone stale past a deliberately generous ceiling, so a run that's genuinely alive but
+# merely slow (a long tool call, a slow provider) is NEVER cut. The ceiling must stay well above any
+# single tool/LLM operation's own timeout; 3600s is far beyond all of them. Env-overridable.
+# "awaiting_approval" is intentionally excluded: it legitimately waits on a human with no heartbeat.
+_DEFAULT_STALE_PROCESSING_HEAL_SECONDS = 3600
+
+
+def _stale_processing_heal_seconds() -> int:
+    return int(os.getenv("STALE_PROCESSING_HEAL_SECONDS", str(_DEFAULT_STALE_PROCESSING_HEAL_SECONDS)))
+
+
+def _heartbeat_age_seconds(session: dict) -> float | None:
+    """Seconds since this session's last agent-loop heartbeat, or None when there's none to judge by
+    (a very early hang, or a session predating the heartbeat field) -- in which case the caller must
+    leave the session for the restart orphan-sweep rather than risk reaping a run that simply hasn't
+    stamped a heartbeat yet."""
+    last_heartbeat = session.get("last_heartbeat_at")
+    if not last_heartbeat:
+        return None
+    try:
+        beat = datetime.fromisoformat(last_heartbeat)
+    except (TypeError, ValueError):
+        return None
+    if beat.tzinfo is None:
+        beat = beat.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - beat).total_seconds()
+
+
+def _heal_stale_processing_session(session_id: str, session: dict) -> dict:
+    """Marks a stale-heartbeat "processing" session interrupted (reusing the same job/subagent
+    reconcile + resumable_from the startup sweep uses) and returns the healed copy; returns the
+    session unchanged when it's live, a different status, or has no heartbeat to judge by."""
+    if session.get("status") != "processing":
+        return session
+    age = _heartbeat_age_seconds(session)
+    if age is None or age < _stale_processing_heal_seconds():
+        return session
+
+    def _apply(fresh: dict) -> None:
+        # Re-checked against the FRESH on-disk copy: a concurrent writer may have moved the status
+        # on, or stamped a new heartbeat, between our read above and this merge.
+        if fresh.get("status") != "processing":
+            return
+        fresh_age = _heartbeat_age_seconds(fresh)
+        if fresh_age is None or fresh_age < _stale_processing_heal_seconds():
+            return
+        reconcile_orphaned_background_jobs(session_id, fresh)
+        reconcile_orphaned_subagent_tasks(session_id, fresh)
+        fresh["status"] = "interrupted"
+        fresh["resumable_from"] = compute_resume_entry_point(fresh)
+
+    healed = reload_merge_save(session_id, _apply)
+    if healed is not None and healed.get("status") == "interrupted":
+        logger.debug(
+            "api: self-healed stale 'processing' session_id=%s (heartbeat %.0fs old) -> interrupted",
+            session_id, age,
+        )
+        return healed
+    return session
 
 
 def _reconcile_orphaned_chat_threads_sweep() -> None:
@@ -2835,6 +3078,16 @@ def start_re(
 
     session = load_session(session_id)
     session["target"] = str(resolved_target)
+    try:
+        # Deterministic, zero-LLM-cost classification (agent/tools/builders/re_target.py's own
+        # detect_target_shape) -- runs once, synchronously, right here, so the Target Profile
+        # panel already shows format/arch/language/shape before Start is ever clicked. Never
+        # allowed to block project creation: a radare2-missing/timeout/unreadable-file hiccup
+        # inside detect_target_shape already degrades to fewer facts on its own, and this except
+        # is the last-resort net for anything else going wrong in that path.
+        apply_detected_target_profile(session, detect_target_shape(str(resolved_target)))
+    except Exception:
+        logger.debug("api: POST /api/scan/re session_id=%s target-shape detection failed", session_id, exc_info=True)
     save_session(session_id, session)
 
     logger.debug("api: POST /api/scan/re name=%s target=%s -> %s session_id=%s", clean_name, clean_target, resolved_target, session_id)
@@ -2966,6 +3219,10 @@ def get_session_fragment(request: Request, session_id: str) -> HTMLResponse:
     session = load_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    # This fragment is polled live while a session shows "processing"; it's the natural place to
+    # self-heal a run that was abandoned mid-flight (see _heal_stale_processing_session) so it stops
+    # polling forever instead of needing a server restart.
+    session = _heal_stale_processing_session(session_id, session)
     return HTMLResponse(_render_fragment(request, session))
 
 
@@ -3810,14 +4067,19 @@ async def chat_stream(request: Request, session_id: str) -> StreamingResponse:
                 {"id": t.get("id"), "pending": t.get("pending"), "title": t.get("title"), "color": t.get("color")}
                 for t in (session.get("chat_threads") or [])
             ]
+            # The live streaming draft (agent/chat.py's in-memory registry) is part of what the
+            # operator sees, but it is NOT in the session dict on disk -- so it must join the hash
+            # explicitly, or a reply typing out token-by-token would never trigger a push between the
+            # moment the turn started and the moment its final text segment lands.
+            stream_draft = get_chat_stream_draft(session_id, thread["id"]) if thread else ""
             current_hash = hashlib.sha256(
-                json.dumps({"active": thread, "all": other_threads_summary}, sort_keys=True, default=str).encode("utf-8")
+                json.dumps({"active": thread, "all": other_threads_summary, "draft": stream_draft}, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()
             if current_hash != last_hash:
                 last_hash = current_hash
                 yield _format_sse_event(_render_chat_messages(request, session) + _render_chat_header_oob(request, session))
 
-            await asyncio.sleep(_SSE_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(_CHAT_SSE_POLL_INTERVAL_SECONDS)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -4168,7 +4430,10 @@ def interactive_findings(request: Request, session_id: str) -> HTMLResponse:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     context = _re_findings_context(session)
-    logger.debug("api: interactive-findings session_id=%s findings=%d", session_id, len(context["findings"]))
+    if debug_log_polls():
+        # A ~1/second poll route -- its per-call line is suppressed by default so it can't bury real
+        # agent/tool activity in the debug console (DEBUG_LOG_POLLS=true restores it).
+        logger.debug("api: interactive-findings session_id=%s findings=%d", session_id, len(context["findings"]))
     return templates.TemplateResponse(request, "partials/interactive_findings.html", context)
 
 
@@ -4185,7 +4450,9 @@ def re_summary_tab(request: Request, session_id: str) -> HTMLResponse:
     session = load_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    logger.debug("api: re-summary-tab session_id=%s status=%s", session_id, session.get("status"))
+    if debug_log_polls():
+        # Suppressed by default -- a ~1/second poll route (see DEBUG_LOG_POLLS).
+        logger.debug("api: re-summary-tab session_id=%s status=%s", session_id, session.get("status"))
     return templates.TemplateResponse(request, "partials/re_summary_tab.html", {"session": session})
 
 
@@ -4555,7 +4822,9 @@ def re_triage_tab(request: Request, session_id: str) -> HTMLResponse:
     status = session.get("status")
     if _LAST_LOGGED_RE_TRIAGE_TAB_STATUS.get(session_id) != status:
         _LAST_LOGGED_RE_TRIAGE_TAB_STATUS[session_id] = status
-        logger.debug("api: re-triage-tab session_id=%s status=%s", session_id, status)
+        if debug_log_polls():
+            # Suppressed by default -- a ~1/second poll route (see DEBUG_LOG_POLLS).
+            logger.debug("api: re-triage-tab session_id=%s status=%s", session_id, status)
     return templates.TemplateResponse(request, "partials/re_triage_tab_content.html", context)
 
 
@@ -4950,6 +5219,53 @@ def dequeue_session_route(session_id: str) -> Response:
     return RedirectResponse(url="/fleet", status_code=303)
 
 
+# Interval unit -> seconds, for the schedule control's own "every N [minutes|hours|days]" form.
+_SCHEDULE_UNIT_SECONDS = {"minutes": 60, "hours": 3600, "days": 86400}
+
+
+def _render_schedule_control(request: Request, session_id: str) -> HTMLResponse:
+    """The one render path all three schedule routes return, so an hx-post swaps the control back in
+    place live (hx-swap="outerHTML" on #schedule-control-<id>) -- no reload, and no dependence on the
+    SSE session morph (a schedule lives in its own store, never bumping the session revision)."""
+    return templates.TemplateResponse(request, "partials/schedule_control.html", {
+        "session_id": session_id,
+        "schedule": schedule_store.get_schedule(session_id),
+        "min_interval_seconds": schedule_store.min_interval_seconds(),
+        "scheduler_enabled": _SCHEDULER_ENABLED,
+    })
+
+
+@app.post("/api/session/{session_id}/schedule")
+def set_schedule_route(request: Request, session_id: str, interval: int = Form(...), unit: str = Form("hours")) -> HTMLResponse:
+    """Create/update this project's unattended repeat schedule. interval+unit -> seconds, floored at
+    SCHEDULER_MIN_INTERVAL_SECONDS inside schedule_store. Returns the re-rendered control."""
+    if load_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    seconds = max(1, int(interval)) * _SCHEDULE_UNIT_SECONDS.get(unit, 3600)
+    schedule_store.set_schedule(session_id, seconds, enabled=True)
+    logger.debug("api: session_id=%s schedule set to every %ds", session_id, seconds)
+    return _render_schedule_control(request, session_id)
+
+
+@app.post("/api/session/{session_id}/schedule/toggle")
+def toggle_schedule_route(request: Request, session_id: str) -> HTMLResponse:
+    """Pause/resume without losing the interval -- the control's Pause/Resume button."""
+    schedule = schedule_store.get_schedule(session_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="No schedule to toggle")
+    schedule_store.set_enabled(session_id, not schedule.get("enabled"))
+    return _render_schedule_control(request, session_id)
+
+
+@app.post("/api/session/{session_id}/schedule/delete")
+def delete_schedule_route(request: Request, session_id: str) -> HTMLResponse:
+    """Remove the schedule entirely -- idempotent (a double-click just re-renders the empty control,
+    never errors)."""
+    schedule_store.delete_schedule(session_id)
+    logger.debug("api: session_id=%s schedule removed", session_id)
+    return _render_schedule_control(request, session_id)
+
+
 @app.get("/fleet", response_class=HTMLResponse)
 def get_fleet(request: Request) -> HTMLResponse:
     """Fleet mode's own status page -- the queue (in start order) plus every currently
@@ -4966,10 +5282,21 @@ def get_fleet(request: Request) -> HTMLResponse:
         s for s in summaries_by_id.values()
         if s["status"] in _ORPHANABLE_STATUSES or s["status"] == "pending"
     ]
-    logger.debug("api: GET /fleet queue_depth=%d running=%d", len(queue), len(running))
+    # Portfolio-level view of which projects auto-repeat (the per-project control lives on each
+    # session's Overview tab; this is the read-only "what's scheduled across everything" list). A
+    # schedule whose project no longer exists is skipped here rather than shown as a dangling row --
+    # the scheduler worker drops it on its own next due tick.
+    scheduled = [
+        {"session_id": sid, "summary": summaries_by_id[sid], "schedule": sched}
+        for sid, sched in schedule_store.load_schedules().items()
+        if sid in summaries_by_id
+    ]
+    logger.debug("api: GET /fleet queue_depth=%d running=%d scheduled=%d", len(queue), len(running), len(scheduled))
     return templates.TemplateResponse(request, "fleet.html", {
         "queue": queue,
         "running": running,
+        "scheduled": scheduled,
+        "scheduler_enabled": _SCHEDULER_ENABLED,
         "max_concurrent": fleet_store.max_concurrent_sessions(),
     })
 
@@ -5151,6 +5478,57 @@ def re_triage_rescan(background_tasks: BackgroundTasks, session_id: str) -> Redi
     finally:
         current_session_id.reset(token)
     return RedirectResponse(url=f"/session/{session_id}", status_code=303)
+
+
+@app.post("/api/session/{session_id}/re-experience-level", response_class=HTMLResponse)
+def set_re_experience_level(session_id: str, re_experience_level: str = Form("")) -> HTMLResponse:
+    """RE mode's in-session "Experience level" picker (partials/re_experience_level_control.html) --
+    changes session["re_experience_level"] (novice/hobbyist/professional) mid-engagement, not only
+    at creation (start_re above). Saved on change via htmx (hx-swap="none", the same "persist a
+    setting with no visible response" idiom save_session_notes uses), through reload_merge_save so
+    it can't clobber a concurrent chat/triage write that holds its own stale session snapshot across
+    a long tool loop. agent/core.py's _re_experience_level_addendum reads this field fresh from the
+    session on every chat/triage turn (agent/chat.py reloads the session per turn before building
+    the system prompt), so the new level is in force on the NEXT turn with no agent-loop restart --
+    persisting it is the whole mechanism. An unrecognized value is ignored and the current level
+    stays, the same _RE_EXPERIENCE_LEVELS guard start_re applies at creation; a post against a
+    non-RE session is a no-op (this field is meaningful in Reverse Engineering mode only)."""
+    if re_experience_level not in _RE_EXPERIENCE_LEVELS:
+        # Reject anything outside the known set rather than writing a bogus value the prompt addendum
+        # would then silently fall back to "hobbyist" for -- keep whatever is already persisted.
+        session = load_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        token = current_session_id.set(session_id)
+        try:
+            logger.debug("api: re-experience-level rejected session_id=%s value=%r current=%s", session_id, re_experience_level, session.get("re_experience_level"))
+        finally:
+            current_session_id.reset(token)
+        return HTMLResponse("")
+
+    state: dict = {"previous": None, "applied": False}
+
+    def _apply(s: dict) -> None:
+        if s.get("mode") != "reverse_engineering":
+            return  # RE-only field -- ignore a post aimed at any other mode's session
+        state["previous"] = s.get("re_experience_level")
+        s["re_experience_level"] = re_experience_level
+        state["applied"] = True
+
+    session = reload_merge_save(session_id, _apply)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # current_session_id set around the log line -- lands it in this session's own project-folder
+    # debug.log too, same reasoning as the re-triage control routes above.
+    token = current_session_id.set(session_id)
+    try:
+        if state["applied"]:
+            logger.debug("api: re-experience-level session_id=%s %s -> %s", session_id, state["previous"], re_experience_level)
+        else:
+            logger.debug("api: re-experience-level no-op (non-RE) session_id=%s mode=%s", session_id, session.get("mode"))
+    finally:
+        current_session_id.reset(token)
+    return HTMLResponse("")
 
 
 @app.post("/api/session/{session_id}/stop-time-budget", response_class=HTMLResponse)
@@ -5656,6 +6034,49 @@ def delete_all_sessions_route() -> Response:
     return RedirectResponse(url="/sessions", status_code=303)
 
 
+# Projects tab -> Export / Import (sessions/transfer.py holds all the logic). Export streams a real
+# .zip (a long scan's project can be gigabytes, so it is built in a temp file and handed over as a
+# file download, never held in memory); import answers JSON because its dialog drives it with fetch().
+@app.get("/api/projects/export")
+def projects_export(ids: str = "", include_logs: str = "", include_headers: str = "") -> Response:
+    session_ids = [part for part in ids.split(",") if part.strip()] or None
+    handle, temp_name = tempfile.mkstemp(prefix="asra-export-", suffix=".zip")
+    os.close(handle)
+    temp_path = Path(temp_name)
+    try:
+        summary = projects_transfer.export_projects(
+            temp_path, session_ids, include_logs=include_logs == "1", include_headers=include_headers == "1",
+        )
+    except projects_transfer.ProjectTransferError as exc:
+        temp_path.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except OSError as exc:
+        temp_path.unlink(missing_ok=True)
+        logger.debug("api: projects export failed (%s)", exc)
+        return JSONResponse({"ok": False, "error": f"Could not write the archive: {exc}"}, status_code=500)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", summary["names"][0]).strip("-")[:40] if summary["count"] == 1 else "projects"
+    return FileResponse(
+        temp_path, media_type="application/zip", filename=f"asra-{stem or 'project'}-{stamp}.zip",
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
+
+
+@app.post("/api/projects/import")
+def projects_import(file: UploadFile = File(...), conflict: str = Form("skip")) -> JSONResponse:
+    try:
+        results = projects_transfer.import_archive(file.file, conflict)
+    except projects_transfer.ProjectTransferError as exc:
+        logger.debug("api: projects import rejected (%s)", exc)
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    for outcome in results:
+        if outcome["status"] in ("imported", "replaced", "copied"):
+            new_id = outcome["session_id"]
+            reload_merge_save(new_id, lambda data, sid=new_id: reconcile_orphaned_chat_threads(sid, data))
+    logger.debug("api: projects import done results=%s", [(r["status"]) for r in results])
+    return JSONResponse({"ok": True, "results": results})
+
+
 @app.post("/api/session/{session_id}/chat", response_class=HTMLResponse)
 def chat_turn(
     request: Request, session_id: str, background_tasks: BackgroundTasks,
@@ -5820,11 +6241,11 @@ def get_chat_threads_route(request: Request, session_id: str) -> HTMLResponse:
 
 @app.get("/api/session/{session_id}/subagents-panel", response_class=HTMLResponse)
 def get_session_subagents_panel(request: Request, session_id: str) -> HTMLResponse:
-    """chat_panel.html's own #chat-subagents-btn (Quick Chat only -- see that button's own
-    docstring for why a real project never renders it) -- a <dialog>'s worth of content
-    (partials/chat_subagents_panel.html), same shape as get_chat_threads_route just above. This
-    endpoint itself is a plain, session-id-generic read of session["enabled_subagent_ids"]; only
-    the ONE button that links to it is restricted to mode == "standalone"."""
+    """chat_panel.html's own #chat-subagents-btn (every session mode -- see that button's own
+    docstring for why a real project's picker isn't one-time-only anymore) -- a <dialog>'s worth
+    of content (partials/chat_subagents_panel.html), same shape as get_chat_threads_route just
+    above. This endpoint itself is a plain, session-id-generic read of
+    session["enabled_subagent_ids"]."""
     session = load_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -5836,13 +6257,14 @@ def get_session_subagents_panel(request: Request, session_id: str) -> HTMLRespon
 
 @app.post("/api/session/{session_id}/enabled-subagents")
 def save_session_enabled_subagents(session_id: str, enabled_subagent_ids: list[str] = Form([])) -> Response:
-    """Quick Chat's own Subagents dialog (partials/chat_subagents_panel.html) saves straight into
-    its session here, one field at a time, same "each toggle its own independent request" posture
-    as save_chat_setting_route -- every checkbox submits the checklist's CURRENT full state
-    (hx-include="closest [data-chat-subagents-checklist]"), so this always resolves the complete
-    picture, never a single field in isolation. This endpoint itself is a plain, session-id-generic
-    write to session["enabled_subagent_ids"] -- nothing here is Quick-Chat-specific, only the ONE
-    button that links to it is."""
+    """#chat-subagents-btn's Subagents dialog (partials/chat_subagents_panel.html, every session
+    mode) saves straight into its session here, one field at a time, same "each toggle its own
+    independent request" posture as save_chat_setting_route -- every checkbox submits the
+    checklist's CURRENT full state (hx-include="closest [data-chat-subagents-checklist]"), so this
+    always resolves the complete picture, never a single field in isolation. A plain, session-id-
+    generic write to session["enabled_subagent_ids"] -- this is also how a real project's own
+    New-Project-form choice gets revisited later (e.g. to pick up a Subagent profile created or
+    enabled after that project already existed), not just Quick Chat's."""
     session = load_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -6072,10 +6494,58 @@ async def api_public_ip() -> JSONResponse:
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
+def _stage_desktop_update(status: desktop_update.DesktopUpdateStatus) -> dict:
+    """Downloads + checksum-verifies the launcher for this platform, adding the staged path
+    translated to a real Windows-shaped one (resolve_path_for_windows_shell) -- the Rust shell that
+    will act on it never runs inside WSL2 even when this backend does. Shared by the Desktop app
+    card's own button and the one-flow follow-up of "Update now" below."""
+    result = desktop_update.stage_desktop_update(status)
+    if result.get("ok"):
+        result["windows_path"] = resolve_path_for_windows_shell(Path(result["path"]))
+    return result
+
+
+def _desktop_follow_up() -> dict:
+    """After the project code was updated: if the desktop launcher is behind the latest release too,
+    download + verify it in this same request, so ONE restart finishes both updates. Without this the
+    exe sat on its old version until the operator found a separate card (the exe's own file version
+    then kept showing the old number although the agent already ran new code). Empty when there is
+    nothing to do -- not running via the desktop app, already current, or no build for this CPU."""
+    shell = desktop_update.refresh_cache()
+    if not (shell.applicable and shell.available and not shell.error):
+        logger.debug("api: desktop follow-up skipped applicable=%s available=%s error=%s", shell.applicable, shell.available, shell.error)
+        return {}
+    stage = _stage_desktop_update(shell)
+    logger.debug("api: desktop follow-up staged ok=%s version=%s", stage.get("ok"), shell.latest_version)
+    return {"desktop_status": shell, "desktop_stage": stage}
+
+
+def _update_panel_context(status: updater.UpdateStatus | None, result: dict | None) -> dict:
+    """Shared by every render of the Updates panel: `project_version` is the release number of the
+    code on disk, shown even before any check ran (status is None) -- the git commit alone
+    never told the operator which release they are on."""
+    return {"u": status, "result": result, "project_version": updater.read_project_version()}
+
+
+def _desktop_card_context(status: desktop_update.DesktopUpdateStatus | None, stage_result: dict | None) -> dict:
+    """Shared by every render of the Desktop app card. `launcher_version` comes straight from the
+    running exe (known without any network check), `code_version` from the code on disk -- the two
+    legitimately differ after a code-only update, and the card says so instead of leaving the
+    operator to wonder why the exe's own properties show an older number."""
+    code_version = updater.read_project_version()
+    return {
+        "d": status,
+        "stage_result": stage_result,
+        "launcher_version": desktop_update.running_launcher_version(),
+        "code_version": code_version,
+        "launcher_older_than_code": desktop_update.launcher_older_than_code(code_version),
+    }
+
+
 @app.get("/api/updates/status", response_class=HTMLResponse)
 def api_updates_status(request: Request) -> HTMLResponse:
     """Settings -> Updates panel initial render, from the startup cache (no network)."""
-    return templates.TemplateResponse(request, "partials/update_status.html", {"u": updater.cached_status(), "result": None})
+    return templates.TemplateResponse(request, "partials/update_status.html", _update_panel_context(updater.cached_status(), None))
 
 
 @app.get("/api/updates/check", response_class=HTMLResponse)
@@ -6083,7 +6553,7 @@ def api_updates_check(request: Request) -> HTMLResponse:
     """Force a fresh check (git fetch) and re-render the panel. Also refreshes the cache."""
     status = updater.refresh_cache(fetch=True)
     logger.debug("api: updates check available=%s behind=%d error=%s", status.available, status.behind, status.error)
-    return templates.TemplateResponse(request, "partials/update_status.html", {"u": status, "result": None})
+    return templates.TemplateResponse(request, "partials/update_status.html", _update_panel_context(status, None))
 
 
 @app.post("/api/updates/apply", response_class=HTMLResponse)
@@ -6092,15 +6562,19 @@ def api_updates_apply(request: Request) -> HTMLResponse:
     result = updater.apply_update()
     status = updater.refresh_cache(fetch=False)
     logger.debug("api: updates apply ok=%s no_op=%s", result.get("ok"), result.get("no_op"))
-    return templates.TemplateResponse(request, "partials/update_status.html", {"u": status, "result": result})
+    context = _update_panel_context(status, result)
+    if result.get("ok") and not result.get("no_op"):
+        context.update(_desktop_follow_up())
+    return templates.TemplateResponse(request, "partials/update_status.html", context)
 
 
 @app.get("/api/desktop-update/status", response_class=HTMLResponse)
 def api_desktop_update_status(request: Request) -> HTMLResponse:
-    """Settings -> Updates' desktop-shell card initial render -- no startup cache/network call for
-    this one (unlike the git-based panel above), so this is always the empty "not checked" state
-    until the operator clicks Check."""
-    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": None, "stage_result": None})
+    """Settings -> Updates' desktop-shell card initial render, from the startup cache (no network);
+    None (the "not checked" state) only when the startup check is switched off or hasn't finished."""
+    return templates.TemplateResponse(
+        request, "partials/desktop_update_status.html", _desktop_card_context(desktop_update.cached_status(), None)
+    )
 
 
 @app.get("/api/desktop-update/check", response_class=HTMLResponse)
@@ -6111,7 +6585,7 @@ def api_desktop_update_check(request: Request) -> HTMLResponse:
         "api: desktop update check applicable=%s available=%s error=%s",
         status.applicable, status.available, status.error,
     )
-    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": status, "stage_result": None})
+    return templates.TemplateResponse(request, "partials/desktop_update_status.html", _desktop_card_context(status, None))
 
 
 @app.post("/api/desktop-update/stage", response_class=HTMLResponse)
@@ -6123,11 +6597,9 @@ def api_desktop_update_stage(request: Request) -> HTMLResponse:
     status = desktop_update.check_for_desktop_update()
     result = {"ok": False, "message": "No update detected — click Check first."}
     if status.available:
-        result = desktop_update.stage_desktop_update(status)
-        if result.get("ok"):
-            result["windows_path"] = resolve_path_for_windows_shell(Path(result["path"]))
+        result = _stage_desktop_update(status)
     logger.debug("api: desktop update stage ok=%s", result.get("ok"))
-    return templates.TemplateResponse(request, "partials/desktop_update_status.html", {"d": status, "stage_result": result})
+    return templates.TemplateResponse(request, "partials/desktop_update_status.html", _desktop_card_context(status, result))
 
 
 @app.get("/api/updates/indicator", response_class=HTMLResponse)
@@ -6589,6 +7061,33 @@ def _chat_settings_context() -> dict:
     return {"chat_settings": load_chat_settings()}
 
 
+def _reliability_settings_context() -> dict:
+    """Settings -> Reliability -- the weak-model reliability knobs (tool-call temperature, structured
+    output, weak-model profile, argument coercion, fuzzy tool names, the invalid-call signal, and the
+    secondary-verification hint). Returns each one's EFFECTIVE value (GUI-saved, else .env, else the
+    hardcoded default) so the form shows what is actually in force. The resolvers live in agent.core /
+    agent.llm_client (which import agent.reliability_settings), so they're imported locally here.
+    Like _chat_settings_context, this key must be spread into every settings.html render site: the
+    Reliability <section> is always in the rendered DOM, so a render that omits it fails with a
+    strict-Undefined error the instant that section dereferences the value."""
+    from agent import core as _core
+    from agent import llm_client as _llm
+    return {"reliability_settings": {
+        "LLM_TOOL_CALL_TEMPERATURE": _llm._tool_call_temperature(),
+        "LLM_STRUCTURED_OUTPUT": _llm._structured_output_enabled(),
+        "WEAK_MODEL_MODE": _llm._weak_model_mode(),
+        "WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD": _llm._weak_context_limit_threshold(),
+        "WEAK_MODEL_MAX_TOOLS": _core._weak_model_max_tools(),
+        "TOOL_ARG_COERCION": _core._tool_arg_coercion_enabled(),
+        "TOOL_NAME_FUZZY_MATCH": _core._tool_name_fuzzy_match_enabled(),
+        "TOOL_NAME_FUZZY_CUTOFF": _core._tool_name_fuzzy_cutoff(),
+        "WEAK_SIGNAL_ENABLED": _core._weak_signal_enabled(),
+        "WEAK_SIGNAL_WINDOW": _core._weak_signal_window(),
+        "WEAK_SIGNAL_INVALID_RATE": _core._weak_signal_invalid_rate(),
+        "WEAK_MODEL_VERIFICATION_HINT": _core._weak_model_verification_hint_enabled(),
+    }}
+
+
 def _capability_settings_context(*, install_error: dict | None = None) -> dict:
     """Settings -> Optional interpreters/compilers accordion -- one row per
     agent/tools/capability_registry.py entry, merged with its live install status and any saved
@@ -6754,14 +7253,18 @@ def get_settings(request: Request) -> HTMLResponse:
     tools_context = _grouped_tools_context(list_tool_availability())
     tools_context["nuclei_packs"] = list_nuclei_packs()
     tools_context["custom_tools_root"] = get_custom_tools_root()
-    tools_context["custom_tools"] = load_custom_tools()
+    # Normalize each record's availability scopes here (legacy records with no "scopes" field resolve
+    # to "all consumers") so the per-tool toggles in the UI always have an explicit list to render.
+    tools_context["custom_tools"] = [{**t, "scopes": tool_scopes(t)} for t in load_custom_tools()]
     tools_context["custom_tool_categories"] = CUSTOM_TOOL_CATEGORIES
+    tools_context["custom_tool_scopes"] = CUSTOM_TOOL_SCOPES
+    tools_context["custom_tool_scope_labels"] = _CUSTOM_TOOL_SCOPE_LABELS
     return templates.TemplateResponse(
         request,
         "settings.html",
         {
             "error": None, "wordlist_error": None,
-            **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+            **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             **tools_context,
         },
     )
@@ -6877,7 +7380,7 @@ def save_llm(request: Request, provider: str = Form(""), model: str = Form("")) 
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -6900,6 +7403,164 @@ def save_free_models_only(enabled: str | None = Form(None)) -> Response:
     """
     set_free_models_only(bool(enabled))
     logger.debug("api: free_models_only=%s", bool(enabled))
+    return Response(status_code=204)
+
+
+@app.post("/api/settings/ui-descriptions")
+def save_ui_descriptions(enabled: str | None = Form(None)) -> Response:
+    """Settings -> Customization -> "Show helper descriptions" switch. Checked = show the app-wide
+    explanatory `.ui-desc` helper text (the default); unchecked = collapse it for a leaner UI, with
+    the text still available on a long hover. Same checked/unchecked-via-Form(None) convention as
+    save_free_models_only above. The visible effect is applied instantly client-side on the same
+    change event (static/js/ui_descriptions.js, window.asraSetHideDescriptions, which flips the
+    body's data-hide-descriptions attribute) -- this route only persists the choice so it survives a
+    reload, the exact "flips on screen at once; the save follows" split the live-visual-feedback rule
+    asks for. 204, no body: nothing on the page needs to re-render from the response."""
+    set_ui_descriptions_hidden(not bool(enabled))
+    logger.debug("api: ui_descriptions_hidden=%s", not bool(enabled))
+    return Response(status_code=204)
+
+
+# Settings -> Reliability: which keys are a plain on/off, a bounded fraction, a positive integer, or
+# a fixed-choice string. Used only to validate a save before it reaches the store, so a bad request
+# can never write an out-of-range or junk value that a resolver would then silently reject anyway.
+_RELIABILITY_BOOL_KEYS = frozenset({
+    "LLM_STRUCTURED_OUTPUT", "TOOL_ARG_COERCION", "TOOL_NAME_FUZZY_MATCH",
+    "WEAK_SIGNAL_ENABLED", "WEAK_MODEL_VERIFICATION_HINT",
+})
+_RELIABILITY_UNIT_FRACTION_KEYS = frozenset({"LLM_TOOL_CALL_TEMPERATURE", "TOOL_NAME_FUZZY_CUTOFF"})
+_RELIABILITY_POSITIVE_INT_KEYS = frozenset({
+    "WEAK_MODEL_CONTEXT_LIMIT_THRESHOLD", "WEAK_MODEL_MAX_TOOLS", "WEAK_SIGNAL_WINDOW",
+})
+
+
+def _normalize_reliability_value(key: str, value: str) -> str:
+    """Validate and canonicalize one reliability setting, returning the string to store, or raising
+    HTTPException(400) on anything out of range / malformed. Kept server-side so the saved file is
+    always something the matching resolver can read back cleanly."""
+    value = (value or "").strip()
+    if key in _RELIABILITY_BOOL_KEYS:
+        low = value.lower()
+        if low in ("1", "true", "yes", "on"):
+            return "true"
+        if low in ("0", "false", "no", "off"):
+            return "false"
+        raise HTTPException(status_code=400, detail=f"{key} expects a boolean")
+    if key == "WEAK_MODEL_MODE":
+        low = value.lower()
+        if low not in ("auto", "on", "off"):
+            raise HTTPException(status_code=400, detail="WEAK_MODEL_MODE expects auto/on/off")
+        return low
+    if key in _RELIABILITY_UNIT_FRACTION_KEYS:
+        try:
+            num = float(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{key} expects a number")
+        if not 0.0 <= num <= 1.0:
+            raise HTTPException(status_code=400, detail=f"{key} must be between 0 and 1")
+        return str(num)
+    if key == "WEAK_SIGNAL_INVALID_RATE":
+        try:
+            num = float(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="WEAK_SIGNAL_INVALID_RATE expects a number")
+        if not 0.0 < num <= 1.0:
+            raise HTTPException(status_code=400, detail="WEAK_SIGNAL_INVALID_RATE must be in (0, 1]")
+        return str(num)
+    if key in _RELIABILITY_POSITIVE_INT_KEYS:
+        try:
+            num_int = int(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{key} expects an integer")
+        if num_int < 1:
+            raise HTTPException(status_code=400, detail=f"{key} must be at least 1")
+        return str(num_int)
+    raise HTTPException(status_code=404, detail=f"unknown reliability setting {key!r}")
+
+
+@app.post("/api/settings/reliability")
+def save_reliability_setting_route(key: str = Form(...), value: str = Form(...)) -> Response:
+    """Settings -> Reliability: persist one weak-model knob to data/reliability_settings.json, which
+    the matching resolver then reads ahead of its .env default. One key per request (same
+    independent-field pattern as save_clock_display_route) so a stale tab can't revert a sibling
+    field. These settings change how FUTURE turns/sessions behave, not the current page, so the only
+    live feedback needed is the control reflecting its own new state (done client-side on change);
+    204, no body. An unknown key or out-of-range value is rejected before anything is written."""
+    if key not in reliability_settings.ALLOWED_KEYS:
+        raise HTTPException(status_code=404, detail=f"unknown reliability setting {key!r}")
+    normalized = _normalize_reliability_value(key, value)
+    reliability_settings.save_reliability_setting(key, normalized)
+    logger.debug("api: reliability setting saved %s=%s", key, normalized)
+    return Response(status_code=204)
+
+
+@app.get("/operator-profile", response_class=HTMLResponse)
+def get_operator_profile(request: Request) -> HTMLResponse:
+    """Standalone Operator Profile page (sidebar nav, under Dashboard) -- the MAIN agent's standing,
+    cross-project style/priorities (agent/operator_profile_store.py). operator_profile() is a
+    page-wide template global (registered next to ui_descriptions_hidden), so this needs no context."""
+    return templates.TemplateResponse(request, "operator_profile.html", {})
+
+
+@app.get("/api/operator-profile/export")
+def export_operator_profile_route() -> Response:
+    """Download the current operator profile as a single JSON file -- the Operator Profile page's own
+    one-file export (Settings -> Transfer handles the full multi-section settings bundle separately).
+    ensure_ascii=False so non-Latin standing instructions stay readable in the file."""
+    profile = load_operator_profile()
+    body = json.dumps(profile, indent=2, ensure_ascii=False)
+    logger.debug("api: operator profile exported")
+    return Response(
+        content=body, media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="asra_operator_profile.json"'},
+    )
+
+
+@app.post("/api/operator-profile/import")
+async def import_operator_profile_route(file: UploadFile = File(...)) -> Response:
+    """Apply an operator profile JSON uploaded from the Operator Profile page. Every field is run
+    through save_operator_profile's own validation (unknown severities dropped, bad style coerced to
+    "", text stripped), so a hand-edited or foreign file can never wedge the profile -- a malformed
+    upload just lands as an empty/partial profile, never an error page. Redirects back so the
+    imported values show immediately."""
+    try:
+        data = json.loads((await file.read()).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    save_operator_profile(
+        standing_instructions=str(data.get("standing_instructions") or ""),
+        focus_classes=str(data.get("focus_classes") or ""),
+        communication_style=str(data.get("communication_style") or ""),
+        approval_severities=data.get("approval_severities"),
+    )
+    logger.debug("api: operator profile imported from upload")
+    return RedirectResponse(url="/operator-profile", status_code=303)
+
+
+@app.post("/api/settings/operator-profile")
+def save_operator_profile_route(
+    standing_instructions: str = Form(""),
+    focus_classes: str = Form(""),
+    communication_style: str = Form(""),
+    approval_severities: list[str] = Form([]),
+) -> Response:
+    """Settings -> Operator Profile -- the MAIN agent's standing, cross-project style/priorities
+    (agent/operator_profile_store.py), applied by default to every new project's task messages
+    (agent/core.py's _operator_profile_task_addendum), with a project's own one-off custom
+    instructions still layered on top as the more-specific override. approval_severities is the one
+    non-prompt field: severities the operator wants to personally approve before exploitation
+    (agent/core.py's _exploit_requires_approval reads it directly, never prompts with it). All fields
+    submit together as one unit (same single-form convention as secondary-verification below), so one
+    save writes the whole profile. 204, no body: the visible state is exactly the field values the
+    operator already sees on the page, nothing needs to re-render from the response."""
+    saved = save_operator_profile(standing_instructions, focus_classes, communication_style, approval_severities)
+    logger.debug(
+        "api: operator profile saved (standing=%d chars, focus=%d chars, style=%r, approval_severities=%s)",
+        len(saved["standing_instructions"]), len(saved["focus_classes"]),
+        saved["communication_style"], saved["approval_severities"],
+    )
     return Response(status_code=204)
 
 
@@ -6964,7 +7625,7 @@ def save_fallback_chain(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(error=error),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7076,7 +7737,7 @@ def add_custom_provider_route(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7128,7 +7789,7 @@ def edit_custom_provider_route(
                 **_llm_settings_context(),
                 **_wordlist_settings_context(),
                 **_fallback_chain_context(),
-                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7556,7 +8217,7 @@ def download_wordlist_route(request: Request, source_url: str = Form(""), name: 
             request, "settings.html",
             {
                 "error": None, "wordlist_error": "Enter a URL to download from.",
-                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7568,7 +8229,7 @@ def download_wordlist_route(request: Request, source_url: str = Form(""), name: 
             request, "settings.html",
             {
                 "error": None, "wordlist_error": str(exc),
-                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(), **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(), **_capability_settings_context(), **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7611,7 +8272,7 @@ def install_capability_route(request: Request, capability_id: str) -> Response:
                 **_llm_settings_context(), **_wordlist_settings_context(), **_fallback_chain_context(),
                 **_custom_providers_context(), **_codex_oauth_context(), **_copilot_oauth_context(),
                 **_capability_settings_context(install_error={"capability_id": capability_id, **result}),
-                **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_chat_settings_context(),
+                **_toolkit_agent_settings_context(), **_tool_api_keys_context(), **_timezone_settings_context(), **_sound_settings_context(), **_intro_settings_context(), **_update_settings_context(), **_secondary_verification_context(), **_reliability_settings_context(), **_chat_settings_context(),
             },
             status_code=400,
         )
@@ -7796,36 +8457,62 @@ def _tool_domain(entry: dict) -> str:
     return "web"
 
 
+# delegate_to_subagent/check_subagent_task/record_finding/record_target and the six phase-terminal
+# "recording" tools can never actually work for a subagent -- agent/core.py's
+# _delegate_to_subagent_impl (_subagent_disallowed_tools) strips them from tool_specs unconditionally
+# regardless of what's stored, so a subagent calling one still returns "status": "ok" while the real
+# effect (persisting a finding/decision, ending a phase, or -- for the first two -- spawning a nested
+# subagent) silently never happens. They are therefore never offered as an ENABLE-able checkbox, but
+# (operator request) they are still SHOWN in the checklist, greyed and un-toggleable, with the reason
+# below on hover, rather than silently hidden -- so the full tool surface is visible and the "why"
+# is explained in place instead of leaving the operator to wonder where ~10 tools went.
+_SUBAGENT_UNOFFERABLE_TOOLS = {
+    "delegate_to_subagent", "check_subagent_task", "record_finding", "record_target",
+    "record_hypothesis", "resolve_hypothesis", "record_exploit_decision",
+    "record_chain_result", "record_reverification_result", "record_skeptical_verification_result",
+}
+
+
+def _subagent_tool_block_reason(name: str) -> str:
+    """Why a tool is rendered greyed-out and un-enablable in a subagent's own tool checklist --
+    surfaced on hover alongside the tool's own description (subagents.html). Two structural reasons,
+    matching _SUBAGENT_UNOFFERABLE_TOOLS above and agent/core.py's own _subagent_disallowed_tools."""
+    if name in ("delegate_to_subagent", "check_subagent_task"):
+        return (
+            "Can't be enabled for a subagent: a subagent must not spawn or manage further subagents "
+            "— delegation has to stay one bounded task reported straight back to the main agent "
+            "(nested delegation once ran 85 LLM turns instead of the small task it was meant to be)."
+        )
+    return (
+        "Can't be enabled for a subagent: persisting a finding/target/hypothesis/decision, or ending "
+        "a phase, only takes effect inside the main agent's own run — a subagent call would return "
+        "\"ok\" while silently doing nothing. A subagent reports its results back in its own summary "
+        "instead, and the main agent records them."
+    )
+
+
 def _subagent_context() -> dict:
     profiles = load_subagent_profiles()["profiles"]
-    installed_tools = [entry for entry in list_tool_availability() if entry["installed"]]
-    # delegate_to_subagent/check_subagent_task/record_finding/record_target and the six phase-
-    # terminal "recording" tools are never offered as a checkable option for a subagent profile's
-    # own tool list -- agent/core.py's _delegate_to_subagent_impl (_subagent_disallowed_tools)
-    # strips them from tool_specs unconditionally regardless of what's stored here (see that
-    # filter's own docstring for the real recursive-delegation incident the first two close, and
-    # the real finding-loss incident record_finding/record_target and their six siblings close), so
-    # showing them as checkable would just be a checkbox that silently does nothing useful once
-    # saved -- worse than an ordinary unavailable tool, since the tool call itself still returns
-    # "status": "ok", making it look like it worked right up until the operator notices the
-    # finding/decision never actually made it into the report.
-    _subagent_unofferable_tools = {
-        "delegate_to_subagent", "check_subagent_task", "record_finding", "record_target",
-        "record_hypothesis", "resolve_hypothesis", "record_exploit_decision",
-        "record_chain_result", "record_reverification_result", "record_skeptical_verification_result",
-    }
-    installed_tools = [entry for entry in installed_tools if entry["name"] not in _subagent_unofferable_tools]
+    all_installed = [entry for entry in list_tool_availability() if entry["installed"]]
+    offerable = [entry for entry in all_installed if entry["name"] not in _SUBAGENT_UNOFFERABLE_TOOLS]
+    blocked = [entry for entry in all_installed if entry["name"] in _SUBAGENT_UNOFFERABLE_TOOLS]
+    logger.debug(
+        "subagents page: %d offerable tool(s), %d shown-but-blocked", len(offerable), len(blocked),
+    )
     return {
         "subagent_profiles": profiles,
-        # Only real, currently-installed tools are ever offered for a profile's own checklist —
-        # never a hardcoded list a machine might not actually have (agent/tools/tool_inventory.py).
-        "available_tools": [entry["name"] for entry in installed_tools],
-        # Surfaced as a hover tooltip on each tool checkbox (subagents.html's tool_checklist macro)
-        # so picking a tool doesn't require already knowing what it does.
-        "tool_descriptions": {entry["name"]: entry["description"] for entry in installed_tools},
-        # Drives the small colored domain dot subagents.html renders next to each checkbox --
+        # Only real, currently-installed tools are ever listed — never a hardcoded list a machine
+        # might not actually have (agent/tools/tool_inventory.py). available_tools = the enable-able
+        # ones; blocked_tools = installed-but-never-usable, shown greyed with tool_block_reasons.
+        "available_tools": [entry["name"] for entry in offerable],
+        "blocked_tools": [entry["name"] for entry in blocked],
+        "tool_block_reasons": {entry["name"]: _subagent_tool_block_reason(entry["name"]) for entry in blocked},
+        # Surfaced as a hover tooltip on each tool row (subagents.html's tool_checklist macro) so
+        # picking a tool doesn't require already knowing what it does -- for offerable AND blocked.
+        "tool_descriptions": {entry["name"]: entry["description"] for entry in all_installed},
+        # Drives the small colored domain dot subagents.html renders next to each row --
         # see _tool_domain's own docstring for the browser/re/toolkit/web bucketing itself.
-        "tool_domains": {entry["name"]: _tool_domain(entry) for entry in installed_tools},
+        "tool_domains": {entry["name"]: _tool_domain(entry) for entry in all_installed},
         **_provider_picker_context(),
         **_subagent_model_context(profiles),
     }
@@ -8073,7 +8760,7 @@ async def ws_terminal(websocket: WebSocket, terminal_id: str) -> None:
         terminal_manager.detach(terminal_id, websocket)
 
 
-def _filter_techniques(techniques: list[dict], query: str, outcome: str = "", rank: str = "", confidence: str = "", source_id: str = "") -> list[dict]:
+def _filter_techniques(techniques: list[dict], query: str, outcome: str = "", rank: str = "", confidence: str = "", source_id: str = "", skills_only: str = "") -> list[dict]:
     """Narrows the list by the operator's own filters, most-selective/cheapest first: outcome
     ('worked'/'failed', from the Outcome dropdown), rank tier ('bronze'..'legendary', see
     playbook_store.RANK_ORDER, from the Rank dropdown), confidence ('unreviewed', from the Review
@@ -8093,6 +8780,10 @@ def _filter_techniques(techniques: list[dict], query: str, outcome: str = "", ra
         out = [t for t in out if t.get("confidence") == "unreviewed"]
     if source_id:
         out = [t for t in out if t.get("source_id") == source_id]
+    # "Skills only" -- just the entries that actually carry an executable skill, so the operator can
+    # see where the saved skills live instead of hunting for them among every technique.
+    if skills_only == "yes":
+        out = [t for t in out if t.get("skill")]
     q = (query or "").strip().lower()
     if q:
         def _hay(t: dict) -> str:
@@ -8121,9 +8812,9 @@ def _sort_techniques(techniques: list[dict], sort: str) -> list[dict]:
     return techniques
 
 
-def _render_playbook_list(request: Request, query: str = "", outcome: str = "", rank: str = "", sort: str = "", message: str = "", confidence: str = "", source_id: str = "") -> str:
+def _render_playbook_list(request: Request, query: str = "", outcome: str = "", rank: str = "", sort: str = "", message: str = "", confidence: str = "", source_id: str = "", skills_only: str = "") -> str:
     all_techniques = playbook_store.list_all_techniques()
-    techniques = _sort_techniques(_filter_techniques(all_techniques, query, outcome, rank, confidence, source_id), sort)
+    techniques = _sort_techniques(_filter_techniques(all_techniques, query, outcome, rank, confidence, source_id, skills_only), sort)
     # A human title for the "Reviewing from: X" banner even when the scoped list comes up empty
     # (e.g. every technique from that source is already reviewed, and some OTHER active filter --
     # confidence=unreviewed, an outcome/rank/text filter -- excludes all of them from `techniques`
@@ -8150,6 +8841,7 @@ def _render_playbook_list(request: Request, query: str = "", outcome: str = "", 
     return templates.env.get_template("partials/playbook_list.html").render({
         "request": request, "techniques": techniques, "query": query,
         "outcome": outcome, "rank": rank, "sort": sort, "message": message, "confidence": confidence,
+        "skills_only": skills_only,
         "source_id": source_id, "source_title": source_title, "library_source_ids": library_source_ids,
         "source_unreviewed_count": source_unreviewed_count,
         "total": playbook_store.count_techniques(), "rank_order": playbook_store.RANK_ORDER,
@@ -8260,9 +8952,9 @@ def get_playbook(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/playbook", response_class=HTMLResponse)
-def playbook_list(request: Request, q: str = "", outcome: str = "", rank: str = "", sort: str = "", confidence: str = "", source_id: str = "") -> HTMLResponse:
-    logger.debug("api: GET /api/playbook q=%r outcome=%r rank=%r sort=%r confidence=%r source_id=%r", q, outcome, rank, sort, confidence, source_id)
-    return HTMLResponse(_render_playbook_list(request, q, outcome, rank, sort, confidence=confidence, source_id=source_id))
+def playbook_list(request: Request, q: str = "", outcome: str = "", rank: str = "", sort: str = "", confidence: str = "", source_id: str = "", skills_only: str = "") -> HTMLResponse:
+    logger.debug("api: GET /api/playbook q=%r outcome=%r rank=%r sort=%r confidence=%r source_id=%r skills_only=%r", q, outcome, rank, sort, confidence, source_id, skills_only)
+    return HTMLResponse(_render_playbook_list(request, q, outcome, rank, sort, confidence=confidence, source_id=source_id, skills_only=skills_only))
 
 
 def _parse_keyword_list(raw: str) -> list[str]:
@@ -8282,7 +8974,8 @@ def playbook_update(request: Request, technique_id: str, technique: str = Form("
                     vuln_class: str = Form(""), outcome: str = Form("worked"), tech_keywords: str = Form(""),
                     waf_vendors: str = Form(""), cves: str = Form(""), q: str = Form(""),
                     filter_outcome: str = Form(""), filter_rank: str = Form(""), sort: str = Form(""),
-                    filter_confidence: str = Form(""), filter_source_id: str = Form("")) -> HTMLResponse:
+                    filter_confidence: str = Form(""), filter_source_id: str = Form(""),
+                    filter_skills_only: str = Form("")) -> HTMLResponse:
     updates = {
         "technique": technique.strip(),
         "payload_or_command": payload_or_command.strip() or None,
@@ -8297,28 +8990,29 @@ def playbook_update(request: Request, technique_id: str, technique: str = Form("
         cves=[cves],
     )
     logger.debug("api: playbook update id=%s ok=%s", technique_id, ok)
-    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id))
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
 
 
 @app.post("/api/playbook/{technique_id}/delete", response_class=HTMLResponse)
 def playbook_delete(request: Request, technique_id: str, q: str = Form(""), filter_outcome: str = Form(""),
                     filter_rank: str = Form(""), sort: str = Form(""), filter_confidence: str = Form(""),
-                    filter_source_id: str = Form("")) -> HTMLResponse:
+                    filter_source_id: str = Form(""), filter_skills_only: str = Form("")) -> HTMLResponse:
     ok = playbook_store.delete_technique(technique_id)
     logger.debug("api: playbook delete id=%s ok=%s", technique_id, ok)
-    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id))
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
 
 
 @app.post("/api/playbook/{technique_id}/review", response_class=HTMLResponse)
 def playbook_review(request: Request, technique_id: str, confirmed: str = Form("true"), q: str = Form(""),
                     filter_outcome: str = Form(""), filter_rank: str = Form(""), sort: str = Form(""),
-                    filter_confidence: str = Form(""), filter_source_id: str = Form("")) -> HTMLResponse:
+                    filter_confidence: str = Form(""), filter_source_id: str = Form(""),
+                    filter_skills_only: str = Form("")) -> HTMLResponse:
     """The Playbook UI's own "Confirm"/"Reject" buttons on an unreviewed (library-extracted, see
     agent/tools/library_store.py) card -- the manual half of reviewing an entry (the automatic
     half is playbook_store.record_technique's own dedup-against-a-live-capture branch)."""
     ok = playbook_store.mark_reviewed(technique_id, confirmed == "true")
     logger.debug("api: playbook review id=%s confirmed=%s ok=%s", technique_id, confirmed, ok)
-    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id))
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
 
 
 @app.post("/api/playbook/bulk-review", response_class=HTMLResponse)
@@ -8377,7 +9071,16 @@ async def library_upload_url(request: Request, url: str = Form(""), title: str =
     so a slow/unresponsive URL never stalls this server's whole event loop (every other in-flight
     request, every open terminal WS) for the length of its own timeout."""
     source_id = await asyncio.to_thread(library_store.add_source_from_url, url, title, author)
-    message = "" if source_id else "Couldn't fetch that URL -- check it's a real http(s) link."
+    if source_id:
+        message = ""
+    elif not (url or "").strip().lower().startswith(("http://", "https://")):
+        message = "That's not a valid http(s) link."
+    else:
+        # The link is well-formed -- the fetch itself failed. Say so honestly instead of blaming the
+        # URL: a browser-UA httpx GET plus a real headless-browser fallback already tried, so a
+        # failure here means the SITE refused it (bot/Cloudflare block, a login wall, or it's down),
+        # not that the operator mistyped the address.
+        message = "Couldn't fetch that URL — the site blocked the request or is unreachable (bot/Cloudflare block, a login wall, or down). Most plain articles work; a few sites simply can't be fetched."
     logger.debug("api: library upload-url url=%r source_id=%s", url, source_id)
     return HTMLResponse(_render_library_sources(request, message))
 
@@ -8404,20 +9107,23 @@ def library_card(request: Request, source_id: str) -> HTMLResponse:
 
 @app.get("/api/library/{source_id}/estimate", response_class=HTMLResponse)
 def library_estimate(source_id: str, provider: str = "", model: str = "") -> HTMLResponse:
-    """A live "~N / MAX chunks" estimate shown before the operator commits to Analyze --
-    refetched whenever the provider/model picker changes, since chunk size depends on the chosen
-    model's own real context_limit (library_store.estimate_chunk_count). MAX is library_store's
-    own _MAX_CHUNKS safety cap (shown as the infinity symbol when configured as unlimited) --
-    always shown, not just when exceeded, so the operator can see how close to it they are before
-    clicking Analyze, not only as an error after."""
+    """A live chunk/LLM-call estimate shown before the operator commits to Analyze -- refetched
+    whenever the provider/model picker changes, since chunk size depends on the chosen model's own
+    real context_limit (library_store.estimate_chunk_count). When the raw chunk count exceeds the
+    per-run call budget (_MAX_CHUNKS) the source is NOT refused: it's sampled evenly to cover the
+    whole document within the budget, so this says so plainly instead of showing an error."""
     count = library_store.estimate_chunk_count(source_id, provider, model)
-    max_label = library_store._limit_label(library_store._MAX_CHUNKS)
+    budget = library_store._MAX_CHUNKS
+    max_label = library_store._limit_label(budget)
     if not count:
         return HTMLResponse(f"n/a / {max_label} chunks")
-    label = f"~{count} / {max_label} chunk{'s' if count != 1 else ''} (LLM call{'s' if count != 1 else ''})"
-    if library_store._MAX_CHUNKS > 0 and count > library_store._MAX_CHUNKS:
-        return HTMLResponse(f'<span class="text-severity-high">{label} — over the limit, pick a bigger-context model</span>')
-    return HTMLResponse(label)
+    if budget > 0 and count > budget:
+        # Covered, not refused -- show the real call count (the budget) and that it spans the whole source.
+        return HTMLResponse(
+            f'<span class="text-secondary">~{budget} LLM call{"s" if budget != 1 else ""} — '
+            f'covering the whole source (sampled from {count} sections)</span>'
+        )
+    return HTMLResponse(f"~{count} / {max_label} chunk{'s' if count != 1 else ''} (LLM call{'s' if count != 1 else ''})")
 
 
 @app.post("/api/library/{source_id}/analyze", response_class=HTMLResponse)
@@ -8581,6 +9287,165 @@ def playbook_add(request: Request, technique: str = Form(""), payload_or_command
             _embed_playbook_entries(get_provider(None), fresh)
     logger.debug("api: playbook add technique -> id=%s", new_id)
     return HTMLResponse(_render_playbook_list(request))
+
+
+# --- Playbook skills: an executable command/script/instruction-list attached to a technique, so a
+# proven win reruns in one action. The store (agent/tools/playbook_store.py) is the single source of
+# truth; these routes are the Playbook UI's view onto it. Execution always goes through
+# agent.tools.skill_runner.execute_skill, which sandbox-gates and hash-gates internally -- these
+# routes never touch a subprocess themselves. #
+
+
+def _skill_param_names(technique_id: str) -> list[str]:
+    """The declared param names of a technique's skill (empty if none) -- the Run route reads exactly
+    these off the submitted form, so an operator-supplied value lands in the skill's own {{slot}}."""
+    skill = playbook_store.get_technique_skill(technique_id)
+    return [p.get("name") for p in (skill or {}).get("params", []) if p.get("name")]
+
+
+@app.post("/api/playbook/{technique_id}/run-skill", response_class=HTMLResponse)
+async def playbook_run_skill(request: Request, technique_id: str) -> HTMLResponse:
+    """Run a technique's attached skill and show the result in-place. Param values arrive as
+    param_<name> form fields (the per-card Run form), collected into the params dict execute_skill
+    fills the body's {{slots}} from. The result renders into the card's own result slot, not the
+    whole list, so running one skill never disturbs anything else on the page."""
+    form = await request.form()
+    params = {name: str(form.get(f"param_{name}", "")) for name in _skill_param_names(technique_id)}
+    from agent.tools.skill_runner import execute_skill
+    result = execute_skill(technique_id, params)
+    logger.debug("api: playbook run-skill id=%s status=%s", technique_id, result.get("status"))
+    return templates.TemplateResponse(
+        request, "partials/playbook_skill_result.html", {"result": result, "technique_id": technique_id}
+    )
+
+
+@app.post("/api/playbook/{technique_id}/skill-trust", response_class=HTMLResponse)
+def playbook_skill_trust(request: Request, technique_id: str, trusted: str = Form("true"), q: str = Form(""),
+                         filter_outcome: str = Form(""), filter_rank: str = Form(""), sort: str = Form(""),
+                         filter_confidence: str = Form(""), filter_source_id: str = Form(""),
+                         filter_skills_only: str = Form("")) -> HTMLResponse:
+    """Operator's manual "vouch for this skill" toggle. Advisory metadata only -- it never gates
+    execution (sandbox + hash + provenance do), so flipping it can't make an unsafe body run. The
+    badge flips client-side on click for instant feedback (static/js/playbook_skill.js); this
+    re-render makes the server the authority once it lands."""
+    ok = playbook_store.set_skill_trust(technique_id, trusted == "true")
+    logger.debug("api: playbook skill-trust id=%s trusted=%s ok=%s", technique_id, trusted, ok)
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
+
+
+@app.post("/api/playbook/{technique_id}/skill-enabled", response_class=HTMLResponse)
+def playbook_skill_enabled(request: Request, technique_id: str, enabled: str = Form("true"), q: str = Form(""),
+                           filter_outcome: str = Form(""), filter_rank: str = Form(""), sort: str = Form(""),
+                           filter_confidence: str = Form(""), filter_source_id: str = Form(""),
+                           filter_skills_only: str = Form("")) -> HTMLResponse:
+    """Shelve a stored skill without deleting it, or bring it back. A disabled skill is refused by
+    execute_skill and no longer surfaced to the agent (both gated server-side in the store/runner) --
+    this route is purely the operator's on/off control. The card dims and its toggle flips
+    client-side on click for instant feedback (static/js/playbook_skill.js); this re-render is the
+    authority once it lands."""
+    ok = playbook_store.set_skill_enabled(technique_id, enabled == "true")
+    logger.debug("api: playbook skill-enabled id=%s enabled=%s ok=%s", technique_id, enabled, ok)
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
+
+
+@app.post("/api/playbook/{technique_id}/update-skill", response_class=HTMLResponse)
+def playbook_update_skill(request: Request, technique_id: str, body: str = Form(""), params: str = Form(""),
+                          q: str = Form(""), filter_outcome: str = Form(""), filter_rank: str = Form(""),
+                          sort: str = Form(""), filter_confidence: str = Form(""), filter_source_id: str = Form(""),
+                          filter_skills_only: str = Form("")) -> HTMLResponse:
+    """Edit a skill's body/params (the UI's "Edit body" form). A changed body re-pins the hash and
+    resets trust to unreviewed (playbook_store.update_skill_body) -- an earlier vouch was for the old
+    bytes, and re-saving is also how a tampered (hash-mismatched) body becomes runnable again. params
+    is a comma-separated list of names, each a required {{slot}}."""
+    param_names = [p.strip() for p in params.split(",") if p.strip()]
+    ok = playbook_store.update_skill_body(technique_id, body=body, params=param_names)
+    logger.debug("api: playbook update-skill id=%s ok=%s", technique_id, ok)
+    return HTMLResponse(_render_playbook_list(request, q, filter_outcome, filter_rank, sort, confidence=filter_confidence, source_id=filter_source_id, skills_only=filter_skills_only))
+
+
+@app.post("/api/playbook/add-skill", response_class=HTMLResponse)
+def playbook_add_skill(request: Request, kind: str = Form("instructions"), interpreter: str = Form("none"),
+                       body: str = Form(""), technique: str = Form(""), tech_keywords: str = Form(""),
+                       waf_vendors: str = Form(""), vuln_class: str = Form(""), target_shape: str = Form(""),
+                       mode: str = Form(""), params: str = Form("")) -> HTMLResponse:
+    """The "New skill" manual-authoring form -- an operator adds a reusable skill by hand, exactly
+    like the agent capturing one. add_manual_skill marks it derived_from='operator'/operator_trusted
+    (a human wrote the body) and creates its backing technique in one step. Empty body is a no-op."""
+    new_id = playbook_store.add_manual_skill(
+        kind=kind, body=body, technique=technique,
+        params=[p.strip() for p in params.split(",") if p.strip()], interpreter=interpreter,
+        tech_keywords=_parse_keyword_list(tech_keywords), waf_vendors=_parse_keyword_list(waf_vendors),
+        vuln_class=vuln_class, target_shape=target_shape, mode=mode,
+    )
+    logger.debug("api: playbook add-skill kind=%s -> id=%s", kind, new_id)
+    return HTMLResponse(_render_playbook_list(request))
+
+
+# The whole-playbook export (/api/playbook/export above) already carries every skill inline, since a
+# skill is just a field on its technique entry -- these two are the skill-only portable envelope
+# (playbook_store.export_skills/import_skills, agentskills.io-style) for sharing just the skills with
+# another agent/machine without the surrounding technique store. #
+
+
+@app.get("/api/playbook/skills/export")
+def playbook_skills_export() -> Response:
+    """Download every stored skill as a portable JSON envelope (schema + skills[]) -- backup, or hand
+    to another agent. import_skills merges it back (always as trust='unreviewed')."""
+    payload = json.dumps(playbook_store.export_skills(), indent=2, ensure_ascii=False)
+    logger.debug("api: playbook skills export (%d bytes)", len(payload))
+    return Response(payload, media_type="application/json", headers={"Content-Disposition": 'attachment; filename="asra_skills.json"'})
+
+
+@app.get("/api/playbook/{technique_id}/skill-export")
+def playbook_skill_export(technique_id: str) -> Response:
+    """The per-card "Export" button -- the same portable envelope as the bulk export above, scoped to
+    one skill. Built from the public store reads (get_technique_skill + the technique's own flattened
+    entry) so it mirrors export_skills()'s item shape exactly without reaching into store internals."""
+    skill = playbook_store.get_technique_skill(technique_id)
+    entry = next((e for e in playbook_store.list_all_techniques() if e.get("id") == technique_id), None)
+    if not skill or entry is None:
+        raise HTTPException(status_code=404, detail="No skill is attached to that technique.")
+    envelope = {
+        "schema": playbook_store.SKILL_EXPORT_SCHEMA,
+        "skills": [{
+            "technique": entry.get("technique") or "",
+            "kind": skill.get("kind"),
+            "body": skill.get("body"),
+            "params": skill.get("params") or [],
+            "interpreter": skill.get("interpreter") or "none",
+            "tech_keywords": entry.get("tech_keywords") or [],
+            "waf_vendors": entry.get("waf_vendors") or [],
+            "vuln_class": entry.get("vuln_class") or "",
+            "target_shape": entry.get("target_shape") or "",
+            "mode": entry.get("mode") or "",
+            "provenance": skill.get("provenance") or {},
+        }],
+    }
+    payload = json.dumps(envelope, indent=2, ensure_ascii=False)
+    logger.debug("api: playbook skill-export id=%s (%d bytes)", technique_id, len(payload))
+    return Response(payload, media_type="application/json", headers={"Content-Disposition": 'attachment; filename="asra_skill.json"'})
+
+
+@app.post("/api/playbook/skills/import", response_class=HTMLResponse)
+async def playbook_skills_import(request: Request, data: str = Form(""), file: UploadFile | None = File(None)) -> HTMLResponse:
+    """Merge a skills envelope (paste into the textarea, or upload a file) via import_skills -- every
+    imported skill lands derived_from='import'/trust='unreviewed' (a body authored elsewhere is the
+    untrusted-provenance case the security model exists for). Malformed JSON is reported inline,
+    never fatal."""
+    raw = data
+    if file is not None and getattr(file, "filename", ""):
+        raw = (await file.read()).decode("utf-8", "replace")
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return HTMLResponse(_render_playbook_list(request, message="That's not valid JSON — nothing imported."), status_code=200)
+    added = playbook_store.import_skills(payload, source_label="import")
+    logger.debug("api: playbook skills import added=%d", added)
+    message = (
+        f"Imported {added} skill{'s' if added != 1 else ''} — they're marked unreviewed until you trust them."
+        if added else "No skills found in that JSON — nothing imported."
+    )
+    return HTMLResponse(_render_playbook_list(request, message=message))
 
 
 @app.post("/api/playbook/reembed", response_class=HTMLResponse)
@@ -8827,6 +9692,17 @@ def delete_subagent_route(profile_id: str) -> Response:
     return RedirectResponse(url="/subagents", status_code=303)
 
 
+# Human labels for each custom-tool availability scope (custom_tools_store.CUSTOM_TOOL_SCOPES),
+# shown next to each toggle in a custom tool's own card (templates/partials/custom_tools_list.html).
+_CUSTOM_TOOL_SCOPE_LABELS = {
+    "main_agent": "Main agent",
+    "chat": "Chat",
+    "reverse": "Reverse eng.",
+    "interactive": "Interactive",
+    "subagent": "Subagents",
+}
+
+
 _TOOL_DOMAIN_SECTIONS = (
     ("web", "Web / API Pentest", "Recon, scan, exploit, and post-exploit tools for a live web/API target."),
     ("re", "Reverse Engineering", "Static/dynamic analysis for a local binary, mobile app, smart contract, or source tree."),
@@ -8972,18 +9848,36 @@ def post_custom_tools_root_save(path: str = Form("")) -> Response:
 
 
 @app.post("/api/tools/custom-tools/add")
-def post_custom_tool_add(name: str = Form(...), path: str = Form(...)) -> Response:
-    """Settings -> Tools -> Custom tools -- "Add" on a discovered candidate
-    (discover_custom_tool_candidates). The only explicit confirmation step this registration gets
-    -- capture_usage_hint's own --help capture happens here, synchronously, same "capture now,
-    editable immediately after" flow agent/tools/custom_tools_root.py's own docstring describes;
-    nothing is saved before this click. A full-page redirect, not htmx, so the new entry appears
-    in the "Custom tools" list below through the ordinary GET /settings render -- same convention
-    every other registering POST on this tab already uses (capability path, sudo password, the
-    custom-root save above)."""
-    description = capture_usage_hint(path)
-    add_custom_tool(name=name, path=path, description=description, requires_target=True, category="custom")
-    logger.debug("api: custom tool added name=%r path=%r", name, path)
+def post_custom_tool_add(
+    name: str = Form(...), path: str = Form(...), manual: str | None = Form(None),
+    description: str = Form(""), category: str = Form("custom"),
+    requires_target: str | None = Form(None), scopes: list[str] = Form([]),
+) -> Response:
+    """Settings -> Tools -> Custom tools -- registers a tool, from one of two entry points that both
+    post here: the discovery "Add" on a found candidate (name+path only -- capture_usage_hint's own
+    --help capture fills the description, requires_target defaults on, every consumer scope on), or
+    the manual "Add custom tool" dialog (manual=1 -- the operator typed name/path/description/
+    category and picked requires_target + availability scopes themselves). capture_usage_hint's
+    --help capture happens here, synchronously, same "capture now, editable immediately after" flow;
+    nothing is saved before this click. A full-page redirect so the new entry appears in the list
+    below through the ordinary GET /settings render."""
+    try:
+        if manual:
+            add_custom_tool(
+                name=name, path=path,
+                description=description.strip() or capture_usage_hint(path),
+                requires_target=bool(requires_target),
+                category=category if category in CUSTOM_TOOL_CATEGORIES else "custom",
+                scopes=scopes or None,
+            )
+        else:
+            add_custom_tool(name=name, path=path, description=capture_usage_hint(path), requires_target=True, category="custom")
+    except ValueError as exc:
+        # Duplicate name (custom_tool_name_exists) -- don't 500 the whole page over it; the existing
+        # entry is untouched. Logged so a confused operator can see why their add "did nothing".
+        logger.debug("api: custom tool add rejected name=%r: %s", name, exc)
+        return RedirectResponse(url="/settings", status_code=303)
+    logger.debug("api: custom tool added name=%r path=%r manual=%s", name, path, bool(manual))
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -8999,10 +9893,13 @@ def post_custom_tool_toggle(tool_id: str, enabled: str | None = Form(None)) -> R
 
 
 @app.post("/api/tools/custom-tools/{tool_id}/update")
-def post_custom_tool_update(tool_id: str, description: str = Form(""), category: str = Form("custom"), requires_target: str | None = Form(None)) -> Response:
-    if update_custom_tool(tool_id, description=description, requires_target=bool(requires_target), category=category) is None:
+def post_custom_tool_update(tool_id: str, description: str = Form(""), category: str = Form("custom"), requires_target: str | None = Form(None), scopes: list[str] = Form([])) -> Response:
+    # scopes comes straight from the card's own availability checkboxes -- an all-unchecked save is a
+    # real, intentional "available to nobody" (update_custom_tool keeps an explicit empty list), not
+    # a missing field, because the toggles are always part of this same form.
+    if update_custom_tool(tool_id, description=description, requires_target=bool(requires_target), category=category, scopes=scopes) is None:
         raise HTTPException(status_code=404, detail="Unknown custom tool")
-    logger.debug("api: custom tool id=%s updated category=%s requires_target=%s", tool_id, category, bool(requires_target))
+    logger.debug("api: custom tool id=%s updated category=%s requires_target=%s scopes=%s", tool_id, category, bool(requires_target), scopes)
     return RedirectResponse(url="/settings", status_code=303)
 
 

@@ -108,6 +108,41 @@ def test_session_folder_is_none_with_no_active_session():
     assert debug_mod._session_folder() is None
 
 
+def test_session_log_scope_routes_a_line_to_the_named_session_not_the_ambient_one(tmp_path, monkeypatch):
+    """Real incident this guards against: the toolkit traffic proxy/racer/repeater run on a
+    long-lived task that never sets current_session_id, so it inherited whichever session was
+    ambient when that task started. One engagement's captured traffic (usr_kiwi) was logged while
+    usr_temu was ambient, landing 677 lines in the WRONG project's debug.log. session_log_scope,
+    keyed on the record's OWN session, must override the ambient value for the duration."""
+    import sessions.store as store_mod
+
+    def fake_folder(sid):
+        return str(tmp_path / sid) if sid else None
+
+    monkeypatch.setattr(store_mod, "get_session_folder", fake_folder)
+    monkeypatch.setattr("sessions.store.get_session_folder", fake_folder)
+
+    global_path = tmp_path / "global-debug.log"
+    handler = debug_mod._SessionAwareFileHandler(global_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    # Ambient context points at usr_temu (the finished engagement whose task is still live) ...
+    ambient = debug_mod.current_session_id.set("usr_temu")
+    try:
+        # ... but this traffic line belongs to usr_kiwi, so it must follow usr_kiwi.
+        with debug_mod.session_log_scope("usr_kiwi"):
+            handler.emit(_make_record(message="kiwi traffic line"))
+        # Outside the scope, the ambient session is restored unchanged.
+        assert debug_mod.current_session_id.get() == "usr_temu"
+    finally:
+        debug_mod.current_session_id.reset(ambient)
+    handler.close()
+
+    assert "kiwi traffic line" in (tmp_path / "usr_kiwi" / "debug.log").read_text(encoding="utf-8")
+    temu_log = tmp_path / "usr_temu" / "debug.log"
+    assert not temu_log.exists() or "kiwi traffic line" not in temu_log.read_text(encoding="utf-8")
+
+
 def test_dump_large_payload_goes_into_the_session_folder_when_active(tmp_path, monkeypatch):
     session_folder = tmp_path / "proj"
     monkeypatch.setattr(debug_mod, "_session_folder", lambda: session_folder)

@@ -12,6 +12,7 @@ SecLists checkout onto one of these same paths outside this project's own instal
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from agent.tools.wordlist_store import load_wordlist_store
@@ -52,20 +53,32 @@ def _guess_kind(path: Path) -> str:
     return "general"
 
 
-def _count_lines(path: Path, size_bytes: int) -> int | None:
+@lru_cache(maxsize=1024)
+def _count_lines_cached(path_text: str, size_bytes: int, mtime_ns: int) -> int | None:
+    # Keyed on size + mtime so an edited wordlist is recounted, an untouched one never is: Settings
+    # re-renders this catalog on every visit, and re-reading every list (rockyou is 130MB+) each
+    # time made that tab visibly slow.
     # rockyou.txt-sized files (100MB+) would materialize as a huge list of Python str objects via
-    # readlines()/splitlines() just to get a count -- count raw b"\n" bytes in fixed-size chunks
+    # readlines()/splitlines() just to get a count -- count raw newline bytes in fixed-size chunks
     # instead, which stays O(1) in memory regardless of file size.
     if size_bytes > _MAX_LINE_COUNT_BYTES:
         return None
     count = 0
     try:
-        with path.open("rb") as f:
+        with open(path_text, "rb") as f:
             while chunk := f.read(1024 * 1024):
-                count += chunk.count(b"\n")
+                count += chunk.count(10)  # 10 == ord("\n")
     except OSError:
         return None
     return count
+
+
+def _count_lines(path: Path, size_bytes: int) -> int | None:
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    return _count_lines_cached(str(path), size_bytes, mtime_ns)
 
 
 def _scan_root(root: Path, budget: int) -> list[dict]:

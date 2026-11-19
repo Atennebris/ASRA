@@ -41,16 +41,19 @@ def test_exploited_finding_shows_exploited_badge_on_the_card():
     assert html.count("Exploited") >= 2
 
 
-def test_skipped_finding_with_advisory_note_shows_not_exploitable_badge():
-    session = _base_session("usr_badge_not_exploitable", [
+def test_attempted_finding_with_advisory_note_shows_not_exploited_badge():
+    # A real-but-unproven attempt (advisory_note, no skip outcome) reads "Not exploited" -- never the
+    # old "Not exploitable", which overclaimed that the finding can't be exploited at all.
+    session = _base_session("usr_badge_not_exploited", [
         {
             "title": "CORS misconfiguration", "severity": "Medium", "description": "x", "verification": "verified",
             "exploited": False, "advisory_note": "No credentialed session available to demonstrate impact.",
         },
     ])
     client = _client_with_session(session)
-    html = client.get("/session/usr_badge_not_exploitable").text
-    assert "Not exploitable" in html
+    html = client.get("/session/usr_badge_not_exploited").text
+    assert "Not exploited" in html
+    assert "Not exploitable" not in html
 
 
 def test_pending_finding_shows_no_exploited_badge_yet():
@@ -62,6 +65,9 @@ def test_pending_finding_shows_no_exploited_badge_yet():
     client = _client_with_session(session)
     html = client.get("/session/usr_badge_pending").text
     assert "Not exploitable" not in html
+    # The meta line no longer claims "Not exploited" for a finding Exploit never reached -- the
+    # "none" state renders nothing on this axis at all.
+    assert "Not exploited" not in html
     assert "&#9873; Exploited" not in html
 
 

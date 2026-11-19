@@ -172,6 +172,24 @@ def set_free_models_only(enabled: bool) -> None:
     logger.debug("llm_settings: free_models_only=%s", enabled)
 
 
+def get_ui_descriptions_hidden() -> bool:
+    """Settings -> Customization -> "Show helper descriptions" switch (inverted). When True, the
+    app-wide explanatory helper text (the paragraphs under headings, mode cards, fields, and
+    Settings sections -- every element tagged `.ui-desc`) is collapsed via a `data-hide-descriptions`
+    body attribute + CSS, leaving a cleaner, less dense UI; the same text is still reachable on a
+    long hover (static/js/ui_descriptions.js tooltip). Off by default -- the text is shown as-is,
+    same "nothing set -> no behavior change" convention as the other flags here, so a fresh install
+    keeps its full in-context guidance until the operator chooses the leaner layout."""
+    return bool(load_llm_settings().get("ui_descriptions_hidden"))
+
+
+def set_ui_descriptions_hidden(hidden: bool) -> None:
+    existing = load_llm_settings()
+    existing["ui_descriptions_hidden"] = hidden
+    _write_llm_settings(existing)
+    logger.debug("llm_settings: ui_descriptions_hidden=%s", hidden)
+
+
 def get_secondary_verification_provider() -> dict | None:
     """Settings -> Secondary verification provider (optional) -- when set, Skeptical Verification
     (agent/core.py's _run_skeptical_verification) independently re-checks each Critical/High

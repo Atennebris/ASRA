@@ -3,6 +3,7 @@ put-back semantics (a non-matching instruction must survive a drain/pop call unt
 order) are exactly the kind of thing worth pinning down directly, not just via a live run.
 """
 import asyncio
+from types import SimpleNamespace
 
 import agent.core as core
 from agent.core import (
@@ -11,6 +12,7 @@ from agent.core import (
     _drain_pending_hypotheses,
     _pop_deep_dive_instruction,
     _pop_skip_instruction,
+    _truncate_tools_for_weak_model,
     get_instruction_queue,
 )
 
@@ -222,3 +224,33 @@ def test_pop_deep_dive_instruction_leaves_other_instruction_types_in_queue():
 
     assert _pop_deep_dive_instruction(session_id) is None
     assert queue.qsize() == 2
+
+
+# --- _truncate_tools_for_weak_model: cap the tool menu, never drop the phase's terminal tool ------
+
+
+def _specs(*names):
+    # The function only reads .name and slices, so a lightweight stand-in avoids building full ToolSpecs.
+    return [SimpleNamespace(name=n) for n in names]
+
+
+def test_truncate_tools_leaves_a_short_list_untouched(monkeypatch):
+    monkeypatch.setenv("WEAK_MODEL_MAX_TOOLS", "14")
+    specs = _specs("a", "b", "c")
+    assert _truncate_tools_for_weak_model(specs, terminal_tool=None) is specs
+
+
+def test_truncate_tools_caps_a_long_list_to_the_limit(monkeypatch):
+    monkeypatch.setenv("WEAK_MODEL_MAX_TOOLS", "3")
+    specs = _specs("a", "b", "c", "d", "e")
+    kept = _truncate_tools_for_weak_model(specs, terminal_tool=None)
+    assert [s.name for s in kept] == ["a", "b", "c"]  # already-priority-ordered front is kept
+
+
+def test_truncate_tools_always_keeps_the_terminal_tool(monkeypatch):
+    monkeypatch.setenv("WEAK_MODEL_MAX_TOOLS", "3")
+    specs = _specs("a", "b", "c", "d", "record_result")
+    kept = _truncate_tools_for_weak_model(specs, terminal_tool="record_result")
+    names = [s.name for s in kept]
+    assert len(names) == 3
+    assert "record_result" in names  # re-inserted into the dropped tail's slot
