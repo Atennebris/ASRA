@@ -11,8 +11,21 @@ An autonomous pentesting agent: point it at an authorized target and it recons, 
 exploits — driven by an LLM through a ReAct tool-calling loop, streamed live in the browser. Runs
 entirely locally, no cloud/database — session state is plain JSON on disk.
 
+<p align="center">
+  <img src="docs/screenshots/ASRA_readme_demo.gif" alt="ASRA in the dark theme: dashboard, a session's plan, its findings, and the live chat panel" width="900">
+</p>
+
 Full documentation — features, architecture, screenshots, per-OS setup, configuration reference,
 development, uninstalling: see the documentation badges above (English / Русский).
+
+## Screenshots
+
+Demo data only (reserved `example.test` targets) — no real engagement is shown.
+
+<p align="center">
+  <img src="docs/screenshots/ASRA_readme_dashboard.png" alt="ASRA dashboard — recent projects with status badges" width="49%">
+  <img src="docs/screenshots/ASRA_readme_findings.png" alt="A session's Findings tab — severity, verification status, and live chat side panel" width="49%">
+</p>
 
 ## Quick start
 
