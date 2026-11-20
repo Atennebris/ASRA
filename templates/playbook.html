@@ -176,6 +176,23 @@
     {{ list_html | safe }}
   </div>
 
+  {# Learned tool recommendations -- agent/tools/tool_affinity_store.py (tool-selection roadmap
+     items 1/2), blended into the agent's own tool reordering/labeling during a run
+     (agent/core.py's _apply_plan_recommendations). Read-only history + an operator trusted/
+     irrelevant override per record; never a gate on what the agent can actually call. #}
+  <div class="mt-6 pt-4 border-t border-default">
+    <h2 class="text-[13px] font-semibold text-primary mb-0.5">Learned tool recommendations</h2>
+    <p class="ui-desc text-[11px] text-secondary/70 mb-2 max-w-2xl">
+      Which tool has actually run usefully for a given target shape + phase, learned from this
+      agent's own real dispatch history — a clean rule-out counts as the tool doing its job, only a
+      real execution failure counts against it. Mark a row <strong class="text-secondary">trusted</strong>
+      or <strong class="text-secondary">irrelevant</strong> to override the learned score yourself.
+    </p>
+    <div id="tool-affinity-list">
+      {{ tool_affinity_html | safe }}
+    </div>
+  </div>
+
   {# Add-technique dialog -- hand-add a single technique the operator already knows.
      Deliberately NO `overflow-hidden` on the <dialog> itself -- same real, confirmed desktop-app
      (WebView2) bug subagents.html's own edit dialog ran into: a native <select> (the Outcome
@@ -534,4 +551,8 @@
   {# Instant trust-badge flip for the per-skill "Trusted on/off" toggle (the real server toggle still
      re-renders the list afterward) -- page-scoped, the skill cards only exist on /playbook. #}
   <script src="{{ static_url('/static/js/playbook_skill.js') }}"></script>
+  {# Instant trusted/irrelevant flip for the "Learned tool recommendations" panel's feedback
+     buttons -- same optimistic-then-server-is-authority shape as playbook_skill.js above,
+     page-scoped since the panel only exists on /playbook. #}
+  <script src="{{ static_url('/static/js/tool_affinity.js') }}"></script>
 {% endblock %}

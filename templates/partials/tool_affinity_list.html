@@ -1,0 +1,57 @@
+{# Learned tool recommendations panel -- the operator-facing view onto
+   agent/tools/tool_affinity_store.py (tool-selection roadmap items 1/2). Read-only except for the
+   two feedback buttons per record (trusted/irrelevant -- item 7's "operator feedback as top-weight
+   signal"), which outrank the learned score regardless of its own counters. Re-rendered wholesale
+   on every feedback click (main.py's tool_affinity_feedback route), same "server is the authority,
+   client flips first for instant feedback" shape as playbook_list.html's own skill-trust toggle. #}
+<div class="space-y-2">
+  {% if not records %}
+    <p class="text-[11px] text-secondary/60">
+      No tool outcomes recorded yet — this fills in as real scans run (a tool's own dispatch result,
+      classified automatically into success / clean rule-out / execution failure). Until then, a
+      small curated cold-start prior still steers recommendations per target shape and phase.
+    </p>
+  {% endif %}
+  {% for r in records %}
+    <div class="flex items-center justify-between gap-3 rounded-md border border-default bg-elevated px-3 py-2"
+         data-affinity-card data-record-id="{{ r.id }}">
+      <div class="min-w-0">
+        <div class="text-[12px] font-medium text-primary">
+          {{ r.tool }}
+          <span class="text-secondary/60 font-normal">&middot; {{ r.target_shape }} / {{ r.phase }}</span>
+        </div>
+        <div class="text-[10.5px] text-secondary/70 mt-0.5 leading-relaxed">
+          {{ explanations.get(r.id, "") }}
+        </div>
+      </div>
+      <div class="flex items-center gap-1 shrink-0">
+        <button type="button" data-affinity-feedback-btn data-feedback-value="trusted"
+                data-active="{{ 'true' if r.operator_feedback == 'trusted' else 'false' }}"
+                hx-post="/api/tool-affinity/{{ r.id }}/feedback"
+                hx-vals='{"feedback": "{{ '' if r.operator_feedback == 'trusted' else 'trusted' }}"}'
+                hx-target="#tool-affinity-list" hx-swap="innerHTML"
+                onclick="window.asraFlipToolAffinityFeedback(this, 'trusted')"
+                class="inline-flex items-center justify-center w-6 h-6 rounded border transition-colors
+                       {{ 'text-severity-low border-severity-low/40 bg-severity-low/10' if r.operator_feedback == 'trusted' else 'text-secondary border-default bg-transparent hover:border-accent hover:text-accent' }}"
+                aria-label="Mark trusted" title="Mark trusted — outranks the learned score">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M7 11v8H4a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1h3zm0 0l4.5-8a1.5 1.5 0 0 1 2.7 1.3L13 8h5a2 2 0 0 1 2 2.2l-1 6A2 2 0 0 1 17 18H9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button type="button" data-affinity-feedback-btn data-feedback-value="irrelevant"
+                data-active="{{ 'true' if r.operator_feedback == 'irrelevant' else 'false' }}"
+                hx-post="/api/tool-affinity/{{ r.id }}/feedback"
+                hx-vals='{"feedback": "{{ '' if r.operator_feedback == 'irrelevant' else 'irrelevant' }}"}'
+                hx-target="#tool-affinity-list" hx-swap="innerHTML"
+                onclick="window.asraFlipToolAffinityFeedback(this, 'irrelevant')"
+                class="inline-flex items-center justify-center w-6 h-6 rounded border transition-colors
+                       {{ 'text-severity-high border-severity-high/40 bg-severity-high/10' if r.operator_feedback == 'irrelevant' else 'text-secondary border-default bg-transparent hover:border-severity-high/50 hover:text-severity-high' }}"
+                aria-label="Mark irrelevant" title="Mark irrelevant — never promoted regardless of the learned score">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M17 13V5h3a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-3zm0 0l-4.5 8a1.5 1.5 0 0 1-2.7-1.3L11 16H6a2 2 0 0 1-2-2.2l1-6A2 2 0 0 1 7 6h8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  {% endfor %}
+</div>

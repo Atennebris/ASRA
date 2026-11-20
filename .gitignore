@@ -161,6 +161,20 @@ data/asset_baseline/*
 data/tool_memory/*
 !data/tool_memory/.gitkeep
 
+# Learned tool-affinity index (agent/tools/tool_affinity_store.py) -- cross-session, per-
+# (tool, target_shape, phase) outcome counters derived from real engagement runs. Same reasoning
+# as data/tool_memory/ just above (a single-file store, matching data/allowed_targets.json's own
+# convention): real engagement-derived data, never committed.
+data/tool_affinity.json
+
+# Tool-retrieval embedding index (agent/tools/tool_retrieval_store.py) -- vectors over the tool
+# registry's own catalog text (names/descriptions, not engagement data). Not sensitive the way
+# data/playbook or data/tool_affinity.json are, but still excluded as a regenerable, machine- and
+# embedding-model-specific cache -- same housekeeping reasoning as data/cache/* above, kept out of
+# git rather than committing a derived artifact that just gets rebuilt on first use anyway.
+data/tool_retrieval/*
+!data/tool_retrieval/.gitkeep
+
 # frida-trace's own auto-generated handler .js files (agent/tools/builders/frida.py) -- frida-trace
 # always writes these to ./__handlers__ relative to whatever process's CWD invoked it (no flag to
 # redirect this, confirmed against its own --help), which for ASRA is the repo root itself, not the

@@ -8,6 +8,7 @@ current plan back before it acts.
 """
 import asyncio
 
+import agent.core as core
 import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
 from agent.core import RunContext, _apply_plan_recommendations, _apply_updated_plan, _plan_task_addendum, _run_recon
 from agent.llm_client import LLMResponse, ToolCallRequest
@@ -663,6 +664,158 @@ def test_apply_plan_recommendations_only_reads_the_matching_phase():
     session = _plan_session("analyze", recommended_tools=["dns_lookup"])
     result = _apply_plan_recommendations(tools, session, "recon")
     assert result == tools  # the recommendation belongs to "analyze", not "recon"
+
+
+# --- _apply_plan_recommendations: (c) the item-3 retrieval shortlist, blended in alongside (a)/(b) ---
+
+
+def test_apply_plan_recommendations_promotes_a_retrieval_only_tool():
+    tools = _recon_tools()
+    session = {"plan": {"phases": [], "version": 0, "updated_at": None}}
+    retrieval = (["whois_lookup"], {"whois_lookup": "retrieval shortlist match for 'enumerate domain ownership' (semantic=0.80, keyword=2)"})
+
+    result = _apply_plan_recommendations(tools, session, "recon", retrieval)
+
+    assert result[0].name == "whois_lookup"
+    assert result[0].description.startswith("[retrieval shortlist match")
+    assert {spec.name for spec in result} == {spec.name for spec in tools}  # reordered, never removed
+
+
+def test_apply_plan_recommendations_retrieval_tool_sorts_behind_model_recommended():
+    tools = _recon_tools()
+    session = _plan_session("recon", recommended_tools=["dns_lookup"])
+    retrieval = (["whois_lookup"], {"whois_lookup": "retrieval shortlist match"})
+
+    result = _apply_plan_recommendations(tools, session, "recon", retrieval)
+
+    assert [spec.name for spec in result[:2]] == ["dns_lookup", "whois_lookup"]
+    assert result[0].description.startswith("[Plan-recommended]")
+    assert result[1].description.startswith("[retrieval shortlist match]")
+
+
+def test_apply_plan_recommendations_labels_both_affinity_and_retrieval_when_a_tool_earns_both():
+    tools = _recon_tools()
+    session = {"plan": {"phases": [], "version": 0, "updated_at": None}}
+    retrieval = (["dns_lookup"], {"dns_lookup": "retrieval shortlist match"})
+    # A tool the retrieval shortlist alone promotes still gets a combined label if the learned
+    # affinity side also happens to name it -- _label() appends every tag that applies, never
+    # just the first signal that matched.
+    original = core.tool_affinity_store.recommended_tools_for
+    core.tool_affinity_store.recommended_tools_for = lambda *a, **k: (["dns_lookup"], {"dns_lookup": "6/8 past attempts ran usefully"})
+    try:
+        result = _apply_plan_recommendations(tools, session, "recon", retrieval)
+    finally:
+        core.tool_affinity_store.recommended_tools_for = original
+
+    assert result[0].name == "dns_lookup"
+    assert "retrieval shortlist match" in result[0].description
+    assert "6/8 past attempts ran usefully" in result[0].description
+
+
+def test_apply_plan_recommendations_none_retrieval_keeps_prior_ab_only_behavior():
+    # The default (no 4th argument / explicit None) must behave byte-identical to before item 3 --
+    # every pre-existing caller/test that never passes `retrieval` relies on this.
+    tools = _recon_tools()
+    session = _plan_session("recon", recommended_tools=["dns_lookup"])
+    assert _apply_plan_recommendations(tools, session, "recon") == _apply_plan_recommendations(tools, session, "recon", None)
+
+
+# --- _retrieval_query_text: the free-text query fed into the item-3 retrieval shortlist ---
+
+
+def test_retrieval_query_text_is_empty_with_no_plan_yet():
+    session = {"plan": {"phases": [], "version": 0, "updated_at": None}}
+    assert core._retrieval_query_text(session, "recon") == ""
+
+
+def test_retrieval_query_text_includes_rationale_and_open_task_and_subtask_text():
+    recorded = update_plan({"phases": [{
+        "phase": "analyze", "rationale": "WordPress confirmed",
+        "tasks": [{"text": "Scan the CMS", "subtasks": [
+            {"text": "run wpscan", "status": "active"},
+        ]}],
+    }]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    text = core._retrieval_query_text(session, "analyze")
+    assert "WordPress confirmed" in text
+    assert "Scan the CMS" in text
+    assert "run wpscan" in text
+
+
+def test_retrieval_query_text_excludes_done_tasks_and_subtasks():
+    recorded = update_plan({"phases": [{
+        "phase": "recon", "tasks": [{"text": "finished task", "status": "done", "subtasks": [
+            {"text": "finished subtask", "status": "done"},
+        ]}]},
+    ]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    assert core._retrieval_query_text(session, "recon") == ""
+
+
+def test_retrieval_query_text_only_reads_the_matching_phase():
+    recorded = update_plan({"phases": [{"phase": "analyze", "tasks": [{"text": "analyze-only text", "subtasks": [{"text": "a subtask"}]}]}]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    assert core._retrieval_query_text(session, "recon") == ""
+
+
+# --- _plan_lookahead_query_texts: item 4's per-step query set for the multi-step retrieval shortlist ---
+
+
+def test_plan_lookahead_query_texts_is_empty_with_no_plan_yet():
+    session = {"plan": {"phases": [], "version": 0, "updated_at": None}}
+    assert core._plan_lookahead_query_texts(session, "recon", 3) == []
+
+
+def test_plan_lookahead_query_texts_one_entry_per_open_task_in_plan_order():
+    recorded = update_plan({"phases": [{
+        "phase": "recon", "rationale": "Widget Corp web app",
+        "tasks": [
+            {"text": "Enumerate the attack surface", "subtasks": [{"text": "dns lookup", "status": "active"}]},
+            {"text": "Fingerprint the stack", "subtasks": [{"text": "run whatweb", "status": "pending"}]},
+        ],
+    }]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    steps = core._plan_lookahead_query_texts(session, "recon", 5)
+    assert len(steps) == 2
+    assert "Enumerate the attack surface" in steps[0] and "dns lookup" in steps[0]
+    assert "Fingerprint the stack" in steps[1] and "run whatweb" in steps[1]
+    # the phase's own rationale carries into EVERY step's own text, not just the first
+    assert "Widget Corp web app" in steps[0]
+    assert "Widget Corp web app" in steps[1]
+
+
+def test_plan_lookahead_query_texts_excludes_a_fully_done_task_but_keeps_partial_progress():
+    recorded = update_plan({"phases": [{"phase": "recon", "tasks": [
+        {"text": "finished task", "subtasks": [{"text": "finished subtask", "status": "done"}]},
+        {"text": "in-progress task", "subtasks": [
+            {"text": "done subtask", "status": "done"},
+            {"text": "still-open subtask", "status": "active"},
+        ]},
+    ]}]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    steps = core._plan_lookahead_query_texts(session, "recon", 5)
+    assert len(steps) == 1  # the fully-done task contributes no step at all
+    assert "finished task" not in steps[0]
+    assert "in-progress task" in steps[0]
+    assert "still-open subtask" in steps[0]
+    assert "done subtask" not in steps[0]  # an already-done subtask is excluded even on an open task
+
+
+def test_plan_lookahead_query_texts_is_capped_at_max_steps():
+    recorded = update_plan({"phases": [{"phase": "recon", "tasks": [
+        {"text": f"task {i}", "subtasks": [{"text": f"subtask {i}"}]} for i in range(5)
+    ]}]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    steps = core._plan_lookahead_query_texts(session, "recon", 2)
+    assert len(steps) == 2
+    assert "task 0" in steps[0]
+    assert "task 1" in steps[1]
+
+
+def test_plan_lookahead_query_texts_only_reads_the_matching_phase():
+    recorded = update_plan({"phases": [{"phase": "analyze", "tasks": [{"text": "analyze-only text", "subtasks": [{"text": "a subtask"}]}]}]})["recorded"]
+    session = {"plan": {"phases": recorded["phases"], "version": 1, "updated_at": "now"}}
+    assert core._plan_lookahead_query_texts(session, "recon", 3) == []
 
 
 # --- end-to-end: a real _run_recon phase, proving the full wiring, not just the isolated helpers ---

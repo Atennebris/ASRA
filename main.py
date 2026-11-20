@@ -186,6 +186,7 @@ from agent.tools.toolkit_decoder import SCHEMES as DECODER_SCHEMES
 from agent.tools.toolkit_decoder import run_codec
 from agent.tools import library_store
 from agent.tools import playbook_store
+from agent.tools import tool_affinity_store
 from agent.tools import toolkit_intruder
 from projects import icons as project_icons
 from projects.paths import resolve_open_target, resolve_path_for_windows_shell
@@ -8901,6 +8902,33 @@ def _render_playbook_list(request: Request, query: str = "", outcome: str = "", 
     })
 
 
+def _render_tool_affinity_list(request: Request) -> str:
+    """The Playbook page's "Learned tool recommendations" panel -- the operator-facing view onto
+    agent/tools/tool_affinity_store.py (tool-selection roadmap items 1/2). Read-only except for the
+    trusted/irrelevant feedback buttons (tool_affinity_feedback route below), same split as the
+    Playbook list's own skill-trust toggle vs. everything else on that list being read-only."""
+    records = tool_affinity_store.list_records()
+    explanations = {r["id"]: tool_affinity_store.explain_record(r) for r in records if r.get("id")}
+    return templates.env.get_template("partials/tool_affinity_list.html").render({
+        "request": request, "records": records, "explanations": explanations,
+    })
+
+
+@app.post("/api/tool-affinity/{record_id}/feedback", response_class=HTMLResponse)
+def tool_affinity_feedback(request: Request, record_id: str, feedback: str = Form("")) -> HTMLResponse:
+    """Operator's trusted/irrelevant mark on a learned tool-affinity record -- tool-selection
+    roadmap item 2's safeguard #5 / item 7's "operator feedback as top-weight signal". Same
+    operator_trusted pattern as playbook_skill_trust above: advisory metadata that outranks the
+    learned stat (agent/tools/tool_affinity_store.py's score_record), never a gate -- the tool
+    stays fully callable regardless of this mark. Empty feedback clears any existing mark (the
+    button's own client-side script, static/js/tool_affinity.js, sends "" when the clicked mark is
+    already active, so a second click toggles it off)."""
+    value = feedback.strip().lower() or None
+    ok = tool_affinity_store.set_operator_feedback(record_id, value)
+    logger.debug("api: tool-affinity feedback id=%s feedback=%r ok=%s", record_id, value, ok)
+    return HTMLResponse(_render_tool_affinity_list(request))
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard(request: Request) -> HTMLResponse:
     """Cross-session cost/efficiency dashboard -- aggregates compute_portfolio_summary (by
@@ -8982,6 +9010,7 @@ def get_playbook(request: Request) -> HTMLResponse:
     )
     return templates.TemplateResponse(request, "playbook.html", {
         "list_html": _render_playbook_list(request),
+        "tool_affinity_html": _render_tool_affinity_list(request),
         "total": total,
         "embedded": embedded,
         "seeded": playbook_store.seed_pack_imported(),

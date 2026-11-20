@@ -153,7 +153,7 @@ from agent.tools.discovery import interpret_httpx_failure
 from agent.tools.js_fingerprint import run_js_fingerprint
 from agent.tools.native import _derive_plan_status, _normalize_false_positive_reason, _VALID_SEVERITIES, classify_ip_role, geoip_lookup, interpret_arjun_crash, interpret_arjun_failure, interpret_github_code_search_permanent_failure, interpret_missing_identity, interpret_permanent_connection_refusal, interpret_ssl_cert_info_failure, register_discovered_credential, version_is_ruled_out
 from agent.tools.notifications import notify_high_severity_finding, notify_session_ended
-from agent.tools import playbook_store, tool_memory_store
+from agent.tools import playbook_store, tool_affinity_store, tool_memory_store, tool_retrieval_store
 
 # Importing agent.tools.registry forces Python to first fully run agent/tools/__init__.py (the
 # composition root that populates TOOL_REGISTRY) — spelled out explicitly rather than relied on
@@ -1466,6 +1466,14 @@ class RunContext:
     # drift must never be mistaken for a fresh operator Save and reverted.
     configured_provider: str | None = field(default=None)
     configured_model: str | None = field(default=None)
+    # Set at the top of every turn inside _run_llm_tool_loop_impl (plan_phase, falling back to that
+    # loop's own non-plan `phase` string when plan_phase is None -- RE-mode passes like re_triage/
+    # re_reverify have no plan-phase key at all but still benefit from phase-scoped tool-affinity
+    # recording). Read by _track_tool_affinity/_credit_tool_affinity_for_finding/_resolve_hypothesis
+    # (agent/tools/tool_affinity_store.py's consuming/recording hooks) so a tool dispatch is scored
+    # against the phase it actually ran in, without threading an extra parameter through every one
+    # of _run_tool_with_retry's ~20 call sites.
+    current_plan_phase: str | None = field(default=None)
 
 
 def _new_run_context(session: dict, session_id: str, provider_id: str | None) -> RunContext:
@@ -2843,6 +2851,56 @@ def _track_tool_memory(ctx: RunContext, result: dict) -> None:
         logger.debug("core: session=%s _track_tool_memory failed, skipping this update", ctx.session_id, exc_info=True)
 
 
+def _classify_tool_affinity_outcome(result: dict) -> str | None:
+    """Mechanical class-3 "execution failure" classification (tool-selection roadmap item 2) --
+    read straight off the tool-runner result's own status, no LLM judgment needed: reuses the
+    exact same _HOST_HEALTH_TRACKED_STATUSES set _track_host_health/_track_tool_memory already
+    classify real dispatch outcomes with, since "error"/"timeout"/"failed" there already IS this
+    module's own mechanical definition of a real execution failure (non-zero exit, exception,
+    timeout, validator reject, shape mismatch all surface as one of those three statuses by the
+    time a result dict reaches here).
+
+    Returns "failure" for one of those, "null_result" for a clean "ok" dispatch (provisionally --
+    real class-1 "success" credit only ever comes later, from _credit_tool_affinity_for_finding or
+    a confirmed resolve_hypothesis), or None when this dispatch isn't even a real attempt at all
+    ("skipped"/"tool_unavailable"/etc — same statuses _track_tool_memory already excludes).
+    """
+    status = result.get("status")
+    if status not in _HOST_HEALTH_TRACKED_STATUSES:
+        return None
+    return "null_result" if status == "ok" else "failure"
+
+
+def _track_tool_affinity(ctx: RunContext, result: dict) -> None:
+    """Records this dispatch's real outcome into agent/tools/tool_affinity_store.py -- the learned
+    tool-affinity index (tool-selection roadmap items 1+2). Rides the exact same real dispatch
+    outcomes _track_host_health/_track_tool_memory already observe, one hook further, same
+    best-effort posture.
+
+    Scoped to tool_tier=2 tools in "scan" OR "exploit" category -- item 1's whole point is
+    steering EXPLOIT tool choice too (sqlmap/dalfox/wpscan/hydra_start), not just recon/scan, so
+    this is deliberately wider than _track_tool_memory's "scan"-only scope above.
+    """
+    tool_name = result.get("tool")
+    if not tool_name:
+        return
+    spec = get_tool(tool_name)
+    if spec is None or spec.tool_tier != 2 or not any(c in ("scan", "exploit") for c in categories_of(spec)):
+        return
+    outcome_class = _classify_tool_affinity_outcome(result)
+    if outcome_class is None:
+        return
+    try:
+        target_shape = _current_target_affinity_shape(ctx.session)
+        phase = ctx.current_plan_phase or "unscoped"
+        tool_affinity_store.record_outcome(tool_name, target_shape, phase, outcome_class, ctx.session_id)
+    except Exception:
+        # Best-effort bookkeeping, same discipline as _track_host_health/_track_tool_memory above --
+        # a transient disk read/write failure here must never take down an otherwise-healthy scan
+        # over a telemetry side-channel.
+        logger.debug("core: session=%s _track_tool_affinity failed, skipping this update", ctx.session_id, exc_info=True)
+
+
 _ASSET_GRAPH_CREDENTIAL_TOOLS = frozenset({"default_creds_check", "web_self_register", "background_job_check"})
 # Tools whose background job produces a genuinely structured {username, password} pair with zero
 # LLM interpretation -- same set _update_asset_graph's own background_job_check branch already
@@ -3596,6 +3654,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
             # an otherwise-healthy multi-hour run over a telemetry side-channel.
             logger.debug("core: session=%s _track_host_health failed, skipping this update", ctx.session_id, exc_info=True)
         _track_tool_memory(ctx, result)
+        _track_tool_affinity(ctx, result)
         _update_asset_graph(ctx, spec, arguments, result)
         _record_agent_relationship(ctx, spec, result)
         _record_tls_cert_info(ctx, spec, arguments, result)
@@ -3654,6 +3713,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
         _track_host_health(ctx, arguments, failed_result)
         _track_tool_memory(ctx, failed_result)
+        _track_tool_affinity(ctx, failed_result)
         return failed_result
     # Real, confirmed incident this fixes (CM-usr_b416f2): the correction call further below asked
     # the model to "fix" a bare timeout -- {"status": "timeout", ...} carries no stdout/stderr/
@@ -3677,6 +3737,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
         _track_host_health(ctx, arguments, failed_result)
         _track_tool_memory(ctx, failed_result)
+        _track_tool_affinity(ctx, failed_result)
         return failed_result
     _log_agent_debug(ctx, "tool=%s failed (%s), requesting one corrected retry", spec.name, result.get("status"))
     # Real, confirmed incident this fixes: this correction call used to carry zero schema
@@ -3746,6 +3807,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         failed_result = _dead_end_hint({**result, "status": "failed"}, spec.name)
         _track_host_health(ctx, arguments, failed_result)
         _track_tool_memory(ctx, failed_result)
+        _track_tool_affinity(ctx, failed_result)
         return failed_result
 
     retry_arguments = {**corrected_arguments, **injected}
@@ -3800,6 +3862,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         retry_result["schema_violation_corrected"] = True
     _track_host_health(ctx, retry_arguments, retry_result)
     _track_tool_memory(ctx, retry_result)
+    _track_tool_affinity(ctx, retry_result)
     _update_asset_graph(ctx, spec, retry_arguments, retry_result)
     _record_agent_relationship(ctx, spec, retry_result)
     _record_tls_cert_info(ctx, spec, retry_arguments, retry_result)
@@ -4318,7 +4381,35 @@ async def _run_llm_tool_loop_impl(
         # turn is offered, not wait for some later, separate phase call into this same function.
         # tool_specs itself (the base list) never changes across turns, only which of its entries
         # get promoted/labeled, so this is cheap (a plain reorder over an already-small list).
-        current_tool_specs = _apply_plan_recommendations(tool_specs, ctx.session, plan_phase) if plan_phase else tool_specs
+        # Also the tool-affinity index's own phase key (agent/tools/tool_affinity_store.py) -- set
+        # here, every turn, so _track_tool_affinity/_credit_tool_affinity_for_finding/
+        # _resolve_hypothesis (this module's recording/credit hooks) score a dispatch against the
+        # phase it actually ran in, without threading an extra parameter through every one of
+        # _run_tool_with_retry's call sites. None (Validate/a subagent's own conversation/RE modes,
+        # which have no plan-phase key) records under "unscoped" instead of being left unattributed.
+        ctx.current_plan_phase = plan_phase
+        retrieval_shortlist: tuple[list[str], dict[str, str]] | None = None
+        if plan_phase:
+            # Item 4 (TOOLQP multi-step retrieval): query separately per still-open upcoming plan
+            # step, not once against a single blended query -- see _plan_lookahead_query_texts' own
+            # docstring for why a merged blob dilutes the semantic half of the hybrid score. Degrades
+            # to item 3's exact original single-query behavior whenever there's only one open step.
+            lookahead_query_texts = _plan_lookahead_query_texts(
+                ctx.session, plan_phase, tool_retrieval_store.lookahead_steps(),
+            )
+            if lookahead_query_texts:
+                # Off the event loop thread -- shortlist_for's own query-embedding cache (agent/
+                # tools/tool_retrieval_store.py) makes a repeated call with unchanged task text a
+                # pure dict lookup, but the first call for a brand-new task text pays one real
+                # provider HTTP round trip, and shortlist_for_steps pays one such call per step
+                # looked ahead. Same reasoning _llm_complete already uses asyncio.to_thread for its
+                # own ctx.llm.complete call later this same turn -- a plain sync def must never block
+                # the shared event loop on network I/O.
+                retrieval_shortlist = await asyncio.to_thread(
+                    tool_retrieval_store.shortlist_for_steps,
+                    ctx.llm, lookahead_query_texts, plan_phase, _current_target_affinity_shape(ctx.session), tool_specs,
+                )
+        current_tool_specs = _apply_plan_recommendations(tool_specs, ctx.session, plan_phase, retrieval_shortlist) if plan_phase else tool_specs
         if weak_profile:
             trimmed = _truncate_tools_for_weak_model(current_tool_specs, terminal_tool)
             if len(trimmed) != len(current_tool_specs):
@@ -5899,17 +5990,138 @@ def _sync_exploit_plan_from_findings(ctx: RunContext, current_title: str | None 
 _LAST_LOGGED_PLAN_RECOMMENDATIONS: dict[tuple[str | None, str], frozenset[str]] = {}
 
 
-def _apply_plan_recommendations(tool_specs: list[ToolSpec], session: dict, phase: str) -> list[ToolSpec]:
-    """Reorders tool_specs so tools the model's own current plan (session["plan"]) already
-    recommended for phase's still-open tasks come first, with their description prefixed so the
-    model notices without needing to cross-reference the plan text itself. Never removes a tool —
-    only reorders and labels ones already present, matching this project's own rule that a tool the
-    model might still legitimately need is never hidden for efficiency alone (that's reserved for
-    a real scope/safety boundary — the subdomain-tools-when-not-enumerated exclusion in
-    _run_recon, or _tech_gate_blocked's hard skip for a confirmed-absent technology). A plan
-    recommendation is a steer, not a gate. A recommendation naming a tool that isn't in tool_specs
-    at all (out of this phase's category, or a name update_plan already dropped as unknown) is a
-    safe no-op — nothing to reorder, no error.
+def _current_target_affinity_shape(session: dict) -> str:
+    """The target_shape half of the tool-affinity index's (tool, target_shape, phase) key
+    (agent/tools/tool_affinity_store.py) -- reuses session["target_shape"] where it already exists
+    (RE mode's own detect_target_shape, agent/tools/builders/re_target.py), and falls back to a
+    coarse "web" bucket for a web-pentest session, which carries no target_shape field at all today
+    (recon_result is the one signal a web session always has). "unknown" only when neither is
+    present yet (a brand-new session before its first real tool call)."""
+    shape = session.get("target_shape")
+    if shape:
+        return str(shape)
+    return "web" if session.get("recon_result") else "unknown"
+
+
+def _matching_plan_phase_entry(session: dict, phase: str) -> dict | None:
+    """The plan's own entry for `phase`, if any. _apply_updated_plan's own replace-by-key
+    persistence (see that function's docstring) guarantees at most one entry per phase name in
+    session["plan"]["phases"] at a time, so this is a lookup, not a merge across entries -- shared
+    by _retrieval_query_text (item 3) and _plan_lookahead_query_texts (item 4) below, both of which
+    used to each walk this same list themselves. None before update_plan has ever been called for
+    this phase."""
+    phases = (session.get("plan") or {}).get("phases") or []
+    for phase_entry in phases:
+        if phase_entry.get("phase") == phase:
+            return phase_entry
+    return None
+
+
+def _retrieval_query_text(session: dict, phase: str) -> str:
+    """The free-text "what is this phase actually trying to do right now" query for the tool-
+    retrieval shortlist (agent/tools/tool_retrieval_store.py, item 3 of the tool-selection roadmap)
+    -- built from this phase's own still-open plan tasks/subtasks + rationale, the same source
+    _plan_task_addendum already reads for its own operator-facing addendum, just as plain prose
+    instead of that function's own status-bracket/tool-list formatting (noise that would only
+    dilute what gets embedded/keyword-matched here). Empty string when there's no plan yet for this
+    phase (the very first turn, before update_plan has ever been called) -- the caller treats that
+    as "nothing to retrieve against yet" and skips the retrieval call entirely rather than guessing
+    from no real task text at all.
+
+    Kept as its own single-blended-query helper (item 4's _plan_lookahead_query_texts below is the
+    multi-step upgrade, not a replacement) -- still a correct, independently useful "everything
+    open in this phase, as one string" view, and every one of its own existing tests here reads it
+    directly.
+    """
+    phase_entry = _matching_plan_phase_entry(session, phase)
+    if not phase_entry:
+        return ""
+    parts: list[str] = []
+    if phase_entry.get("rationale"):
+        parts.append(str(phase_entry["rationale"]))
+    for task in phase_entry.get("tasks") or []:
+        if task.get("status") != "done":
+            parts.append(str(task.get("text") or ""))
+        for subtask in task.get("subtasks") or []:
+            if subtask.get("status") != "done":
+                parts.append(str(subtask.get("text") or ""))
+    return " ".join(p for p in parts if p).strip()
+
+
+def _plan_lookahead_query_texts(session: dict, phase: str, max_steps: int) -> list[str]:
+    """Per-step query texts for the item-4 multi-step retrieval shortlist
+    (agent/tools/tool_retrieval_store.py's shortlist_for_steps) -- one entry per still-open TASK
+    (a task is this plan's own atomic "step": update_plan's own docstring draws the phase -> task ->
+    subtask split, a task is "a real, concrete unit of work", its subtasks are what realize it) in
+    `phase`'s current plan, in the SAME order the model itself laid them out, capped to `max_steps`
+    so looking further ahead costs a bounded number of extra query embeddings, never an unbounded
+    one (agent/tools/tool_retrieval_store.py's lookahead_steps(), env-configured).
+
+    This is the TOOLQP fix for the classic single-query miss: _retrieval_query_text (item 3) already
+    merges every open task in the phase into ONE blended query string, which keeps keyword coverage
+    (every open task's words are still present in that merged bag of tokens) but dilutes the
+    SEMANTIC half of the hybrid score -- one averaged embedding for "enumerate the attack surface
+    AND test for SQLi AND check for XSS" scores moderately against every one of those tools' own
+    vectors and strongly against none, so a tool only a LATER step genuinely needs can still lose
+    out to whichever open task's wording happens to dominate that single blended vector. Querying
+    each open step SEPARATELY keeps each step's own embedding sharp, so a later step's tool is
+    retrieved on that step's own text, not averaged away by an earlier one's.
+
+    Each step's own text is its task's text plus its own still-open subtasks' text (the exact same
+    status != "done" filter _retrieval_query_text already applies at both levels) -- a task already
+    fully "done" is skipped outright (nothing left in it to retrieve tools for). The phase's own
+    rationale is prefixed to every step's text, not just the first, so each per-step query still
+    carries the phase's overall intent alongside that one task's narrower wording. Returns [] with
+    no plan yet for this phase, or once every task in it is done -- the caller treats that exactly
+    like _retrieval_query_text's own empty-string case and skips the retrieval call entirely.
+    """
+    phase_entry = _matching_plan_phase_entry(session, phase)
+    if not phase_entry:
+        return []
+    rationale = str(phase_entry.get("rationale") or "")
+    steps: list[str] = []
+    for task in phase_entry.get("tasks") or []:
+        if task.get("status") == "done":
+            continue
+        task_parts = [str(task.get("text") or "")]
+        for subtask in task.get("subtasks") or []:
+            if subtask.get("status") != "done":
+                task_parts.append(str(subtask.get("text") or ""))
+        step_text = " ".join(p for p in (rationale, *task_parts) if p).strip()
+        if step_text:
+            steps.append(step_text)
+        if len(steps) >= max_steps:
+            break
+    return steps
+
+
+def _apply_plan_recommendations(
+    tool_specs: list[ToolSpec],
+    session: dict,
+    phase: str,
+    retrieval: tuple[list[str], dict[str, str]] | None = None,
+) -> list[ToolSpec]:
+    """Reorders tool_specs so tools either (a) the model's own current plan (session["plan"])
+    already recommended for phase's still-open tasks, (b) this session's learned tool-affinity
+    history (agent/tools/tool_affinity_store.py, item 1/2 of the tool-selection roadmap) ranks well
+    for this (target_shape, phase), or (c) the retrieval shortlist (agent/tools/
+    tool_retrieval_store.py, item 3) matched the phase's current task text -- come first, with
+    their description prefixed so the model notices without needing to cross-reference the plan
+    text itself. Never removes a tool — only reorders and labels ones already present, matching
+    this project's own rule that a tool the model might still legitimately need is never hidden for
+    efficiency alone (that's reserved for a real scope/safety boundary — the
+    subdomain-tools-when-not-enumerated exclusion in _run_recon, or _tech_gate_blocked's hard skip
+    for a confirmed-absent technology). All three of (a)/(b)/(c) are steers, never gates. A
+    recommendation naming a tool that isn't in tool_specs at all (out of this phase's category, or
+    a name update_plan already dropped as unknown) is a safe no-op — nothing to reorder, no error.
+
+    retrieval is the caller's already-computed (names, reasons) pair from
+    tool_retrieval_store.shortlist_for — computed by the caller (off the event loop thread, via
+    asyncio.to_thread, since it may embed a query against the active LLM provider) rather than
+    inside this function, so this function itself stays the same cheap, synchronous, "called every
+    single turn" reorder it always was. None (the default) means no retrieval signal this call —
+    every existing caller/test that never passes it keeps the exact pre-item-3 (a)/(b)-only
+    behavior, unchanged.
 
     Race condition, by design not by oversight: this reads session["plan"] fresh every call, so if
     update_plan runs mid-turn (one of several tool calls in the same batch), the tool_specs already
@@ -5922,7 +6134,7 @@ def _apply_plan_recommendations(tool_specs: list[ToolSpec], session: dict, phase
     the task level.
     """
     phases = (session.get("plan") or {}).get("phases") or []
-    recommended: set[str] = set()
+    model_recommended: set[str] = set()
     for phase_entry in phases:
         if phase_entry.get("phase") != phase:
             continue
@@ -5930,11 +6142,39 @@ def _apply_plan_recommendations(tool_specs: list[ToolSpec], session: dict, phase
             for subtask in task.get("subtasks") or []:
                 if subtask.get("status") == "done":
                     continue  # a finished subtask's own recommendation no longer needs pushing forward
-                recommended.update(subtask.get("recommended_tools") or [])
+                model_recommended.update(subtask.get("recommended_tools") or [])
+
+    # (b) learned tool-affinity ranking, blended in alongside (a) above -- never replacing it.
+    candidate_names = {spec.name for spec in tool_specs}
+    affinity_names, affinity_reasons = tool_affinity_store.recommended_tools_for(
+        _current_target_affinity_shape(session), phase, candidate_names,
+    )
+    # (c) retrieval shortlist, blended in alongside (a)/(b) -- never replacing either.
+    retrieval_names, retrieval_reasons = retrieval or ([], {})
+    recommended = model_recommended | set(affinity_names) | set(retrieval_names)
     if not recommended:
         return tool_specs
 
-    promoted = [replace(spec, description=f"[Plan-recommended] {spec.description}") for spec in tool_specs if spec.name in recommended]
+    def _label(spec: ToolSpec) -> str:
+        tags = []
+        if spec.name in model_recommended:
+            tags.append("Plan-recommended")
+        if spec.name in affinity_names:
+            tags.append(affinity_reasons.get(spec.name, "learned tool affinity"))
+        if spec.name in retrieval_names:
+            tags.append(retrieval_reasons.get(spec.name, "retrieval shortlist match"))
+        return f"[{' | '.join(tags)}] {spec.description}"
+
+    # Model-recommended tools sort ahead of affinity/retrieval-only promotions (within each group,
+    # original tool_specs/registry order is kept) -- the model's own explicit, in-the-moment plan is
+    # the primary signal, the learned/retrieved ranking is a secondary nudge layered on top of it,
+    # not an equal-weight shuffle. Without this split, a cold-start/exploration/retrieval promotion
+    # could easily land ahead of the model's own pick purely by registry ordering coincidence.
+    secondary = (set(affinity_names) | set(retrieval_names)) - model_recommended
+    promoted = (
+        [replace(spec, description=_label(spec)) for spec in tool_specs if spec.name in model_recommended]
+        + [replace(spec, description=_label(spec)) for spec in tool_specs if spec.name in secondary]
+    )
     rest = [spec for spec in tool_specs if spec.name not in recommended]
     if promoted:
         promoted_names = frozenset(spec.name for spec in promoted)
@@ -5947,8 +6187,9 @@ def _apply_plan_recommendations(tool_specs: list[ToolSpec], session: dict, phase
         if _LAST_LOGGED_PLAN_RECOMMENDATIONS.get(cache_key) != promoted_names:
             _LAST_LOGGED_PLAN_RECOMMENDATIONS[cache_key] = promoted_names
             logger.debug(
-                "core: session=%s plan recommends %d tool(s) for phase=%s: %s",
+                "core: session=%s plan+affinity+retrieval recommends %d tool(s) for phase=%s: %s (model=%s, affinity=%s, retrieval=%s)",
                 session.get("session_id"), len(promoted), phase, [spec.name for spec in promoted],
+                sorted(model_recommended), sorted(affinity_names), sorted(retrieval_names),
             )
     return promoted + rest
 
@@ -6171,6 +6412,25 @@ def _resolve_hypothesis(ctx: RunContext, resolved: dict, phase: str, target_hypo
     resolving_tool = resolved.get("resolving_tool")
     if resolving_tool:
         _append_tool_timeline(match, [{"tool": resolving_tool, "stage": "verification"}])
+        try:
+            affinity_shape = _current_target_affinity_shape(ctx.session)
+            affinity_phase = ctx.current_plan_phase or "unscoped"
+            if match["status"] == "confirmed":
+                # Class 1 (tool-selection roadmap item 2): a hypothesis CONFIRMED by this tool is
+                # real signal that advanced the objective, same credit a record_finding's own
+                # tool_timeline gets via _credit_tool_affinity_for_finding.
+                tool_affinity_store.upgrade_to_success(resolving_tool, affinity_shape, affinity_phase, ctx.session_id)
+            elif match["status"] == "ruled_out":
+                # Class 2, item 2's own central nuance: a clean, conclusive rule-out is a POSITIVE
+                # engagement outcome, NOT a strike against the tool -- it was already recorded as a
+                # neutral null_result at dispatch time (_track_tool_affinity), nothing further to
+                # do here except make that decision explicit and auditable in the debug trail.
+                logger.debug(
+                    "core: session=%s tool_affinity: resolving_tool=%r cleanly ruled out hypothesis id=%s -- "
+                    "kept as a neutral null_result, not a failure", ctx.session_id, resolving_tool, match["id"],
+                )
+        except Exception:
+            logger.debug("core: session=%s _resolve_hypothesis tool-affinity credit failed, skipping", ctx.session_id, exc_info=True)
     # session["past_hypothesis_outcomes"] is this lineage's own cross-rescan memory of hypotheses,
     # the counterpart to _run_reverify's past_reverification_outcomes -- never reset, carried forward
     # by every one of main.py's rescan routes, read back by
@@ -6384,6 +6644,7 @@ async def _persist_new_finding(ctx: RunContext, recorded: dict) -> dict | None:
     _credit_playbook_for_finding(ctx.session)
     _maybe_capture_playbook_entry(ctx, recorded)
     _credit_tool_memory_for_finding(ctx, recorded)
+    _credit_tool_affinity_for_finding(ctx, recorded)
     # Reload-merge-save (_reload_merge_save above), not a blind save_session(ctx.session_id,
     # ctx.session) -- ctx.session can be a long-lived in-memory snapshot (a whole RE triage pass, a
     # deep dive) that predates a concurrent writer's own fresh-load-append-save (e.g. the session's
@@ -8334,6 +8595,26 @@ def _credit_tool_memory_for_finding(ctx: RunContext, finding: dict) -> None:
         tool_memory_store.credit_tool_run(fingerprint_key, tool_names)
     except Exception:
         logger.debug("core: session=%s _credit_tool_memory_for_finding failed, skipping this update", ctx.session_id, exc_info=True)
+
+
+def _credit_tool_affinity_for_finding(ctx: RunContext, finding: dict) -> None:
+    """The tool_affinity_store counterpart to _credit_tool_memory_for_finding just above -- same
+    tool_timeline source, upgrades each contributing tool from its provisional null_result to a
+    real class-1 success (tool-selection roadmap item 2) for the CURRENT (target_shape, phase)
+    key. Called alongside it at every site that touches a finding, for the same reason:
+    tool_timeline genuinely grows over a finding's lifecycle, so crediting at each touch point lets
+    whichever tools actually contributed get real, incremental credit.
+    """
+    tool_names = {entry.get("tool") for entry in (finding.get("tool_timeline") or []) if entry.get("tool")}
+    if not tool_names:
+        return
+    try:
+        target_shape = _current_target_affinity_shape(ctx.session)
+        phase = ctx.current_plan_phase or "unscoped"
+        for tool_name in tool_names:
+            tool_affinity_store.upgrade_to_success(tool_name, target_shape, phase, ctx.session_id)
+    except Exception:
+        logger.debug("core: session=%s _credit_tool_affinity_for_finding failed, skipping this update", ctx.session_id, exc_info=True)
 
 
 def _capture_re_playbook_entry(ctx: RunContext, finding: dict) -> None:
@@ -10321,6 +10602,7 @@ async def _run_exploit(ctx: RunContext, target: str) -> None:
             _append_tool_timeline(finding, _extract_tool_timeline_entries(trace, "exploitation"))
             _maybe_capture_playbook_entry(ctx, finding)
             _credit_tool_memory_for_finding(ctx, finding)
+            _credit_tool_affinity_for_finding(ctx, finding)
         else:
             _apply_skip_outcome(finding, action or {"reasoning": "Exploit phase produced no parseable decision"})
 
@@ -10859,6 +11141,7 @@ async def run_focused_exploit(session_id: str, finding_title: str, provider_id: 
             _append_tool_timeline(finding, _extract_tool_timeline_entries(trace, "exploitation"))
             _maybe_capture_playbook_entry(ctx, finding)
             _credit_tool_memory_for_finding(ctx, finding)
+            _credit_tool_affinity_for_finding(ctx, finding)
         else:
             _apply_skip_outcome(finding, action or {"reasoning": "Deep dive produced no parseable decision"})
         logger.debug("run_focused_exploit: session=%s finding=%r resolved exploited=%s", session_id, finding_title, finding.get("exploited"))
@@ -12594,6 +12877,29 @@ async def _run_playbook_distillation_pass(ctx: RunContext) -> None:
         _playbook_logger.debug("core: session=%s playbook auto-pruned %d low-value entr(y/ies)", ctx.session_id, pruned)
 
 
+def _run_tool_affinity_maintenance_pass(ctx: RunContext) -> None:
+    """Item 6 of the tool-selection roadmap: the periodic self-maintenance pass over
+    agent/tools/tool_affinity_store.py's own store (prune degrading/stale records, consolidate
+    consistently-strong ones -- see tool_affinity_store.run_maintenance_pass's own docstring for
+    exactly what each action means and why it's distinct from _staleness_decay's existing
+    per-read fade). Deliberately called from the SAME place _run_playbook_distillation_pass is,
+    right above -- reusing that already-established "amortized, once per pipeline pass" cadence
+    rather than standing up a second, separately-scheduled maintenance mechanism for what is,
+    structurally, the exact same kind of job (a learned index keeping itself clean over time).
+
+    Unlike the playbook pass above, this is pure local JSON read/write with no LLM call -- no
+    `await` needed, and run_maintenance_pass itself never raises (same posture as every other
+    tool_affinity_store public function), so this is intentionally not wrapped in its own
+    try/except here.
+    """
+    result = tool_affinity_store.run_maintenance_pass()
+    if result.get("pruned") or result.get("consolidated"):
+        logger.debug(
+            "core: session=%s tool-affinity maintenance pass pruned=%d consolidated=%d",
+            ctx.session_id, result.get("pruned", 0), result.get("consolidated", 0),
+        )
+
+
 VALID_ENTRY_POINTS = {"recon", "analyze", "exploit"}
 
 
@@ -12914,6 +13220,7 @@ async def run_session(
             # report, not just the ones that existed before it ran.
             await _run_skeptical_verification(ctx)
             await _run_playbook_distillation_pass(ctx)
+            _run_tool_affinity_maintenance_pass(ctx)
 
             # _time_budget_pass_is_a_repeat has a real side effect (updates the stall-tracking
             # field) -- short-circuit `or` is what keeps it from running at all once time is already

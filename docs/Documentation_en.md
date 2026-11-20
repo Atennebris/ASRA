@@ -104,6 +104,41 @@ a per-session approval click in the UI instead.
   didn't personally author — imported, or distilled from an uploaded document — is treated as
   untrusted, starts unreviewed, and runs only inside the same sandbox as other model-written code;
   its body is hash-pinned, so a tampered or out-of-band-edited body is refused until re-vetted.
+- **Learned tool recommendations** — separately from the skill library above, ASRA also tracks
+  *which tool* is worth reaching for: a cross-session record of how often each tool actually ran
+  usefully for a given target shape + phase (recon/analyze/exploit). A real success and a clean,
+  conclusive "not vulnerable here" both count as the tool doing its job — only a genuine execution
+  failure (crash, timeout, rejected input) counts against it, so a scanner is never penalized for
+  correctly ruling something out. This blends into the agent's own tool recommendations as a soft
+  nudge (never a hard restriction — every tool stays fully callable), falls back to a small curated
+  default per target shape before any history exists, and always keeps a little room for an
+  under-tried tool so one early winner can't permanently crowd out a better alternative later.
+  Playbook → **Learned tool recommendations** shows the live picture with a one-line reason behind
+  each entry, and you can mark any row **trusted** or **irrelevant** to override the learned score
+  yourself at any time. The index also self-maintains: a short periodic pass (run from the same
+  point in the pipeline the skill library's own distillation pass runs from) prunes records that
+  are both consistently failing and long stale, and stamps a "confirmed stable" note on records
+  with enough history of consistently running usefully — no manual cleanup needed either way.
+- **Tool-retrieval shortlist** — with 40+ registered tools, handing the model the WHOLE registry on
+  every turn measurably hurts its own tool choice (the well-known "tool explosion" effect — more
+  candidates, worse pick accuracy). Instead, each phase's current open task text is matched against
+  every tool's own purpose by a hybrid of meaning (semantic embedding, reusing the exact same
+  embedder/model the playbook's own semantic search already uses) and plain keyword/name overlap —
+  pure meaning-only matching alone is measurably weaker for tool retrieval specifically, so both
+  halves always run together. The resulting compact top-K shortlist blends into the same
+  recommendation surface as the learned tool recommendations above — a soft nudge, never a
+  restriction: a tool outside the shortlist is always still fully callable by name. This also looks
+  AHEAD, not only at the phase's single current step: it queries separately against each of the
+  plan's own next few still-open steps (in the order the agent itself laid them out) and merges the
+  results, so a tool a later step will need is already shortlisted before that step's own turn
+  arrives, instead of only once it's too late to matter — a step closer to now still outranks one
+  further out, and the merge stays capped so looking further ahead widens the search, never the
+  final menu size. Each candidate's own registered category is also bucketed into a coarse
+  web/binary shape and compared against the current target's shape, so a narrow-shape task (e.g.
+  reverse-engineering a `pe_x86_64` binary) gets a nudge toward tools built for that world instead
+  of being diluted by unrelated web-tool keyword/meaning overlap — never an exclusion, just a
+  lighter weight for a genuine mismatch. No separate UI; it's observable live in the debug log
+  (`DEBUG=true`) alongside every other agent-reasoning step.
 - **Real credential brute-forcing, without blocking the agent** — Hydra (SSH/FTP/telnet/
   MySQL/PostgreSQL/RDP/SMB) and a purpose-built CSRF-aware web-login brute-forcer both run as real
   background jobs: `hydra_start`/`web_login_bruteforce_start` return immediately with a job ID, and

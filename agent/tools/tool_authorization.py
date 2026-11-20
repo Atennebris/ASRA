@@ -4,8 +4,12 @@ default-deny rule.
 
 Recognized means exactly one of:
 - the very ToolSpec object registered in TOOL_REGISTRY under that name (built-in and
-  autodiscovered tools). Identity, not just a matching name: a spec that merely reuses a
-  registered name carries its own code and must not inherit the registered tool's trust;
+  autodiscovered tools), OR a copy of it that differs ONLY in `description`
+  (`_is_description_only_relabel` below) -- the one cosmetic transform `agent/core.py`'s
+  `_apply_plan_recommendations` performs when it promotes a model-/tool-affinity-recommended tool
+  (`dataclasses.replace(registered, description=...)`). Every other field, especially
+  `native_function`, is still compared exactly: a spec that merely reuses a registered name but
+  carries different code must not inherit the registered tool's trust;
 - an operator-registered custom tool (Settings -> Tools -> Custom tools) that is still enabled,
   with the same id/name/path the spec was minted from -- disabling it takes effect immediately,
   even for a tool set already handed to the model earlier in the same run.
@@ -22,6 +26,7 @@ replaces, the per-call gates (scope/allowlist, approval tiers, egress kill-switc
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from functools import partial
 
 from agent.tools.custom_tool_runtime import run_registered_custom_tool
@@ -61,6 +66,32 @@ def _operator_allowed_external_tools() -> set[str]:
     return {name.strip() for name in raw.split(",") if name.strip()}
 
 
+def _is_description_only_relabel(spec: ToolSpec, registered: ToolSpec) -> bool:
+    """True when `spec` differs from the canonical `registered` ToolSpec ONLY in `description` --
+    exactly the shape `agent/core.py`'s `_apply_plan_recommendations` produces when it promotes a
+    model-recommended or learned-tool-affinity-recommended tool
+    (`dataclasses.replace(registered, description=f"[...] {registered.description}")`, prefixing
+    the model-facing description so the operator/model sees WHY a tool was promoted).
+
+    This does NOT relax the "a spec that merely reuses a registered name must not inherit the
+    registered tool's trust" invariant above -- every OTHER field, especially `native_function`/
+    `executable`/`build_command`/`tool_tier`, must still match the registered tool byte-for-byte
+    (via `ToolSpec`'s own generated dataclass equality, so a different function object -- even one
+    with identical behavior -- still correctly fails this and stays refused). It only recognizes
+    this one specific, narrow, cosmetic transform the codebase's own promotion mechanism performs,
+    not "same name, plausible-looking tool" in general.
+
+    Real, confirmed bug this fixes: before this, ANY tool `_apply_plan_recommendations` promoted
+    became permanently undispatchable the instant the model actually tried to call it -- the
+    relabeled copy always failed the `registered is spec` identity check below, wrongly refused as
+    "not ASRA's own registered tool of that name" even though its code was identical to the real
+    tool's. Caught by the tool-affinity index's own self-check (its cold-start/exploration
+    promotion fires far more often than the plan-recommendation path alone ever did, reaching this
+    latent break for the first time).
+    """
+    return spec is not registered and replace(spec, description=registered.description) == registered
+
+
 def _is_enabled_custom_tool(spec: ToolSpec) -> bool:
     executor = spec.native_function
     if not (isinstance(executor, partial) and executor.func is run_registered_custom_tool):
@@ -88,7 +119,7 @@ def unrecognized_tool_reason(spec: ToolSpec) -> str | None:
             )
         logger.debug("tool authorization: external tool %r explicitly allowed via ASRA_ALLOWED_EXTERNAL_TOOLS", name)
     registered = get_tool(name)
-    if registered is spec or _is_enabled_custom_tool(spec):
+    if registered is spec or _is_enabled_custom_tool(spec) or (registered is not None and _is_description_only_relabel(spec, registered)):
         return None
     if registered is not None:
         return (
