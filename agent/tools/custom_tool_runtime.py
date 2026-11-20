@@ -114,6 +114,20 @@ def run_registered_custom_tool(params: dict, *, record: dict) -> dict:
     return result
 
 
+def _is_available(path: str) -> bool:
+    """Real existence check for availability_check below -- deliberately also requires `path` to be
+    absolute, not just os.path.isfile(path) on its own. A relative path can look "available" here
+    purely by accident of this SERVER process's own current working directory at check time, yet
+    run_registered_custom_tool above always executes through run_sandboxed with cwd=<session-scoped
+    scratch dir> -- never this server's cwd -- so a relative path can structurally never resolve at
+    call time regardless of what this check sees. add_custom_tool (custom_tools_store.py) already
+    rejects a relative path on new registrations; this is the backstop for a record written before
+    that check existed, so it's excluded from the model's toolset instead of looking available and
+    failing on every single call.
+    """
+    return Path(path).is_absolute() and os.path.isfile(path)
+
+
 def _mint_toolspec(record: dict) -> ToolSpec:
     path = record["path"]
     return ToolSpec(
@@ -133,8 +147,9 @@ def _mint_toolspec(record: dict) -> ToolSpec:
         # A tier-1 tool is normally ALWAYS "installed" (runner.py's tool_is_installed) -- wrong
         # here: the operator can move/delete the real binary after registering it. Real existence
         # check, same purpose ToolSpec.availability_check's own docstring describes for exactly
-        # this "tier-1 wrapper with a real external dependency" shape.
-        availability_check=partial(os.path.isfile, path),
+        # this "tier-1 wrapper with a real external dependency" shape. See _is_available above for
+        # why this also checks absoluteness, not just file existence.
+        availability_check=partial(_is_available, path),
     )
 
 

@@ -110,6 +110,31 @@ def test_refuted_verdict_downgrades_verification_but_keeps_the_finding(tmp_path,
     assert findings[0]["skeptical_verification_note"] == "re-ran the exact same login, got 401 not 200"
 
 
+def test_refuted_verdict_drops_a_stale_false_positive_reason(tmp_path, monkeypatch):
+    """A finding only reaches this phase while verification=="verified", so a false_positive_reason
+    on it already is stale by definition (e.g. left over from an earlier, since-corrected auto-
+    record). A "refuted" verdict pulls the finding back INTO needs_verification -- it must not also
+    leave a contradictory "settled false positive" marker standing, since every consumer of
+    false_positive_reason elsewhere in the codebase treats its mere presence as a closed case."""
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+
+    findings = [{
+        "title": "Misread finding", "severity": "Critical", "verification": "verified", "evidence_ref": "ref-a",
+        "false_positive_reason": "stale: previously ruled out",
+    }]
+    llm = _ScriptedLLM([("record_skeptical_verification_result", {
+        "verdict": "refuted", "reasoning": "re-ran the exact same login, got 401 not 200",
+        "evidence_ref": "authenticated_request returned status_code=401",
+    })])
+    ctx = RunContext(llm=llm, session=_make_session(findings), session_id="usr_skeptical_test")
+
+    _run(_run_skeptical_verification(ctx))
+
+    assert findings[0]["verification"] == "needs_verification"
+    assert not findings[0].get("false_positive_reason")
+
+
 def test_inconclusive_verdict_leaves_verification_untouched(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")

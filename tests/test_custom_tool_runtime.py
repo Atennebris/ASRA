@@ -62,6 +62,21 @@ def test_mint_toolspec_availability_check_reflects_real_file_existence(tmp_path)
     assert missing_spec.availability_check() is False
 
 
+def test_mint_toolspec_availability_check_rejects_a_relative_path_even_if_a_same_named_file_exists(tmp_path, monkeypatch):
+    """A relative-path record (e.g. a pre-fix legacy registration) must never look "available"
+    just because a same-named file happens to exist relative to whatever this process's cwd is at
+    check time -- run_registered_custom_tool always executes through run_sandboxed with a
+    session-scoped scratch cwd, never this one, so a relative path can structurally never resolve
+    at call time regardless of what a bare os.path.isfile(path) would report here."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "toolroot").mkdir()
+    (tmp_path / "toolroot" / "mycustombin").write_text("#!/bin/sh\n")
+
+    spec = ctr._mint_toolspec(_record(path="toolroot/mycustombin"))
+
+    assert spec.availability_check() is False
+
+
 def test_mint_toolspec_parameters_schema_is_none_so_it_falls_back_to_the_generic_shape():
     """None -> agent/core.py's _tool_to_openai_schema falls back to _GENERIC_DISCOVERED_SCHEMA
     (target + extra_args), the same shape every autodiscovered tool already uses."""

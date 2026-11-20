@@ -56,6 +56,20 @@ def test_add_custom_tool_rejects_an_unknown_category(tmp_path, monkeypatch):
         assert "category" in str(exc)
 
 
+def test_add_custom_tool_rejects_a_relative_path(tmp_path, monkeypatch):
+    """Real, confirmed incident: a relative path registration looks fine at mint time but can
+    never actually run -- run_registered_custom_tool executes through run_sandboxed with
+    cwd=<session-scoped scratch dir>, never this server's own cwd, so a relative path has no
+    directory left to resolve against once the tool is actually called."""
+    _isolate(tmp_path, monkeypatch)
+    try:
+        cts.add_custom_tool(name="mytool", path="toolroot/mytool", description="", requires_target=True, category="recon")
+        assert False, "expected a ValueError for the relative path"
+    except ValueError as exc:
+        assert "absolute" in str(exc)
+    assert cts.load_custom_tools() == []
+
+
 def test_post_exploit_is_not_a_choosable_category():
     """Real, confirmed gap this guards against: nothing in agent/core.py/agent/chat.py ever
     queries get_tools_by_category("post_exploit") directly -- a custom tool registered under that

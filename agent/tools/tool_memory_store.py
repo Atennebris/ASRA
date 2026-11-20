@@ -13,6 +13,7 @@ this module never inspects it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -24,6 +25,18 @@ from projects.paths import resolve_global_app_dir
 logger = get_logger("TOOLS")
 
 TOOL_MEMORY_STORE_PATH = resolve_global_app_dir() / "data" / "tool_memory" / "tool_outcomes.json"
+
+
+def _key_preview(fingerprint_key: str) -> str:
+    """A short, stable stand-in for `fingerprint_key` in debug logs. The real key is a JSON dump of
+    every tech/WAF keyword detected so far this session (agent/core.py's _playbook_fingerprint_key)
+    -- it only grows as recon finds more of the stack, and was confirmed live reaching ~900 characters
+    by mid-session, repeated near-verbatim (just a bumped times_run) on every single scan-tool call.
+    A short hash still lets two log lines be compared for "same fingerprint" at a glance without
+    bloating debug.log with the same near-900-char string hundreds of times per session.
+    """
+    digest = hashlib.sha1(fingerprint_key.encode("utf-8")).hexdigest()[:10]
+    return f"{digest} ({len(fingerprint_key)} chars)"
 
 _VALID_OUTCOMES = ("productive", "empty", "failed")
 
@@ -108,7 +121,7 @@ def record_tool_run(fingerprint_key: str, tool: str, outcome: str, session_id: s
         if session_id not in source_sessions:
             source_sessions.append(session_id)
         _write_tool_memory_store(store)
-        logger.debug("record_tool_run: bumped existing entry under key=%r tool=%r (times_run=%d)", fingerprint_key, tool, existing["times_run"])
+        logger.debug("record_tool_run: bumped existing entry under key=%s tool=%r (times_run=%d)", _key_preview(fingerprint_key), tool, existing["times_run"])
         return existing.get("id")
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -123,7 +136,7 @@ def record_tool_run(fingerprint_key: str, tool: str, outcome: str, session_id: s
     }
     entries.append(entry)
     _write_tool_memory_store(store)
-    logger.debug("record_tool_run: new entry under key=%r tool=%r outcome=%r", fingerprint_key, tool, outcome)
+    logger.debug("record_tool_run: new entry under key=%s tool=%r outcome=%r", _key_preview(fingerprint_key), tool, outcome)
     return entry["id"]
 
 

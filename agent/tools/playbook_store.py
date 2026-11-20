@@ -25,6 +25,17 @@ from projects.paths import resolve_global_app_dir
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
+
+def _key_preview(fingerprint_key: str) -> str:
+    """A short, stable stand-in for `fingerprint_key` in debug logs -- same reasoning and shape as
+    agent/tools/tool_memory_store.py's own _key_preview (confirmed live: the real key grows to
+    ~900 characters by mid-session and was being logged in full, near-verbatim, on nearly every
+    scan-tool call). Duplicated rather than imported -- this module's own docstring is explicit
+    about staying a self-contained sibling of tool_memory_store.py, not importing from it.
+    """
+    digest = hashlib.sha1(fingerprint_key.encode("utf-8")).hexdigest()[:10]
+    return f"{digest} ({len(fingerprint_key)} chars)"
+
 # A payload template is a proven payload with its target-specific bits lifted out into {{placeholder}}
 # slots (e.g. {{target}}, {{param}}, {{host}}), so it drops straight onto the next similar target.
 _TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
@@ -293,11 +304,11 @@ def record_technique(fingerprint_key: str, entry: dict) -> str | None:
         if existing.get("confidence") == "unreviewed" and entry.get("source_type") == "live":
             existing["confidence"] = "confirmed"
             logger.debug("record_technique: auto-confirmed previously-unreviewed entry id=%s via live capture", existing.get("id"))
-        logger.debug("record_technique: bumped existing entry under key=%r (times_confirmed=%d)", fingerprint_key, existing["times_confirmed"])
+        logger.debug("record_technique: bumped existing entry under key=%s (times_confirmed=%d)", _key_preview(fingerprint_key), existing["times_confirmed"])
         _write_playbook_store(store)
         return existing.get("id")
     entries.append(entry)
-    logger.debug("record_technique: new entry under key=%r technique=%r", fingerprint_key, entry.get("technique"))
+    logger.debug("record_technique: new entry under key=%s technique=%r", _key_preview(fingerprint_key), entry.get("technique"))
     _write_playbook_store(store)
     return entry.get("id")
 
@@ -354,7 +365,7 @@ def replace_technique_entries(fingerprint_key: str, entries: list[dict]) -> None
     else:
         store.pop(fingerprint_key, None)
     _write_playbook_store(store)
-    logger.debug("replace_technique_entries: key=%r now has %d entry(ies)", fingerprint_key, len(entries))
+    logger.debug("replace_technique_entries: key=%s now has %d entry(ies)", _key_preview(fingerprint_key), len(entries))
 
 
 def _decay_halflife_days() -> float:

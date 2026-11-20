@@ -1081,8 +1081,34 @@ def subdomain_enum(params: dict) -> dict:
     }
 
 
+def _ensure_url_scheme(target: str) -> str:
+    """A 1-Step Retry correction sometimes "fixes" an unrelated error by stripping a URL's scheme
+    entirely (confirmed live, mail.kiwi.com SSL-EOF retries) -- httpx then raises a deterministic,
+    unrecoverable InvalidURL for the exact same host that just failed for a real reason, turning one
+    real error into a worse one no further correction can fix. Defaulting a schemeless target to
+    https:// (the overwhelmingly common case for a live web target) fixes this at the tool itself
+    instead of hoping the correction model infers that a scheme is mandatory from a bare schema hint.
+    """
+    if not urlsplit(target).scheme:
+        return f"https://{target}"
+    return target
+
+
+def _nxdomain_result(url: str, exc: httpx.HTTPError) -> dict | None:
+    """The shared negative-result shape for a genuine NXDOMAIN -- factored out after the same
+    check was hand-copied into http_request and web_fetch independently while every other native
+    tool that fetches params["target"] directly kept falling into the generic, always-retryable
+    status="error" branch for an unfixable DNS failure. Returns None for anything else (a real
+    TCP-level failure, a timeout, a resolver hiccup) so the caller's own generic error path still
+    runs unchanged.
+    """
+    if _is_nxdomain_errno(_dns_resolution_errno(exc)):
+        return {"status": "ok", "resolved": False, "note": f"{url} does not resolve (no such host) — a real, negative result, not a tool failure"}
+    return None
+
+
 def http_request(params: dict) -> dict:
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     # Real, confirmed incident this fixes: the schema accepted (and a model correctly tried to
     # set) follow_redirects=False to test an open-redirect PoC against a deliberately
     # non-resolving redirect target, but the client below unconditionally hardcoded True — the
@@ -1132,11 +1158,9 @@ def http_request(params: dict) -> dict:
         # 1-Step Retry (no corrected URL/argument makes a nonexistent hostname resolve) before this
         # fix; without it, http_request's DNS failures fell straight into the generic
         # status="error" branch below with no NXDOMAIN-awareness at all.
-        if _is_nxdomain_errno(_dns_resolution_errno(exc)):
-            return {
-                "status": "ok", "resolved": False,
-                "note": f"{url} does not resolve (no such host) — a real, negative result, not a tool failure",
-            }
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     security_headers = {h: resp.headers.get(h) for h in _SECURITY_HEADERS_CHECKLIST if h in resp.headers}
@@ -1297,7 +1321,7 @@ _SENSITIVE_PATHS = [
 
 
 def common_exposure_scan(params: dict) -> dict:
-    base_url = params["target"].rstrip("/")
+    base_url = _ensure_url_scheme(params["target"]).rstrip("/")
 
     exposed = []
     try:
@@ -1343,7 +1367,7 @@ def api_schema_discovery(params: dict) -> dict:
     from — a field-level authz check or a batching probe is only as good as the field name/args
     it's actually pointed at, never a guess.
     """
-    base_url = params["target"].rstrip("/")
+    base_url = _ensure_url_scheme(params["target"]).rstrip("/")
     graphql_endpoints = []
     openapi_specs = []
 
@@ -1401,11 +1425,14 @@ def api_schema_discovery(params: dict) -> dict:
 
 
 def favicon_hash(params: dict) -> dict:
-    base_url = params["target"].rstrip("/")
+    base_url = _ensure_url_scheme(params["target"]).rstrip("/")
     try:
         with httpx.Client(timeout=8.0, follow_redirects=True, **_target_client_kwargs(params)) as client:
             resp = _with_hard_deadline(lambda: client.get(base_url + "/favicon.ico"), 8.0)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(base_url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     if resp.status_code != 200 or not resp.content:
@@ -1437,11 +1464,16 @@ _SECURITY_HEADERS_CHECKLIST = [
 
 
 def security_headers_audit(params: dict) -> dict:
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     try:
         with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True, **_target_client_kwargs(params)) as client:
             resp = _with_hard_deadline(lambda: client.get(url), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        # Same unfixable-DNS treatment as http_request/web_fetch -- confirmed live gap: this tool
+        # fell straight into the generic status="error" branch with no NXDOMAIN-awareness at all.
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     return {
@@ -1545,7 +1577,7 @@ def cors_check(params: dict) -> dict:
     allows_credentials is True here, cors_credentialed_check can attempt the real credentialed
     cross-origin read as concrete proof, not just an inference from these headers.
     """
-    target = params["target"]
+    target = _ensure_url_scheme(params["target"])
     hostname = urlsplit(target).hostname or ""
     same_suffix_origin = f"https://{uuid.uuid4().hex[:10]}.{hostname}"
 
@@ -1598,7 +1630,7 @@ def cors_credentialed_check(params: dict) -> dict:
     this is a real authenticated request against a live target using a real test account's actual
     session, not a read-only probe, and gets the exact same safety treatment.
     """
-    target = params["target"]
+    target = _ensure_url_scheme(params["target"])
     identity = params["identity"]
     hostname = urlsplit(target).hostname or ""
     session_id = params.get("_session_id")
@@ -1609,6 +1641,9 @@ def cors_credentialed_check(params: dict) -> dict:
     try:
         resp = _with_hard_deadline(lambda: client.get(target, headers={"Origin": _CORS_UNRELATED_TEST_ORIGIN}), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(target, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     acao = resp.headers.get("access-control-allow-origin")
@@ -1660,11 +1695,14 @@ _MAX_MATCHES = 50
 
 
 def view_source(params: dict) -> dict:
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     try:
         with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True, **_target_client_kwargs(params)) as client:
             resp = _with_hard_deadline(lambda: client.get(url), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     html = resp.text
@@ -1728,7 +1766,7 @@ def js_bundle_scan(params: dict) -> dict:
     body-preview truncation could ever reach blindly -- and with no location hint the model gave up
     on a genuine, still-unresolved lead instead of ever confirming or ruling it out.
     """
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
 
     def _read_capped(client: httpx.Client, target_url: str) -> tuple[bytes, bool, int]:
         data = b""
@@ -1748,6 +1786,11 @@ def js_bundle_scan(params: dict) -> dict:
             sourcemap_body, _, sourcemap_status = _with_hard_deadline(lambda: _read_capped(client, url + ".map"), _HTTP_TIMEOUT)
             sourcemap_exposed = sourcemap_status == 200
     except httpx.HTTPError as exc:
+        # Confirmed live: a nonexistent bundle host burned 34.6s + 4241 tokens on a doomed 1-Step
+        # Retry before this fix -- same unfixable-DNS treatment http_request/web_fetch already give.
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     text = body.decode("utf-8", errors="replace")
@@ -1826,11 +1869,9 @@ def web_fetch(params: dict) -> dict:
         # give a genuine NXDOMAIN -- confirmed live (a real session, timetravel.mementoweb.org
         # lookup): without this, a nonexistent hostname fell into the generic status="error" branch
         # below and burned a full 1-Step Retry round-trip no corrected argument could ever fix.
-        if _is_nxdomain_errno(_dns_resolution_errno(exc)):
-            return {
-                "status": "ok", "resolved": False,
-                "note": f"{url} does not resolve (no such host) — a real, negative result, not a tool failure",
-            }
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     raw = resp.text
@@ -2495,7 +2536,7 @@ def _hydra_http_form_preflight(params: dict) -> str | None:
     if not login_path:
         return None  # nothing to preflight without a login path -- build_hydra_command will
         # reject the call outright for missing login_path anyway
-    target = str(params["target"]).rstrip("/")
+    target = _ensure_url_scheme(str(params["target"])).rstrip("/")
     url = target + login_path
     username_field = str(params.get("username_field") or "username")
     password_field = str(params.get("password_field") or "password")
@@ -2959,11 +3000,14 @@ def authenticated_request(params: dict) -> dict:
     # "target", not "url" — this is what the requires_allowed_target guardrail (run_tool()) reads
     # to check the allowlist, same convention every other gated tool (sqlmap, default_creds_check)
     # already uses; naming it something else here would silently skip that check.
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     method = params.get("method", "GET").upper()
     try:
         resp = _with_hard_deadline(lambda: client.request(method, url, data=params.get("data"), headers=params.get("headers")), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     return {
@@ -3044,7 +3088,7 @@ def idor_probe(params: dict) -> dict:
     differing status codes (200 vs 401/403/404) is the actual shape of working access control.
     """
     session_id = params.get("_session_id")
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     identity_a = params["identity_a"]
     identity_b = params.get("identity_b")
 
@@ -3054,6 +3098,9 @@ def idor_probe(params: dict) -> dict:
     try:
         resp_a = _with_hard_deadline(lambda: client_a.get(url), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": f"identity_a request failed: {exc}"}
 
     if identity_b:
@@ -3065,6 +3112,9 @@ def idor_probe(params: dict) -> dict:
     try:
         resp_b = _with_hard_deadline(lambda: client_b.get(url), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": f"identity_b request failed: {exc}"}
 
     similarity = round(SequenceMatcher(None, resp_a.text[:5000], resp_b.text[:5000]).ratio(), 3)
@@ -3285,7 +3335,7 @@ def graphql_authz_probe(params: dict) -> dict:
     access-denied error response as a working access-control bypass.
     """
     session_id = params.get("_session_id")
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     query = params["query"]
     variables = params.get("variables") or {}
     identity_a = params["identity_a"]
@@ -3299,6 +3349,9 @@ def graphql_authz_probe(params: dict) -> dict:
     try:
         resp_a = _with_hard_deadline(lambda: client_a.post(url, content=payload, headers=headers), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": f"identity_a request failed: {exc}"}
 
     if identity_b:
@@ -3310,6 +3363,9 @@ def graphql_authz_probe(params: dict) -> dict:
     try:
         resp_b = _with_hard_deadline(lambda: client_b.post(url, content=payload, headers=headers), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": f"identity_b request failed: {exc}"}
 
     outcome_a = _graphql_response_outcome(resp_a)
@@ -3366,7 +3422,7 @@ def graphql_batching_probe(params: dict) -> dict:
     that fails to parse.
     """
     session_id = params.get("_session_id")
-    url = params["target"]
+    url = _ensure_url_scheme(params["target"])
     operation_type = params.get("operation_type", "mutation")
     if operation_type not in ("query", "mutation"):
         return {"status": "error", "error": f"operation_type must be 'query' or 'mutation', got {operation_type!r}"}
@@ -3394,6 +3450,9 @@ def graphql_batching_probe(params: dict) -> dict:
     try:
         resp = _with_hard_deadline(lambda: client.post(url, content=payload, headers=headers), _HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": f"batched request failed: {exc}"}
 
     try:
@@ -3702,6 +3761,22 @@ def _version_definitely_not_affected(version: tuple[int, ...], bounds: list[tupl
         # a fresh call (already tuples, no-op) and a cached one (lists) identically.
         lower = tuple(raw_lower) if raw_lower is not None else None
         upper = tuple(raw_upper) if raw_upper is not None else None
+        # A confirmed version that's a strict PREFIX of the bound it's being compared against is
+        # itself ambiguous -- e.g. confirmed "2.3" vs a lower bound of (2, 3, 0): Python's own tuple
+        # comparison says (2, 3) < (2, 3, 0) (a prefix always compares as "less than" the longer
+        # tuple it's a prefix of), but "2.3" could really mean anything from 2.3.0 to 2.3.99, so
+        # it's not provably below 2.3.0. Real incident this fixes: a CVE affecting 2.3.0-2.3.9 was
+        # wrongly ruled out against a confirmed "XenForo 2.3" on exactly this mismatch. Only a true
+        # prefix is ambiguous, not just "shorter" -- a shorter version that already differs from the
+        # bound within their shared length (e.g. (6, 54) vs a (6, 19, 1) upper bound) is decisively
+        # ordered by that differing digit alone, no matter what a missing trailing component would
+        # be, so it must keep comparing normally instead of being swept into the same ambiguous
+        # carve-out. Treat a true ambiguous prefix as the same "doesn't exclude it" case as a value
+        # genuinely inside the range, per this function's own "ambiguous -> don't rule out" contract.
+        if lower is not None and len(version) < len(lower) and lower[:len(version)] == version:
+            return False
+        if upper is not None and len(version) < len(upper) and upper[:len(version)] == version:
+            return False
         if lower is not None and version < lower:
             continue
         if upper is not None:
@@ -5340,7 +5415,7 @@ def web_self_register(params: dict) -> dict:
     created — registration succeeding but this follow-up login failing does NOT undo the
     registration result, since the account still exists either way.
     """
-    target = str(params["target"])
+    target = _ensure_url_scheme(str(params["target"]))
     registration_path = params.get("registration_path")
     if not registration_path:
         return {"status": "error", "error": "registration_path is required"}
@@ -5399,6 +5474,9 @@ def web_self_register(params: dict) -> dict:
                     pass  # registration itself still succeeded -- just couldn't confirm a fresh login
             cookie = "; ".join(f"{c.name}={c.value}" for c in client.cookies.jar) or None
     except httpx.HTTPError as exc:
+        nxdomain_result = _nxdomain_result(registration_url, exc)
+        if nxdomain_result is not None:
+            return nxdomain_result
         return {"status": "error", "error": describe_exception(exc)}
 
     return {
@@ -5423,7 +5501,7 @@ def default_creds_check(params: dict) -> dict:
     substring fallback, so an approximate slug still resolves). Omitting "vendor" keeps the exact
     original behavior: only the six generic pairs, tried once each.
     """
-    login_url = params["target"]
+    login_url = _ensure_url_scheme(params["target"])
     username_field = params.get("username_field", "email")
     password_field = params.get("password_field", "password")
     vendor_query = (params.get("vendor") or "").strip()

@@ -24,6 +24,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 
 from agent.utils.logger import get_logger
 from projects.paths import resolve_global_app_dir
@@ -119,6 +120,15 @@ def add_custom_tool(*, name: str, path: str, description: str, requires_target: 
         raise ValueError(f"a custom tool named {name!r} is already registered -- remove it first, or this is the same binary already added.")
     if category not in CUSTOM_TOOL_CATEGORIES:
         raise ValueError(f"category must be one of {CUSTOM_TOOL_CATEGORIES}, got {category!r}")
+    if not Path(path).is_absolute():
+        # Real, confirmed incident: a relative path registered here looked fine at mint time (its
+        # availability_check ran against the SERVER's own cwd) but could never actually run --
+        # agent/tools/custom_tool_runtime.py's run_registered_custom_tool executes through
+        # agent/tools/sandbox.py's run_sandboxed with cwd=<session-scoped scratch dir>, never this
+        # server's own cwd, so a relative path has no directory left to resolve against once the
+        # tool is actually called. Rejecting it here is the only place that can catch it before a
+        # broken record is ever persisted and offered to subagents.
+        raise ValueError(f"path {path!r} must be an absolute filesystem path -- a relative path can never resolve once the tool actually runs, since it executes from a session-scoped sandbox directory, not this server's own working directory.")
 
     record = {
         "id": uuid.uuid4().hex[:12],

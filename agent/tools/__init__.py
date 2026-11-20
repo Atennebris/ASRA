@@ -224,7 +224,13 @@ register_tool(
         retry_command_on_timeout=retry_nmap_without_os_detection_on_timeout,
         requires_allowed_target=False,
         installed_by_default=True,
-        description="Fast TCP port scan with service/version detection (-F -sV) against a host.",
+        description=(
+            "Fast TCP port scan with service/version detection (-F -sV) against a host. Only takes "
+            "a target -- there is no '--script'/NSE flag here (a confirmed-live gap: the model used "
+            "to pass flags like '--script ssl-cert' inside the target string, which the target "
+            "validator correctly rejects, wasting a retry on a bare rescan). For a TLS certificate "
+            "check, use ssl_cert_info instead -- it already does exactly that, deterministically."
+        ),
         parameters_schema={
             "type": "object",
             "properties": {"target": {"type": "string", "description": "Hostname or IP to scan"}},

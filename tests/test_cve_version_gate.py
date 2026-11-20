@@ -115,6 +115,26 @@ def test_version_definitely_not_affected_false_when_there_are_no_bounds_to_check
     assert _version_definitely_not_affected((1, 14, 0), []) is False
 
 
+def test_version_definitely_not_affected_false_for_a_shorter_confirmed_version_ambiguous_against_the_lower_bound():
+    """Real incident this fixes: a CVE affecting 2.3.0-2.3.9 was wrongly ruled out because the only
+    confirmed version string was "2.3" (no patch digit) -> _parse_dotted_version gives (2, 3), and a
+    raw tuple comparison against the lower bound (2, 3, 0) evaluates (2, 3) < (2, 3, 0) as True in
+    Python (a tuple that's a strict prefix of another compares as less-than it), even though "2.3"
+    is genuinely ambiguous -- it could mean anything from 2.3.0 through 2.3.99, not provably below
+    2.3.0. Must NOT be ruled out on this absent evidence.
+    """
+    bounds = [((2, 3, 0), (2, 3, 9), False)]
+    assert _version_definitely_not_affected((2, 3), bounds) is False
+
+
+def test_version_definitely_not_affected_still_true_for_a_full_length_version_unambiguously_below_the_range():
+    """Companion case: a confirmed version with the SAME number of components as the bound it's
+    compared against must still be ruled out correctly -- the ambiguity fix above must not weaken
+    this already-correct, unambiguous exclusion."""
+    bounds = [((2, 3, 0), (2, 3, 9), False)]
+    assert _version_definitely_not_affected((2, 2, 9), bounds) is True
+
+
 def test_version_is_ruled_out_false_when_the_confirmed_version_text_does_not_parse():
     bounds = [((0, 5, 6), (1, 13, 2), False)]
     assert version_is_ruled_out("Cloudflare http proxy", bounds) is False

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import zipfile
 from typing import Any
 
@@ -124,6 +125,11 @@ def build_report_data(session: dict, generated_at: str) -> dict[str, Any]:
         "recon_targets": recon_targets,
         "recon_cves": recon_result.get("cves") or [],
         "findings": findings,
+        # Same findings, pre-grouped by _group_findings -- every render_* Findings section below
+        # iterates this instead of the flat list, so the SAME issue confirmed on several hosts gets
+        # one shared heading instead of N near-identical ones. `findings` itself is left untouched
+        # (still the flat list, in scan order) for anything that doesn't care about grouping.
+        "finding_groups": _group_findings(findings),
         "approvals": session.get("approvals") or [],
     }
 
@@ -142,6 +148,80 @@ def _recon_target_line(t: dict) -> str:
 def _chain_heading(chain: dict) -> str:
     hop_tag = f" (hop {chain['hop']})" if chain.get("hop") and chain["hop"] > 1 else ""
     return " → ".join(chain.get("finding_titles") or []) + hop_tag
+
+
+# This project's own native tools title a per-host finding exactly this way (e.g. "Fastly CDN
+# Debug Headers Exposure on auth.skypicker.com") -- real incident this exists for: a real rescan
+# produced 9 near-identical findings sharing this exact shape, each independently and correctly
+# confirmed on its own host (not a dedup bug), but a flat report lists them as 9 separate issues a
+# HackerOne triager would very likely bundle/duplicate-close anyway. Deliberately conservative: only
+# matches a trailing "<text> on <hostname-looking-token>" clause, never touches the rest of the
+# title, and a title with no such suffix (or a unique one) is completely unaffected.
+_FINDING_TITLE_HOST_SUFFIX = re.compile(r"\s+on\s+(?P<host>[A-Za-z0-9][\w.-]*\.[A-Za-z]{2,})$", re.IGNORECASE)
+
+
+def _split_title_host_suffix(title: str) -> tuple[str | None, str | None]:
+    match = _FINDING_TITLE_HOST_SUFFIX.search(title or "")
+    if not match:
+        return None, None
+    return title[: match.start()], match.group("host")
+
+
+def _group_findings(findings: list[dict]) -> list[dict]:
+    """One group per (title-with-host-suffix-stripped, severity, qualification) combination that
+    actually has a host suffix to strip AND recurs more than once -- everything else (no host
+    suffix, or a unique one) stays its own single-member group, rendered byte-for-byte the same as
+    a flat list always has. Never merges or drops evidence: every member's own full body still
+    renders in full under its own host/title line, this only changes whether each one gets its OWN
+    top-level heading or shares one with its siblings. Order-preserving: a group's position is
+    wherever its FIRST member first appeared in `findings`.
+    """
+    groups: list[dict] = []
+    groups_by_key: dict[tuple, dict] = {}
+    for f in findings:
+        stripped_title, host = _split_title_host_suffix(f.get("title") or "")
+        key = (stripped_title, f.get("severity"), f.get("qualifies_for_bounty")) if stripped_title else None
+        group = groups_by_key.get(key) if key is not None else None
+        if group is None:
+            group = {"group_title": stripped_title, "members": [], "hosts": []}
+            groups.append(group)
+            if key is not None:
+                groups_by_key[key] = group
+        group["members"].append(f)
+        group["hosts"].append(host)
+    for group in groups:
+        if len(group["members"]) == 1:
+            group["group_title"] = None  # not really a group -- render the member's own title instead
+    return groups
+
+
+def _finding_body_txt(f: dict, indent: str = "    ") -> list[str]:
+    """Everything render_txt used to inline directly under a finding's own heading line --
+    factored out so a grouped finding's member can render the identical body under a shared
+    group heading instead of its own top-level one, with no loss of detail either way.
+    """
+    lines: list[str] = []
+    if f.get("original_title"):
+        lines.append(f'{indent}(Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.)')
+    correction_note = _correction_note(f)
+    if correction_note:
+        lines.append(f"{indent}({correction_note})")
+    if f.get("description"):
+        lines.append(f"{indent}{f['description']}")
+    lines.append(f"{indent}Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
+    if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
+        lines.append(f"{indent}EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".rstrip())
+    elif not f.get("exploited") and f.get("advisory_note"):
+        lines.append(f"{indent}{_non_exploited_status_label(f)}: {f['advisory_note']}")
+    if f.get("false_positive_reason"):
+        lines.append(f"{indent}Likely false positive: {f['false_positive_reason']}")
+    elif is_ungrounded_cve_lookup(f):
+        lines.append(f"{indent}No confirmed target: matched by product name only -- no host in this scan's Recon results was ever confirmed running that product.")
+    for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
+        if f.get(key):
+            lines.append(f"{indent}{label}:")
+            lines += [f"{indent}  {ln}" for ln in f[key].splitlines()]
+    return lines
 
 
 def render_txt(data: dict) -> str:
@@ -186,29 +266,20 @@ def render_txt(data: dict) -> str:
 
     lines.append(f"FINDINGS ({len(data['findings'])})")
     lines.append("-" * 60)
-    for i, f in enumerate(data["findings"], 1):
-        tag = f" -- {f.get('qualifies_for_bounty')}" if f.get("qualifies_for_bounty") else ""
-        lines.append(f"[{i}] {f.get('title')} -- {f.get('severity')}{tag}")
-        if f.get("original_title"):
-            lines.append(f'    (Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.)')
-        correction_note = _correction_note(f)
-        if correction_note:
-            lines.append(f"    ({correction_note})")
-        if f.get("description"):
-            lines.append(f"    {f['description']}")
-        lines.append(f"    Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
-        if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
-            lines.append(f"    EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".rstrip())
-        elif not f.get("exploited") and f.get("advisory_note"):
-            lines.append(f"    {_non_exploited_status_label(f)}: {f['advisory_note']}")
-        if f.get("false_positive_reason"):
-            lines.append(f"    Likely false positive: {f['false_positive_reason']}")
-        elif is_ungrounded_cve_lookup(f):
-            lines.append("    No confirmed target: matched by product name only -- no host in this scan's Recon results was ever confirmed running that product.")
-        for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
-            if f.get(key):
-                lines.append(f"    {label}:")
-                lines += [f"      {ln}" for ln in f[key].splitlines()]
+    for i, group in enumerate(data["finding_groups"], 1):
+        members = group["members"]
+        if group["group_title"]:
+            host_list = ", ".join(h for h in group["hosts"] if h)
+            tag = f" -- {members[0].get('qualifies_for_bounty')}" if members[0].get("qualifies_for_bounty") else ""
+            lines.append(f"[{i}] {group['group_title']} -- {members[0].get('severity')}{tag}  (same issue, {len(members)} hosts: {host_list})")
+            for member, host in zip(members, group["hosts"]):
+                lines.append(f"    * {host or member.get('title')}")
+                lines += _finding_body_txt(member, indent="      ")
+        else:
+            f = members[0]
+            tag = f" -- {f.get('qualifies_for_bounty')}" if f.get("qualifies_for_bounty") else ""
+            lines.append(f"[{i}] {f.get('title')} -- {f.get('severity')}{tag}")
+            lines += _finding_body_txt(f, indent="    ")
         lines.append("")
 
     if data["approvals"]:
@@ -218,6 +289,47 @@ def render_txt(data: dict) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _finding_body_md(f: dict) -> list[str]:
+    """Markdown sibling of _finding_body_txt -- same reasoning, same factoring-out, just this
+    format's own existing markup (bold/blockquote/fenced code) instead of plain indentation."""
+    lines: list[str] = []
+    if f.get("original_title"):
+        lines.append(f'*Originally reported as "{f["original_title"]}" — corrected once exploitation confirmed the real target.*')
+        lines.append("")
+    correction_note = _correction_note(f)
+    if correction_note:
+        lines.append(f"*{correction_note}*")
+        lines.append("")
+    if f.get("description"):
+        lines.append(f["description"])
+        lines.append("")
+    lines.append(f"- **Verification:** {f.get('verification')}")
+    lines.append(f"- **Exploited:** {f.get('exploited')}")
+    lines.append("")
+    if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
+        lines.append(f"> **Exploited — access confirmed.** {f.get('artifact_usage_hint', '')}".rstrip())
+        if f.get("extracted_artifact"):
+            lines.append(f"> `{f['extracted_artifact']}`")
+        lines.append("")
+    elif not f.get("exploited") and f.get("advisory_note"):
+        lines.append(f"> **{_non_exploited_status_label(f)}:** {f['advisory_note']}")
+        lines.append("")
+    if f.get("false_positive_reason"):
+        lines.append(f"> ⊘ **Likely false positive:** {f['false_positive_reason']}")
+        lines.append("")
+    elif is_ungrounded_cve_lookup(f):
+        lines.append("> ⊘ **No confirmed target:** matched by product name only — no host in this scan's Recon results was ever confirmed running that product.")
+        lines.append("")
+    for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
+        if f.get(key):
+            lines.append(f"**{label}**")
+            lines.append("```")
+            lines.append(f[key])
+            lines.append("```")
+            lines.append("")
+    return lines
 
 
 def render_md(data: dict) -> str:
@@ -275,44 +387,25 @@ def render_md(data: dict) -> str:
 
     lines.append(f"## Findings ({len(data['findings'])})")
     lines.append("")
-    for i, f in enumerate(data["findings"], 1):
-        tag = f" `{f.get('qualifies_for_bounty')}`" if f.get("qualifies_for_bounty") else ""
-        lines.append(f"### {i}. {f.get('title')} — {f.get('severity')}{tag}")
-        lines.append("")
-        if f.get("original_title"):
-            lines.append(f'*Originally reported as "{f["original_title"]}" — corrected once exploitation confirmed the real target.*')
+    for i, group in enumerate(data["finding_groups"], 1):
+        members = group["members"]
+        if group["group_title"]:
+            host_list = ", ".join(h for h in group["hosts"] if h)
+            tag = f" `{members[0].get('qualifies_for_bounty')}`" if members[0].get("qualifies_for_bounty") else ""
+            lines.append(f"### {i}. {group['group_title']} — {members[0].get('severity')}{tag}")
             lines.append("")
-        correction_note = _correction_note(f)
-        if correction_note:
-            lines.append(f"*{correction_note}*")
+            lines.append(f"*Same issue, independently confirmed on {len(members)} hosts: {host_list}*")
             lines.append("")
-        if f.get("description"):
-            lines.append(f["description"])
-            lines.append("")
-        lines.append(f"- **Verification:** {f.get('verification')}")
-        lines.append(f"- **Exploited:** {f.get('exploited')}")
-        lines.append("")
-        if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
-            lines.append(f"> **Exploited — access confirmed.** {f.get('artifact_usage_hint', '')}".rstrip())
-            if f.get("extracted_artifact"):
-                lines.append(f"> `{f['extracted_artifact']}`")
-            lines.append("")
-        elif not f.get("exploited") and f.get("advisory_note"):
-            lines.append(f"> **{_non_exploited_status_label(f)}:** {f['advisory_note']}")
-            lines.append("")
-        if f.get("false_positive_reason"):
-            lines.append(f"> ⊘ **Likely false positive:** {f['false_positive_reason']}")
-            lines.append("")
-        elif is_ungrounded_cve_lookup(f):
-            lines.append("> ⊘ **No confirmed target:** matched by product name only — no host in this scan's Recon results was ever confirmed running that product.")
-            lines.append("")
-        for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
-            if f.get(key):
-                lines.append(f"**{label}**")
-                lines.append("```")
-                lines.append(f[key])
-                lines.append("```")
+            for member, host in zip(members, group["hosts"]):
+                lines.append(f"#### {host or member.get('title')}")
                 lines.append("")
+                lines += _finding_body_md(member)
+        else:
+            f = members[0]
+            tag = f" `{f.get('qualifies_for_bounty')}`" if f.get("qualifies_for_bounty") else ""
+            lines.append(f"### {i}. {f.get('title')} — {f.get('severity')}{tag}")
+            lines.append("")
+            lines += _finding_body_md(f)
 
     if data["approvals"]:
         lines.append("## Exploit approvals")
@@ -347,6 +440,34 @@ def _register_pdf_font(pdf) -> str:
         _PDF_FONT_REGULAR_PATH,
     )
     return "helvetica"
+
+
+def _finding_body_pdf(pdf, family: str, line, f: dict) -> None:
+    """PDF sibling of _finding_body_txt/_finding_body_md -- takes `line`/`pdf`/`family` explicitly
+    rather than closing over them, since render_pdf's own `line` helper is a local closure."""
+    pdf.set_font(family, "", 9)
+    if f.get("original_title"):
+        line(5, f'Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.')
+    correction_note = _correction_note(f)
+    if correction_note:
+        line(5, correction_note)
+    if f.get("description"):
+        line(5, f["description"])
+    line(5, f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
+    if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
+        line(5, f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
+    elif not f.get("exploited") and f.get("advisory_note"):
+        line(5, f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
+    if f.get("false_positive_reason"):
+        line(5, f"Likely false positive: {f['false_positive_reason']}")
+    elif is_ungrounded_cve_lookup(f):
+        line(5, "No confirmed target: matched by product name only.")
+    for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
+        if f.get(key):
+            pdf.set_font(family, "B", 9)
+            line(5, label)
+            pdf.set_font(family, "", 8)
+            line(4.5, f[key])
 
 
 def render_pdf(data: dict) -> bytes:
@@ -427,33 +548,25 @@ def render_pdf(data: dict) -> bytes:
 
     pdf.set_font(family, "B", 13)
     line(8, f"Findings ({len(data['findings'])})")
-    for i, f in enumerate(data["findings"], 1):
-        pdf.set_font(family, "B", 11)
-        tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
-        line(7, f"{i}. {f.get('title')} -- {f.get('severity')}{tag}")
-        pdf.set_font(family, "", 9)
-        if f.get("original_title"):
-            line(5, f'Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.')
-        correction_note = _correction_note(f)
-        if correction_note:
-            line(5, correction_note)
-        if f.get("description"):
-            line(5, f["description"])
-        line(5, f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
-        if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
-            line(5, f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
-        elif not f.get("exploited") and f.get("advisory_note"):
-            line(5, f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
-        if f.get("false_positive_reason"):
-            line(5, f"Likely false positive: {f['false_positive_reason']}")
-        elif is_ungrounded_cve_lookup(f):
-            line(5, "No confirmed target: matched by product name only.")
-        for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
-            if f.get(key):
-                pdf.set_font(family, "B", 9)
-                line(5, label)
-                pdf.set_font(family, "", 8)
-                line(4.5, f[key])
+    for i, group in enumerate(data["finding_groups"], 1):
+        members = group["members"]
+        if group["group_title"]:
+            host_list = ", ".join(h for h in group["hosts"] if h)
+            tag = f" [{members[0].get('qualifies_for_bounty')}]" if members[0].get("qualifies_for_bounty") else ""
+            pdf.set_font(family, "B", 11)
+            line(7, f"{i}. {group['group_title']} -- {members[0].get('severity')}{tag}")
+            pdf.set_font(family, "", 9)
+            line(5, f"Same issue, independently confirmed on {len(members)} hosts: {host_list}")
+            for member, host in zip(members, group["hosts"]):
+                pdf.set_font(family, "B", 10)
+                line(6, host or member.get("title"))
+                _finding_body_pdf(pdf, family, line, member)
+        else:
+            f = members[0]
+            pdf.set_font(family, "B", 11)
+            tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
+            line(7, f"{i}. {f.get('title')} -- {f.get('severity')}{tag}")
+            _finding_body_pdf(pdf, family, line, f)
         pdf.ln(3)
 
     if data["approvals"]:
@@ -498,6 +611,32 @@ def _rtf_escape(text: str) -> str:
         else:
             out.append("?")
     return "".join(out)
+
+
+def _finding_body_doc(para, f: dict) -> None:
+    """RTF sibling of _finding_body_txt/_finding_body_md/_finding_body_pdf -- takes `para` (render_
+    doc's own _rtf_escape-wrapping closure) explicitly rather than closing over it."""
+    if f.get("original_title"):
+        para(f'Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.')
+    correction_note = _correction_note(f)
+    if correction_note:
+        para(correction_note)
+    if f.get("description"):
+        para(f["description"])
+    para(f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
+    if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
+        para(f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
+    elif not f.get("exploited") and f.get("advisory_note"):
+        para(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
+    if f.get("false_positive_reason"):
+        para(f"Likely false positive: {f['false_positive_reason']}")
+    elif is_ungrounded_cve_lookup(f):
+        para("No confirmed target: matched by product name only.")
+    for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
+        if f.get(key):
+            para(label + ":")
+            for ln in f[key].splitlines():
+                para("    " + ln)
 
 
 def render_doc(data: dict) -> bytes:
@@ -561,30 +700,21 @@ def render_doc(data: dict) -> bytes:
         lines.append("\\par")
 
     heading(f"Findings ({len(data['findings'])})", 28)
-    for i, f in enumerate(data["findings"], 1):
-        tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
-        heading(f"{i}. {f.get('title')} -- {f.get('severity')}{tag}", 24)
-        if f.get("original_title"):
-            para(f'Originally reported as "{f["original_title"]}" -- corrected once exploitation confirmed the real target.')
-        correction_note = _correction_note(f)
-        if correction_note:
-            para(correction_note)
-        if f.get("description"):
-            para(f["description"])
-        para(f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
-        if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
-            para(f"EXPLOITED -- ACCESS CONFIRMED: {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip())
-        elif not f.get("exploited") and f.get("advisory_note"):
-            para(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
-        if f.get("false_positive_reason"):
-            para(f"Likely false positive: {f['false_positive_reason']}")
-        elif is_ungrounded_cve_lookup(f):
-            para("No confirmed target: matched by product name only.")
-        for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
-            if f.get(key):
-                para(label + ":")
-                for ln in f[key].splitlines():
-                    para("    " + ln)
+    for i, group in enumerate(data["finding_groups"], 1):
+        members = group["members"]
+        if group["group_title"]:
+            host_list = ", ".join(h for h in group["hosts"] if h)
+            tag = f" [{members[0].get('qualifies_for_bounty')}]" if members[0].get("qualifies_for_bounty") else ""
+            heading(f"{i}. {group['group_title']} -- {members[0].get('severity')}{tag}", 24)
+            para(f"Same issue, independently confirmed on {len(members)} hosts: {host_list}")
+            for member, host in zip(members, group["hosts"]):
+                heading(host or member.get("title"), 20)
+                _finding_body_doc(para, member)
+        else:
+            f = members[0]
+            tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
+            heading(f"{i}. {f.get('title')} -- {f.get('severity')}{tag}", 24)
+            _finding_body_doc(para, f)
         lines.append("\\par")
 
     if data["approvals"]:
@@ -597,6 +727,39 @@ def render_doc(data: dict) -> bytes:
     # 7-bit-ASCII control words/escapes -- errors="replace" is a pure safety net, not something
     # expected to ever actually trigger.
     return "\n".join(lines).encode("ascii", errors="replace")
+
+
+def _finding_body_docx(doc, f: dict) -> None:
+    """docx sibling of _finding_body_txt/_finding_body_md/_finding_body_pdf/_finding_body_doc --
+    local `from docx.shared import Pt` mirrors render_docx's own lazy-import-per-function style."""
+    from docx.shared import Pt
+
+    if f.get("original_title"):
+        p = doc.add_paragraph()
+        p.add_run(f'Originally reported as "{f["original_title"]}" — corrected once exploitation confirmed the real target.').italic = True
+    correction_note = _correction_note(f)
+    if correction_note:
+        p = doc.add_paragraph()
+        p.add_run(correction_note).italic = True
+    if f.get("description"):
+        doc.add_paragraph(f["description"])
+    doc.add_paragraph(f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
+    if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
+        p = doc.add_paragraph()
+        p.add_run(f"Exploited — access confirmed. {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip()).bold = True
+    elif not f.get("exploited") and f.get("advisory_note"):
+        doc.add_paragraph(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
+    if f.get("false_positive_reason"):
+        doc.add_paragraph(f"Likely false positive: {f['false_positive_reason']}")
+    elif is_ungrounded_cve_lookup(f):
+        doc.add_paragraph("No confirmed target: matched by product name only.")
+    for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
+        if f.get(key):
+            doc.add_paragraph().add_run(label).bold = True
+            pre = doc.add_paragraph(f[key])
+            for run in pre.runs:
+                run.font.name = "Consolas"
+                run.font.size = Pt(9)
 
 
 def render_docx(data: dict) -> bytes:
@@ -651,35 +814,21 @@ def render_docx(data: dict) -> bytes:
             doc.add_paragraph("CVEs: " + ", ".join(data["recon_cves"]))
 
     doc.add_heading(f"Findings ({len(data['findings'])})", level=2)
-    for i, f in enumerate(data["findings"], 1):
-        tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
-        doc.add_heading(f"{i}. {f.get('title')} — {f.get('severity')}{tag}", level=3)
-        if f.get("original_title"):
-            p = doc.add_paragraph()
-            p.add_run(f'Originally reported as "{f["original_title"]}" — corrected once exploitation confirmed the real target.').italic = True
-        correction_note = _correction_note(f)
-        if correction_note:
-            p = doc.add_paragraph()
-            p.add_run(correction_note).italic = True
-        if f.get("description"):
-            doc.add_paragraph(f["description"])
-        doc.add_paragraph(f"Verification: {f.get('verification')}    Exploited: {f.get('exploited')}")
-        if f.get("exploited") and (f.get("extracted_artifact") or f.get("artifact_usage_hint")):
-            p = doc.add_paragraph()
-            p.add_run(f"Exploited — access confirmed. {f.get('extracted_artifact', '')} {f.get('artifact_usage_hint', '')}".strip()).bold = True
-        elif not f.get("exploited") and f.get("advisory_note"):
-            doc.add_paragraph(f"{_non_exploited_status_label(f)}: {f['advisory_note']}")
-        if f.get("false_positive_reason"):
-            doc.add_paragraph(f"Likely false positive: {f['false_positive_reason']}")
-        elif is_ungrounded_cve_lookup(f):
-            doc.add_paragraph("No confirmed target: matched by product name only.")
-        for label, key in (("Reproduction steps", "reproduction_steps"), ("PoC command", "poc_command"), ("Evidence", "evidence")):
-            if f.get(key):
-                doc.add_paragraph().add_run(label).bold = True
-                pre = doc.add_paragraph(f[key])
-                for run in pre.runs:
-                    run.font.name = "Consolas"
-                    run.font.size = Pt(9)
+    for i, group in enumerate(data["finding_groups"], 1):
+        members = group["members"]
+        if group["group_title"]:
+            host_list = ", ".join(h for h in group["hosts"] if h)
+            tag = f" [{members[0].get('qualifies_for_bounty')}]" if members[0].get("qualifies_for_bounty") else ""
+            doc.add_heading(f"{i}. {group['group_title']} — {members[0].get('severity')}{tag}", level=3)
+            doc.add_paragraph(f"Same issue, independently confirmed on {len(members)} hosts: {host_list}")
+            for member, host in zip(members, group["hosts"]):
+                doc.add_heading(host or member.get("title"), level=4)
+                _finding_body_docx(doc, member)
+        else:
+            f = members[0]
+            tag = f" [{f.get('qualifies_for_bounty')}]" if f.get("qualifies_for_bounty") else ""
+            doc.add_heading(f"{i}. {f.get('title')} — {f.get('severity')}{tag}", level=3)
+            _finding_body_docx(doc, f)
 
     if data["approvals"]:
         doc.add_heading("Exploit approvals", level=2)

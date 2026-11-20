@@ -32,9 +32,14 @@ class _ScriptedLLM:
         self._script = list(tool_calls_per_turn)
         self.calls_made = 0
         self.offered_tool_names: list[str] | None = None
+        # Captured for test_run_reverify_surfaces_a_confirmed_tech_fact_as_a_lead below -- every
+        # other existing test here only cares about the FINAL verdict, this is the first to assert
+        # on the task text reverify actually sent the model.
+        self.received_tasks: list[str] = []
 
     def complete(self, messages, tools=None, stop_check=None):
         self.calls_made += 1
+        self.received_tasks.append(messages[1]["content"])
         if self.offered_tool_names is None and tools is not None:
             self.offered_tool_names = [t["function"]["name"] for t in tools]
         if self._script:
@@ -142,6 +147,43 @@ def test_run_reverify_reconfirmed_finding_is_persisted_with_provenance(tmp_path,
     }
 
 
+def test_run_reverify_surfaces_a_confirmed_tech_fact_as_a_lead(tmp_path, monkeypatch):
+    """Real incident this guards against: a log-review audit found reverify re-deriving the exact
+    same fact (a product's installed version) from a fresh HTTP round-trip on every single rescan
+    pass, with zero awareness of what exploit (or an earlier reverify pass THIS session) already
+    confirmed about the same stack -- even though exploit's own task-building has had this exact
+    lead-surfacing mechanism (_confirmed_tech_facts_task_addendum) wired in all along. This only
+    checks the lead actually reaches reverify's task text; _run_reverify still requires a real
+    tool call before any verdict either way (prior_history_note/the terminal tool's own contract),
+    so this is never a license to skip the independent check itself.
+    """
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    llm = _ScriptedLLM([
+        ("record_reverification_result", {
+            "verification_outcome": "confirmed_present", "reasoning": "still there",
+            "evidence_ref": "fresh evidence",
+        }),
+    ])
+    old = _old_finding(technology="XenForo — confirmed installed at forum.example.com (XenForo 2.3.4)")
+    session = _base_session(
+        carried_over_findings=[old],
+        confirmed_tech_facts=[{
+            "technology_keywords": ["xenforo"],
+            "fact": "Confirmed installed version is XenForo 2.3.4, inside the advisory's affected range.",
+            "source_finding": "XenForo — CVE-2026-35054",
+        }],
+    )
+    ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+
+    _run(_run_reverify(ctx))
+
+    assert len(llm.received_tasks) == 1
+    task = llm.received_tasks[0]
+    assert "Already confirmed earlier in this same session" in task
+    assert "XenForo 2.3.4, inside the advisory's affected range" in task
+
+
 def test_run_reverify_resolved_finding_is_not_persisted_but_is_recorded_in_history(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
@@ -190,6 +232,34 @@ def test_run_reverify_inconclusive_finding_is_carried_forward_flagged_needs_veri
 
     assert len(session["reverification_history"]) == 1
     assert session["reverification_history"][0]["verification_outcome"] == "inconclusive"
+
+
+def test_run_reverify_inconclusive_drops_a_stale_false_positive_reason(tmp_path, monkeypatch):
+    """Real, confirmed incident this guards against: a finding carried a false_positive_reason from
+    an earlier, since-corrected auto-record that wrongly ruled it out. A later rescan's reverify
+    pass honestly reports it can't confirm or refute (inconclusive) -- but `carried = dict(old_finding)`
+    is a full shallow copy, so the stale false_positive_reason used to survive untouched, leaving the
+    persisted finding contradictorily both "needs_verification" AND "settled false positive" at the
+    same time (every consumer of false_positive_reason, e.g. the exploit-phase auto-skip, treats its
+    mere presence as a closed case). It must be cleared, not carried forward."""
+    monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
+    llm = _ScriptedLLM([
+        ("record_reverification_result", {
+            "verification_outcome": "inconclusive",
+            "reasoning": "every attempt hit the same Cloudflare challenge, could not verify either way",
+        }),
+    ])
+    old = _old_finding(title="Blocked-by-WAF finding", false_positive_reason="previously ruled out: CVE did not apply")
+    session = _base_session(rescanned_from="usr_old_session", carried_over_findings=[old])
+    ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
+
+    _run(_run_reverify(ctx))
+
+    assert len(session["findings"]) == 1
+    carried = session["findings"][0]
+    assert carried["verification"] == "needs_verification"
+    assert not carried.get("false_positive_reason")
 
 
 def test_run_reverify_treats_a_no_verdict_pass_as_inconclusive_not_confirmed_fixed(tmp_path, monkeypatch):

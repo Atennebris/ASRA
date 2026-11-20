@@ -5107,7 +5107,10 @@ _AUTO_DELEGATE_MAX_HOSTS = 10  # a bound on one subagent task's own scope, not a
 # +ssl_cert_info sweep of each. Scaled by len(batch) at the one call site that actually batches
 # multiple hosts into a single task (_delegate_to_subagent_impl's own default stays exactly 900s
 # for every ordinary, single-task delegation, which was never the problem).
-_AUTO_DELEGATE_TIMEOUT_PER_HOST_SECONDS = int(os.getenv("SUBAGENT_AUTO_OVERFLOW_TIMEOUT_PER_HOST_SECONDS", "300"))
+# Default bumped 300 -> 600: a real sweep's own nuclei run alone took 537s/504s on two of four hosts
+# in a confirmed log-review incident, already exceeding the old 300s/host allowance before whatweb/
+# dns_lookup/security_headers_audit time for that same host is even added.
+_AUTO_DELEGATE_TIMEOUT_PER_HOST_SECONDS = int(os.getenv("SUBAGENT_AUTO_OVERFLOW_TIMEOUT_PER_HOST_SECONDS", "600"))
 
 
 def _host_dns_identities(host: str, dns_map: dict) -> set[str]:
@@ -7398,6 +7401,16 @@ async def _run_reverify(ctx: RunContext) -> None:
         task += _program_url_task_addendum(ctx.session)
         task += _custom_user_agent_task_addendum(ctx.session)
         task += _custom_headers_task_addendum(ctx.session)
+        # Same mechanism exploit's own task-building already uses (_confirmed_tech_facts_task_
+        # addendum's own docstring) -- wired in here too after a log-review audit found reverify
+        # re-deriving an identical fact (a product's exact installed version) from scratch, via a
+        # fresh HTTP round-trip, on every single rescan pass, with zero memory of what exploit (or
+        # an earlier reverify pass THIS session) already confirmed about the same stack. Still only
+        # ever a LEAD to check, never an answer to inherit -- the model is still required to reach
+        # its own independent verdict via a real tool call this pass (prior_history_note/the terminal
+        # tool's own contract already enforce that); this just gives it a cheaper starting point
+        # instead of reconstructing an already-known fact byte-for-byte from zero context.
+        task += _confirmed_tech_facts_task_addendum(ctx.session, old_finding)
         task += _protection_task_addendum(ctx.session)
         task += _plan_task_addendum(ctx.session, "exploit")
         task += subagent_addendum
@@ -7474,6 +7487,13 @@ async def _run_reverify(ctx: RunContext) -> None:
             carried["advisory_note"] = f"Reverify could not confirm or refute this: {reasoning}"
             carried["carried_over_from"] = ctx.session.get("rescanned_from")
             carried["first_found_at"] = old_finding.get("found_at")
+            # An inconclusive verdict is not a reaffirmation of whatever old_finding's dict happened
+            # to carry -- drop a stale false_positive_reason from before this re-check, so a finding
+            # reverify just admitted it can't confirm or refute doesn't still read as a settled,
+            # ruled-out false positive everywhere else in the codebase that trusts that field's mere
+            # presence (e.g. the exploit-phase auto-skip). The call right below still applies a fresh
+            # one if the verdict actually provides it.
+            carried.pop("false_positive_reason", None)
             _apply_reverify_correction(carried, old_finding, verdict, ctx.session_id)
             _apply_corrected_false_positive_reason(carried, (verdict or {}).get("corrected_false_positive_reason"))
             conflict_result = await _persist_new_finding(ctx, carried)
@@ -7500,6 +7520,12 @@ async def _run_skeptical_verification(ctx: RunContext) -> None:
     hands each "verified" finding's claim + reproduction recipe (never the original reasoning/tool
     trace) to a fresh pass of SKEPTICAL_VERIFICATION_PROMPT and requires it to independently
     reproduce or explicitly refute — never a rubber stamp of the original narrative.
+
+    Deliberately does NOT get _confirmed_tech_facts_task_addendum either, unlike exploit/reverify's
+    own task-building (agent/core.py) — considered during a log-review audit and rejected on purpose,
+    not an oversight: that addendum is explicitly a LEAD the model may lean on, which is exactly the
+    kind of pre-digested context this phase's own "blind, never a rubber stamp" contract exists to
+    withhold. Re-add this exclusion to any future addendum before wiring it in here.
 
     Deliberately NOT built on delegate_to_subagent's own profile system: every subagent profile is
     entirely operator-configured (data/subagent_profiles.json) and can be disabled from Settings at
@@ -7595,6 +7621,13 @@ async def _run_skeptical_verification(ctx: RunContext) -> None:
         # could still sit in the report as "Medium"/"qualifying". Same corrected_* pattern
         # record_exploit_decision's skip path already applies, just never extended to this sibling
         # terminal tool.
+        if result == "refuted":
+            # A refuted verdict is not a reaffirmation of a prior "ruled out" conclusion (same
+            # reasoning as Reverify's own inconclusive branch) -- drop a stale false_positive_reason
+            # from before this correction helper runs, since that helper only fills an empty slot
+            # and would otherwise leave the stale one standing even though this finding was just
+            # pulled back OUT of "settled false positive" territory.
+            finding.pop("false_positive_reason", None)
         _apply_corrected_qualification(finding, (verdict or {}).get("corrected_severity"), (verdict or {}).get("corrected_qualifies_for_bounty"))
         _apply_corrected_false_positive_reason(finding, (verdict or {}).get("corrected_false_positive_reason"))
         if result == "refuted":

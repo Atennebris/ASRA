@@ -146,8 +146,12 @@ a per-session approval click in the UI instead.
   approval click before the agent exploits them, leaving the rest autonomous — this *adds* to the
   global `EXPLOIT_REQUIRE_APPROVAL` switch (when that's on, everything is gated regardless), so a
   high-value target can stay mostly hands-off while you still personally confirm the top-tier hits.
-- **Proof report export** — one click turns a completed session into a standalone HTML report:
-  findings, real evidence, and the full human-approval audit trail.
+- **Proof report export** — one click turns a completed session into a standalone report (HTML,
+  TXT, Markdown, PDF, DOCX, or a legacy DOC, plus a bundle of all of them): findings, real
+  evidence, and the full human-approval audit trail. In the TXT/Markdown/PDF/DOCX/DOC downloads,
+  the same underlying issue confirmed independently on several hosts (e.g. the same CDN
+  misconfiguration on a dozen subdomains) is grouped under one shared heading listing every
+  affected host, instead of repeating as that many separate top-level findings.
 - **Local-only** — no cloud dependency besides the LLM API call itself, and no database; session
   state is plain JSON on disk.
 - **"My IP" sidebar block** — a small, hidden-by-default block between the Settings nav item and
