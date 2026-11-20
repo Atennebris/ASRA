@@ -1168,6 +1168,56 @@
         <div id="desktop-update-panel" hx-get="/api/desktop-update/status" hx-trigger="load" hx-swap="innerHTML"></div>
       </div>
 
+      {# Fail-closed egress kill-switch (agent/egress_guard.py). When the operator routes through a
+         VPN/proxy and that channel drops, every network-touching tool call (scanners, HTTP client,
+         browser) refuses to run instead of silently falling back to the direct route and leaking the
+         real IP to the target. Two independent fields, each POSTing to its own /api/settings/egress
+         key (same stale-tab-safe pattern as the Reliability toggles). The sidebar's live "Egress"
+         dot (base.html) updates the instant either changes — asraEgressSave re-polls it. #}
+      <div class="bg-surface border border-default rounded-xl p-5">
+        {{ section_label("Fail-closed egress (kill-switch)") }}
+        <p class="ui-desc text-[12px] text-secondary mb-3">
+          Hold all outbound tool traffic to your own VPN/proxy. When the configured exit IP stops
+          matching this machine's current public IP (the channel dropped), network-touching tools
+          refuse to run rather than reaching the target over the direct route and leaking your real
+          IP. Off by default. The live status shows next to "My IP" in the sidebar.
+        </p>
+        <label class="flex items-start gap-3 cursor-pointer mb-4">
+          {{ toggle_switch("enabled", checked=egress_enforce_enabled(), onchange="asraEgressSave('ASRA_EGRESS_ENFORCE', this.checked)") }}
+          <span>
+            <span class="block text-sm font-medium text-primary">Enforce egress channel</span>
+            <span class="ui-desc block text-[11px] text-secondary mt-0.5">Block outbound network tool calls whenever the configured channel is down. Takes effect immediately for future tool calls.</span>
+          </span>
+        </label>
+        <label class="block">
+          <span class="block text-[11px] font-semibold uppercase tracking-wider text-secondary mb-1">Expected exit IP(s)</span>
+          <input type="text" id="asra-egress-expected-ip" value="{{ egress_expected_ip_raw() }}"
+                 placeholder="e.g. 203.0.113.7, 2001:db8::1"
+                 onchange="asraEgressSave('ASRA_EGRESS_EXPECTED_IP', this.value)"
+                 class="w-full bg-elevated border border-default rounded px-3 py-2 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-1 focus:border-accent focus:ring-accent/20">
+          <span class="ui-desc block text-[11px] text-secondary mt-1">Your VPN/proxy's own public exit IP (comma-separate several). Reveal it via "My IP" in the sidebar while the VPN is up. Leave empty and enforcement only reports reachability — it can't detect a drop-to-direct.</span>
+        </label>
+      </div>
+      <script>
+        window.asraEgressSave = window.asraEgressSave || function (key, value) {
+          var body = new URLSearchParams({ key: key, value: String(value) });
+          fetch("/api/settings/egress", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body,
+          }).then(function (r) {
+            if (!r.ok) { console.error("[UI] egress save failed", key, r.status); return; }
+            // Live feedback: re-poll the sidebar's egress dot so enabling/disabling (or a new exit
+            // IP) is reflected the same frame, not only on the next 15s tick.
+            if (window.htmx) {
+              try { window.htmx.ajax("GET", "/api/egress-status", { target: "#asra-egress-status", swap: "innerHTML" }); } catch (e) {}
+            }
+          }).catch(function (err) {
+            console.error("[UI] egress save error", key, err);
+          });
+        };
+      </script>
+
       {# Native toolkit's own agent/chat/subagent access (Sequencer's and Racer's toggles were each
          added in a later follow-up pass) -- seven independent toggles, each posting to its OWN
          field-specific endpoint, same "never resubmit every checkbox's current page state

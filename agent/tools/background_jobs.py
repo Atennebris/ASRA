@@ -20,6 +20,16 @@ sync check call sidesteps that mismatch entirely: there is no separate "watcher"
 job's completion is only ever noticed the next time something actually calls check_background_job
 (or await_all_running_jobs, right before a session finishes) -- deliberately simple over building
 cross-thread event-loop bridging that a plain sync tool function has no clean way to use anyway.
+
+check_background_job's result carries one of two genuinely different kinds of "not running
+anymore": "ok"/"error" mean the subprocess itself exited and its real returncode/output was
+observed (a confirmed outcome, good or bad); "completed_unverified" means the opposite -- this
+job's own deadline ran out before it ever produced that signal, so it was force-killed without
+ever being seen to actually finish. The job's own work may or may not have been done at that
+moment; nobody observed it either way, so this must never be read as proof of success. _reap below
+is the only place that sets it (on its own deadline, nothing else) and nothing in this module ever
+auto-restarts a job from this state -- whether to try again at all is left entirely to whatever
+called check_background_job, same discipline as "killed"/"interrupted" already get.
 """
 from __future__ import annotations
 
@@ -174,14 +184,27 @@ def _reap(session_id: str, session: dict, job_id: str, job: dict) -> None:
     returncode = process.poll()
     if returncode is None:
         if time.time() >= job.get("deadline", float("inf")):
+            # This is a FORCED stop, not a real completion signal -- SIGKILL here guarantees a
+            # returncode from process.wait(), but that returncode describes the kill, not whatever
+            # the job's own work had or hadn't accomplished at that moment. "completed_unverified"
+            # (not "ok"/"error") makes that distinction explicit for whatever reads this status
+            # next: we gave up waiting, we never observed the job's own real exit/output signal, so
+            # this must never be read as a confirmed success. See check_background_job's own
+            # registered tool description (agent/tools/__init__.py) for the model-facing wording of
+            # this same rule, and agent/core.py's _run_tool_with_retry (_STATUS_CHECK_TOOLS_SKIP_RETRY)
+            # for why this status is never auto-retried/replayed underneath the model either.
             process.kill()
             process.wait()
-            job["status"] = "timeout"
+            job["status"] = "completed_unverified"
             _RUNNING_PROCESSES.pop(job_id, None)
             _PARSERS.pop(job_id, None)
             # Reload-merge-save -- same fix/reasoning as start_background_job above.
             reload_merge_save(session_id, lambda s: s.setdefault("background_jobs", {}).__setitem__(job_id, job))
-            logger.debug("background_jobs: session=%s job=%s hit its own timeout", session_id, job_id)
+            logger.debug(
+                "background_jobs: session=%s job=%s hit its own deadline before producing a real exit "
+                "signal -- marked completed_unverified (forced kill, not a confirmed result)",
+                session_id, job_id,
+            )
         return  # still genuinely running
 
     parse_result = _PARSERS.pop(job_id, None)

@@ -87,12 +87,13 @@ def test_no_investigation_is_false_once_a_real_tool_ran():
 # --- _make_hypothesis_verification_executor: the execute() closure directly ---
 
 
-def test_executor_dispatches_record_finding_and_persists_it():
+def test_executor_dispatches_record_finding_and_persists_it(register_test_tool):
     session = _session()
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = ToolSpec(name="record_finding", category="scan", tool_tier=1, executable="", build_command=None, requires_allowed_target=False, installed_by_default=True, native_function=lambda p: {"status": "ok", "recorded": {"title": p["title"], "severity": "Low", "description": "d"}})
     execute = _make_hypothesis_verification_executor(ctx)
 
+    register_test_tool(spec)
     result = _run(execute(spec, {"title": "Exposed .git directory"}))
 
     assert result["status"] == "ok"
@@ -100,12 +101,13 @@ def test_executor_dispatches_record_finding_and_persists_it():
     assert ctx.session["findings"][0]["title"] == "Exposed .git directory"
 
 
-def test_executor_dispatches_resolve_hypothesis_and_persists_it():
+def test_executor_dispatches_resolve_hypothesis_and_persists_it(register_test_tool):
     session = _session(hypotheses=[_open_hypothesis()])
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = ToolSpec(name="resolve_hypothesis", category="post_exploit", tool_tier=1, executable="", build_command=None, requires_allowed_target=False, installed_by_default=True, native_function=lambda p: {"status": "ok", "resolved": {"hypothesis_text": p["hypothesis_text"], "status": p["status"], "note": p.get("note", "")}})
     execute = _make_hypothesis_verification_executor(ctx)  # no trace -> guard disabled
 
+    register_test_tool(spec)
     result = _run(execute(spec, {"hypothesis_text": "staging debug mode might be on", "status": "ruled_out", "note": "checked, not present"}))
 
     assert result["status"] == "ok"
@@ -125,7 +127,7 @@ def test_executor_rejects_resolve_hypothesis_with_zero_prior_investigation_when_
     assert ctx.session["hypotheses"][0]["status"] == "unconfirmed"  # untouched, rejected before persisting
 
 
-def test_executor_with_target_id_can_re_resolve_an_already_resolved_hypothesis():
+def test_executor_with_target_id_can_re_resolve_an_already_resolved_hypothesis(register_test_tool):
     """Real gap this closes: without target_hypothesis_id, _resolve_hypothesis's own fuzzy match
     only ever considers "unconfirmed" hypotheses, so a re-check of one that's already
     confirmed/ruled-out (run_all_hypotheses_verification's whole point, or a future single-item
@@ -135,6 +137,7 @@ def test_executor_with_target_id_can_re_resolve_an_already_resolved_hypothesis()
     spec = ToolSpec(name="resolve_hypothesis", category="post_exploit", tool_tier=1, executable="", build_command=None, requires_allowed_target=False, installed_by_default=True, native_function=lambda p: {"status": "ok", "resolved": {"hypothesis_text": p["hypothesis_text"], "status": p["status"], "note": p.get("note", "")}})
     execute = _make_hypothesis_verification_executor(ctx, target_hypothesis_id="hyp001")
 
+    register_test_tool(spec)
     result = _run(execute(spec, {"hypothesis_text": "staging debug mode might be on", "status": "confirmed", "note": "actually present, re-checked and confirmed"}))
 
     assert result["status"] == "ok"
@@ -142,7 +145,7 @@ def test_executor_with_target_id_can_re_resolve_an_already_resolved_hypothesis()
     assert ctx.session["hypotheses"][0]["resolution_note"] == "actually present, re-checked and confirmed"
 
 
-def test_executor_without_target_id_ignores_an_already_resolved_hypothesis():
+def test_executor_without_target_id_ignores_an_already_resolved_hypothesis(register_test_tool):
     """Unchanged existing behavior for the gate's own multi-hypothesis pass (no single target) --
     only ever matches a still-"unconfirmed" hypothesis, silent no-op otherwise."""
     session = _session(hypotheses=[_open_hypothesis(status="ruled_out")])
@@ -150,19 +153,21 @@ def test_executor_without_target_id_ignores_an_already_resolved_hypothesis():
     spec = ToolSpec(name="resolve_hypothesis", category="post_exploit", tool_tier=1, executable="", build_command=None, requires_allowed_target=False, installed_by_default=True, native_function=lambda p: {"status": "ok", "resolved": {"hypothesis_text": p["hypothesis_text"], "status": p["status"], "note": p.get("note", "")}})
     execute = _make_hypothesis_verification_executor(ctx)  # no target_hypothesis_id
 
+    register_test_tool(spec)
     result = _run(execute(spec, {"hypothesis_text": "staging debug mode might be on", "status": "confirmed", "note": "should not apply"}))
 
     assert result["status"] == "ok"  # tool call itself still "succeeds"...
     assert ctx.session["hypotheses"][0]["status"] == "ruled_out"  # ...but nothing was actually re-matched
 
 
-def test_executor_allows_resolve_hypothesis_after_a_real_tool_call_in_trace():
+def test_executor_allows_resolve_hypothesis_after_a_real_tool_call_in_trace(register_test_tool):
     session = _session(hypotheses=[_open_hypothesis()])
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = ToolSpec(name="resolve_hypothesis", category="post_exploit", tool_tier=1, executable="", build_command=None, requires_allowed_target=False, installed_by_default=True, native_function=lambda p: {"status": "ok", "resolved": {"hypothesis_text": p["hypothesis_text"], "status": p["status"], "note": p.get("note", "")}})
     trace_with_real_call = [{"tool": "http_request", "arguments": {"target": "https://example.com/debug"}, "result": {"status": "ok"}}]
     execute = _make_hypothesis_verification_executor(ctx, trace=trace_with_real_call)
 
+    register_test_tool(spec)
     result = _run(execute(spec, {"hypothesis_text": "staging debug mode might be on", "status": "ruled_out", "note": "probed /debug, got a clean 404"}))
 
     assert result["status"] == "ok"

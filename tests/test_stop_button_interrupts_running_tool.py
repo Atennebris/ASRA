@@ -30,7 +30,7 @@ def _sleep_spec(seconds: float) -> ToolSpec:
     )
 
 
-def test_stop_click_kills_a_tool_call_already_in_flight(monkeypatch):
+def test_stop_click_kills_a_tool_call_already_in_flight(monkeypatch, register_test_tool):
     monkeypatch.setattr(runner, "_timeout_for", lambda spec: 30)  # long enough our Stop wins the race
     real_popen = subprocess.Popen
     captured: list[subprocess.Popen] = []
@@ -47,6 +47,7 @@ def test_stop_click_kills_a_tool_call_already_in_flight(monkeypatch):
 
     async def _scenario():
         spec = _sleep_spec(5)
+        register_test_tool(spec)
         task = asyncio.create_task(_run_tool_with_retry(ctx, spec, {}))
         # Give the worker thread time to actually spawn the real subprocess before clicking Stop --
         # otherwise this test could "pass" for the wrong reason (stopping before it ever started).
@@ -72,7 +73,7 @@ def test_stop_click_kills_a_tool_call_already_in_flight(monkeypatch):
     assert returncode != 0  # killed, not a clean voluntary exit
 
 
-def test_stop_already_requested_before_the_call_starts_never_dispatches(monkeypatch):
+def test_stop_already_requested_before_the_call_starts_never_dispatches(monkeypatch, register_test_tool):
     """If Stop was already clicked (e.g. a queued-up second tool call in the same batch after the
     first one already noticed Stop), a fresh dispatch must not even start a new subprocess."""
     real_popen = subprocess.Popen
@@ -85,7 +86,7 @@ def test_stop_already_requested_before_the_call_starts_never_dispatches(monkeypa
 
     async def _scenario():
         try:
-            await _run_tool_with_retry(ctx, _sleep_spec(5), {})
+            await _run_tool_with_retry(ctx, register_test_tool(_sleep_spec(5)), {})
             assert False, "expected SessionStopRequested"
         except SessionStopRequested:
             pass

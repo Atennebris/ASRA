@@ -73,7 +73,7 @@ class _RecordingLLM:
         return LLMResponse(content=json.dumps({"arguments": {"target": "https://example.com", "tags": "cookie"}}), tool_calls=[])
 
 
-def test_end_to_end_retry_correction_prompt_contains_the_hint_not_the_raw_banner(monkeypatch):
+def test_end_to_end_retry_correction_prompt_contains_the_hint_not_the_raw_banner(monkeypatch, register_test_tool):
     session = {"session_id": "usr_nuclei_hint_e2e", "logs": []}
     llm = _RecordingLLM()
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
@@ -85,6 +85,7 @@ def test_end_to_end_retry_correction_prompt_contains_the_hint_not_the_raw_banner
         "command": ["nuclei", "-u", args["target"], "-jsonl", "-tags", args.get("tags", "")],
     })
 
+    register_test_tool(spec)
     _run(_run_tool_with_retry(ctx, spec, {"target": "https://example.com", "tags": "cookies-without-httponly"}))
 
     assert llm.seen_messages is not None

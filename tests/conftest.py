@@ -214,3 +214,23 @@ def _never_touch_real_app_state(tmp_path, monkeypatch):
     tool_inventory_mod._tool_availability_cache = None
     timezone_settings_mod._raw_cache = None
     store_mod._summaries_cache = None
+
+
+@pytest.fixture
+def register_test_tool(monkeypatch):
+    """Registers a test-double ToolSpec in TOOL_REGISTRY for one test, replacing any real tool of
+    the same name, and restores the real registry afterwards.
+
+    Needed because agent/core.py's _run_tool_with_retry enforces default-deny tool authorization
+    (agent/tools/tool_authorization.py): only the exact ToolSpec registered under a name may run,
+    so a hand-built double is refused like any other unrecognized tool unless a test registers it.
+    A fresh list (not an in-place mutation) is swapped in, so monkeypatch restores the original on
+    teardown even when the test itself fails midway."""
+    import agent.tools.registry as registry_mod
+
+    def _register(spec):
+        others = [existing for existing in registry_mod.TOOL_REGISTRY if existing.name != spec.name]
+        monkeypatch.setattr(registry_mod, "TOOL_REGISTRY", [*others, spec])
+        return spec
+
+    return _register

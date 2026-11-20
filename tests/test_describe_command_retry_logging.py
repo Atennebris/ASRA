@@ -124,7 +124,7 @@ def test_describe_command_keeps_non_underscore_arguments_intact():
     assert "the real live dict" not in described
 
 
-def test_end_to_end_retry_with_a_different_identity_logs_the_retrys_own_arguments(tmp_path, monkeypatch):
+def test_end_to_end_retry_with_a_different_identity_logs_the_retrys_own_arguments(tmp_path, monkeypatch, register_test_tool):
     """Full path: a real _run_tool_with_retry call whose 1-Step Retry corrects identity="user_a"
     to identity="default", both failing -- the resulting log description must show identity=
     "default" (what the retry that produced this error actually ran), never the original
@@ -135,6 +135,7 @@ def test_end_to_end_retry_with_a_different_identity_logs_the_retrys_own_argument
     spec = _make_failing_identity_tool()
     call = ToolCallRequest(id="1", name="authenticated_request", arguments={"identity": "user_a"})
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, call.arguments))
 
     assert result["status"] == "failed"

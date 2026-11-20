@@ -45,7 +45,7 @@ import markdown
 import markupsafe
 from markupsafe import Markup
 
-from agent import desktop_update, public_ip, reliability_settings, updater
+from agent import desktop_update, egress_guard, public_ip, reliability_settings, updater
 from agent import settings_transfer
 from agent.chat import (
     _find_thread,
@@ -754,6 +754,12 @@ templates.env.globals["load_clock_show_date"] = load_clock_show_date
 templates.env.globals["load_clock_style"] = load_clock_style
 # base.html's sidebar "My IP" block reads its auto-hide delay from env at render time (never the IP itself).
 templates.env.globals["public_ip_autohide_seconds"] = public_ip.autohide_seconds
+# Fail-closed egress kill-switch (agent/egress_guard.py): base.html's sidebar reads whether
+# enforcement is on to decide if the live status row shows/polls; settings.html reads both the
+# effective toggle and the configured expected exit IP. Page-wide globals (not per-render context)
+# so both pages get them without threading an egress context dict through every settings render site.
+templates.env.globals["egress_enforce_enabled"] = egress_guard.enforcement_enabled
+templates.env.globals["egress_expected_ip_raw"] = egress_guard.configured_expected_ip_raw
 # Same "callable global, invoked fresh at render time" reasoning as load_display_timezone above --
 # base.html emits window.ASRA_SOUND_SETTINGS from this on every page (not just settings.html), since
 # static/js/sound_events.js's own event watchers (new finding, session done, ...) need to fire from
@@ -6494,6 +6500,25 @@ async def api_public_ip() -> JSONResponse:
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
+_last_logged_egress_state: str | None = None
+
+
+@app.get("/api/egress-status", response_class=HTMLResponse)
+async def get_egress_status(request: Request) -> HTMLResponse:
+    """Sidebar fail-closed egress indicator (base.html), polled while enforcement is on. Renders the
+    current channel state (off/ok/blocked) -- the same verdict the tool-launch gate enforces, from
+    one shared short-TTL probe (agent/egress_guard.py). The probe runs off the event loop so a real
+    public-IP lookup never blocks the server. Logged only on a state change, same low-noise reason
+    as /api/system-health (otherwise a per-tab poll would dominate the debug log)."""
+    global _last_logged_egress_state
+    status = await asyncio.to_thread(egress_guard.probe_egress)
+    if status.state != _last_logged_egress_state:
+        logger.debug("api: egress-status state=%s configured=%s", status.state, status.configured)
+        _last_logged_egress_state = status.state
+    response = templates.TemplateResponse(request, "partials/egress_status.html", {"egress": status})
+    return response
+
+
 def _stage_desktop_update(status: desktop_update.DesktopUpdateStatus) -> dict:
     """Downloads + checksum-verifies the launcher for this platform, adding the staged path
     translated to a real Windows-shaped one (resolve_path_for_windows_shell) -- the Rust shell that
@@ -7491,6 +7516,34 @@ def save_reliability_setting_route(key: str = Form(...), value: str = Form(...))
     normalized = _normalize_reliability_value(key, value)
     reliability_settings.save_reliability_setting(key, normalized)
     logger.debug("api: reliability setting saved %s=%s", key, normalized)
+    return Response(status_code=204)
+
+
+@app.post("/api/settings/egress")
+def save_egress_setting_route(key: str = Form(...), value: str = Form(...)) -> Response:
+    """Settings -> General -> Fail-closed egress: persist one egress kill-switch setting
+    (ASRA_EGRESS_ENFORCE toggle, ASRA_EGRESS_EXPECTED_IP exit IP) to the egress settings store, which
+    the probe/gate then read ahead of the .env default. One key per request (same independent-field
+    pattern as the reliability/clock routes) so a stale tab can't revert a sibling field. The expected
+    IP is validated as a real IP (or comma-separated list, or empty to clear) before saving so a typo
+    never becomes a permanently-never-matching channel. The sidebar status updates live client-side;
+    204, no body."""
+    if key not in egress_guard.ALLOWED_KEYS:
+        raise HTTPException(status_code=404, detail=f"unknown egress setting {key!r}")
+    if key == egress_guard.ENFORCE_KEY:
+        normalized = "true" if egress_guard._as_bool(value) else "false"
+    else:
+        # Expected exit IP(s): accept empty (clear it) or a comma-separated list of real IPs; reject
+        # anything unparseable so the operator gets a clear error instead of a silently dead channel.
+        candidates = [part.strip() for part in value.split(",") if part.strip()]
+        for candidate in candidates:
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"{candidate!r} is not a valid IP address")
+        normalized = ", ".join(candidates)
+    egress_guard.save_setting(key, normalized)
+    logger.debug("api: egress setting saved %s=%r", key, normalized)
     return Response(status_code=204)
 
 

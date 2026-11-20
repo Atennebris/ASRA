@@ -1,0 +1,23 @@
+{# Sidebar fail-closed egress kill-switch indicator (base.html) — polled by GET /api/egress-status
+   (main.py). Renders nothing while enforcement is off, so the row simply collapses. When on: a
+   green dot + "Egress · OK" if the current public IP matches the configured VPN/proxy exit; a red
+   dot + "Egress · Blocked" if the channel is down and outbound network tools are being refused; a
+   muted dot + "Egress · Set exit IP" if enforcement is on but no expected exit IP is configured yet
+   (so a drop-to-direct cannot be detected). This verdict is the exact one the tool-launch gate
+   enforces (agent/egress_guard.py), from one shared probe, so the dot can never disagree with the
+   agent's real behavior. The detail/reason lives on title= (hover), same convention as the System
+   health row's own "detail on hover". #}
+{% if egress.state != "off" %}
+<div class="flex items-center gap-2" title="{{ egress.reason or 'Outbound tool traffic is held to the configured VPN/proxy exit.' }}">
+  {% if egress.state == "blocked" %}
+    <span class="w-1.5 h-1.5 rounded-full status-dot-offline shrink-0"></span>
+    <span class="text-[11px] text-secondary">Egress &middot; Blocked</span>
+  {% elif egress.configured %}
+    <span class="w-1.5 h-1.5 rounded-full status-dot-online shrink-0"></span>
+    <span class="text-[11px] text-secondary">Egress &middot; OK</span>
+  {% else %}
+    <span class="w-1.5 h-1.5 rounded-full bg-secondary/40 shrink-0"></span>
+    <span class="text-[11px] text-secondary">Egress &middot; Set exit IP</span>
+  {% endif %}
+</div>
+{% endif %}

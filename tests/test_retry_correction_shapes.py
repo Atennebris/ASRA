@@ -58,7 +58,7 @@ class _CapturingCorrectionLLM:
         return LLMResponse(content=self._correction_content, tool_calls=[])
 
 
-def test_retry_correction_prompt_includes_the_tools_real_parameter_names():
+def test_retry_correction_prompt_includes_the_tools_real_parameter_names(register_test_tool):
     """Real, confirmed incident this fixes: arjun timed out twice against a WAF-slowed target;
     both retries sent "url" instead of the real required field "target" and failed identically
     both times, costing 58% of a 42-minute Analyze phase -- the correction call had zero schema
@@ -81,6 +81,7 @@ def test_retry_correction_prompt_includes_the_tools_real_parameter_names():
     session = {"session_id": "usr_schema_grounding_test", "logs": []}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     _run(_run_tool_with_retry(ctx, spec, {"url": "https://example.com"}))
 
     assert llm.seen_messages is not None
@@ -89,7 +90,7 @@ def test_retry_correction_prompt_includes_the_tools_real_parameter_names():
     assert "URL to probe for hidden parameters" not in correction_prompt_text  # names only, not full descriptions -- stays compact
 
 
-def test_retry_correction_prompt_excludes_server_injected_internal_fields():
+def test_retry_correction_prompt_excludes_server_injected_internal_fields(register_test_tool):
     """Real, confirmed incident this fixes (live session Safety-Bug-Bounty-usr_158b31): for a tool
     that gets _session injected (delegate_to_subagent, check_subagent_task, browser_*, ...), the
     correction prompt used to json.dumps() the POST-injection arguments dict verbatim -- including
@@ -117,6 +118,7 @@ def test_retry_correction_prompt_excludes_server_injected_internal_fields():
     session = {"session_id": "usr_injection_leak_test", "logs": [], "findings": [{"title": "MARKER_" + ("x" * 500)}]}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     _run(_run_tool_with_retry(ctx, spec, {"subagent_name": "subdns", "task_description": "enumerate one subdomain"}))
 
     assert llm.seen_messages is not None
@@ -128,7 +130,7 @@ def test_retry_correction_prompt_excludes_server_injected_internal_fields():
     assert "subdns" in correction_prompt_text
 
 
-def test_retry_correction_prompt_falls_back_to_real_help_text_for_a_schemaless_tool(monkeypatch):
+def test_retry_correction_prompt_falls_back_to_real_help_text_for_a_schemaless_tool(monkeypatch, register_test_tool):
     """Real, confirmed incident this fixes: a generic/discovered tool (httpx, whatweb, ffuf, ...)
     has no real parameters_schema of its own, so schema_hint above comes out empty -- the
     correction retry had nothing but the tool's bare name to go on, unlike a schema-backed tool
@@ -148,6 +150,7 @@ def test_retry_correction_prompt_falls_back_to_real_help_text_for_a_schemaless_t
     session = {"session_id": "usr_help_fallback_test", "logs": []}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     _run(_run_tool_with_retry(ctx, spec, {"target": "https://example.com", "extra_args": ["-tls-verify"]}))
 
     assert llm.seen_messages is not None
@@ -178,7 +181,7 @@ def _make_tool(native_function) -> ToolSpec:
     )
 
 
-def test_retry_accepts_a_correction_sent_without_the_arguments_envelope(tmp_path, monkeypatch):
+def test_retry_accepts_a_correction_sent_without_the_arguments_envelope(tmp_path, monkeypatch, register_test_tool):
     calls = []
 
     def native_function(args: dict) -> dict:
@@ -194,6 +197,7 @@ def test_retry_accepts_a_correction_sent_without_the_arguments_envelope(tmp_path
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {}))
 
     assert result["status"] == "ok"
@@ -201,7 +205,7 @@ def test_retry_accepts_a_correction_sent_without_the_arguments_envelope(tmp_path
     assert len(calls) == 2
 
 
-def test_retry_still_gives_up_on_a_correction_with_no_usable_shape(tmp_path, monkeypatch):
+def test_retry_still_gives_up_on_a_correction_with_no_usable_shape(tmp_path, monkeypatch, register_test_tool):
     def native_function(args: dict) -> dict:
         return {"status": "error", "error": "domain is required"}
 
@@ -213,12 +217,13 @@ def test_retry_still_gives_up_on_a_correction_with_no_usable_shape(tmp_path, mon
         ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
         spec = _make_tool(native_function)
 
+        register_test_tool(spec)
         result = _run(_run_tool_with_retry(ctx, spec, {}))
 
         assert result["status"] == "failed"
 
 
-def test_retry_prefers_the_wrapped_arguments_shape_when_both_are_plausible():
+def test_retry_prefers_the_wrapped_arguments_shape_when_both_are_plausible(register_test_tool):
     """If the model DOES send the proper {"arguments": {...}} envelope, that's used as-is --
     the unwrapped fallback only ever kicks in when "arguments" is genuinely absent."""
     calls = []
@@ -234,13 +239,14 @@ def test_retry_prefers_the_wrapped_arguments_shape_when_both_are_plausible():
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {}))
 
     assert result["status"] == "ok"
     assert result["used_arguments"]["domain"] == "wrapped.example.com"
 
 
-def test_retry_that_fails_again_with_no_error_text_gets_a_synthesized_reason():
+def test_retry_that_fails_again_with_no_error_text_gets_a_synthesized_reason(register_test_tool):
     """The FIRST attempt is a real "error" (not a bare timeout -- see the bare-timeout-skip tests
     further below for that case, which never reaches a second dispatch at all) so the correction
     call actually gets attempted; the RETRY itself then ends in a retryable-but-textless status --
@@ -260,6 +266,7 @@ def test_retry_that_fails_again_with_no_error_text_gets_a_synthesized_reason():
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "x"}))
 
     assert len(calls) == 2
@@ -286,7 +293,7 @@ class _TruncatedThenRepairedLLM:
         return LLMResponse(content=json.dumps({"arguments": {"domain": "example.com"}}), tool_calls=[])
 
 
-def test_retry_repairs_a_truncated_correction_reply_instead_of_giving_up(tmp_path, monkeypatch):
+def test_retry_repairs_a_truncated_correction_reply_instead_of_giving_up(tmp_path, monkeypatch, register_test_tool):
     calls = []
 
     def native_function(args: dict) -> dict:
@@ -300,6 +307,7 @@ def test_retry_repairs_a_truncated_correction_reply_instead_of_giving_up(tmp_pat
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {}))
 
     assert llm.calls_made == 2  # the correction call, plus exactly one repair attempt
@@ -324,7 +332,7 @@ class _CountingCorrectionLLM:
         return LLMResponse(content=self._correction_content, tool_calls=[])
 
 
-def test_bare_timeout_never_asks_for_a_correction_or_redispatches():
+def test_bare_timeout_never_asks_for_a_correction_or_redispatches(register_test_tool):
     """Real, confirmed incident this fixes (CM-usr_b416f2): the correction call used to be asked
     to "fix" a bare timeout -- {"status": "timeout"} carries no stdout/stderr/exit_code at all,
     nothing diagnostic for a correction to actually react to -- and came back with
@@ -350,6 +358,7 @@ def test_bare_timeout_never_asks_for_a_correction_or_redispatches():
         requires_allowed_target=False, installed_by_default=True, native_function=native_function,
     )
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "5.252.32.97"}))
 
     assert len(calls) == 1  # never re-dispatched
@@ -358,7 +367,7 @@ def test_bare_timeout_never_asks_for_a_correction_or_redispatches():
     assert "playbook_hint" in result  # see _dead_end_hint's own docstring
 
 
-def test_bare_timeout_skip_needs_no_llm_at_all():
+def test_bare_timeout_skip_needs_no_llm_at_all(register_test_tool):
     """Stronger version of the test above: ctx.llm=None (nothing to call even if the code tried)
     proves this path never touches the correction mechanism, independent of what any LLM would
     have replied."""
@@ -369,12 +378,85 @@ def test_bare_timeout_skip_needs_no_llm_at_all():
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "x"}))
 
     assert result["status"] == "failed"
 
 
-def test_run_tool_with_retry_injects_session_id_for_custom_re_script():
+# --- background_job_check/check_subagent_task: their own job/task lifecycle status (running/ok/
+# error/completed_unverified/killed/...) must pass through _run_tool_with_retry completely
+# untouched -- it is NOT a verdict on whether this one poll dispatch succeeded, so it must never
+# collide with _RETRYABLE_STATUSES (same {"error", "timeout"} field names, different meaning) and
+# get silently rewritten to "failed", nor trigger an automatic "corrected retry" re-dispatch of the
+# same poll -- that would be exactly the silent auto-replay of a disconnected/stale-tracked job
+# CLAUDE.md's completed_unverified item explicitly forbids. See agent/core.py's
+# _STATUS_CHECK_TOOLS_SKIP_RETRY.
+
+
+def test_background_job_check_completed_unverified_passes_through_untouched(register_test_tool):
+    def native_function(args: dict) -> dict:
+        return {"status": "completed_unverified", "result": None}
+
+    spec = ToolSpec(
+        name="background_job_check", category="exploit", tool_tier=1, executable="", build_command=None,
+        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
+    )
+    session = {"session_id": "usr_bg_check_unverified_test", "logs": []}
+    ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
+
+    register_test_tool(spec)
+    result = _run(_run_tool_with_retry(ctx, spec, {"job_id": "job123"}))
+
+    # Not rewritten to "failed" (the bare-timeout collision this test guards against), and no
+    # correction was ever attempted -- ctx.llm=None would raise if the code tried to call it.
+    assert result["status"] == "completed_unverified"
+
+
+def test_background_job_check_real_error_is_never_sent_through_the_correction_mechanism(register_test_tool):
+    """A job that genuinely errored (real nonzero exit code, already captured by background_jobs.py's
+    own _reap) has nothing a "corrected retry" could fix -- job_id isn't a guessable argument, and
+    re-dispatching the poll changes nothing about the job that already finished. Confirms no LLM
+    call happens and the call count stays at 1 (never silently polled twice)."""
+    calls = []
+
+    def native_function(args: dict) -> dict:
+        calls.append(dict(args))
+        return {"status": "error", "result": {"exit_code": 1}}
+
+    spec = ToolSpec(
+        name="background_job_check", category="exploit", tool_tier=1, executable="", build_command=None,
+        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
+    )
+    session = {"session_id": "usr_bg_check_error_test", "logs": []}
+    ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
+
+    register_test_tool(spec)
+    result = _run(_run_tool_with_retry(ctx, spec, {"job_id": "job123"}))
+
+    assert result["status"] == "error"
+    assert len(calls) == 1
+
+
+def test_check_subagent_task_completed_unverified_passes_through_untouched(register_test_tool):
+    def native_function(args: dict) -> dict:
+        return {"status": "completed_unverified", "result": {"summary": "partial progress, 3 tool calls"}}
+
+    spec = ToolSpec(
+        name="check_subagent_task", category="post_exploit", tool_tier=1, executable="", build_command=None,
+        requires_allowed_target=False, installed_by_default=True, native_function=native_function,
+    )
+    session = {"session_id": "usr_subagent_check_unverified_test", "logs": []}
+    ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
+
+    register_test_tool(spec)
+    result = _run(_run_tool_with_retry(ctx, spec, {"task_id": "task123"}))
+
+    assert result["status"] == "completed_unverified"
+    assert result["result"]["summary"] == "partial progress, 3 tool calls"
+
+
+def test_run_tool_with_retry_injects_session_id_for_custom_re_script(register_test_tool):
     """Real, confirmed incident this fixes (hcm-usr_15eee7, NinthCircle-crackmes-usr_04a301):
     custom_re_script (agent/tools/__init__.py) reuses custom_exploit_run's own native_function
     wholesale under a second tool name for RE mode, but the injected{} block above only ever
@@ -397,12 +479,13 @@ def test_run_tool_with_retry_injects_session_id_for_custom_re_script():
     session = {"session_id": "usr_re_script_scoping_test", "logs": []}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     _run(_run_tool_with_retry(ctx, spec, {"source": "print('ok')"}))
 
     assert captured["session_id"] == "usr_re_script_scoping_test"
 
 
-def test_run_tool_with_retry_injects_session_id_for_tshark_capture():
+def test_run_tool_with_retry_injects_session_id_for_tshark_capture(register_test_tool):
     """tshark_capture (agent/tools/builders/tshark.py) keys its saved .pcap's location off
     _session_id the exact same way custom_re_script keys its scripts/ folder off it (test right
     above) -- same injection tuple, same reasoning: without it every capture would fall back to
@@ -423,13 +506,14 @@ def test_run_tool_with_retry_injects_session_id_for_tshark_capture():
     session = {"session_id": "usr_tshark_scoping_test", "logs": []}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {}))
 
     assert result["status"] == "ok"
     assert captured["session_id"] == "usr_tshark_scoping_test"
 
 
-def test_retry_that_fails_again_with_real_error_text_keeps_it_unchanged():
+def test_retry_that_fails_again_with_real_error_text_keeps_it_unchanged(register_test_tool):
     """The synthesized fallback must never overwrite a real error the retry actually produced."""
     def native_function(args: dict) -> dict:
         return {"status": "error", "error": "connection refused"}
@@ -439,6 +523,7 @@ def test_retry_that_fails_again_with_real_error_text_keeps_it_unchanged():
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "x"}))
 
     assert result["status"] == "failed"
@@ -462,7 +547,7 @@ def _make_session_injected_tool(native_function) -> ToolSpec:
     )
 
 
-def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_first_success():
+def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_first_success(register_test_tool):
     """Real, confirmed incident this fixes (live session Safety-Bug-Bounty-usr_158b31):
     used_arguments carried the full POST-injection arguments (including the entire live _session --
     every finding, every log line, every chat thread) straight into the tool's own result. Shown to
@@ -475,6 +560,7 @@ def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_firs
     session = {"session_id": "usr_used_args_leak_test", "logs": [], "findings": [{"title": "MARKER_" + ("x" * 500)}]}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "ssh://example.com"}))
 
     assert result["status"] == "ok"
@@ -484,7 +570,7 @@ def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_firs
     assert "MARKER_" not in json.dumps(result)
 
 
-def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_retry():
+def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_retry(register_test_tool):
     calls = []
 
     def native_function(args: dict) -> dict:
@@ -498,6 +584,7 @@ def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_retr
     session = {"session_id": "usr_used_args_leak_retry_test", "logs": [], "findings": [{"title": "MARKER_" + ("x" * 500)}]}
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {}))
 
     assert result["status"] == "ok"
@@ -506,7 +593,7 @@ def test_run_tool_with_retry_strips_injected_session_from_used_arguments_on_retr
     assert "MARKER_" not in json.dumps(result)
 
 
-def test_retry_flags_when_the_correction_silently_swaps_in_a_different_host():
+def test_retry_flags_when_the_correction_silently_swaps_in_a_different_host(register_test_tool):
     """Real, confirmed incident this fixes (test-2-again2-usr_2f4db1): a failed
     security_headers_audit against "mail.z8games.com" came back from the correction call
     "fixed" to "z8games.com" -- a completely different host, not a fix to the original call --
@@ -525,6 +612,7 @@ def test_retry_flags_when_the_correction_silently_swaps_in_a_different_host():
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "mail.z8games.com"}))
 
     assert len(calls) == 2
@@ -532,7 +620,7 @@ def test_retry_flags_when_the_correction_silently_swaps_in_a_different_host():
     assert result["target_changed_by_retry"] == {"from": "mail.z8games.com", "to": "z8games.com"}
 
 
-def test_retry_does_not_flag_a_correction_that_keeps_the_same_host():
+def test_retry_does_not_flag_a_correction_that_keeps_the_same_host(register_test_tool):
     """Regression guard for the fix above: a correction that only changes shape (bare host to a
     full URL for the SAME host) must not be flagged -- only a genuinely different host should be."""
     calls = []
@@ -548,6 +636,7 @@ def test_retry_does_not_flag_a_correction_that_keeps_the_same_host():
     ctx = RunContext(llm=llm, session=session, session_id=session["session_id"])
     spec = _make_tool(native_function)
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"domain": "mail.z8games.com"}))
 
     assert len(calls) == 2

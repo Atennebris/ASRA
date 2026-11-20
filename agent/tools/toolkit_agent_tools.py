@@ -28,6 +28,7 @@ from agent.tools.toolkit_decoder import SCHEMES as _DECODER_SCHEMES
 from agent.tools.toolkit_decoder import run_codec
 from agent.tools.toolkit_query import QuerySyntaxError, compile_query
 from agent.tools.toolkit_repeater import send_raw_request
+from agent.tools.tool_authorization import PLATFORM_POLICY_REFUSAL_NOTICE
 
 # Same "cap what's handed to the model" convention as native.py's http_request (body_preview:
 # resp.text[:2000]) -- a captured/sent response body can run to ~1MB (confirmed live end-to-end),
@@ -333,7 +334,7 @@ def _sequencer_analyze_native(params: dict) -> dict:
                     f"target {target!r} is not in this project's exploitation allowlist. This is a permanent, "
                     "deterministic rejection for this target for the rest of this session — no combination of "
                     "arguments will change the outcome. Use mode='stored' instead if you only need to analyze "
-                    "tokens already seen in this session's own captured traffic."
+                    f"tokens already seen in this session's own captured traffic. {PLATFORM_POLICY_REFUSAL_NOTICE}"
                 ),
             }
         method = (params.get("method") or "GET").strip().upper()

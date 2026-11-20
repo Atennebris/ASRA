@@ -808,8 +808,15 @@ register_tool(
             "Polls a background job started by hydra_start or web_login_bruteforce_start, by its "
             "job_id. {\"status\": \"running\"} means it's genuinely still going — check other "
             "findings, call other tools, and come back to this later; it's fine to poll more than "
-            "once. Any other status (ok/error/timeout/killed/interrupted) means it's actually done, "
-            "with credentials (if any were found) in result."
+            "once. status=ok/error means the job's own process really exited and you're looking at "
+            "a confirmed result (credentials, if any were found, are in result). "
+            "status=completed_unverified means something different: this job's own time budget ran "
+            "out before it ever produced that real exit signal, so it was force-stopped without "
+            "being observed to actually finish — this is NOT proof of success (or failure); do not "
+            "report it as a completed task. It will never restart itself — if you need an answer, "
+            "say so explicitly (poll again if you suspect it was still close, or treat it as "
+            "inconclusive), don't just assume it quietly succeeded. (killed/interrupted mean an "
+            "operator Stop or a server restart ended it, also not a confirmed result.)"
         ),
         parameters_schema={
             "type": "object",
@@ -2976,7 +2983,12 @@ register_tool(
             "If you have no other useful work left and are only waiting on a delegated subagent, do "
             "NOT poll this in a loop — the system automatically waits for every still-running "
             "subagent before the phase actually concludes, at no extra cost to you. Just move on to "
-            "wrapping up the phase instead."
+            "wrapping up the phase instead. status=done/error means the subagent's own conversation "
+            "genuinely reached that outcome. status=completed_unverified means its own time budget "
+            "ran out before it ever called report_subagent_result — result may hold real partial "
+            "progress (tool calls it actually made), but this is NOT a confirmed finished answer; "
+            "never report it as if the subagent concluded successfully, and never assume calling "
+            "this again will make it magically finish — it won't restart on its own."
         ),
         parameters_schema={
             "type": "object",

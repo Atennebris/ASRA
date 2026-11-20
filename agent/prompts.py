@@ -1283,7 +1283,9 @@ operator's time on a Windows target.
   crash-class bugs rather than reason about them from code alone, afl_fuzz_start kicks off a real
   fuzzing run IN THE BACKGROUND — it returns a job_id immediately and keeps running while you do
   other work; check on it later with background_job_check (crash/hang counts + file paths once it
-  finishes). Dumb mode (no coverage feedback) — an honest limitation of what's actually installed
+  finishes). A status=completed_unverified result means the run's own time budget expired before
+  it reported real crash/hang counts — treat that as "no confirmed finding yet", never as "zero
+  crashes found". Dumb mode (no coverage feedback) — an honest limitation of what's actually installed
   here, not full coverage-guided fuzzing; still finds real, genuinely reproducible crashes on a
   black-box target, just less efficiently than instrumented fuzzing would.
   Once afl_fuzz_start (or a manual gdb session) actually produces a real crash, pwntools_analysis
@@ -1596,6 +1598,10 @@ failure, timeout) from your own replies, that says nothing about whether delegat
 was your own reasoning call, not the subagent's. Never refuse or skip calling delegate_to_subagent
 because of a past error sitting in your own conversation history; always actually attempt it fresh
 and let its own real result (success, or its own distinct error) speak for itself.
+check_subagent_task's status=completed_unverified is a distinct outcome from status=done/error: it
+means the subagent's own time budget ran out before it ever reported back, not that it succeeded
+or failed — treat whatever partial result comes with it as real but unfinished progress, never as
+a settled answer you can relay to the operator as-is.
 
 query_playbook: before re-deriving an attack, ask the cross-session playbook with a plain-language
 question — it matches prior wins and confirmed dead-ends by MEANING, not just keywords, so you reuse
@@ -1917,7 +1923,9 @@ _RE_CHAT_SHAPE_BLOCKS = {
   parses untrusted input and you
   want to look for crash-class bugs, afl_fuzz_start kicks off a real fuzzing run in the background
   (job_id returned immediately, keeps running while you do other work) — check on it later with
-  background_job_check. Dumb mode, no coverage feedback (the honest limitation of what's actually
+  background_job_check. status=completed_unverified there means the run's own deadline expired
+  before it ever reported real crash/hang counts — not a confirmed "no crashes", just no answer
+  yet. Dumb mode, no coverage feedback (the honest limitation of what's actually
   installed here), but it still finds real, reproducible crashes on a black-box target. Once a real
   crash actually turns up (from afl_fuzz_start or a manual gdb session), pwntools_analysis turns it
   into exploit-dev groundwork: mode="cyclic_pattern" generates a De Bruijn input to feed the target

@@ -840,6 +840,16 @@
         </button>
       </div>
 
+      {# Fail-closed egress kill-switch status (agent/egress_guard.py), right under "My IP" — a live
+         green/red signal using the same polled-partial pattern as the System health row below.
+         ALWAYS in the DOM (never {% if %}-ed out) so flipping the Settings toggle updates it LIVE
+         client-side (asraEgressSave triggers a refresh); the partial itself renders nothing while
+         enforcement is off, so the row collapses to zero height then. hx-select="unset" for the same
+         reason the system-health/update rows below need it (don't inherit #sidebar's hx-boost
+         target/select). #}
+      <div id="asra-egress-status" class="px-3 shrink-0 flex items-center justify-center empty:hidden"
+           hx-get="/api/egress-status" hx-trigger="load, every 15s" hx-target="this" hx-select="unset" hx-swap="innerHTML"></div>
+
       {# Corner clock, own row so it stays visible on every page (this sidebar footer is the one
          part of the shell that's never swapped by htmx) -- ticks client-side (static/js/
          header_clock.js), server only ever renders the operator's saved Settings -> Customization

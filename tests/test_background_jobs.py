@@ -194,7 +194,11 @@ def test_kill_all_running_jobs_kills_every_running_job_not_just_one(tmp_path):
         os.kill(pid2, 0)
 
 
-def test_job_hitting_its_own_timeout_is_killed_and_marked_timeout(tmp_path):
+def test_job_hitting_its_own_timeout_is_killed_and_marked_completed_unverified(tmp_path):
+    """A deadline-forced kill is NOT a confirmed outcome -- status must read as "completed_unverified",
+    never "ok"/"error" (both of those mean a real exit code was actually observed) and never
+    silently swallowed by the generic tool-retry machinery (see agent/core.py's
+    _STATUS_CHECK_TOOLS_SKIP_RETRY)."""
     session_id = "usr_bg_timeout_test"
     session = _base_session(session_id)
     start = bg.start_background_job(session_id, session, "test-tool", _sleep_setup(30), max_concurrent=2, timeout_seconds=0)
@@ -203,7 +207,7 @@ def test_job_hitting_its_own_timeout_is_killed_and_marked_timeout(tmp_path):
     time.sleep(0.2)
 
     result = bg.check_background_job(session_id, session, job_id)
-    assert result["status"] == "timeout"
+    assert result["status"] == "completed_unverified"
 
 
 def test_reconcile_orphaned_background_jobs_kills_a_real_orphaned_process(tmp_path):

@@ -7,11 +7,13 @@ import shutil
 import subprocess
 import time
 
+from agent import egress_guard
 from agent.tools.allowed_targets import is_target_allowed
 from agent.tools.cache import cache_get, cache_set
 from agent.tools.custom_tools_root import resolve_via_custom_root
 from agent.tools.registry import ToolSpec, categories_of
 from agent.tools.tool_api_keys import redact_secrets_in_command
+from agent.tools.tool_authorization import PLATFORM_POLICY_REFUSAL_NOTICE
 from agent.utils.debug import current_subagent_label, truncate_for_log
 from agent.utils.logger import get_logger
 
@@ -200,7 +202,8 @@ def _check_guardrail(spec: ToolSpec, params: dict) -> dict | None:
                 "deterministic rejection for this target for the rest of this session — no combination of "
                 "arguments or source code will change the outcome, so do not retry this tool against this same "
                 "target. For read-only reference material (CVE advisories, release notes, public write-ups) "
-                "outside the assessment scope, use http_request instead — it isn't gated by this allowlist."
+                f"outside the assessment scope, use http_request instead — it isn't gated by this allowlist. "
+                f"{PLATFORM_POLICY_REFUSAL_NOTICE}"
             ),
         }
     return None
@@ -252,7 +255,33 @@ def _run_native(spec: ToolSpec, params: dict) -> dict:
     return result
 
 
+# A tier-2 subprocess tool in any of these categories talks to an external target over the network
+# (nmap/nuclei/sqlmap/httpx/ffuf/dalfox/...), so it's subject to the fail-closed egress kill-switch.
+# The "re" category (radare2/ghidra/gdb — local binary analysis) is deliberately NOT here: those
+# touch no network and must stay runnable even when the egress channel is down.
+_EGRESS_GATED_CATEGORIES = frozenset({"recon", "scan", "exploit", "post_exploit"})
+
+
+def _egress_block_result(spec: ToolSpec) -> dict | None:
+    """Fail-closed egress gate for a network-touching tool: returns a model-facing "blocked" result
+    when egress enforcement is on and the configured VPN/proxy channel is down, else None. Only
+    consulted for tools in _EGRESS_GATED_CATEGORIES, so local-only tools are never affected."""
+    if not _EGRESS_GATED_CATEGORIES.intersection(categories_of(spec)):
+        return None
+    reason = egress_guard.egress_block_reason()
+    if reason is None:
+        return None
+    _debug("run_tool: %s blocked by egress kill-switch", spec.name)
+    # never_dispatched=True: the call never reached the host, exactly like a build_command failure,
+    # so agent/core.py's _track_host_health must not count it toward the host's dead-host streak.
+    return {"status": "blocked", "tool": spec.name, "reason": reason, "never_dispatched": True}
+
+
 def _run_subprocess(spec: ToolSpec, params: dict) -> dict:
+    egress_blocked = _egress_block_result(spec)
+    if egress_blocked is not None:
+        return egress_blocked
+
     resolved_executable = _resolve_executable(spec)
     if resolved_executable is None:
         _debug("run_tool: %s unavailable (executable not found)", spec.name)

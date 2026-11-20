@@ -251,7 +251,7 @@ def test_apply_output_parser_leaves_the_arjun_timeout_case_retryable():
     assert "drop" in result["error"].lower() or "--stable" in result["error"]
 
 
-def test_run_tool_with_retry_skips_the_correction_round_trip_for_a_known_arjun_crash(monkeypatch):
+def test_run_tool_with_retry_skips_the_correction_round_trip_for_a_known_arjun_crash(monkeypatch, register_test_tool):
     """End-to-end proof of the real incident's own fix: the LLM must never even be asked for a
     correction once the known-permanent Arjun crash signature is recognized -- same "prove it
     through the real dispatch path" discipline as test_nuclei_failure_hint.py's own end-to-end test."""
@@ -275,6 +275,7 @@ def test_run_tool_with_retry_skips_the_correction_round_trip_for_a_known_arjun_c
         "error": "AttributeError inside initialize(): 'dict' object has no attribute 'status_code'",
     })
 
+    register_test_tool(spec)
     result = asyncio.run(_run_tool_with_retry(ctx, spec, {"target": "https://example.com"}))
 
     assert result["status"] == "failed"

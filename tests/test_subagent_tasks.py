@@ -149,7 +149,10 @@ def test_check_subagent_task_reports_a_real_error():
     assert "something real broke" in result["result"]["error"]
 
 
-def test_check_subagent_task_reports_a_real_timeout():
+def test_check_subagent_task_reports_a_real_timeout_as_completed_unverified():
+    """asyncio.wait_for()'s own deadline firing is a forced cutoff, not a confirmed outcome -- the
+    subagent never got to report success OR failure, so this must read as "completed_unverified",
+    never "done"/"error" (both of which mean the subagent's own conversation actually concluded)."""
     session_id = "usr_subagent_timeout_test"
     session = _base_session(session_id)
 
@@ -160,7 +163,7 @@ def test_check_subagent_task_reports_a_real_timeout():
         return st.check_subagent_task(session_id, session, "task1")
 
     result = _run(_go())
-    assert result["status"] == "timeout"
+    assert result["status"] == "completed_unverified"
     assert result["result"] is None
 
 
@@ -183,7 +186,7 @@ def test_check_subagent_task_reports_partial_progress_on_a_real_timeout():
         return st.check_subagent_task(session_id, session, "task1")
 
     result = _run(_go())
-    assert result["status"] == "timeout"
+    assert result["status"] == "completed_unverified"
     assert result["result"] is not None
     assert result["result"]["tool_calls"] == 2
     assert result["result"]["partial_trace"] == live_trace

@@ -43,6 +43,7 @@ import mmh3
 import pyevmasm
 from curl_cffi import requests as curl_requests
 
+from agent import egress_guard
 from agent.tools import toolkit_store
 from agent.tools.allowed_targets import collapse_cdn_edge_node_hosts, is_target_allowed
 from agent.tools.background_jobs import check_background_job, start_background_job
@@ -1108,6 +1109,13 @@ def _nxdomain_result(url: str, exc: httpx.HTTPError) -> dict | None:
 
 
 def http_request(params: dict) -> dict:
+    # Fail-closed egress gate: this is the agent's primary native outbound call, so a dropped
+    # VPN/proxy channel must refuse it rather than silently reaching the target over the direct
+    # route (agent/egress_guard.py). No-op when enforcement is off or the channel is healthy.
+    egress_reason = egress_guard.egress_block_reason()
+    if egress_reason is not None:
+        logger.debug("native: http_request blocked by egress kill-switch")
+        return {"status": "blocked", "error": egress_reason, "never_dispatched": True}
     url = _ensure_url_scheme(params["target"])
     # Real, confirmed incident this fixes: the schema accepted (and a model correctly tried to
     # set) follow_redirects=False to test an open-redirect PoC against a deliberately
@@ -2664,8 +2672,11 @@ def web_login_bruteforce_start(params: dict) -> dict:
 
 def background_job_check(params: dict) -> dict:
     """Polls any *_start background job (hydra_start, web_login_bruteforce_start, ...) by its
-    job_id — {"status": "running"} means genuinely still going (check again later), any other
-    status ("ok"/"error"/"timeout"/"killed"/"interrupted") means it's actually done."""
+    job_id — {"status": "running"} means genuinely still going (check again later). Any other
+    status means it's done, but "ok"/"error" (a real exit code was observed) and
+    "completed_unverified" (the job's own deadline ran out before that ever happened — forcibly
+    stopped, NOT a confirmed outcome either way) mean very different things; see
+    check_background_job's own docstring (agent/tools/background_jobs.py) for the full reasoning."""
     session_id = params.get("_session_id")
     session = params.get("_session")
     job_id = params.get("job_id")

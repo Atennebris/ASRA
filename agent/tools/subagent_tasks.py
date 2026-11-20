@@ -18,6 +18,13 @@ across a process restart), an asyncio.Task simply ceases to exist the instant th
 does -- there is no orphan process to find and kill on the next startup, only a stale "running"
 status left over from a run that never got to update it. reconcile_orphaned_subagent_tasks reflects
 exactly that: no kill step, just an honest status correction.
+
+check_subagent_task's result shares background_jobs.py's same "ok"/"error" (a real exception or a
+real report_subagent_result observed) vs. "completed_unverified" (this task's own asyncio.wait_for
+deadline ran out, or it was cancelled past that same deadline, before either ever happened) split --
+see that module's own docstring for the full reasoning. The partial trace _reap salvages for a
+completed_unverified task is real, genuine progress, just never confirmed as the task's own actual
+conclusion -- never treat it as equivalent to a real report_subagent_result.
 """
 from __future__ import annotations
 
@@ -241,13 +248,31 @@ def _reap(session_id: str, session: dict, task_id: str, entry: dict) -> None:
                 task_id, "was cut short — the ASRA server was shut down while its own conversation was still running",
             ) or {"summary": "Stopped — the ASRA server was shut down while this subagent's own conversation was still running."}
         else:
-            entry["status"] = "timeout"
+            # Its own asyncio.wait_for() deadline genuinely ran out -- cancellation here is the
+            # budget enforcement itself, not evidence the subagent's own work failed or finished.
+            # "completed_unverified" (not "timeout") makes that explicit for whatever reads this
+            # next: the partial trace below is real progress, but nobody ever saw this task reach
+            # its own actual conclusion, so this is not proof of success or failure either way.
+            entry["status"] = "completed_unverified"
             entry["result"] = _synthesize_partial_result(task_id)
+            logger.debug(
+                "subagent_tasks: session=%s task=%s hit its own deadline (via cancellation) before "
+                "reporting a real result -- marked completed_unverified, not a confirmed outcome",
+                session_id, task_id,
+            )
     else:
         exc = task.exception()
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            entry["status"] = "timeout"
+            # Same deadline-ran-out case as the cancelled branch above, just surfaced as
+            # wait_for()'s own TimeoutError instead of a raw cancellation -- same status, same
+            # "not a confirmed outcome" reasoning.
+            entry["status"] = "completed_unverified"
             entry["result"] = _synthesize_partial_result(task_id)
+            logger.debug(
+                "subagent_tasks: session=%s task=%s hit its own asyncio.wait_for deadline before "
+                "reporting a real result -- marked completed_unverified, not a confirmed outcome",
+                session_id, task_id,
+            )
         elif exc is not None and type(exc).__name__ == "SessionStopRequested":
             # Matched by class NAME, not isinstance -- this module must stay import-safe with
             # respect to agent.core (see this file's own top docstring), so it can't import

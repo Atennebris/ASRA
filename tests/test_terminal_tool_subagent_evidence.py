@@ -197,6 +197,10 @@ def test_terminal_call_is_blocked_while_an_uncited_subagent_task_from_this_pass_
 
 
 def test_terminal_call_is_accepted_once_every_delegated_task_has_actually_resolved():
+    """"completed_unverified" (the task's own time budget ran out, not a crash and not a real
+    report_subagent_result) still counts as RESOLVED here -- there's a final status to look at,
+    just not a confirmed one -- so the terminal call isn't blocked waiting on a task that will
+    never move past "running" on its own."""
     llm = _ScriptedLLM([
         ("check_subagent_task", {"task_id": "abc123"}),
         (
@@ -209,7 +213,7 @@ def test_terminal_call_is_accepted_once_every_delegated_task_has_actually_resolv
         ),
     ])
     ctx = _make_ctx(llm)
-    execute = _make_execute(check_statuses=["timeout"])
+    execute = _make_execute(check_statuses=["completed_unverified"])
 
     result, trace = _run(_run_llm_tool_loop(
         ctx, "system", "task", [_make_tool("check_subagent_task"), _make_tool("record_reverification_result")],

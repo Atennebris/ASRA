@@ -159,6 +159,21 @@ a per-session approval click in the UI instead.
   own IP) — click the eye icon to reveal it, fetched fresh on that click only (never polled, so
   switching a VPN shows its new exit IP on the very next reveal), auto-hidden again after
   `PUBLIC_IP_AUTOHIDE_SECONDS` or as soon as the tab is hidden.
+- **Fail-closed egress kill-switch** — if you route through a VPN/proxy and that channel drops,
+  ASRA refuses to let the agent's network-touching tools (scanners, the HTTP client, the browser,
+  `http_request`) fall back to your machine's direct route — so your real IP never leaks to the
+  target on a dropped VPN. Off by default; enable it in **Settings → General → Fail-closed egress**
+  and set your VPN/proxy's own public exit IP (`ASRA_EGRESS_EXPECTED_IP`). A probe compares that
+  against this machine's current public IP; a mismatch (or an unverifiable lookup while an exit IP
+  is set) puts egress in a **blocked** state and refuses outbound tool calls with a clear reason
+  until the channel is restored. A live "Egress" dot next to "My IP" in the sidebar shows the
+  current state (green OK / red Blocked).
+- **Default-deny tool authorization** — the agent can only execute ASRA's own registered tools and
+  the custom tools you enabled in Settings → Tools. Anything else (an unrecognized tool, or a tool
+  merely reusing a registered tool's name) is refused before it runs, with a clear reason returned
+  to the model. Tools from an external provider (the `mcp_` namespace, e.g. an MCP server you
+  connected) never run by default — list the ones you have vetted in `ASRA_ALLOWED_EXTERNAL_TOOLS`.
+  This sits in front of, and does not replace, the scope/approval/egress gates.
 
 ## Screenshots
 
@@ -823,6 +838,10 @@ The ones worth knowing going in:
 | `PUBLIC_IP_V4_URL` / `PUBLIC_IP_V6_URL` | `https://api.ipify.org` / `https://api6.ipify.org` | Plain-text lookup services behind the sidebar's "My IP" block (each must answer a GET with nothing but the address) |
 | `PUBLIC_IP_TIMEOUT_SECONDS` / `PUBLIC_IP_CACHE_SECONDS` | `4` / `5` | Per-lookup timeout, and a tiny server-side cache TTL that only absorbs a double-click — kept short so a VPN switch never shows a stale IP for long |
 | `PUBLIC_IP_AUTOHIDE_SECONDS` | `30` | How long the sidebar's "My IP" block stays revealed before it hides itself again |
+| `ASRA_EGRESS_ENFORCE` | `false` | Fail-closed egress kill-switch: when on, network-touching tool calls refuse to run if the configured VPN/proxy channel is down (also toggled live in Settings → General) |
+| `ASRA_EGRESS_EXPECTED_IP` | *(empty)* | Your VPN/proxy's own public exit IP(s), comma-separated — defines "the configured channel". A mismatch with this machine's current public IP (VPN dropped) blocks outbound tools. Empty = reachability-only, can't detect a drop-to-direct |
+| `ASRA_EGRESS_PROBE_TIMEOUT_SECONDS` / `ASRA_EGRESS_PROBE_CACHE_SECONDS` | `4` / `15` | Per-request timeout for the egress health probe's public-IP lookup, and how long one verdict is cached and shared by every tool-launch gate and the sidebar poll |
+| `ASRA_ALLOWED_EXTERNAL_TOOLS` | *(empty)* | Comma-separated exact names of external-provider tools (`mcp_` namespace) you have vetted and allow to run. Everything not listed stays blocked by default-deny tool authorization |
 
 The LLM provider/model can also be changed later from `/settings` without editing `.env` again.
 

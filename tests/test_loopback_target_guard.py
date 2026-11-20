@@ -51,26 +51,28 @@ def _make_tool(name: str = "tcp_port_check") -> ToolSpec:
     )
 
 
-def test_run_tool_with_retry_skips_a_call_against_a_loopback_target(tmp_path, monkeypatch):
+def test_run_tool_with_retry_skips_a_call_against_a_loopback_target(tmp_path, monkeypatch, register_test_tool):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
     session = {"session_id": "usr_loopback_test", "logs": []}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = _make_tool()
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "127.0.0.1", "port": 2077}))
 
     assert result["status"] == "skipped"
     assert "loopback" in result["reason"]
 
 
-def test_run_tool_with_retry_runs_normally_for_a_real_target(tmp_path, monkeypatch):
+def test_run_tool_with_retry_runs_normally_for_a_real_target(tmp_path, monkeypatch, register_test_tool):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
     session = {"session_id": "usr_loopback_clear", "logs": []}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = _make_tool()
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "insanitycheats.com", "port": 443}))
 
     assert result["status"] == "ok"

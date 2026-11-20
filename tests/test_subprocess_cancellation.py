@@ -3,7 +3,8 @@ process, not just mark the awaiting coroutine itself as cancelled/timed out.
 
 Real, confirmed incident: a subagent's own asyncio.wait_for(timeout=900) fired while its worker
 thread was still blocked inside a live nuclei subprocess call — the coroutine was correctly marked
-"timeout" (agent/tools/subagent_tasks.py's _reap), but the real nuclei process kept running for
+"completed_unverified" (agent/tools/subagent_tasks.py's _reap; named "timeout" at the time of this
+incident), but the real nuclei process kept running for
 another 86 real seconds, finishing (and logging its own completion) well after the whole session
 had already been recorded as completed. Cancelling an asyncio Task awaiting asyncio.to_thread does
 NOT stop the underlying worker thread's blocking call on its own — a documented asyncio/threading

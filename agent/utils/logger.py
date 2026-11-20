@@ -31,6 +31,9 @@ LOG_CATEGORIES: set[str] = {
     # agent/operator_profile_store.py + agent/core.py's _operator_profile_task_addendum
     "SCHEDULER",  # unattended repeat-scan scheduler — agent/tools/schedule_store.py +
     # main.py's _scheduler_worker_loop (which projects are due, what got enqueued, recon reused)
+    "EGRESS",  # fail-closed egress kill-switch — agent/egress_guard.py: channel health/IP probe +
+    # the enforcement decisions at each outbound tool-launch point (runner subprocess, toolkit HTTP
+    # client, browser_manager, native http_request)
 }
 
 _configured: set[str] = set()

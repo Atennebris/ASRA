@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent import egress_guard
 from agent.tools.allowed_targets import extract_hostname, is_target_out_of_scope
 from agent.tools.browser_stealth import STEALTH_INIT_SCRIPT, derive_stealth_user_agent, launch_headless
 from agent.tools.native import get_identity_browser_creds, interpret_missing_identity
@@ -584,6 +585,14 @@ class BrowserSessionManager:
         if loopback_hit is not None:
             logger.debug("browser_manager: session=%s navigate url=%r rejected -- loopback/link-local", session_id, url)
             return {"status": "error", "error": f"target {loopback_hit!r} is a loopback/link-local address -- this can never be the real pentest target"}
+        # Fail-closed egress gate (agent/egress_guard.py): refuse to drive the browser to a real URL
+        # when the configured VPN/proxy channel is down -- checked BEFORE launching a context, so a
+        # blocked navigate never consumes a concurrency slot or spins up Chromium. Off the event
+        # loop: a cache miss does a real (blocking) public-IP probe.
+        egress_reason = await asyncio.to_thread(egress_guard.egress_block_reason)
+        if egress_reason is not None:
+            logger.debug("browser_manager: session=%s navigate url=%r blocked by egress kill-switch", session_id, url)
+            return {"status": "blocked", "error": egress_reason}
         ensure = await self.get_or_create_context(session_id)
         if ensure["status"] != "ok":
             logger.debug("browser_manager: session=%s navigate url=%r failed to get a context (%s)", session_id, url, ensure.get("error") or ensure.get("reason"))

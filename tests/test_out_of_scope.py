@@ -198,26 +198,28 @@ def _make_tool(name: str = "http_request") -> ToolSpec:
     )
 
 
-def test_run_tool_with_retry_skips_a_call_against_an_out_of_scope_target(tmp_path, monkeypatch):
+def test_run_tool_with_retry_skips_a_call_against_an_out_of_scope_target(tmp_path, monkeypatch, register_test_tool):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
     session = {"session_id": "usr_oos_test", "logs": [], "out_of_scope": ["staging.example.com"]}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = _make_tool()
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "https://staging.example.com/login"}))
 
     assert result["status"] == "skipped"
     assert "out of scope" in result["reason"]
 
 
-def test_run_tool_with_retry_runs_normally_for_an_in_scope_target(tmp_path, monkeypatch):
+def test_run_tool_with_retry_runs_normally_for_an_in_scope_target(tmp_path, monkeypatch, register_test_tool):
     monkeypatch.setattr(store, "SESSIONS_DIR", tmp_path)
     monkeypatch.setattr(store, "INDEX_PATH", tmp_path / "sessions_index.json")
     session = {"session_id": "usr_oos_clear", "logs": [], "out_of_scope": ["staging.example.com"]}
     ctx = RunContext(llm=None, session=session, session_id=session["session_id"])
     spec = _make_tool()
 
+    register_test_tool(spec)
     result = _run(_run_tool_with_retry(ctx, spec, {"target": "https://app.example.com/login"}))
 
     assert result["status"] == "ok"

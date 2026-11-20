@@ -14,11 +14,13 @@ already does it -- this function itself stays a plain, ungated HTTP client.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
 import httpx
 
+from agent import egress_guard
 from agent.tools import toolkit_store
 from agent.tools.toolkit_store import TrafficSource
 from agent.utils.debug import session_log_scope
@@ -63,6 +65,15 @@ async def send_raw_request(
     pentest target commonly has a self-signed/expired cert, and a manual Repeater resend should
     show the RAW response (a redirect itself is often exactly what's being tested), never silently
     follow it."""
+    # Fail-closed egress gate (agent/egress_guard.py): when the configured VPN/proxy channel is
+    # down, refuse the send rather than letting it exit the direct route. Run off the event loop --
+    # a stale cache makes this a dict lookup, but a cache miss does a real (blocking) network probe.
+    egress_reason = await asyncio.to_thread(egress_guard.egress_block_reason)
+    if egress_reason is not None:
+        with session_log_scope(session_id):
+            logger.debug("toolkit_repeater: send blocked by egress kill-switch session=%s url=%s", session_id, url)
+        return {"status": "blocked", "error": egress_reason}
+
     request_body_bytes = body.encode("utf-8") if body else b""
     started_at = time.monotonic()
     try:

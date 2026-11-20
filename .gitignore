@@ -89,6 +89,11 @@ data/toolkit_agent_settings.json
 # agent/reliability_settings.py) — machine-specific operator preference, GUI default over .env
 data/reliability_settings.json
 
+# Fail-closed egress kill-switch settings (managed via /settings -> General, see
+# agent/egress_guard.py) — machine-specific operator config (the VPN/proxy exit IP), GUI over .env.
+# The live store lives under Documents/ASRA/data; this guards the repo-relative data/ dir too.
+data/egress_settings.json
+
 # Custom LLM provider instances (managed via the /settings UI, see agent/custom_providers.py) —
 # each entry carries its own real API key in plain JSON (unlike the 6 built-in providers, which
 # have no fixed env var name to live in since an arbitrary number of these can exist)

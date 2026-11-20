@@ -162,6 +162,7 @@ import agent.tools  # noqa: F401  (side effect: populates TOOL_REGISTRY)
 from agent.tools.custom_tool_runtime import build_dynamic_toolspecs
 from agent.tools.registry import ToolSpec, categories_of, get_tool, get_tools_by_category, register_tool
 from agent.tools.runner import _loggable_params, current_subprocess_registry, run_tool
+from agent.tools.tool_authorization import PLATFORM_POLICY_REFUSAL_NOTICE, authorization_block_result
 from agent.tools.tool_api_keys import get_tool_api_key
 from agent.tools.toolkit_settings_store import load_toolkit_agent_settings
 from agent.utils.debug import current_session_id, current_subagent_label
@@ -426,6 +427,21 @@ _DEGRADED_OK_HINTS: dict[str, Callable[[dict], str | None]] = {
 # decision) and "tool_unavailable" (missing binary) are not fixable by different arguments, so
 # they're deliberately excluded.
 _RETRYABLE_STATUSES = {"error", "timeout"}
+
+# background_job_check/check_subagent_task never go through this generic retry-on-failure path at
+# all (see _run_tool_with_retry's own use of this set) -- their own "status" field is the polled
+# JOB's lifecycle status (running/ok/error/completed_unverified/killed/...), not a verdict on
+# whether the POLL ITSELF (this one dispatch of the check tool) succeeded. Without this exemption,
+# a job that genuinely errored, or one whose own deadline ran out (status="completed_unverified"),
+# fell into the SAME {"error", "timeout"} bucket above by field-name coincidence and either got
+# silently rewritten to status="failed" (erasing the completed_unverified/partial-progress signal
+# the model is supposed to see and act on) or triggered a nonsensical "corrected retry" asking the
+# model for better arguments to re-poll an unchanged job_id/task_id — an automatic re-dispatch of
+# the SAME check call the model never asked for, exactly the kind of silent auto-replay a
+# disconnected/stale-tracked job must never get. Whether to poll again, investigate further, or
+# treat it as a dead end is the model's own explicit call every time, not something this layer
+# should ever make for it underneath.
+_STATUS_CHECK_TOOLS_SKIP_RETRY = frozenset({"background_job_check", "check_subagent_task"})
 
 # _run_tool_with_retry's own bookkeeping fields — never part of a tool's real output, so a
 # terminal_tool result (where the whole dict becomes the phase's final answer, see
@@ -2162,7 +2178,11 @@ def _log_output(result: dict) -> str | None:
 # proof ("the subagent has now reported back: OpenSSH 8.9p1...") when the only status this same
 # trace had ever actually observed for that task_id was "running" -- the model invented a version
 # number and scanner verdict that turned out to be false once the real result eventually arrived.
-_RESOLVED_SUBAGENT_STATUSES = {"done", "timeout", "error"}
+# "completed_unverified" belongs here too: the task stopped being "running" (there's a final status
+# to look at, not an open-ended wait), it's just NOT a confirmed success/failure -- still resolved
+# in the sense this set cares about (safe to stop waiting and look at what's there), never treated
+# as equivalent to "done"/"error" by anything downstream that reads this same status value.
+_RESOLVED_SUBAGENT_STATUSES = {"done", "completed_unverified", "error"}
 
 
 def _unresolved_subagent_task_ids(trace: list[dict]) -> set[str]:
@@ -3371,10 +3391,20 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
     included; it fixes a broken invocation, it does not grant a second exploitation attempt
     (that's state["attempted"] in _run_exploit_for_finding, a separate rule).
     """
+    # Default-deny first: every agent tool execution (pipeline loops, chat, subagents) funnels through
+    # here, so an unrecognized tool is refused before any other gate or the retry machinery runs.
+    unauthorized = authorization_block_result(spec)
+    if unauthorized is not None:
+        return unauthorized
+
     out_of_scope_hit = _out_of_scope_target(ctx.session, arguments)
     if out_of_scope_hit is not None:
         _log_agent_debug(ctx, "tool=%s skipped, target=%r matches an out-of-scope entry", spec.name, out_of_scope_hit)
-        return {"status": "skipped", "tool": spec.name, "reason": f"target {out_of_scope_hit!r} is explicitly out of scope for this project"}
+        return {
+            "status": "skipped",
+            "tool": spec.name,
+            "reason": f"target {out_of_scope_hit!r} is explicitly out of scope for this project. {PLATFORM_POLICY_REFUSAL_NOTICE}",
+        }
 
     loopback_hit = _loopback_or_link_local_target(arguments)
     if loopback_hit is not None:
@@ -3556,7 +3586,7 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
     result["used_arguments"] = _model_visible_arguments(arguments)
     if msf_search_query is not None and result.get("status") == "ok":
         cache_set("msf_module_search", str(msf_search_query), result)
-    if result.get("status") not in _RETRYABLE_STATUSES:
+    if spec.name in _STATUS_CHECK_TOOLS_SKIP_RETRY or result.get("status") not in _RETRYABLE_STATUSES:
         try:
             _track_host_health(ctx, arguments, result)
         except Exception:
@@ -3730,7 +3760,12 @@ async def _run_tool_with_retry(ctx: RunContext, spec: ToolSpec, arguments: dict)
         # original failed call — same guarantee as the first-call check above, not just applied
         # once and assumed to still hold.
         _log_agent_debug(ctx, "tool=%s retry skipped, target=%r matches an out-of-scope entry", spec.name, retry_out_of_scope_hit)
-        return {"status": "skipped", "tool": spec.name, "reason": f"target {retry_out_of_scope_hit!r} is explicitly out of scope for this project", "retried": True}
+        return {
+            "status": "skipped",
+            "tool": spec.name,
+            "reason": f"target {retry_out_of_scope_hit!r} is explicitly out of scope for this project. {PLATFORM_POLICY_REFUSAL_NOTICE}",
+            "retried": True,
+        }
 
     # NOTE: a bare-timeout correction guard used to live here (real incidents it closed:
     # midnight-usr_24ba7e's nmap-against-a-dead-host retry, and Live-Nation-HackerOne-usr_0f5c71's
@@ -3905,10 +3940,11 @@ def _record_llm_usage_event(session: dict, provider_id: str, model: str, latency
 
 # check_subagent_task/check_background_job don't share the tier-2 tool convention of returning
 # {"status": "ok"} on success -- they pass through their OWN task/job lifecycle status instead
-# ("running" while still in flight, "done"/"ok" once finished, "error"/"timeout"/"killed"/
-# "orphaned"/"stopped" only for genuine terminal failures). Without this allowlist, every single
-# legitimate poll -- including one that lands on a task the operator's own docs tell the model to
-# delegate to and NOT poll in a tight loop -- got counted as a phase failure by the generic
+# ("running" while still in flight, "done"/"ok" once finished, "error"/"completed_unverified"/
+# "killed"/"orphaned"/"stopped" only for genuine terminal failures/ambiguous outcomes). Without
+# this allowlist, every single legitimate poll -- including one that lands on a task the
+# operator's own docs tell the model to delegate to and NOT poll in a tight loop -- got counted as
+# a phase failure by the generic
 # `status != "ok"` check below. Confirmed live (a real HackerOne session): an analyze phase
 # logged "6 ended not-ok" when only 3 were real errors; the other 4 were check_subagent_task calls
 # that correctly found the delegated task still "running". non_ok/failure_rate carries double the
@@ -7233,10 +7269,12 @@ async def _upgrade_stall_forced_reverify_verdict(
     )
     upgrade_task = (
         task
-        + "\n\n[Subagent finished after this pass already had to conclude without it] "
+        + "\n\n[Subagent task reached a final status after this pass already had to conclude without it] "
         + json.dumps({"outcome": resolved["status"], "result": resolved["result"]})[:_TOOL_RESULT_CHAR_LIMIT]
         + "\n\nYour previous attempt at this same finding had to answer verification_outcome=\"inconclusive\" "
-        "before this delegated subagent task finished. It has now finished — the real result is above. Use "
+        "before this delegated subagent task reached a final status. The real outcome/result is above — "
+        "note that outcome=\"completed_unverified\" means the task's own time budget ran out before it ever "
+        "reported a real result (NOT a confirmed success), so treat its partial result accordingly. Use "
         "it to give an actual verdict now if it lets you; answer inconclusive again only if it genuinely "
         "still doesn't settle this."
     )
@@ -9690,7 +9728,7 @@ async def _run_exploit_for_finding(
         if not is_multi_call_tool:
             state["attempted"] = True
         if not approved:
-            return {"status": "skipped", "reason": "exploit not approved in time"}
+            return {"status": "skipped", "reason": f"exploit not approved in time. {PLATFORM_POLICY_REFUSAL_NOTICE}"}
         return await _run_tool_with_retry(ctx, spec, arguments)
 
     task = (
@@ -11579,7 +11617,7 @@ def _make_hypothesis_verification_executor(
             return await _run_tool_with_retry(ctx, spec, arguments)
         approved = await _await_exploit_approval(ctx, {"title": "hypothesis verification"})
         if not approved:
-            return {"status": "skipped", "reason": "exploit not approved in time"}
+            return {"status": "skipped", "reason": f"exploit not approved in time. {PLATFORM_POLICY_REFUSAL_NOTICE}"}
         return await _run_tool_with_retry(ctx, spec, arguments)
 
     return execute
@@ -12146,7 +12184,7 @@ async def _run_chain_pass(ctx: RunContext, hop_index: int) -> dict | None:
         # during Exploit itself doesn't ask again here.
         approved = await _await_exploit_approval(ctx, {"title": "chaining pass"})
         if not approved:
-            return {"status": "skipped", "reason": "exploit not approved in time"}
+            return {"status": "skipped", "reason": f"exploit not approved in time. {PLATFORM_POLICY_REFUSAL_NOTICE}"}
         return await _run_tool_with_retry(ctx, spec, arguments)
 
     # Full evidence, not _run_validate's slim dedup summary below — a chain claim has to quote

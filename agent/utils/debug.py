@@ -72,6 +72,8 @@ CATEGORY_COLORS: dict[str, str] = {
     # main-agent operator profile load/save (agent/operator_profile_store.py)
     "SCHEDULER": "\033[38;5;49m",  # spring green — distinct from every other category, the
     # unattended repeat-scan scheduler (agent/tools/schedule_store.py + main.py's worker loop)
+    "EGRESS": "\033[38;5;198m",  # hot pink/magenta — distinct from every other category, the
+    # fail-closed egress kill-switch probe + enforcement (agent/egress_guard.py)
 }
 _RESET = "\033[0m"
 _FALLBACK_COLOR = "\033[37m"  # white, for a category missing from CATEGORY_COLORS
